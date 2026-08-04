@@ -18,7 +18,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-layout style="height: 100vh">
+  <n-layout position="absolute" style="--app-header-h: 48px">
     <n-layout-header v-if="!bare" bordered class="topbar">
       <div class="brand">
         <n-icon :component="TrendingUp" size="22" color="#f5c23f" />
@@ -31,8 +31,10 @@ onMounted(() => {
       <n-tag v-else type="warning" size="small" round>定时扫描已暂停</n-tag>
     </n-layout-header>
     <n-layout-content
+      position="absolute"
+      :style="bare ? 'top: 0' : 'top: var(--app-header-h)'"
       :native-scrollbar="false"
-      :content-style="bare ? 'height: 100%; padding: 0' : 'padding: 16px'"
+      :content-style="bare ? 'height: 100%; padding: 0' : 'height: 100%; box-sizing: border-box; padding: 16px'"
     >
       <!-- 只缓存列表页（DashboardView）：返回时不再全量重载；K线图页不缓存，保持每次进入重置视图 -->
       <router-view v-slot="{ Component }">

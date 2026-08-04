@@ -14,6 +14,7 @@ import {
 import { ArrowLeft, Eye, EyeOff, List } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import { api, onDataUpdated, onScanCompleted } from '../services/api'
+import OverflowText from '../components/OverflowText.vue'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
@@ -33,10 +34,44 @@ const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code ===
 
 /** 最近一次扫描识别出的该品种全部N形态（策略基于 15m/60m，与图表显示级别无关） */
 const signals = computed<PatternDto[]>(() => {
-  if (!scansStore.latest) return []
-  return scansStore.latest.signals
+  return scansStore.latestSignals
     .filter((s) => s.symbol === symbol.value)
     .map((s) => s as unknown as PatternDto)
+})
+
+/**
+ * 形态身份键：方向+级别+s1/s2 索引，用于把「最近活跃信号」历史挂到对应的形态卡片上
+ */
+function historyKey(s: PatternDto) {
+  return `${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
+}
+
+/**
+ * 每个形态的状态演变历史：来自最近若干次扫描的实时记录（不是事后回算），
+ * 同一形态连续几轮状态不变时只保留一次。挂在对应形态卡片下展示。
+ */
+const patternHistory = computed(() => {
+  const map = new Map<string, { time: string; state: string }[]>()
+  const rows = [...scansStore.recentSignals].sort((a, b) =>
+    a.created_at.localeCompare(b.created_at),
+  )
+  for (const r of rows) {
+    let d: PatternDto | null = null
+    try {
+      d = JSON.parse(r.detail) as PatternDto
+    } catch {
+      d = null
+    }
+    if (!d) continue
+    const key = `${r.direction}|${r.level}|${d.s1.index}|${d.s2.index}`
+    const arr = map.get(key) ?? []
+    const last = arr[arr.length - 1]
+    if (!last || last.state !== r.state) {
+      arr.push({ time: r.created_at, state: r.state })
+    }
+    map.set(key, arr)
+  }
+  return map
 })
 
 const latestClose = computed(() =>
@@ -45,6 +80,22 @@ const latestClose = computed(() =>
 
 /** 被点击隐藏的形态编号（用于控制K线图上的展示） */
 const hiddenNumbers = ref<Set<number>>(new Set())
+
+/** 记录“仅显示首个形态”的默认隐藏是否已应用到当前 品种+周期 */
+const hiddenApplied = ref('')
+
+/**
+ * 默认只显示第一个形态：其余全部在K线图上隐藏，避免画线/标点堆叠看不清。
+ * 用户手动点开/隐藏后不再自动重置；切换品种或周期时重新按默认应用。
+ */
+function applyDefaultHidden() {
+  const key = `${symbol.value}|${timeframe.value}`
+  if (hiddenApplied.value === key) return
+  const nums = signals.value.map((s) => s.number)
+  if (!nums.length) return
+  hiddenApplied.value = key
+  hiddenNumbers.value = new Set(nums.slice(1))
+}
 
 /** 左侧品种列表开关与行情快照 */
 const showList = ref(true)
@@ -239,11 +290,24 @@ function fmtDelta(delta: number) {
   return Math.abs(delta).toFixed(1)
 }
 
+/** 最近活跃信号时间显示：MM-DD HH:mm */
+function fmtRecentTime(t: string) {
+  return t.length >= 16 ? t.slice(5, 16) : t
+}
+
 let unlisteners: (() => void)[] = []
 
+// 形态列表就绪后（含进入页面、扫描完成刷新）按默认规则隐藏非首个形态
+watch(signals, applyDefaultHidden, { immediate: true })
+
 watch([symbol, timeframe], async () => {
-  hiddenNumbers.value = new Set()
-  if (symbol.value) await klinesStore.load(symbol.value, timeframe.value, 1200)
+  hiddenApplied.value = ''
+  applyDefaultHidden()
+  if (symbol.value) {
+    await klinesStore.load(symbol.value, timeframe.value, 1200)
+    scansStore.loadRecentSignals(symbol.value)
+    scansStore.refreshLatestSignals()
+  }
 })
 
 onMounted(async () => {
@@ -251,20 +315,33 @@ onMounted(async () => {
     await onScanCompleted((result) => {
       scansStore.ingest(result)
       loadSnapshots()
+      scansStore.loadRecentSignals(symbol.value)
+      scansStore.refreshLatestSignals()
     }),
   )
-  unlisteners.push(await onDataUpdated(() => loadSnapshots()))
+  unlisteners.push(
+    await onDataUpdated(() => {
+      loadSnapshots()
+      scansStore.refreshLatestSignals()
+    }),
+  )
   await symbolsStore.load()
   // 进入页面立即拉一次行情快照，避免左侧价格/涨幅要等下一次刷新或扫描事件才显示
   loadSnapshots()
   if (!scansStore.latest) {
     try {
       await scansStore.runScan()
+      scansStore.loadRecentSignals(symbol.value)
+      scansStore.refreshLatestSignals()
     } catch {
       // 无数据时扫描失败不影响看图
     }
   }
-  if (symbol.value) await klinesStore.load(symbol.value, timeframe.value, 1200)
+  if (symbol.value) {
+    await klinesStore.load(symbol.value, timeframe.value, 1200)
+    scansStore.loadRecentSignals(symbol.value)
+    scansStore.refreshLatestSignals()
+  }
 })
 
 onBeforeUnmount(() => {
@@ -318,7 +395,7 @@ onBeforeUnmount(() => {
             @click="router.push({ name: 'chart', params: { symbol: row.code } })"
           >
             <div class="sl-main">
-              <span class="sl-name">{{ row.name || row.code }}</span>
+              <OverflowText class="sl-name" :text="row.name || row.code" />
               <span class="sl-code">{{ row.code }}</span>
             </div>
             <span
@@ -430,6 +507,13 @@ onBeforeUnmount(() => {
                   <span class="dot"></span>{{ s.state }}
                 </div>
 
+                <div v-if="patternHistory.get(historyKey(s))?.length" class="pc-history">
+                  <span class="pc-history-label">状态演变</span>
+                  <span v-for="(h, i) in patternHistory.get(historyKey(s))" :key="i">
+                    {{ i > 0 ? ' → ' : '' }}{{ fmtRecentTime(h.time) }} {{ h.state }}
+                  </span>
+                </div>
+
                 <div class="pc-prices">
                   <div class="pc-price">
                     <span>入场</span>
@@ -491,8 +575,9 @@ onBeforeUnmount(() => {
   padding: 10px;
 }
 .symbol-list {
-  flex: 0 0 210px;
-  width: 210px;
+  /* 字号整体放大一档后，容器同步加宽，避免文字挤在一起 */
+  flex: 0 0 230px;
+  width: 230px;
   min-width: 0;
   background: #fff;
   border-radius: 10px;
@@ -502,8 +587,8 @@ onBeforeUnmount(() => {
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
 }
 .sl-title {
-  padding: 10px 12px 6px;
-  font-size: 13px;
+  padding: 12px 14px 8px;
+  font-size: 14px;
   font-weight: 600;
   color: #334155;
 }
@@ -511,8 +596,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 7px 12px;
+  gap: 10px;
+  padding: 8px 14px;
   cursor: pointer;
   border-left: 3px solid transparent;
   transition: background 0.15s;
@@ -531,14 +616,11 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 .sl-name {
-  font-size: 12px;
+  font-size: 14px;
   color: #1f2329;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .sl-code {
-  font-size: 10px;
+  font-size: 12px;
   color: #94a3b8;
 }
 .sl-quote {
@@ -548,11 +630,11 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
 }
 .sl-price {
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 600;
 }
 .sl-change {
-  font-size: 10px;
+  font-size: 12px;
 }
 .sl-row.has-pending {
   background: rgba(22, 119, 255, 0.05);
@@ -567,18 +649,18 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  font-size: 10px;
+  gap: 4px;
+  font-size: 12px;
   font-weight: 600;
   line-height: 1;
-  padding: 2px 5px;
+  padding: 3px 8px;
   border-radius: 999px;
   white-space: nowrap;
 }
 .sl-sig::before {
   content: '';
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: currentColor;
 }
@@ -857,6 +939,17 @@ onBeforeUnmount(() => {
 .pc-state.error {
   color: #e03131;
   background: rgba(224, 49, 49, 0.1);
+}
+.pc-history {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #94a3b8;
+}
+.pc-history-label {
+  margin-right: 6px;
+  font-weight: 600;
+  color: #64748b;
 }
 .pc-prices {
   display: grid;

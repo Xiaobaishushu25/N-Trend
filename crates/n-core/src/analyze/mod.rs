@@ -60,6 +60,11 @@ pub fn analyze_bars(symbol: &str, bars15: &[Bar], bars60: &[Bar]) -> Result<Anal
     let latest_down_fine = pattern::latest_pattern(&fine, Dir::Down);
     let latest_down_large = pattern::latest_pattern(&large, Dir::Down);
     let latest_up_fine = pattern::latest_pattern(&fine, Dir::Up);
+    // 上涨大级别此前未进入候选：识别阶段会算出并保留合法的“较大”上涨N，
+    // 但这里没有对应的 latest_up_large，导致这类结构（常见于a段较长、
+    // 超过精细16根上限的行情）在生成信号前被静默丢弃，K线页与列表页都看不到。
+    // 现补上该槽位；与上涨精细同起止点时由 dedup_signals 按评分保留更优者。
+    let latest_up_large = pattern::latest_pattern(&large, Dir::Up);
 
     let mut candidates: Vec<SignalTuple> = Vec::new();
     if let Some(p) = latest_down_large {
@@ -69,6 +74,9 @@ pub fn analyze_bars(symbol: &str, bars15: &[Bar], bars60: &[Bar]) -> Result<Anal
         candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
     }
     if let Some(p) = latest_up_fine {
+        candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
+    }
+    if let Some(p) = latest_up_large {
         candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
     }
     let signals = dedup_signals(candidates);

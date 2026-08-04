@@ -21,3 +21,21 @@ body {
 * {
   box-sizing: border-box;
 }
+
+/* ===== 通用右键菜单（@imengyu/vue3-context-menu）样式微调 ===== */
+
+/* 菜单项里的 svg 图标统一按菜单图标尺寸显示（tabler 图标本身不带 width/height） */
+.mx-context-menu .mx-icon-placeholder svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* 危险操作项标红：配合 openContextMenu 的 customClass: 'menu-item-danger' 使用 */
+.mx-context-menu .menu-item-danger {
+  color: #e03131;
+}
+.mx-context-menu .menu-item-danger:hover,
+.mx-context-menu .menu-item-danger:active {
+  background-color: rgba(224, 49, 49, 0.1);
+  color: #e03131;
+}

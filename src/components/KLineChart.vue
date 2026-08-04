@@ -115,8 +115,8 @@ let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
 
 /** 进入图表时默认展示的K线根数（从最新一根往前数）。根数越少单根K线越宽；
- *  原为 150，降到 130 让默认视图下的K线更宽。先写死便于手工调整，后续由配置传入 */
-const display_k_num = 90
+ *  想再宽就调小，想多看历史就调大。先写死便于手工调整，后续由配置传入 */
+const display_k_num = 160
 /** K线最小间距(px)：窗口较窄或视图拉得较宽时，防止K线细成一条线 */
 const MIN_BAR_SPACING = 8
 /** 默认视图右侧留出的空白（以K线根数为单位），相当于把图表向左拖一段，让最新K线不贴右边缘 */
@@ -592,6 +592,8 @@ onMounted(() => {
         height: container.value.clientHeight,
       })
       applyPaneHeights()
+      // 尺寸定稿后再校准一次默认视图：防止初始化期间宽度变化把视图重置成全量
+      if (!lastView) applyDefaultView()
     }
   })
 })
@@ -711,8 +713,6 @@ onBeforeUnmount(() => {
   justify-content: center;
 }
 </style>
-
-
 
 
 

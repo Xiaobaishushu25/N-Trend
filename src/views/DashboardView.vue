@@ -5,7 +5,6 @@ import {
   NButton,
   NDataTable,
   NInput,
-  NPopconfirm,
   NSpace,
   NSwitch,
   NTag,
@@ -14,9 +13,12 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import dayjs from 'dayjs'
+import { Trash } from '@vicons/tabler'
 import { api, onDataUpdated, onScanCompleted } from '../services/api'
 import { useSymbolsStore } from '../stores/symbols'
 import { useScansStore } from '../stores/scans'
+import { confirmAction } from '../utils/confirm'
+import { openContextMenu } from '../utils/contextMenu'
 import type { KlineRow, SignalRow, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
@@ -126,6 +128,40 @@ function rowProps(row: WatchRow): Record<string, unknown> {
   return {
     style: 'cursor: pointer',
     onDblclick: () => openChart(row),
+    onContextmenu: (e: MouseEvent) => onRowContextMenu(row, e),
+  }
+}
+
+/** 行右键菜单：目前只有删除，后续加“打开K线图”等操作时直接往 items 里加即可 */
+function onRowContextMenu(row: WatchRow, e: MouseEvent) {
+  openContextMenu(e, {
+    items: [
+      {
+        label: '删除品种',
+        icon: h(Trash),
+        customClass: 'menu-item-danger',
+        onClick: () => handleDelete(row),
+      },
+    ],
+  })
+}
+
+/** 删除品种：先弹确认框，确认后再删除并刷新表格 */
+async function handleDelete(row: WatchRow) {
+  const ok = await confirmAction({
+    title: '删除品种',
+    content: `确定删除 ${row.symbol.code} 吗？将同时删除其K线数据。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    type: 'warning',
+  })
+  if (!ok) return
+  try {
+    await symbolsStore.remove(row.symbol.code)
+    message.success(`${row.symbol.code} 已删除`)
+    await loadAll()
+  } catch (err) {
+    message.error(String(err))
   }
 }
 
@@ -244,21 +280,6 @@ const columns: DataTableColumns<WatchRow> = [
         onUpdateValue: (v: boolean) => symbolsStore.setFlags(r.symbol.code, r.symbol.watchlist, v),
       }),
   },
-  {
-    title: '操作',
-    key: 'actions',
-    width: 90,
-    render: (r) =>
-      h(
-        NPopconfirm,
-        { onPositiveClick: () => symbolsStore.remove(r.symbol.code) },
-        {
-          trigger: () =>
-            h(NButton, { size: 'small', type: 'error', quaternary: true }, { default: () => '删除' }),
-          default: () => `删除 ${r.symbol.code}？将同时删除其K线数据。`,
-        },
-      ),
-  },
 ]
 
 async function doRefresh() {
@@ -316,7 +337,13 @@ async function doAddSymbol() {
 
 onMounted(async () => {
   unlisteners.push(await onDataUpdated(() => loadAll()))
-  unlisteners.push(await onScanCompleted(() => loadAll()))
+  // 扫描完成时同步更新内存里的最新扫描结果，避免图表页「全部N形态」停留在旧扫描
+  unlisteners.push(
+    await onScanCompleted((result) => {
+      scansStore.ingest(result)
+      loadAll()
+    }),
+  )
   await loadAll()
 })
 
@@ -343,6 +370,7 @@ onBeforeUnmount(() => {
       </n-space>
     </div>
     <n-data-table
+      class="watch-table"
       :columns="columns"
       :data="rows"
       :loading="loading"
@@ -350,6 +378,7 @@ onBeforeUnmount(() => {
       size="small"
       :bordered="true"
       :single-line="false"
+      flex-height
     />
   </div>
 </template>
@@ -359,11 +388,17 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  height: 100%;
+  min-height: 0;
 }
 .toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+.watch-table {
+  flex: 1;
+  min-height: 0;
 }
 </style>
 
