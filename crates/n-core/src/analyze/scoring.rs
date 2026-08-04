@@ -1,0 +1,1458 @@
+use crate::analyze::indicators;
+use crate::analyze::model::{Bar, Dir, Grade, NPattern, SignalCheck, Trend60};
+
+const STOP_FOLLOW_MIN_AGE: usize = 3;
+const STOP_FOLLOW_MAX_AGE: usize = 6;
+const STOP_FOLLOW_DISTANCE_RISK: f64 = 1.0;
+// 未触发信号的预警K线最大存活根数，超过视为过时
+const PENDING_MAX_AGE: usize = 12;
+const OPPOSING_WICK_ATR_MIN: f64 = 0.25;
+const OPPOSING_WICK_RANGE_MIN: f64 = 0.50;
+const OPPOSING_PREV_RANGE_ATR_MIN: f64 = 0.80;
+const OPPOSING_PREV_BODY_ATR_MIN: f64 = 0.50;
+const ENTRY_BLOCK_TRIGGER_PENALTY: f64 = 0.70;
+const ENTRY_BLOCK_MOMENTUM_PENALTY: f64 = 0.35;
+const TRIGGER_OPPOSITION_PENALTY_MAX: f64 = 2.00;
+// b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不能确认b段结束
+const WEAK_CONFIRM_TRIGGER_PENALTY: f64 = 1.0;
+const WEAK_CONFIRM_MOMENTUM_PENALTY: f64 = 1.0;
+// 弱确认信号总分上限：只允许小仓试错，不进入标准仓区间
+const WEAK_CONFIRM_TOTAL_MAX: f64 = 3.49;
+// 影线预警的收盘位置上限：做空上影线须收盘于振幅下1/3内，做多下影线须收盘于上1/3内
+const WICK_CLOSE_POS_MAX: f64 = 0.35;
+
+fn clamp(v: f64) -> f64 {
+    v.clamp(0.0, 5.0)
+}
+
+fn atr_at(atr20: &[Option<f64>], index: usize) -> f64 {
+    atr20.get(index).and_then(|x| *x).unwrap_or(1.0)
+}
+
+fn score_60m(trend: &Trend60, dir: Dir) -> f64 {
+    if trend.aligned_with(dir) {
+        if trend.strong() {
+            4.5
+        } else {
+            3.0
+        }
+    } else if trend.opposite_to(dir) {
+        if trend.strong() {
+            0.5
+        } else {
+            1.0
+        }
+    } else {
+        2.0
+    }
+}
+
+fn score_a(p: &NPattern, atr20: &[Option<f64>]) -> f64 {
+    let atr = atr_at(atr20, p.s1.index);
+    let speed = p.a_move / p.a_bars.max(1) as f64;
+    let speed_ratio = (speed / atr).min(1.5);
+
+    let mut s = 2.0;
+    if p.a_bars <= 6 {
+        s += 1.0;
+    } else if p.a_bars <= 10 {
+        s += 0.3;
+    } else if p.a_bars <= 16 {
+        s += 0.0;
+    } else {
+        s -= 0.5;
+    }
+
+    s += speed_ratio * 0.8;
+    s += match p.a_strong_trend {
+        0 => 0.0,
+        1 => 0.3,
+        _ => 0.6,
+    };
+    s += if p.a_move >= 2.0 * atr {
+        0.8
+    } else if p.a_move >= 1.5 * atr {
+        0.6
+    } else if p.a_move >= atr {
+        0.4
+    } else {
+        0.0
+    };
+
+    clamp(s)
+}
+
+fn score_b(p: &NPattern) -> f64 {
+    let mut s = p.grade.score_base();
+    if p.b_fast && p.grade != Grade::C {
+        s -= 0.5;
+    }
+    if p.b_too_long {
+        s -= 0.5;
+    }
+    s -= (p.b_strong_reverse.min(2) as f64) * 0.3;
+    clamp(s)
+}
+
+fn score_trigger(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    warning: Option<usize>,
+    trigger: Option<usize>,
+    p: &NPattern,
+    local_block_count: u8,
+) -> f64 {
+    match (warning, trigger) {
+        (None, _) => 0.0,
+        (Some(_), None) => 1.0,
+        (Some(w), Some(t)) => {
+            let mut s = 3.0;
+            let delay = t.saturating_sub(w);
+            if delay <= 1 {
+                s += 1.0;
+            } else if delay <= 3 {
+                s += 0.5;
+            } else {
+                s -= 0.5;
+            }
+            if p.grade == Grade::A {
+                s += 0.2;
+            }
+            if p.c_extended {
+                s -= 0.5;
+            }
+            s -= ENTRY_BLOCK_TRIGGER_PENALTY * local_block_count as f64;
+            s -= trigger_opposition_penalty(bars, atr20, p.dir, p.s2.index, t);
+            clamp(s)
+        }
+    }
+}
+
+fn score_rr(rr: f64, momentum: f64, c_extended: bool) -> f64 {
+    let base = if rr <= 0.0 { 0.0 } else { (rr * 2.5).min(5.0) };
+    if !c_extended && momentum >= 3.5 {
+        base.max(2.0)
+    } else {
+        base
+    }
+}
+
+fn score_momentum(
+    p: &NPattern,
+    trend: &Trend60,
+    atr20: &[Option<f64>],
+    entry_block_count: u8,
+) -> f64 {
+    let atr = atr_at(atr20, p.s2.index);
+    let mut s = 2.5;
+    if p.c_extended {
+        s -= 1.0;
+    } else {
+        s += 0.5;
+    }
+    if trend.aligned_with(p.dir) && trend.strong() {
+        s += 0.5;
+    }
+    if p.a_move >= 1.5 * atr {
+        s += 0.3;
+    }
+    if p.b_strong_reverse == 0 {
+        s += 0.2;
+    }
+    s -= ENTRY_BLOCK_MOMENTUM_PENALTY * entry_block_count as f64;
+    clamp(s)
+}
+
+fn strong_opposite_body_at(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    dir: Dir,
+    index: usize,
+) -> Option<f64> {
+    let bar = bars.get(index)?;
+    let atr = atr_at(atr20, index);
+    if atr <= 0.0 {
+        return None;
+    }
+    let range = bar.high - bar.low;
+    let body = (bar.close - bar.open).abs();
+    if range <= 0.0 || body <= 0.0 {
+        return None;
+    }
+
+    let (dir_ok, close_ok) = match dir {
+        Dir::Up => {
+            let bearish = bar.close < bar.open;
+            let close_near_low = bar.close - bar.low <= 0.5 * body;
+            (bearish, close_near_low)
+        }
+        Dir::Down => {
+            let bullish = bar.close > bar.open;
+            let close_near_high = bar.high - bar.close <= 0.5 * body;
+            (bullish, close_near_high)
+        }
+    };
+
+    if dir_ok
+        && close_ok
+        && range >= OPPOSING_PREV_RANGE_ATR_MIN * atr
+        && body >= OPPOSING_PREV_BODY_ATR_MIN * atr
+        && body >= 0.5 * range
+    {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn entry_block_flags(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    dir: Dir,
+    trigger: usize,
+) -> (bool, bool) {
+    let atr = atr_at(atr20, trigger);
+    let wick_block = bars.get(trigger).is_some_and(|b| {
+        if atr <= 0.0 {
+            return false;
+        }
+        let range = b.high - b.low;
+        if range <= 0.0 {
+            return false;
+        }
+        let body = (b.close - b.open).abs();
+        let upper = b.high - b.open.max(b.close);
+        let lower = b.open.min(b.close) - b.low;
+        let wick = match dir {
+            Dir::Up => upper,
+            Dir::Down => lower,
+        };
+        wick > body
+            && wick >= OPPOSING_WICK_ATR_MIN * atr
+            && wick >= OPPOSING_WICK_RANGE_MIN * range
+    });
+
+    let prev_block = trigger > 0
+        && strong_opposite_body_at(bars, atr20, dir, trigger - 1).is_some();
+
+    (wick_block, prev_block)
+}
+
+fn trigger_opposition_penalty(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    dir: Dir,
+    b_end: usize,
+    trigger: usize,
+) -> f64 {
+    let Some(opposing_body) = strong_opposite_body_at(bars, atr20, dir, b_end) else {
+        return 0.0;
+    };
+    let Some(trigger_bar) = bars.get(trigger) else {
+        return 0.0;
+    };
+    let trigger_body = (trigger_bar.close - trigger_bar.open).abs();
+    if trigger_body <= 0.0 {
+        return TRIGGER_OPPOSITION_PENALTY_MAX;
+    }
+    let ratio = opposing_body / trigger_body;
+    (ratio - 1.0).clamp(0.0, 3.0) * (TRIGGER_OPPOSITION_PENALTY_MAX / 3.0)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WarnKind {
+    Single,
+    Cumulative,
+}
+
+fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
+    match dir {
+        Dir::Up => bar.close > bar.open,
+        Dir::Down => bar.close < bar.open,
+    }
+}
+
+/// b段方向上的严格趋势K线（做多对应强阴线，做空对应强阳线）
+fn strong_b_dir_trend_candle(trend_k: &[(bool, bool)], i: usize, dir: Dir) -> bool {
+    trend_k.get(i).is_some_and(|&(up, down)| match dir {
+        Dir::Up => down,
+        Dir::Down => up,
+    })
+}
+
+/// 单根K线构成的反转形态：吞没反转段前的b向实体 / 强反向趋势K / 反向长影线
+fn single_reversal_pattern(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    trend_k: &[(bool, bool)],
+    dir: Dir,
+    w: usize,
+    run_start: usize,
+) -> bool {
+    let Some(bar) = bars.get(w) else {
+        return false;
+    };
+    let range = bar.high - bar.low;
+    if range <= 0.0 {
+        return false;
+    }
+
+    // 阴包阳/阳包阴：仅对反转段的第一根反向K线检查，目标实体是它前面的b向K线。
+    // 要求前面是b向实体（做空为阳线、做多为阴线），新K线为反向收盘并包住前一根实体，
+    // 且至少一侧严格超过前实体——避免"实体完全相同的镜像小K线"被误判为吞没。
+    let engulf = w == run_start
+        && w > 0
+        && match dir {
+            Dir::Up => {
+                let prev = &bars[w - 1];
+                prev.close < prev.open
+                    && bar.close > bar.open
+                    && bar.close >= prev.open
+                    && bar.open <= prev.close
+                    && (bar.close > prev.open || bar.open < prev.close)
+            }
+            Dir::Down => {
+                let prev = &bars[w - 1];
+                prev.close > prev.open
+                    && bar.close < bar.open
+                    && bar.open >= prev.close
+                    && bar.close <= prev.open
+                    && (bar.open > prev.close || bar.close < prev.open)
+            }
+        };
+    if engulf {
+        return true;
+    }
+
+    let strong = match dir {
+        Dir::Up => trend_k.get(w).is_some_and(|x| x.0),
+        Dir::Down => trend_k.get(w).is_some_and(|x| x.1),
+    };
+    if strong {
+        return true;
+    }
+
+    let body = (bar.close - bar.open).abs();
+    let atr = atr_at(atr20, w);
+    let upper = bar.high - bar.open.max(bar.close);
+    let lower = bar.open.min(bar.close) - bar.low;
+    let wick = match dir {
+        Dir::Up => lower,
+        Dir::Down => upper,
+    };
+    // 影线预警还要求收盘位置在反向一端：避免把十字星/中位收盘的小K线误判为长影线
+    let close_ok = match dir {
+        Dir::Up => (bar.high - bar.close) / range <= WICK_CLOSE_POS_MAX,
+        Dir::Down => (bar.close - bar.low) / range <= WICK_CLOSE_POS_MAX,
+    };
+    wick > body
+        && wick >= OPPOSING_WICK_ATR_MIN * atr
+        && wick >= OPPOSING_WICK_RANGE_MIN * range
+        && close_ok
+}
+
+/// 多K累积覆盖：连续反向收盘至少2根，且最后一根收盘越过强b向K线的开盘价（吞没其实体）
+fn cumulative_coverage(
+    bars: &[Bar],
+    run_start: usize,
+    j: usize,
+    anchor_open: f64,
+    dir: Dir,
+) -> bool {
+    if j < run_start + 1 {
+        return false;
+    }
+    let last_close = bars[j].close;
+    match dir {
+        Dir::Up => last_close > anchor_open,
+        Dir::Down => last_close < anchor_open,
+    }
+}
+
+/// A级快速路径的最低质量门槛：反向收盘必须落在K线振幅的反向一半内。
+/// 排除"小实体+长反向影线"（十字星、射击之星变体）这类收盘被反向力量
+/// 压制的K线直接当预警，避免任意一根小阳线/小阴线都被放行。
+fn fast_path_close_ok(bars: &[Bar], dir: Dir, i: usize) -> bool {
+    let Some(bar) = bars.get(i) else {
+        return false;
+    };
+    let range = bar.high - bar.low;
+    if range <= 0.0 {
+        return false;
+    }
+    match dir {
+        // 做多预警要求收盘在振幅上半部分（上影不占主导）
+        Dir::Up => (bar.high - bar.close) / range <= 0.5,
+        // 做空预警要求收盘在振幅下半部分（下影不占主导）
+        Dir::Down => (bar.close - bar.low) / range <= 0.5,
+    }
+}
+
+fn weak_confirm_prefix(weak: bool) -> &'static str {
+    if weak {
+        "反转仅靠多K累积确认，信号降级为小仓试错；"
+    } else {
+        ""
+    }
+}
+
+fn score_category(total: f64) -> &'static str {
+    if total >= 4.5 {
+        "标准仓，可分批加仓候选"
+    } else if total >= 3.5 {
+        "标准仓，按结构等级调整"
+    } else if total >= 2.5 {
+        "小仓试错，约标准仓25%-50%"
+    } else if total >= 1.5 {
+        "默认观察，不主动开仓"
+    } else {
+        "放弃本次结构"
+    }
+}
+
+fn build_note(p: &NPattern, rr: f64) -> String {
+    let mut parts = Vec::new();
+    if p.grade == Grade::C {
+        parts.push("C级默认半仓，需更严格触发".to_string());
+    }
+    if p.a_too_long {
+        parts.push("a段偏长".to_string());
+    }
+    if p.b_fast {
+        parts.push("b段偏快".to_string());
+    }
+    if p.c_extended {
+        parts.push("c段已透支".to_string());
+    }
+    if rr > 0.0 && rr < 1.0 {
+        parts.push("决策点RR不足1，可按破位预期评估".to_string());
+    }
+    parts.push("前低/前高为决策点，不必然止盈".to_string());
+    parts.join("；")
+}
+
+fn compute_scores(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    trend: &Trend60,
+    rr: f64,
+    warning: Option<usize>,
+    trigger: Option<usize>,
+    local_block_count: u8,
+    entry_block_count: u8,
+    weak_confirm: bool,
+) -> ([f64; 6], f64) {
+    let dim_trend = score_60m(trend, p.dir);
+    let dim_a = score_a(p, atr20);
+    let dim_b = score_b(p);
+    let mut dim_trigger = score_trigger(bars, atr20, warning, trigger, p, local_block_count);
+    let mut dim_momentum = score_momentum(p, trend, atr20, entry_block_count);
+    if weak_confirm {
+        dim_trigger = (dim_trigger - WEAK_CONFIRM_TRIGGER_PENALTY).max(0.0);
+        dim_momentum = (dim_momentum - WEAK_CONFIRM_MOMENTUM_PENALTY).max(0.0);
+    }
+    let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
+
+    let mut total = 0.15 * dim_trend
+        + 0.20 * dim_a
+        + 0.20 * dim_b
+        + 0.15 * dim_trigger
+        + 0.10 * dim_rr
+        + 0.20 * dim_momentum;
+    if weak_confirm {
+        total = total.min(WEAK_CONFIRM_TOTAL_MAX);
+    }
+
+    (
+        [
+            dim_trend,
+            dim_a,
+            dim_b,
+            dim_trigger,
+            dim_rr,
+            dim_momentum,
+        ],
+        total,
+    )
+}
+
+pub fn evaluate_signal(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    trend: &Trend60,
+) -> SignalCheck {
+    let mut sc = SignalCheck::new();
+
+    let end = bars.len().min(p.s2.index + 6);
+    if p.s2.index + 1 >= end {
+        sc.category = "结构未完成";
+        sc.state = "等待后续K线";
+        sc.note = "b端后没有可用于预警的K线".to_string();
+        return sc;
+    }
+
+    // 方案B：B/C级结构按系统文档§6.3要求更严格的反转确认——预警必须是
+    // 吞没/强反向趋势K/长影线/多K累积覆盖之一；A级保留快速预警路径，
+    // 避免浅回调结构因等待确认而错过入场。
+    let strict_confirm = matches!(p.grade, Grade::B | Grade::C);
+    // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不足以
+    // 确认b段结束，必须出现吞没/长影线/强反向趋势K/多K累积覆盖。
+    let trend_k = indicators::trend_flags(bars, atr20);
+    let mut warning = None;
+    let mut warn_kind = WarnKind::Single;
+    let mut gate_active = false;
+    let mut gate_anchor_strong = false;
+    // s2 本身构成合格反转形态（长影线/吞没/强反向趋势K）时，s2 就是预警K线。
+    // 长影线不要求反向收盘：做空时上影线够长即使收阳也算预警，做多方向对称。
+    if single_reversal_pattern(bars, atr20, &trend_k, p.dir, p.s2.index, p.s2.index) {
+        warning = Some(p.s2.index);
+    }
+    let mut i = p.s2.index + 1;
+    while warning.is_none() && i < end {
+        if !is_opposite_close(&bars[i], p.dir) {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let anchor = run_start - 1;
+        let anchor_strong = strong_b_dir_trend_candle(&trend_k, anchor, p.dir);
+        gate_active = anchor_strong || strict_confirm;
+        gate_anchor_strong = anchor_strong;
+        let anchor_open = bars[anchor].open;
+
+        let mut j = run_start;
+        let mut found = false;
+        while j < end && is_opposite_close(&bars[j], p.dir) {
+            // A级允许首根反向收盘直接作为预警，但仍要求收盘在反向一半内，
+            // 排除小实体+长反向影线的K线；其余情况（强b向趋势K顶、B/C级）
+            // 都要求单根反转形态自证。
+            let single_ok = (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
+                || single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
+            // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
+            let cumul_ok = (anchor_strong || strict_confirm)
+                && cumulative_coverage(bars, run_start, j, anchor_open, p.dir);
+            if single_ok || cumul_ok {
+                warning = Some(j);
+                warn_kind = if cumul_ok && !single_ok {
+                    WarnKind::Cumulative
+                } else {
+                    WarnKind::Single
+                };
+                found = true;
+                break;
+            }
+            j += 1;
+        }
+        if found {
+            break;
+        }
+        i = j;
+    }
+
+    let Some(w) = warning else {
+        sc.category = "无预警K线";
+        sc.state = "等待预警";
+        sc.note = if gate_active {
+            if gate_anchor_strong {
+                "b段末为强趋势K线，当前反向K线未形成吞没/强反转/累积覆盖形态，等待更强反转确认"
+                    .to_string()
+            } else {
+                "B/C级结构要求反转预警具备吞没/强反向K/长影线/累积覆盖形态，等待更强反转确认"
+                    .to_string()
+            }
+        } else {
+            "b端后尚未出现与原方向一致的反转预警".to_string()
+        };
+        return sc;
+    };
+    let weak_confirm = warn_kind == WarnKind::Cumulative;
+    sc.warning = Some(w);
+
+    let mut trigger = None;
+    for j in w + 1..bars.len() {
+        let ok = match p.dir {
+            Dir::Down => bars[j].low <= bars[w].low && bars[j].close < bars[w].low,
+            Dir::Up => bars[j].high >= bars[w].high && bars[j].close > bars[w].high,
+        };
+        if ok {
+            trigger = Some(j);
+            break;
+        }
+    }
+
+    let Some(t) = trigger else {
+        let atr_now = atr_at(atr20, p.s2.index);
+        let buffer = (0.1 * atr_now).max(1.0);
+        sc.entry = match p.dir {
+            Dir::Down => bars[w].low,
+            Dir::Up => bars[w].high,
+        };
+        sc.stop = match p.dir {
+            Dir::Down => p.s2.price + buffer,
+            Dir::Up => p.s2.price - buffer,
+        };
+        sc.decision_target = p.s1.price;
+        sc.risk = match p.dir {
+            Dir::Down => sc.stop - sc.entry,
+            Dir::Up => sc.entry - sc.stop,
+        };
+        sc.space = match p.dir {
+            Dir::Down => sc.entry - sc.decision_target,
+            Dir::Up => sc.decision_target - sc.entry,
+        };
+        sc.rr = if sc.risk > 0.0 {
+            sc.space / sc.risk
+        } else {
+            0.0
+        };
+
+        if p.hard_failure || p.grade == Grade::Invalid {
+            sc.state = "结构失效";
+            sc.total = 0.0;
+            sc.category = "结构硬失效，不参与";
+            sc.note = "b段已经突破a段起点，结构事实失效".to_string();
+            return sc;
+        }
+        if sc.risk <= 0.0 || sc.space <= 0.0 {
+            sc.state = "空间异常";
+            sc.total = 0.0;
+            sc.category = "空间异常，暂不参与";
+            sc.note = "止损或决策点空间无法正常计算".to_string();
+            return sc;
+        }
+
+        // 未触发时，b段终点被反向收盘价突破，结构视为失效
+        let b_leg_broken = bars[p.s2.index + 1..].iter().any(|b| match p.dir {
+            Dir::Up => b.close < p.s2.price,
+            Dir::Down => b.close > p.s2.price,
+        });
+        if b_leg_broken {
+            sc.state = "结构失效";
+            sc.total = 0.0;
+            sc.category = "结构失效，不参与";
+            sc.note = match p.dir {
+                Dir::Up => "b段终点已被收盘价跌破，结构失效，放弃等待".to_string(),
+                Dir::Down => "b段终点已被收盘价上破，结构失效，放弃等待".to_string(),
+            };
+            return sc;
+        }
+
+        sc.state = "即将触发";
+        let (dims, total) = compute_scores(
+            bars, atr20, p, trend, sc.rr, Some(w), None, 0, 0, weak_confirm,
+        );
+        sc.dims = dims;
+        sc.total = total;
+        sc.category = score_category(total);
+
+        // 未触发信号的时效检查：触发位距现价过远，或预警后等待过久
+        let last_close = bars.last().map(|b| b.close).unwrap_or(0.0);
+        let entry_distance = (last_close - sc.entry).abs();
+        let pending_age = bars.len().saturating_sub(w + 1);
+        let base_note = format!("{}{}", weak_confirm_prefix(weak_confirm), build_note(p, sc.rr));
+        if entry_distance >= STOP_FOLLOW_DISTANCE_RISK * sc.risk {
+            sc.state = "已过时，仅复盘";
+            sc.note = format!(
+                "{}；预警后尚未触发，现价距入场{:.1}点，触发位已偏离，仅用于复盘",
+                base_note,
+                entry_distance
+            );
+        } else if pending_age > PENDING_MAX_AGE {
+            sc.state = "已过时，仅复盘";
+            sc.note = format!(
+                "{}；预警后{}根K线未触发，信号已过时，仅用于复盘",
+                base_note,
+                pending_age
+            );
+        } else {
+            sc.note = format!("{}；预警后尚未完成突破，继续等待", base_note);
+        }
+        return sc;
+    };
+    sc.trigger = Some(t);
+    let (wick_block, prev_block) = entry_block_flags(bars, atr20, p.dir, t);
+    let b_end_block =
+        strong_opposite_body_at(bars, atr20, p.dir, p.s2.index).is_some();
+    let local_block_count = wick_block as u8 + prev_block as u8;
+    let entry_block_count = local_block_count + b_end_block as u8;
+    if entry_block_count > 0 {
+        sc.entry_block_count = entry_block_count;
+        let mut flags = Vec::new();
+        if b_end_block {
+            flags.push(match p.dir {
+                Dir::Up => "b段末K大实体阴线",
+                Dir::Down => "b段末K大实体阳线",
+            });
+        }
+        if prev_block {
+            flags.push(match p.dir {
+                Dir::Up => "前一根大实体阴线",
+                Dir::Down => "前一根大实体阳线",
+            });
+        }
+        if wick_block {
+            flags.push(match p.dir {
+                Dir::Up => "触发K线长上影",
+                Dir::Down => "触发K线长下影",
+            });
+        }
+        sc.entry_block_detail = flags.join(" + ");
+    }
+    sc.trigger_age = bars.len().saturating_sub(t + 1);
+    sc.state = if p.hard_failure {
+        "结构失效"
+    } else if sc.trigger_age <= 2 {
+        "当前已触发"
+    } else if sc.trigger_age <= 6 {
+        "已触发，接近时效边界"
+    } else {
+        "已过时，仅复盘"
+    };
+
+    let atr_now = atr_at(atr20, p.s2.index);
+    let buffer = (0.1 * atr_now).max(1.0);
+
+    let (entry, stop, decision_target) = match p.dir {
+        Dir::Down => (bars[w].low, p.s2.price + buffer, p.s1.price),
+        Dir::Up => (bars[w].high, p.s2.price - buffer, p.s1.price),
+    };
+
+    sc.entry = entry;
+    sc.stop = stop;
+    sc.decision_target = decision_target;
+    sc.risk = match p.dir {
+        Dir::Down => stop - entry,
+        Dir::Up => entry - stop,
+    };
+    sc.space = match p.dir {
+        Dir::Down => entry - decision_target,
+        Dir::Up => decision_target - entry,
+    };
+    sc.rr = if sc.risk > 0.0 {
+        sc.space / sc.risk
+    } else {
+        0.0
+    };
+    let (dims, total) = compute_scores(
+        bars,
+        atr20,
+        p,
+        trend,
+        sc.rr,
+        Some(w),
+        Some(t),
+        local_block_count,
+        entry_block_count,
+        weak_confirm,
+    );
+    sc.dims = dims;
+
+    if p.hard_failure || p.grade == Grade::Invalid {
+        sc.total = 0.0;
+        sc.category = "结构硬失效，不参与";
+        sc.note = "b段已经突破a段起点，结构事实失效".to_string();
+        return sc;
+    }
+
+    if sc.risk <= 0.0 || sc.space <= 0.0 {
+        sc.total = 0.0;
+        sc.category = "空间异常，暂不参与";
+        sc.note = "止损或决策点空间无法正常计算".to_string();
+        return sc;
+    }
+
+    let last_close = bars.last().map(|b| b.close).unwrap_or(0.0);
+    let entry_distance = (last_close - sc.entry).abs();
+    let stale_by_price = (STOP_FOLLOW_MIN_AGE..=STOP_FOLLOW_MAX_AGE).contains(&sc.trigger_age)
+        && entry_distance >= STOP_FOLLOW_DISTANCE_RISK * sc.risk;
+    if stale_by_price {
+        sc.state = "已过时，仅复盘";
+    }
+
+    sc.total = total;
+    sc.category = score_category(total);
+    sc.note = format!("{}{}", weak_confirm_prefix(weak_confirm), build_note(p, sc.rr));
+    if sc.entry_block_count > 0 {
+        let verb = match p.dir {
+            Dir::Up => "追多",
+            Dir::Down => "追空",
+        };
+        sc.note = format!("{}；触发受阻，不宜急于{}", sc.note, verb);
+    }
+    if stale_by_price {
+        sc.note = format!(
+            "{}；触发已过{}根K线，现价距入场{:.1}点",
+            sc.note, sc.trigger_age, entry_distance
+        );
+    } else if sc.trigger_age > 6 {
+        sc.note = format!("{}；该信号已过时，仅用于复盘", sc.note);
+    } else if sc.trigger_age > 2 {
+        sc.note = format!("{}；触发已过数根K线，谨慎评估", sc.note);
+    }
+    sc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyze::report::is_active_signal;
+    use crate::analyze::model::{Bar, Dir, DT, Swing};
+
+    fn bar(open: f64, high: f64, low: f64, close: f64) -> Bar {
+        Bar {
+            dt: DT {
+                year: 2026,
+                month: 7,
+                day: 31,
+                hour: 13,
+                minute: 30,
+            },
+            open,
+            high,
+            low,
+            close,
+            volume: 0.0,
+            hold: 0.0,
+        }
+    }
+
+    fn atr20(v: f64) -> Vec<Option<f64>> {
+        vec![Some(v), Some(v)]
+    }
+
+    fn atrs(n: usize, v: f64) -> Vec<Option<f64>> {
+        vec![Some(v); n]
+    }
+
+    fn pattern() -> NPattern {
+        NPattern {
+            level: "fine",
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 0.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 1,
+                price: 1.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 0.5,
+                is_high: false,
+            },
+            a_bars: 1,
+            b_bars: 1,
+            a_move: 1.0,
+            b_move: 0.5,
+            retracement: 0.5,
+            grade: Grade::A,
+            hard_failure: false,
+            a_too_long: false,
+            b_too_long: false,
+            b_fast: false,
+            a_strong_trend: 1,
+            b_strong_reverse: 0,
+            c_move: 0.0,
+            c_bars: 0,
+            c_extended: false,
+            c_hard_failure: false,
+        }
+    }
+
+    fn trend60() -> Trend60 {
+        Trend60 {
+            direction: "NEUTRAL".to_string(),
+            ma20: 0.0,
+            slope: 0.0,
+            price_vs_ma: 0.0,
+            higher_highs: false,
+            higher_lows: false,
+            lower_highs: false,
+            lower_lows: false,
+        }
+    }
+
+    #[test]
+    fn detects_opposing_trigger_shapes_for_both_directions() {
+        let atr = atr20(30.0);
+
+        let bars_long = vec![
+            bar(4580.0, 4581.0, 4551.0, 4558.0),
+            bar(4558.0, 4577.0, 4557.0, 4562.0),
+        ];
+        assert_eq!(
+            entry_block_flags(&bars_long, &atr, Dir::Up, 1),
+            (true, true)
+        );
+
+        let bars_short = vec![
+            bar(4518.0, 4542.0, 4517.0, 4537.0),
+            bar(4537.0, 4538.0, 4520.0, 4533.0),
+        ];
+        assert_eq!(
+            entry_block_flags(&bars_short, &atr, Dir::Down, 1),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn clean_trigger_is_not_blocked() {
+        let bars = vec![
+            bar(4550.0, 4560.0, 4549.0, 4558.0),
+            bar(4558.0, 4562.0, 4557.0, 4561.5),
+        ];
+        let atr = atr20(30.0);
+
+        assert_eq!(
+            entry_block_flags(&bars, &atr, Dir::Up, 1),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn entry_block_lowers_trigger_and_momentum_scores() {
+        let p = pattern();
+        let trend = trend60();
+        let atr = vec![Some(10.0), Some(10.0), Some(10.0)];
+        let bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.6, 1.0, 0.5, 0.7),
+        ];
+
+        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0);
+        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2);
+        assert!((blocked_trigger - clean_trigger + 1.4).abs() < 1e-9);
+
+        let clean_momentum = score_momentum(&p, &trend, &atr, 0);
+        let blocked_momentum = score_momentum(&p, &trend, &atr, 2);
+        assert!((blocked_momentum - clean_momentum + 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn b_end_opposition_heavily_lowers_trigger_quality() {
+        let atr = vec![Some(29.6), Some(29.6)];
+
+        let bars_long = vec![
+            bar(4565.6, 4568.2, 4542.4, 4543.2),
+            bar(4558.4, 4577.0, 4557.4, 4562.4),
+        ];
+        assert!(strong_opposite_body_at(&bars_long, &atr, Dir::Up, 0).is_some());
+        assert!(trigger_opposition_penalty(&bars_long, &atr, Dir::Up, 0, 1) > 1.5);
+
+        let bars_short = vec![
+            bar(4518.0, 4542.0, 4517.0, 4537.0),
+            bar(4537.0, 4538.0, 4520.0, 4533.0),
+        ];
+        assert!(strong_opposite_body_at(&bars_short, &atr, Dir::Down, 0).is_some());
+        assert!(trigger_opposition_penalty(&bars_short, &atr, Dir::Down, 0, 1) > 1.5);
+    }
+
+    #[test]
+    fn pending_signal_uses_default_trigger_score() {
+        let p = pattern();
+        let trend = trend60();
+        let atr = vec![Some(10.0); 5];
+        let bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.6, 1.0, 0.5, 0.7),
+            bar(0.7, 0.95, 0.65, 0.9),
+            bar(0.9, 0.9, 0.8, 0.85),
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend);
+        assert_eq!(sc.state, "即将触发");
+        assert_eq!(sc.trigger, None);
+        assert!((sc.dims[3] - 1.0).abs() < 1e-9);
+        assert!(sc.total > 0.0);
+        assert!(sc.note.contains("继续等待"));
+    }
+
+    #[test]
+    fn weak_trends_are_scored_by_direction() {
+        let weak_up = Trend60 {
+            direction: "WEAK_UP".to_string(),
+            ..trend60()
+        };
+        let weak_down = Trend60 {
+            direction: "WEAK_DOWN".to_string(),
+            ..trend60()
+        };
+        assert_eq!(score_60m(&weak_up, Dir::Up), 3.0);
+        assert_eq!(score_60m(&weak_up, Dir::Down), 1.0);
+        assert_eq!(score_60m(&weak_down, Dir::Down), 3.0);
+        assert_eq!(score_60m(&weak_down, Dir::Up), 1.0);
+    }
+
+    #[test]
+    fn pending_signal_invalidated_when_b_leg_broken() {
+        let p = pattern();
+        let trend = trend60();
+        let atr = vec![Some(10.0); 10];
+        let bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.6, 1.0, 0.5, 0.7),
+            bar(0.7, 0.9, 0.55, 0.75),
+            bar(0.6, 0.7, 0.4, 0.45),
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend);
+        assert_eq!(sc.state, "结构失效");
+        assert_eq!(sc.total, 0.0);
+        assert!(sc.note.contains("跌破"));
+        assert!(!is_active_signal(&sc));
+    }
+
+    #[test]
+    fn pending_signal_goes_stale_after_too_many_bars() {
+        let p = pattern();
+        let trend = trend60();
+        let atr = vec![Some(10.0); 20];
+        let mut bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.6, 1.0, 0.5, 0.7),
+            bar(0.7, 0.9, 0.6, 0.75),
+        ];
+        for _ in 0..14 {
+            bars.push(bar(0.6, 0.8, 0.55, 0.65));
+        }
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend);
+        assert_eq!(sc.state, "已过时，仅复盘");
+        assert!(sc.note.contains("过时"));
+        assert!(!is_active_signal(&sc));
+    }
+
+    #[test]
+    fn strong_b_end_requires_qualified_reversal_warning() {
+        // 做空：b段末是强趋势阳线，其后单根弱阴线/更弱阴线都不能确认b段结束
+        let atr = atrs(6, 70.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 14805.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14945.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0), // s0 高点
+            bar(14900.0, 14910.0, 14805.0, 14810.0), // s1 低点
+            bar(14870.0, 14945.0, 14870.0, 14940.0), // s2 强趋势阳线
+            bar(14940.0, 14940.0, 14895.0, 14900.0), // 弱阴线
+            bar(14895.0, 14900.0, 14880.0, 14890.0), // 更弱阴线
+            bar(14890.0, 14900.0, 14885.0, 14892.0), // 阳线打断反转段
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.state, "等待预警");
+        assert_eq!(sc.warning, None);
+        assert!(sc.note.contains("强趋势K"));
+    }
+
+    #[test]
+    fn cumulative_reversal_confirms_but_downgrades_to_small_position() {
+        // 做空：第二根阴线收盘越过强趋势阳线开盘价 → 多K累积覆盖，允许预警但降级为小仓
+        let atr = atrs(6, 70.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 14805.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14945.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14945.0, 14870.0, 14940.0), // s2 强趋势阳线
+            bar(14940.0, 14940.0, 14895.0, 14900.0), // 弱阴线
+            bar(14900.0, 14910.0, 14860.0, 14865.0), // 第二根阴线，收盘越过阳线开盘
+            bar(14865.0, 14870.0, 14830.0, 14840.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.trigger, Some(5));
+        assert_eq!(sc.state, "当前已触发");
+        assert!(sc.total <= 3.49);
+        assert!(sc.category.contains("小仓试错"));
+        assert!(sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn strong_single_reversal_at_b_end_is_not_downgraded() {
+        // 做空：b段末强阳线后直接出现强趋势阴线，属于合格反转，不降级
+        let atr = atrs(5, 40.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 14805.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14945.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14945.0, 14870.0, 14940.0), // s2 强趋势阳线
+            bar(14940.0, 14940.0, 14850.0, 14855.0), // 强趋势阴线
+            bar(14855.0, 14860.0, 14820.0, 14830.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(3));
+        assert_eq!(sc.trigger, Some(4));
+        assert!(!sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn weak_b_end_keeps_original_warning_behavior() {
+        // b段末不是强趋势K时，首根反向收盘K线仍直接作为预警（保持原逻辑）
+        let atr = atrs(4, 40.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 14805.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14900.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线（非强趋势）
+            bar(14890.0, 14890.0, 14860.0, 14865.0), // 首根阴线直接作为预警
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(3));
+    }
+
+    #[test]
+    fn long_upper_wick_at_b_end_is_the_warning_itself() {
+        // 做空（JD0场景）：b段末长上影线（收阴）本身就是预警，入场参考该K线低点
+        let atr = atrs(4, 15.4);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 3996.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 4030.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(4066.0, 4066.0, 4055.0, 4060.0), // s0 高点
+            bar(4050.0, 4055.0, 3996.0, 4000.0), // s1 低点
+            bar(4023.0, 4030.0, 4019.0, 4021.0), // s2 长上影线
+            bar(4021.0, 4021.0, 4002.0, 4007.0), // 触发：跌破s2低点
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.trigger, Some(3));
+        assert_eq!(sc.entry, 4019.0);
+        assert_eq!(sc.state, "当前已触发");
+        assert!(!sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn long_upper_wick_with_bullish_close_counts_as_short_warning() {
+        // 做空：b段末长上影线即使收阳，也算做空预警
+        let atr = atrs(4, 15.4);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 3996.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 4030.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(4066.0, 4066.0, 4055.0, 4060.0),
+            bar(4000.0, 4010.0, 3999.0, 4008.0), // 上涨K线
+            bar(4010.0, 4030.0, 4009.0, 4015.0), // s2 收阳长上影线
+            bar(4015.0, 4016.0, 3995.0, 4000.0), // 触发：跌破s2低点
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.trigger, Some(3));
+        assert_eq!(sc.entry, 4009.0);
+    }
+
+    #[test]
+    fn long_lower_wick_with_bullish_close_counts_as_long_warning() {
+        // 做多：b段末长下影线即使收阳，也算做多预警
+        let atr = atrs(4, 15.4);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 4025.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 3995.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(3985.0, 3990.0, 3985.0, 3988.0), // s0 低点
+            bar(4025.0, 4026.0, 4020.0, 4021.0), // s1 高点
+            bar(4010.0, 4015.0, 3995.0, 4013.0), // s2 收阳长下影线
+            bar(4013.0, 4025.0, 4012.0, 4022.0), // 触发：突破s2高点
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.trigger, Some(3));
+        assert_eq!(sc.entry, 4015.0);
+        assert_eq!(sc.state, "当前已触发");
+    }
+
+    #[test]
+    fn long_lower_wick_with_bearish_close_counts_as_long_warning() {
+        // 做多：b段末长下影线即使收阴，也算做多预警
+        let atr = atrs(4, 15.4);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 4025.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 3990.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(3985.0, 3990.0, 3985.0, 3988.0),
+            bar(4010.0, 4015.0, 4008.0, 4014.0), // 上涨K线
+            bar(4012.0, 4013.0, 3990.0, 4011.0), // s2 收阴锤子线（收盘贴近高点、长下影）
+            bar(4011.0, 4020.0, 4010.0, 4018.0), // 触发：突破s2高点
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.trigger, Some(3));
+        assert_eq!(sc.entry, 4013.0);
+    }
+
+    #[test]
+    fn b_grade_requires_qualified_reversal_warning() {
+        // 方案B：B级结构即使b段顶不是强趋势K，小阴线也不能直接当预警
+        let atr = atrs(5, 40.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            grade: Grade::B,
+            s1: Swing {
+                index: 1,
+                price: 14805.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14900.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线（非强趋势）
+            bar(14890.0, 14892.0, 14870.0, 14880.0), // 小阴线，不构成任何反转形态
+            bar(14880.0, 14900.0, 14878.0, 14890.0), // 阳线打断反转段
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.state, "等待预警");
+        assert_eq!(sc.warning, None);
+        assert!(sc.note.contains("B/C级"));
+    }
+
+    #[test]
+    fn b_grade_accepts_later_strong_reversal() {
+        // 方案B：B级结构等到强趋势阴线出现后才出预警，拒绝前面的小阴线
+        let atr = atrs(6, 40.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            grade: Grade::B,
+            s1: Swing {
+                index: 1,
+                price: 14700.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14900.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线
+            bar(14890.0, 14892.0, 14870.0, 14880.0), // 小阴线，不合格
+            bar(14880.0, 14880.0, 14800.0, 14805.0), // 强趋势阴线 → 合格预警
+            bar(14805.0, 14810.0, 14760.0, 14770.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.trigger, Some(5));
+        assert_eq!(sc.entry, 14800.0);
+        assert!(!sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn b_grade_cumulative_reversal_downgrades_to_small_position() {
+        // 方案B：B级结构靠多K累积覆盖确认时允许预警，但总分封顶在小仓试错
+        let atr = atrs(6, 40.0);
+        let p = NPattern {
+            dir: Dir::Down,
+            grade: Grade::B,
+            s1: Swing {
+                index: 1,
+                price: 14700.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14900.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(15090.0, 15090.0, 15080.0, 15085.0),
+            bar(14900.0, 14910.0, 14805.0, 14810.0),
+            bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线
+            bar(14890.0, 14892.0, 14870.0, 14880.0), // 小阴线1
+            bar(14880.0, 14885.0, 14850.0, 14855.0), // 小阴线2，收盘越过s2开盘 → 累积覆盖
+            bar(14855.0, 14860.0, 14810.0, 14820.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.trigger, Some(5));
+        assert!(sc.total <= 3.49);
+        assert!(sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn a_grade_fast_path_rejects_small_bullish_with_long_upper_wick() {
+        // ss0案例：A级快速路径不接受"小实体+长上影"的阳线做多预警，
+        // 等到收盘位置合格的反向K线才出预警。
+        let atr = atrs(6, 30.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 15090.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 14820.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(14900.0, 14910.0, 14890.0, 14900.0),
+            bar(15080.0, 15090.0, 15070.0, 15085.0), // s1 高点
+            bar(14885.0, 14895.0, 14820.0, 14835.0), // s2 普通阴线（b段低点）
+            bar(14835.0, 14855.0, 14830.0, 14840.0), // 小阳线+长上影 → 不合格
+            bar(14840.0, 14870.0, 14835.0, 14860.0), // 收盘位置合格的反转阳线 → 预警
+            bar(14860.0, 14890.0, 14858.0, 14885.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.trigger, Some(5));
+        assert_eq!(sc.entry, 14870.0);
+    }
+
+    #[test]
+    fn a_grade_fast_path_waits_when_only_cross_star_and_weak_candles() {
+        // bu0案例：s2为十字星、后续阳线收盘位置不合格时不出预警，等待真正的反转K线
+        let atr = atrs(5, 15.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 4175.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 4141.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(4137.0, 4140.0, 4136.0, 4138.0),
+            bar(4172.0, 4175.0, 4168.0, 4173.0), // s1 高点
+            bar(4145.0, 4153.0, 4141.0, 4145.0), // s2 十字星
+            bar(4146.0, 4158.0, 4144.0, 4148.0), // 小阳线+长上影 → 不合格
+            bar(4149.0, 4151.0, 4143.0, 4144.0), // 阴线打断反转段
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, None);
+        assert_eq!(sc.state, "等待预警");
+    }
+}

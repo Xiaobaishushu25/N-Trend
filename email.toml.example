@@ -1,0 +1,11 @@
+# QQ邮箱SMTP配置示例
+[smtp]
+host = "smtp.qq.com"
+port = 465
+user = "2055761346@qq.com"
+password = "在此填写SMTP授权码"
+from = "2055761346@qq.com"
+
+[mail]
+to = ["2055761346@qq.com"]
+enabled = true
