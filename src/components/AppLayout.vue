@@ -34,7 +34,12 @@ onMounted(() => {
       :native-scrollbar="false"
       :content-style="bare ? 'height: 100%; padding: 0' : 'padding: 16px'"
     >
-      <router-view />
+      <!-- 只缓存列表页（DashboardView）：返回时不再全量重载；K线图页不缓存，保持每次进入重置视图 -->
+      <router-view v-slot="{ Component }">
+        <keep-alive include="DashboardView">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
     </n-layout-content>
   </n-layout>
 </template>

@@ -19,6 +19,9 @@ import { useSymbolsStore } from '../stores/symbols'
 import { useScansStore } from '../stores/scans'
 import type { KlineRow, SignalRow, SymbolRow } from '../types'
 
+// 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
+defineOptions({ name: 'DashboardView' })
+
 const router = useRouter()
 const message = useMessage()
 const symbolsStore = useSymbolsStore()
