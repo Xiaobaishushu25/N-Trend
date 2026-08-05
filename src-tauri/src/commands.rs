@@ -76,6 +76,16 @@ pub async fn get_group_symbols(
 }
 
 #[tauri::command]
+pub async fn list_symbol_groups(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<Vec<groups::Model>, String> {
+    n_core::storage::repo::symbol_groups(&state.services.db, &symbol)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn add_symbol_to_group(
     state: State<'_, Arc<AppState>>,
     symbol: String,
@@ -93,6 +103,17 @@ pub async fn remove_symbol_from_group(
     group_id: i64,
 ) -> Result<(), String> {
     n_core::storage::repo::remove_symbol_from_group(&state.services.db, &symbol, group_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn reorder_group_symbols(
+    state: State<'_, Arc<AppState>>,
+    group_id: i64,
+    codes: Vec<String>,
+) -> Result<(), String> {
+    n_core::storage::repo::reorder_group_symbols(&state.services.db, group_id, &codes)
         .await
         .map_err(|e| e.to_string())
 }

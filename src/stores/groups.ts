@@ -7,6 +7,8 @@ export const useGroupsStore = defineStore('groups', {
     groups: [] as GroupRow[],
     /** 当前选中的分组 id；null 表示“全部品种” */
     selectedId: null as number | null,
+    /** 分组/组内排序版本号：列表页与K线页靠它互相通知“顺序已变，请重拉” */
+    revision: 0,
     loading: false,
   }),
   getters: {
@@ -38,6 +40,9 @@ export const useGroupsStore = defineStore('groups', {
     },
     async select(id: number | null) {
       this.selectedId = id
+    },
+    bumpRevision() {
+      this.revision++
     },
   },
 })

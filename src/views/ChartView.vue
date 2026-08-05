@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import draggable from 'vuedraggable'
 import {
   NButton,
   NEmpty,
@@ -28,6 +29,7 @@ import type {
   MarketSnapshot,
   PatternDto,
   SignalOutcome,
+  SymbolRow,
   Timeframe,
 } from '../types'
 
@@ -37,6 +39,8 @@ const symbolsStore = useSymbolsStore()
 const klinesStore = useKlinesStore()
 const scansStore = useScansStore()
 const groupsStore = useGroupsStore()
+
+const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
 const timeframe = ref<Timeframe>('15m')
@@ -198,31 +202,67 @@ const latestClose = computed(() =>
   displayRows.value.length ? displayRows.value[displayRows.value.length - 1].close : null,
 )
 
-/** 当前分组内的品种代码；null 表示全部品种 */
-const groupCodes = ref<Set<string> | null>(null)
+/** 当前分组的成员（按组内 sort_index 顺序）；全部视图下为全部品种 */
+const groupSymbols = ref<SymbolRow[]>([])
+/** 拖拽结束后浏览器可能补发一次 click，用它临时抑制行点击跳转 */
+let symbolSuppressClick = false
 
-async function loadGroupCodes() {
-  if (groupsStore.selectedId == null) {
-    groupCodes.value = null
-    return
-  }
-  const rows = await api.getGroupSymbols(groupsStore.selectedId)
-  groupCodes.value = new Set(rows.map((r) => r.code))
+/** 拉取当前分组的成员（按组内 sort_index 顺序） */
+async function loadGroupSymbols() {
+  groupSymbols.value =
+    groupsStore.selectedId == null
+      ? [...symbolsStore.symbols]
+      : await api.getGroupSymbols(groupsStore.selectedId)
 }
 
-/** 左侧列表按当前分组过滤 */
-const visibleSymbols = computed(() =>
-  groupCodes.value
-    ? symbolsStore.symbols.filter((s) => groupCodes.value!.has(s.code))
-    : symbolsStore.symbols,
-)
+/** 左侧列表：分组视图按组内顺序，全部视图按代码序 */
+const visibleSymbols = computed(() => groupSymbols.value)
+
+/**
+ * 拖拽结束落库：vuedraggable 已把 groupSymbols 调整为新顺序，
+ * 这里把顺序持久化并广播，让列表页表格同步重拉。
+ */
+async function persistListOrder() {
+  // 拖拽结束后浏览器可能补发一次 click，这里临时抑制行点击跳转
+  symbolSuppressClick = true
+  setTimeout(() => {
+    symbolSuppressClick = false
+  }, 0)
+  const groupId = groupsStore.selectedId
+  if (groupId == null) return
+  try {
+    await api.reorderGroupSymbols(
+      groupId,
+      groupSymbols.value.map((s) => s.code),
+    )
+    groupsStore.bumpRevision()
+  } catch (err) {
+    notify.error(String(err))
+    await loadGroupSymbols() // 落库失败则回滚为服务端顺序
+  }
+}
+
+/** 行点击进入K线图；拖拽结束后紧接着的 click 不触发跳转 */
+function onSymbolRowClick(code: string) {
+  if (symbolSuppressClick) return
+  router.push({ name: 'chart', params: { symbol: code } })
+}
 
 /** 左侧品种行右键菜单：与表格行一致（分组操作 + 彻底删除） */
-function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
+async function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
+  // 先同步阻止浏览器默认菜单，再异步查分组归属，避免原生菜单闪现
+  e.preventDefault()
+  let memberGroups: GroupRow[] = []
+  try {
+    memberGroups = await api.listSymbolGroups(row.code)
+  } catch {
+    // 查询失败不影响菜单弹出，仅少了对勾标识
+  }
   openSymbolContextMenu(e, {
     groups: groupsStore.groups,
     selectedGroupId: groupsStore.selectedId,
     symbol: row.code,
+    memberGroupIds: new Set(memberGroups.map((g) => g.id)),
     onRemoveFromGroup: () => handleRemoveFromGroup(row.code),
     onCopyToGroup: (g) => handleCopyToGroup(row.code, g),
     onMoveToGroup: (g) => handleMoveToGroup(row.code, g),
@@ -232,7 +272,7 @@ function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
 
 async function reloadSymbolList() {
   await symbolsStore.load()
-  await loadGroupCodes()
+  await loadGroupSymbols()
 }
 
 async function handleRemoveFromGroup(code: string) {
@@ -317,20 +357,6 @@ function fmtSigned(v: number | null) {
   if (v == null) return '—'
   return `${v >= 0 ? '+' : ''}${v.toFixed(1)}`
 }
-
-const listRows = computed(() =>
-  visibleSymbols.value.map((s) => {
-    const signal = signalBySymbol.value[s.code] ?? null
-    return {
-      code: s.code,
-      name: s.name !== s.code ? s.name : '',
-      latest: snapshots.value[s.code]?.latest ?? null,
-      changePct: snapshots.value[s.code]?.change_pct ?? null,
-      signal,
-      sigType: signal ? sigType(signal.state) : '',
-    }
-  }),
-)
 
 /** 每个品种取优先级最高的信号：即将触发 > 当前已触发 > 接近时效 > 过时；同级按触发/预警时间新的优先 */
 const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
@@ -520,6 +546,9 @@ watch([symbol, timeframe], async () => {
   }
 })
 
+// 分组/组内顺序在别处被改动（如列表页表格拖拽）时，重拉本页列表
+watch(() => groupsStore.revision, () => loadGroupSymbols())
+
 onMounted(async () => {
   unlisteners.push(
     await onScanCompleted((result) => {
@@ -557,7 +586,7 @@ onMounted(async () => {
   )
   await symbolsStore.load()
   await groupsStore.load()
-  await loadGroupCodes()
+  await loadGroupSymbols()
   // 进入页面立即拉一次行情快照，避免左侧价格/涨幅要等下一次刷新或扫描事件才显示
   loadSnapshots()
   if (!scansStore.latest) {
@@ -613,45 +642,69 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="main">
-      <div v-if="showList" class="symbol-list">
+      <div
+        v-if="showList"
+        class="symbol-list"
+        :class="{ 'can-reorder': groupsStore.selectedId != null }"
+      >
         <div class="sl-title">品种</div>
         <n-scrollbar style="flex: 1">
-          <div
-            v-for="row in listRows"
-            :key="row.code"
-            class="sl-row"
-            :class="[
-              { active: row.code === symbol },
-              row.sigType === 'pending' ? 'has-pending' : '',
-              row.sigType === 'triggered' ? 'has-triggered' : '',
-              row.sigType === 'stale' ? 'has-stale' : '',
-              { 'is-flash-up': rowFlash[row.code] === 'up' },
-              { 'is-flash-down': rowFlash[row.code] === 'down' },
-            ]"
-            @click="router.push({ name: 'chart', params: { symbol: row.code } })"
-            @contextmenu="onSymbolContextMenu(row, $event)"
+          <VueDraggable
+            v-model="groupSymbols"
+            item-key="code"
+            class="sl-list"
+            :animation="150"
+            :disabled="groupsStore.selectedId == null"
+            ghost-class="sl-row-ghost"
+            chosen-class="sl-row-chosen"
+            @end="persistListOrder"
           >
-            <div class="sl-main">
-              <OverflowText class="sl-name" :text="row.name || row.code" />
-              <span class="sl-code">{{ row.code }}</span>
-            </div>
-            <span
-              v-if="row.signal"
-              class="sl-sig"
-              :class="'is-' + row.sigType"
-              :title="sigTitle(row.signal)"
-            >
-              {{ sigLabel(row.signal.state) }}
-            </span>
-            <div class="sl-quote">
-              <span class="sl-price" :style="{ color: trendColor(row.changePct) }">
-                {{ fmtPrice(row.latest) }}
-              </span>
-              <span class="sl-change" :style="{ color: trendColor(row.changePct) }">
-                {{ fmtChange(row.changePct) }}
-              </span>
-            </div>
-          </div>
+            <template #item="{ element }">
+              <div
+                class="sl-row"
+                :class="[
+                  { active: element.code === symbol },
+                  { 'is-flash-up': rowFlash[element.code] === 'up' },
+                  { 'is-flash-down': rowFlash[element.code] === 'down' },
+                  signalBySymbol[element.code]?.state === '即将触发' ? 'has-pending' : '',
+                  signalBySymbol[element.code]?.state === '当前已触发' ? 'has-triggered' : '',
+                  signalBySymbol[element.code]?.state === '已触发，接近时效边界' ? 'has-stale' : '',
+                ]"
+                @click="onSymbolRowClick(element.code)"
+                @contextmenu="onSymbolContextMenu(element, $event)"
+              >
+                <div class="sl-main">
+                  <OverflowText
+                    class="sl-name"
+                    :text="element.name !== element.code ? element.name : element.code"
+                  />
+                  <span class="sl-code">{{ element.code }}</span>
+                </div>
+                <span
+                  v-if="signalBySymbol[element.code]"
+                  class="sl-sig"
+                  :class="'is-' + sigType(signalBySymbol[element.code]?.state ?? '')"
+                  :title="sigTitle(signalBySymbol[element.code]!)"
+                >
+                  {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
+                </span>
+                <div class="sl-quote">
+                  <span
+                    class="sl-price"
+                    :style="{ color: trendColor(snapshots[element.code]?.change_pct ?? null) }"
+                  >
+                    {{ fmtPrice(snapshots[element.code]?.latest ?? null) }}
+                  </span>
+                  <span
+                    class="sl-change"
+                    :style="{ color: trendColor(snapshots[element.code]?.change_pct ?? null) }"
+                  >
+                    {{ fmtChange(snapshots[element.code]?.change_pct ?? null) }}
+                  </span>
+                </div>
+              </div>
+            </template>
+          </VueDraggable>
         </n-scrollbar>
       </div>
 
@@ -836,8 +889,22 @@ onBeforeUnmount(() => {
   gap: 10px;
   padding: 8px 14px;
   cursor: pointer;
+  user-select: none;
   border-left: 3px solid transparent;
   transition: background 0.15s;
+}
+.sl-list {
+  min-height: 100%;
+}
+.symbol-list.can-reorder .sl-row {
+  cursor: grab;
+}
+.sl-row-ghost {
+  opacity: 0.45;
+  background: #eaf2ff;
+}
+.sl-row-chosen {
+  background: #dbe9ff;
 }
 .sl-row:hover {
   background: #f6f8fa;
@@ -1263,8 +1330,3 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
-
-
-
-
-

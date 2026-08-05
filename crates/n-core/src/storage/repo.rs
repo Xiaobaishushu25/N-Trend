@@ -304,6 +304,26 @@ pub async fn group_symbols(db: &DatabaseConnection, group_id: i64) -> Result<Vec
         .collect())
 }
 
+/// 品种当前所属的全部分组（供右键菜单里标记“已在某组”）。
+pub async fn symbol_groups(db: &DatabaseConnection, symbol: &str) -> Result<Vec<groups::Model>> {
+    let members = symbol_groups::Entity::find()
+        .filter(symbol_groups::Column::Symbol.eq(symbol))
+        .all(db)
+        .await
+        .context("查询品种分组失败")?;
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<i64> = members.iter().map(|m| m.group_id).collect();
+    groups::Entity::find()
+        .filter(groups::Column::Id.is_in(ids))
+        .order_by_asc(groups::Column::SortIndex)
+        .order_by_asc(groups::Column::Id)
+        .all(db)
+        .await
+        .context("查询分组失败")
+}
+
 /// 把品种加入分组（幂等）。sort_index 取该组内当前最大值 + 1。
 pub async fn add_symbol_to_group(
     db: &DatabaseConnection,
@@ -363,6 +383,29 @@ pub async fn remove_symbol_from_group(
         .exec(db)
         .await
         .context("从分组移除失败")?;
+    Ok(())
+}
+
+/// 批量重排组内品种：按传入的代码顺序重写 sort_index（供拖拽排序落库）。
+pub async fn reorder_group_symbols(
+    db: &DatabaseConnection,
+    group_id: i64,
+    codes: &[String],
+) -> Result<()> {
+    for (idx, code) in codes.iter().enumerate() {
+        let row = symbol_groups::Entity::find()
+            .filter(symbol_groups::Column::Symbol.eq(code))
+            .filter(symbol_groups::Column::GroupId.eq(group_id))
+            .one(db)
+            .await
+            .context("查询分组品种失败")?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mut model: symbol_groups::ActiveModel = row.into();
+        model.sort_index = Set(idx as i64);
+        model.save(db).await.context("更新组内品种排序失败")?;
+    }
     Ok(())
 }
 

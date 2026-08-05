@@ -24,6 +24,50 @@ body {
 
 /* ===== 通用右键菜单（@imengyu/vue3-context-menu）样式微调 ===== */
 
+/* 自定义 native 主题：浅色底、小圆角、柔和投影、整行高亮，弱化网页感 */
+.mx-context-menu.native {
+  padding: 5px;
+  border-radius: 8px;
+  border: 1px solid #e5e8ef;
+  background: #fff;
+  box-shadow:
+    0 8px 24px rgba(15, 23, 42, 0.14),
+    0 2px 6px rgba(15, 23, 42, 0.06);
+  --mx-menu-text: #262c3c;
+  --mx-menu-hover-backgroud: #eaf2ff;
+  --mx-menu-hover-text: #1f2329;
+  --mx-menu-active-backgroud: #d9e8ff;
+  --mx-menu-open-backgroud: #eaf2ff;
+  --mx-menu-open-hover-backgroud: #d9e8ff;
+  --mx-menu-open-text: #1f2329;
+  --mx-menu-divider: #eceff4;
+  --mx-menu-disabled-text: #b9c1ce;
+  --mx-menu-icon-size: 15px;
+  --mx-menu-placeholder-width: 20px;
+  --mx-menu-shadow-color: rgba(15, 23, 42, 0.12);
+}
+.mx-context-menu.native .mx-context-menu-item {
+  border-radius: 5px;
+  margin: 0;
+  padding: 6px 12px 6px 8px;
+}
+.mx-context-menu.native .mx-context-menu-item .label {
+  font-size: 13px;
+  padding-inline-end: 18px;
+}
+.mx-context-menu.native .mx-context-menu-item .mx-icon-placeholder {
+  margin-right: 6px;
+}
+.mx-context-menu.native .mx-context-menu-item-separator,
+.mx-context-menu.native .mx-context-menu-item-sperator {
+  padding: 4px 0;
+}
+.mx-context-menu.native .mx-shortcut {
+  background: transparent;
+  color: #8a94a6;
+  padding: 0 4px;
+}
+
 /* 菜单项里的 svg 图标统一按菜单图标尺寸显示（tabler 图标本身不带 width/height） */
 .mx-context-menu .mx-icon-placeholder svg {
   width: 16px;

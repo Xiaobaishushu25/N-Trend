@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
-import { h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { h, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
+import Sortable from 'sortablejs'
 import {
   NButton,
   NDataTable,
@@ -51,6 +52,9 @@ const newCode = ref('')
 const groupModal = ref<'create' | 'manage' | null>(null)
 const newGroupName = ref('')
 const groupNameDrafts = ref<Record<number, string>>({})
+/** 表格外层容器（Sortable 挂载到其内部 tbody 上） */
+const tableWrapEl = ref<HTMLElement | null>(null)
+let tableSortable: Sortable | null = null
 let unlisteners: (() => void)[] = []
 /** 行闪烁清除计时器：动画结束后把 flash 归零，保证下一次跳动能重新触发动画 */
 const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -155,19 +159,70 @@ function openChart(row: WatchRow) {
 
 function rowProps(row: WatchRow): Record<string, unknown> {
   return {
-    style: 'cursor: pointer',
-    class: row.flash ? (row.flash === 'up' ? 'row-flash-up' : 'row-flash-down') : '',
+    style: `cursor: ${groupsStore.selectedId != null ? 'grab' : 'pointer'}`,
+    class: [
+      row.flash ? (row.flash === 'up' ? 'row-flash-up' : 'row-flash-down') : '',
+    ],
+    'data-code': row.symbol.code,
     onDblclick: () => openChart(row),
     onContextmenu: (e: MouseEvent) => onRowContextMenu(row, e),
   }
 }
 
+/**
+ * Sortable 直接挂载到表格 tbody：行顺序变化后读取 DOM 新顺序落库并广播。
+ * 只在分组视图启用（全部视图没有全局顺序字段）。
+ */
+function setupTableSortable() {
+  if (tableSortable) return
+  const tbody = tableWrapEl.value?.querySelector<HTMLElement>('.watch-table tbody')
+  if (!tbody) return
+  tableSortable = Sortable.create(tbody, {
+    animation: 150,
+    draggable: 'tr[data-code]',
+    ghostClass: 'sl-table-ghost',
+    chosenClass: 'sl-table-chosen',
+    disabled: groupsStore.selectedId == null,
+    onEnd: () => persistTableOrder(tbody),
+  })
+}
+
+async function persistTableOrder(tbody: HTMLElement) {
+  const groupId = groupsStore.selectedId
+  if (groupId == null) return
+  const codes = [...tbody.querySelectorAll<HTMLElement>('tr[data-code]')]
+    .map((tr) => tr.dataset.code)
+    .filter((c): c is string => c != null)
+  if (!codes.length) return
+  // 让 Vue 数据与 DOM 新顺序保持一致
+  const byCode = new Map(rows.value.map((r) => [r.symbol.code, r]))
+  const next = codes.map((c) => byCode.get(c)).filter((r): r is WatchRow => r != null)
+  if (!next.length) return
+  rows.value = next
+  try {
+    await api.reorderGroupSymbols(groupId, codes)
+    groupsStore.bumpRevision()
+  } catch (err) {
+    notify.error(String(err))
+    await loadAll() // 落库失败则回滚为服务端顺序
+  }
+}
+
 /** 行右键菜单：分组操作 + 彻底删除品种 */
-function onRowContextMenu(row: WatchRow, e: MouseEvent) {
+async function onRowContextMenu(row: WatchRow, e: MouseEvent) {
+  // 先同步阻止浏览器默认菜单，再异步查分组归属，避免原生菜单闪现
+  e.preventDefault()
+  let memberGroups: GroupRow[] = []
+  try {
+    memberGroups = await api.listSymbolGroups(row.symbol.code)
+  } catch {
+    // 查询失败不影响菜单弹出，仅少了对勾标识
+  }
   openSymbolContextMenu(e, {
     groups: groupsStore.groups,
     selectedGroupId: groupsStore.selectedId,
     symbol: row.symbol.code,
+    memberGroupIds: new Set(memberGroups.map((g) => g.id)),
     onRemoveFromGroup: () => handleRemoveFromGroup(row),
     onCopyToGroup: (g) => handleCopyToGroup(row, g),
     onMoveToGroup: (g) => handleMoveToGroup(row, g),
@@ -551,9 +606,28 @@ onMounted(async () => {
     }),
   )
   await loadAll()
+  await nextTick()
+  setupTableSortable()
+})
+
+// 组内顺序在别处被改动（如K线页左侧拖拽）时，重拉表格
+watch(() => groupsStore.revision, () => loadAll())
+// 切换分组时同步开关表格拖拽；keep-alive 回到页面时重建 Sortable（tbody 可能被重建）
+watch(
+  () => groupsStore.selectedId,
+  () => {
+    tableSortable?.option('disabled', groupsStore.selectedId == null)
+  },
+)
+onActivated(() => {
+  tableSortable?.destroy()
+  tableSortable = null
+  setupTableSortable()
 })
 
 onBeforeUnmount(() => {
+  tableSortable?.destroy()
+  tableSortable = null
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
   for (const fn of unlisteners) fn()
@@ -602,16 +676,18 @@ onBeforeUnmount(() => {
         </n-button>
       </n-space>
     </div>
-    <n-data-table
-      class="watch-table"
-      :columns="columns"
-      :data="rows"
-      :loading="loading"
-      :row-props="rowProps"
-      size="small"
-      :bordered="false"
-      flex-height
-    />
+    <div ref="tableWrapEl" class="watch-table-wrap">
+      <n-data-table
+        class="watch-table"
+        :columns="columns"
+        :data="rows"
+        :loading="loading"
+        :row-props="rowProps"
+        size="small"
+        :bordered="false"
+        flex-height
+      />
+    </div>
 
     <n-modal
       :show="groupModal === 'create'"
@@ -688,6 +764,12 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.watch-table-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .watch-table {
   flex: 1;
@@ -842,6 +924,18 @@ onBeforeUnmount(() => {
   100% {
     background-color: transparent;
   }
+}
+
+/* 分组视图下表格行支持拖拽排序 */
+.watch-table :deep(tbody tr) {
+  user-select: none;
+}
+.watch-table :deep(tbody tr.sl-table-ghost td) {
+  opacity: 0.45;
+  background: #eaf2ff;
+}
+.watch-table :deep(tbody tr.sl-table-chosen td) {
+  background: #dbe9ff;
 }
 </style>
 

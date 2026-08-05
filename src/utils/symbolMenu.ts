@@ -7,6 +7,8 @@ export interface SymbolMenuContext {
   groups: GroupRow[]
   selectedGroupId: number | null
   symbol: string
+  /** 该品种当前已加入的分组 id 集合：子菜单里打勾标识“已在此组” */
+  memberGroupIds: ReadonlySet<number>
   onRemoveFromGroup: () => void
   onCopyToGroup: (group: GroupRow) => void
   onMoveToGroup: (group: GroupRow) => void
@@ -27,19 +29,21 @@ export function openSymbolContextMenu(e: MouseEvent, ctx: SymbolMenuContext) {
   const copyChildren: ContextMenuItem[] = targetGroups.length
     ? targetGroups.map((g) => ({
         label: g.name,
+        checked: ctx.memberGroupIds.has(g.id),
         onClick: () => ctx.onCopyToGroup(g),
       }))
     : [{ label: emptyPlaceholder, disabled: true }]
   const moveChildren: ContextMenuItem[] = targetGroups.length
     ? targetGroups.map((g) => ({
         label: g.name,
+        checked: ctx.memberGroupIds.has(g.id),
         onClick: () => ctx.onMoveToGroup(g),
       }))
     : [{ label: emptyPlaceholder, disabled: true }]
   const items: ContextMenuItem[] = []
   // 分组操作区
   items.push({
-    label: '复制到某组',
+    label: '复制自选至',
     children: copyChildren,
   })
   if (inGroup) {

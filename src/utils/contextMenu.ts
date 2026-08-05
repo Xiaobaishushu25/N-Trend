@@ -11,6 +11,8 @@ export interface ContextMenuItem {
   icon?: string | VNode
   /** 是否禁用 */
   disabled?: boolean
+  /** 是否已选中：在图标位左侧显示对勾（用于标记“品种已在该分组”） */
+  checked?: boolean
   /** 分隔线：true 表示下方分割线，'up' 表示上方分割线 */
   divided?: boolean | 'up' | 'down'
   /** 右侧快捷键提示文本（仅展示，不绑定按键） */
@@ -31,7 +33,7 @@ export interface ContextMenuConfig {
   minWidth?: number
   /** 菜单最大高度，超出后内部滚动 */
   maxHeight?: number
-  /** 主题：round / default / flat / win10 / mac 等，可加 " dark" 后缀 */
+  /** 主题：native / round / default / flat / win10 / mac 等，可加 " dark" 后缀 */
   theme?: string
 }
 
@@ -54,13 +56,14 @@ export function openContextMenu(event: MouseEvent, config: ContextMenuConfig) {
   const options: MenuOptions = {
     x: event.clientX,
     y: event.clientY,
-    theme: config.theme ?? 'round',
+    theme: config.theme ?? 'native',
     minWidth: config.minWidth ?? 160,
     maxHeight: config.maxHeight,
     items: config.items.map((item) => ({
       label: item.label,
       icon: item.icon,
       disabled: item.disabled,
+      checked: item.checked,
       divided: item.divided,
       shortcut: item.shortcut,
       customClass: item.customClass,
@@ -68,6 +71,7 @@ export function openContextMenu(event: MouseEvent, config: ContextMenuConfig) {
         label: child.label,
         icon: child.icon,
         disabled: child.disabled,
+        checked: child.checked,
         divided: child.divided,
         shortcut: child.shortcut,
         customClass: child.customClass,

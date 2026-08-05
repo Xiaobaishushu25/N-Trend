@@ -27,10 +27,14 @@ export const api = {
   deleteGroup: (id: number) => invoke<void>('delete_group', { id }),
   getGroupSymbols: (groupId: number) =>
     invoke<SymbolRow[]>('get_group_symbols', { groupId }),
+  listSymbolGroups: (symbol: string) =>
+    invoke<GroupRow[]>('list_symbol_groups', { symbol }),
   addSymbolToGroup: (symbol: string, groupId: number) =>
     invoke<void>('add_symbol_to_group', { symbol, groupId }),
   removeSymbolFromGroup: (symbol: string, groupId: number) =>
     invoke<void>('remove_symbol_from_group', { symbol, groupId }),
+  reorderGroupSymbols: (groupId: number, codes: string[]) =>
+    invoke<void>('reorder_group_symbols', { groupId, codes }),
   addSymbol: (code: string) => invoke<number>('add_symbol', { code }),
   removeSymbol: (code: string) => invoke<void>('remove_symbol', { code }),
   setSymbolFlags: (code: string, watchlist: boolean, enabled: boolean) =>
