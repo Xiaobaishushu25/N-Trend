@@ -22,6 +22,14 @@ body {
   box-sizing: border-box;
 }
 
+/* SortableJS 拖拽克隆体样式（克隆体挂在 body 上，须为全局样式） */
+.sl-row-fallback,
+.sl-table-fallback {
+  opacity: 0.85;
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.18);
+  cursor: grabbing;
+}
+
 /* ===== 通用右键菜单（@imengyu/vue3-context-menu）样式微调 ===== */
 
 /* 自定义 native 主题：浅色底、小圆角、柔和投影、整行高亮，弱化网页感 */

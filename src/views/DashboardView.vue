@@ -180,6 +180,9 @@ function setupTableSortable() {
   tableSortable = Sortable.create(tbody, {
     animation: 150,
     draggable: 'tr[data-code]',
+    forceFallback: true,
+    fallbackClass: 'sl-table-fallback',
+    fallbackOnBody: true,
     ghostClass: 'sl-table-ghost',
     chosenClass: 'sl-table-chosen',
     disabled: groupsStore.selectedId == null,

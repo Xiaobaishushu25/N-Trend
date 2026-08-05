@@ -655,6 +655,9 @@ onBeforeUnmount(() => {
             class="sl-list"
             :animation="150"
             :disabled="groupsStore.selectedId == null"
+            :force-fallback="true"
+            fallback-on-body
+            fallback-class="sl-row-fallback"
             ghost-class="sl-row-ghost"
             chosen-class="sl-row-chosen"
             @end="persistListOrder"
