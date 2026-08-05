@@ -1,6 +1,7 @@
 ﻿//! Sina futures data fetching with a polite rate limiter.
 
 pub mod kline;
+pub mod quotes;
 pub mod symbols;
 
 use std::collections::VecDeque;

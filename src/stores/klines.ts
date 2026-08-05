@@ -10,8 +10,9 @@ export const useKlinesStore = defineStore('klines', {
     error: '' as string,
   }),
   actions: {
-    async load(symbol: string, timeframe: Timeframe, limit = 500) {
-      this.loading = true
+    async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
+      // silent：后台静默刷新（如定时入库后），不弹加载遮罩
+      if (!silent) this.loading = true
       this.error = ''
       this.timeframe = timeframe
       try {
@@ -19,7 +20,7 @@ export const useKlinesStore = defineStore('klines', {
       } catch (e) {
         this.error = String(e)
       } finally {
-        this.loading = false
+        if (!silent) this.loading = false
       }
     },
   },

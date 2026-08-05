@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
   AppInfo,
+  GroupRow,
   KlineRow,
   MarketSnapshot,
   RefreshStats,
@@ -20,6 +21,16 @@ export const api = {
   appInfo: () => invoke<AppInfo>('app_info'),
 
   getSymbols: () => invoke<SymbolRow[]>('get_symbols'),
+  listGroups: () => invoke<GroupRow[]>('list_groups'),
+  createGroup: (name: string) => invoke<GroupRow>('create_group', { name }),
+  renameGroup: (id: number, name: string) => invoke<void>('rename_group', { id, name }),
+  deleteGroup: (id: number) => invoke<void>('delete_group', { id }),
+  getGroupSymbols: (groupId: number) =>
+    invoke<SymbolRow[]>('get_group_symbols', { groupId }),
+  addSymbolToGroup: (symbol: string, groupId: number) =>
+    invoke<void>('add_symbol_to_group', { symbol, groupId }),
+  removeSymbolFromGroup: (symbol: string, groupId: number) =>
+    invoke<void>('remove_symbol_from_group', { symbol, groupId }),
   addSymbol: (code: string) => invoke<number>('add_symbol', { code }),
   removeSymbol: (code: string) => invoke<void>('remove_symbol', { code }),
   setSymbolFlags: (code: string, watchlist: boolean, enabled: boolean) =>
@@ -46,6 +57,10 @@ export const api = {
 
 export function onDataUpdated(cb: (stats: RefreshStats) => void) {
   return listen<RefreshStats>('data-updated', (e) => cb(e.payload))
+}
+
+export function onQuotesUpdated(cb: (snapshots: MarketSnapshot[]) => void) {
+  return listen<MarketSnapshot[]>('quote-updated', (e) => cb(e.payload))
 }
 
 export function onScanCompleted(cb: (result: ScanResult) => void) {

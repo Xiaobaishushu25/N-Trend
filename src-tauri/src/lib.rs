@@ -12,11 +12,35 @@ use tokio::time::Duration;
 mod commands;
 mod state;
 
-use state::{AppState, SchedulerState};
+use state::{AppState, SchedulerState, KEY_LAST_REFRESH, KEY_LAST_SCAN};
 
 pub static QUITTING: AtomicBool = AtomicBool::new(false);
 
 const DEFAULT_SYMBOLS: &str = "# 每行一个期货代码\nRB0\nAU0\nIF0\n";
+
+/// 日志时间：使用本地时间（北京时间），替代 tracing 默认的 UTC 时间。
+#[derive(Clone, Debug)]
+struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
+}
+
+/// 日志过滤规则。
+/// 预留位置：后续实现设置模块后，从这里读取 settings.log_level 动态构造过滤串；
+/// 目前先硬编码默认级别，RUST_LOG 环境变量仍可整体覆盖。
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    let hardcoded_level = "info";
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::try_new(hardcoded_level)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    })
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -51,12 +75,24 @@ pub fn run() {
             }
 
             let auto_start = tauri::async_runtime::block_on(services.settings()).auto_start_scheduler;
+            // 恢复上次运行记录的最后成功时间，避免应用重启后丢失
+            let saved = tauri::async_runtime::block_on(n_core::storage::repo::all_settings(&services.db))
+                .unwrap_or_default();
+            let last_refresh = saved
+                .get(KEY_LAST_REFRESH)
+                .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+            let last_scan = saved
+                .get(KEY_LAST_SCAN)
+                .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
             let state = Arc::new(AppState {
                 services,
                 scheduler: tokio::sync::RwLock::new(SchedulerState {
                     running: auto_start,
-                    last_refresh: None,
-                    last_scan: None,
+                    last_refresh,
+                    last_scan,
+                    // 调度起点先用最近一次成功时间：重启后若已超过间隔，首个 tick 即补跑
+                    refresh_anchor: last_refresh,
+                    scan_anchor: last_scan,
                 }),
             });
             app.manage(state.clone());
@@ -98,7 +134,8 @@ pub fn run() {
                     }
                 });
             }
-            spawn_scheduler(app.handle().clone(), state);
+            spawn_scheduler(app.handle().clone(), state.clone());
+            spawn_quote_poller(app.handle().clone(), state);
             setup_tray(app)?;
             Ok(())
         })
@@ -112,6 +149,13 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_symbols,
+            commands::list_groups,
+            commands::create_group,
+            commands::rename_group,
+            commands::delete_group,
+            commands::get_group_symbols,
+            commands::add_symbol_to_group,
+            commands::remove_symbol_from_group,
             commands::add_symbol,
             commands::remove_symbol,
             commands::set_symbol_flags,
@@ -147,10 +191,8 @@ fn init_logging(app: &tauri::App) -> anyhow::Result<()> {
     // 日志写线程随进程存活，guard 需要长期持有
     std::mem::forget(guard);
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter())
+        .with_timer(LocalTime)
         .with_writer(writer)
         .with_ansi(false)
         .init();
@@ -159,8 +201,9 @@ fn init_logging(app: &tauri::App) -> anyhow::Result<()> {
 
 fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(60));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 15 秒一跳：比 60 秒更接近计划时刻，长时间任务结束后也能尽快补上节奏
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let now = Local::now();
@@ -171,10 +214,10 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
                     continue;
                 }
                 let last_refresh = rt
-                    .last_refresh
+                    .refresh_anchor
                     .and_then(|t| t.and_local_timezone(Local).single());
                 let last_scan = rt
-                    .last_scan
+                    .scan_anchor
                     .and_then(|t| t.and_local_timezone(Local).single());
                 n_core::scheduler::next_action(now, &cfg, last_refresh, last_scan)
             };
@@ -195,10 +238,45 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
+/// 实时行情轮询间隔（毫秒）：目前硬编码，后续接入设置模块后从配置读取。
+/// 建议范围 3~5 秒或更长，新浪批量行情接口对低频轮询很宽容。
+const QUOTE_POLL_INTERVAL_MS: u64 = 3000;
+
+/// 实时现价轮询：交易时段内每 `QUOTE_POLL_INTERVAL_MS` 毫秒批量拉一次
+/// 新浪实时行情并推送 `quote-updated` 事件，前端订阅后原地更新价格。
+/// 与调度器共用“运行/暂停”开关；盘外价格不变化，不发起请求。
+fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(QUOTE_POLL_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = Local::now();
+            {
+                let rt = state.scheduler.read().await;
+                if !rt.running {
+                    continue;
+                }
+            }
+            if !n_core::scheduler::is_trading_time(&now) {
+                continue;
+            }
+            match state.services.realtime_quotes().await {
+                Ok(snapshots) => {
+                    let _ = app.emit("quote-updated", &snapshots);
+                }
+                Err(e) => tracing::warn!("实时行情轮询失败: {e}"),
+            }
+        }
+    });
+}
+
 async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
+    // 先把本次尝试的起点记下来：节奏从起点起算，拉取耗时不会把下一次向后推
+    state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
     match state.services.refresh_data().await {
         Ok(stats) => {
-            state.scheduler.write().await.last_refresh = Some(Local::now().naive_local());
+            state.note_refresh_success().await;
             let _ = app.emit("data-updated", &stats);
             tracing::info!("定时刷新完成: 成功 {} 失败 {}", stats.succeeded, stats.failures);
         }
@@ -207,9 +285,10 @@ async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
 }
 
 async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
+    state.scheduler.write().await.scan_anchor = Some(Local::now().naive_local());
     match state.services.run_scan().await {
         Ok(res) => {
-            state.scheduler.write().await.last_scan = Some(Local::now().naive_local());
+            state.note_scan_success().await;
             let _ = app.emit("scan-completed", &res);
             tracing::info!("定时扫描完成: 品种 {} 信号 {}", res.scanned, res.active_count);
             if res.active_count > 0 {

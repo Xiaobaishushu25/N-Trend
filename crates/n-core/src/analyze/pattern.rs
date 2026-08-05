@@ -2,7 +2,7 @@ use crate::analyze::model::{Bar, Dir, Grade, NPattern, Swing};
 
 pub const FINE_MAX_A_BARS: usize = 16;
 pub const FINE_MAX_B_BARS: usize = 12;
-pub const LARGE_MAX_A_BARS: usize = 40;
+pub const LARGE_MAX_A_BARS: usize = 48;
 pub const LARGE_MAX_B_BARS: usize = 32;
 
 // a段内同向趋势K线的最低数量（放宽版趋势K判定）

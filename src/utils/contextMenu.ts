@@ -17,6 +17,8 @@ export interface ContextMenuItem {
   shortcut?: string
   /** 自定义 class，可用于危险操作标红（如 menu-item-danger） */
   customClass?: string
+  /** 子菜单项（支持二级菜单，如“复制到某组”） */
+  children?: ContextMenuItem[]
   /** 点击菜单项后的回调 */
   onClick?: () => void
 }
@@ -62,6 +64,15 @@ export function openContextMenu(event: MouseEvent, config: ContextMenuConfig) {
       divided: item.divided,
       shortcut: item.shortcut,
       customClass: item.customClass,
+      children: item.children?.map((child) => ({
+        label: child.label,
+        icon: child.icon,
+        disabled: child.disabled,
+        divided: child.divided,
+        shortcut: child.shortcut,
+        customClass: child.customClass,
+        onClick: child.onClick,
+      })),
       onClick: item.onClick,
     })),
   }

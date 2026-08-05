@@ -517,7 +517,11 @@ pub fn evaluate_signal(
         }
         let run_start = i;
         let anchor = run_start - 1;
-        let anchor_strong = strong_b_dir_trend_candle(&trend_k, anchor, p.dir);
+        // 强锚判定统一口径：严格趋势K 或 放宽口径的“强反向实体”
+        // （strong_opposite_body_at 与触发受阻检测共用同一判定），
+        // 避免“差一点到严格线”的强反向K线在预警门被放行、却在受阻检测被拦截。
+        let anchor_strong = strong_b_dir_trend_candle(&trend_k, anchor, p.dir)
+            || strong_opposite_body_at(bars, atr20, p.dir, anchor).is_some();
         gate_active = anchor_strong || strict_confirm;
         gate_anchor_strong = anchor_strong;
         let anchor_open = bars[anchor].open;
@@ -556,7 +560,7 @@ pub fn evaluate_signal(
         sc.state = "等待预警";
         sc.note = if gate_active {
             if gate_anchor_strong {
-                "b段末为强趋势K线，当前反向K线未形成吞没/强反转/累积覆盖形态，等待更强反转确认"
+                "b段末为强反向实体（强趋势K或大实体），当前反向K线未形成吞没/强反转/累积覆盖形态，等待更强反转确认"
                     .to_string()
             } else {
                 "B/C级结构要求反转预警具备吞没/强反向K/长影线/累积覆盖形态，等待更强反转确认"
@@ -1393,8 +1397,8 @@ mod tests {
 
     #[test]
     fn a_grade_fast_path_rejects_small_bullish_with_long_upper_wick() {
-        // ss0案例：A级快速路径不接受"小实体+长上影"的阳线做多预警，
-        // 等到收盘位置合格的反向K线才出预警。
+        // A级快速路径不接受"小实体+长上影"的阳线做多预警，
+        // 等到收盘位置合格的反向K线才出预警（b端为普通阴线，未触发强锚门）。
         let atr = atrs(6, 30.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -1405,7 +1409,7 @@ mod tests {
             },
             s2: Swing {
                 index: 2,
-                price: 14820.0,
+                price: 14852.0,
                 is_high: false,
             },
             ..pattern()
@@ -1413,7 +1417,7 @@ mod tests {
         let bars = vec![
             bar(14900.0, 14910.0, 14890.0, 14900.0),
             bar(15080.0, 15090.0, 15070.0, 15085.0), // s1 高点
-            bar(14885.0, 14895.0, 14820.0, 14835.0), // s2 普通阴线（b段低点）
+            bar(14885.0, 14895.0, 14852.0, 14865.0), // s2 普通阴线（b段低点，不构成强反向实体）
             bar(14835.0, 14855.0, 14830.0, 14840.0), // 小阳线+长上影 → 不合格
             bar(14840.0, 14870.0, 14835.0, 14860.0), // 收盘位置合格的反转阳线 → 预警
             bar(14860.0, 14890.0, 14858.0, 14885.0), // 触发
@@ -1423,6 +1427,40 @@ mod tests {
         assert_eq!(sc.warning, Some(4));
         assert_eq!(sc.trigger, Some(5));
         assert_eq!(sc.entry, 14870.0);
+    }
+
+    #[test]
+    fn relaxed_strong_anchor_blocks_fast_path_warning() {
+        // SF0场景：b端大阴线实体/振幅够大但收盘位0.75（未达严格趋势K的0.80），
+        // 强锚口径统一后仍判为“强反向实体”，禁用A级快速路径，小阳线不能直接预警。
+        let atr = atrs(6, 40.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 5910.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 5856.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
+            bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
+            bar(5896.0, 5896.0, 5856.0, 5866.0), // s2 大阴线：实体75%、收盘位0.75（未到严格线）
+            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径可过，但被强锚拦截
+            bar(5874.0, 5884.0, 5872.0, 5878.0), // 小阳线：无合格反转
+            bar(5878.0, 5882.0, 5874.0, 5880.0), // 小阳线：无合格反转，未收复锚定开盘5896
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, None);
+        assert_eq!(sc.state, "等待预警");
+        assert!(sc.note.contains("强反向实体"));
     }
 
     #[test]

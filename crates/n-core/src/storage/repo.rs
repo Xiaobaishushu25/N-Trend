@@ -7,7 +7,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::storage::entities::{klines, scans, settings, signals, symbols};
+use crate::storage::entities::{groups, klines, scans, settings, signals, symbol_groups, symbols};
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
     if rows.is_empty() {
@@ -83,15 +83,23 @@ pub async fn klines(
     if let Some(end) = end_ts {
         q = q.filter(klines::Column::Ts.lte(end));
     }
-    let mut rows = q
-        .order_by_asc(klines::Column::Ts)
-        .all(db)
-        .await
-        .context("查询K线失败")?;
-    if let Some(limit) = limit {
-        let take = limit.min(rows.len());
-        rows = rows.split_off(rows.len() - take);
-    }
+    // 带 limit 时把取数下推到 SQL（倒序取最后 limit 根再翻回），
+    // 避免先把该品种全部K线读进内存再截断。
+    let rows = if let Some(limit) = limit {
+        let mut rows = q
+            .order_by_desc(klines::Column::Ts)
+            .limit(limit as u64)
+            .all(db)
+            .await
+            .context("查询K线失败")?;
+        rows.reverse();
+        rows
+    } else {
+        q.order_by_asc(klines::Column::Ts)
+            .all(db)
+            .await
+            .context("查询K线失败")?
+    };
     Ok(rows)
 }
 
@@ -169,11 +177,192 @@ pub async fn set_symbol_flags(
 }
 
 pub async fn remove_symbol(db: &DatabaseConnection, code: &str) -> Result<()> {
+    // 删除品种的同时清理它在所有分组中的关联
+    symbol_groups::Entity::delete_many()
+        .filter(symbol_groups::Column::Symbol.eq(code))
+        .exec(db)
+        .await
+        .context("删除品种分组关联失败")?;
     symbols::Entity::delete_many()
         .filter(symbols::Column::Code.eq(code))
         .exec(db)
         .await
         .context("删除品种失败")?;
+    Ok(())
+}
+
+pub async fn list_groups(db: &DatabaseConnection) -> Result<Vec<groups::Model>> {
+    groups::Entity::find()
+        .order_by_asc(groups::Column::SortIndex)
+        .order_by_asc(groups::Column::Id)
+        .all(db)
+        .await
+        .context("查询分组失败")
+}
+
+/// 创建分组：名称唯一，sort_index 取当前最大值 + 1（为后续排序预留）。
+pub async fn create_group(db: &DatabaseConnection, name: &str) -> Result<groups::Model> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("分组名称不能为空"));
+    }
+    let exists = groups::Entity::find()
+        .filter(groups::Column::Name.eq(name))
+        .count(db)
+        .await
+        .context("查询分组失败")?
+        > 0;
+    if exists {
+        return Err(anyhow!("分组「{name}」已存在"));
+    }
+    let max_sort = groups::Entity::find()
+        .order_by_desc(groups::Column::SortIndex)
+        .one(db)
+        .await
+        .context("查询分组失败")?
+        .map_or(0, |g| g.sort_index);
+    let now = crate::analyze::time::now_display();
+    let model = groups::ActiveModel {
+        id: Default::default(),
+        name: Set(name.to_string()),
+        sort_index: Set(max_sort + 1),
+        created_at: Set(now.clone()),
+        updated_at: Set(now),
+    };
+    groups::Entity::insert(model)
+        .exec_with_returning(db)
+        .await
+        .context("创建分组失败")
+}
+
+pub async fn rename_group(db: &DatabaseConnection, id: i64, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("分组名称不能为空"));
+    }
+    let row = groups::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .context("查询分组失败")?
+        .ok_or_else(|| anyhow!("分组不存在"))?;
+    if row.name != name {
+        let exists = groups::Entity::find()
+            .filter(groups::Column::Name.eq(name))
+            .filter(groups::Column::Id.ne(id))
+            .count(db)
+            .await
+            .context("查询分组失败")?
+            > 0;
+        if exists {
+            return Err(anyhow!("分组「{name}」已存在"));
+        }
+    }
+    let mut model: groups::ActiveModel = row.into();
+    model.name = Set(name.to_string());
+    model.updated_at = Set(crate::analyze::time::now_display());
+    model.save(db).await.context("重命名分组失败")?;
+    Ok(())
+}
+
+pub async fn delete_group(db: &DatabaseConnection, id: i64) -> Result<()> {
+    symbol_groups::Entity::delete_many()
+        .filter(symbol_groups::Column::GroupId.eq(id))
+        .exec(db)
+        .await
+        .context("删除分组关联失败")?;
+    groups::Entity::delete_many()
+        .filter(groups::Column::Id.eq(id))
+        .exec(db)
+        .await
+        .context("删除分组失败")?;
+    Ok(())
+}
+
+/// 分组内的品种（按组内排序索引、再按代码排序）。
+pub async fn group_symbols(db: &DatabaseConnection, group_id: i64) -> Result<Vec<symbols::Model>> {
+    let members = symbol_groups::Entity::find()
+        .filter(symbol_groups::Column::GroupId.eq(group_id))
+        .order_by_asc(symbol_groups::Column::SortIndex)
+        .order_by_asc(symbol_groups::Column::Symbol)
+        .all(db)
+        .await
+        .context("查询分组品种失败")?;
+    if members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let codes: Vec<String> = members.iter().map(|m| m.symbol.clone()).collect();
+    let syms = symbols::Entity::find()
+        .filter(symbols::Column::Code.is_in(codes))
+        .all(db)
+        .await
+        .context("查询分组品种失败")?;
+    let by_code: std::collections::HashMap<String, symbols::Model> =
+        syms.into_iter().map(|s| (s.code.clone(), s)).collect();
+    Ok(members
+        .into_iter()
+        .filter_map(|m| by_code.get(&m.symbol).cloned())
+        .collect())
+}
+
+/// 把品种加入分组（幂等）。sort_index 取该组内当前最大值 + 1。
+pub async fn add_symbol_to_group(
+    db: &DatabaseConnection,
+    symbol: &str,
+    group_id: i64,
+) -> Result<()> {
+    if !symbol_exists(db, symbol).await? {
+        return Err(anyhow!("品种不存在: {symbol}"));
+    }
+    if groups::Entity::find_by_id(group_id)
+        .one(db)
+        .await
+        .context("查询分组失败")?
+        .is_none()
+    {
+        return Err(anyhow!("分组不存在"));
+    }
+    let exists = symbol_groups::Entity::find()
+        .filter(symbol_groups::Column::Symbol.eq(symbol))
+        .filter(symbol_groups::Column::GroupId.eq(group_id))
+        .count(db)
+        .await
+        .context("查询分组品种失败")?
+        > 0;
+    if exists {
+        return Ok(());
+    }
+    let max_sort = symbol_groups::Entity::find()
+        .filter(symbol_groups::Column::GroupId.eq(group_id))
+        .order_by_desc(symbol_groups::Column::SortIndex)
+        .one(db)
+        .await
+        .context("查询分组品种失败")?
+        .map_or(0, |m| m.sort_index);
+    let model = symbol_groups::ActiveModel {
+        symbol: Set(symbol.to_string()),
+        group_id: Set(group_id),
+        sort_index: Set(max_sort + 1),
+        created_at: Set(crate::analyze::time::now_display()),
+    };
+    symbol_groups::Entity::insert(model)
+        .exec(db)
+        .await
+        .context("加入分组失败")?;
+    Ok(())
+}
+
+/// 把品种从指定分组移除。
+pub async fn remove_symbol_from_group(
+    db: &DatabaseConnection,
+    symbol: &str,
+    group_id: i64,
+) -> Result<()> {
+    symbol_groups::Entity::delete_many()
+        .filter(symbol_groups::Column::Symbol.eq(symbol))
+        .filter(symbol_groups::Column::GroupId.eq(group_id))
+        .exec(db)
+        .await
+        .context("从分组移除失败")?;
     Ok(())
 }
 

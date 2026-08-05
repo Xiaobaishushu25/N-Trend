@@ -52,6 +52,9 @@ pub struct MarketSnapshot {
 pub struct Services {
     pub db: DatabaseConnection,
     client: RwLock<SinaClient>,
+    /// 实时行情专用客户端：独立限速额度，避免与K线抓取互相排队。
+    /// 限速参数目前硬编码，后续接入设置模块后从配置读取。
+    quote_client: RwLock<SinaClient>,
     settings: RwLock<Settings>,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
@@ -62,9 +65,13 @@ impl Services {
         let settings = Settings::load(&db).await?;
         let client =
             SinaClient::with_limits(settings.request_interval_ms, settings.minutely_budget);
+        // 实时行情轮询：单批最多 50 个品种、轮询间隔数秒，200ms/120次每分钟足够，
+        // 且与K线抓取的 60/分钟预算互不影响。
+        let quote_client = SinaClient::with_limits(200, 120);
         Ok(Self {
             db,
             client: RwLock::new(client),
+            quote_client: RwLock::new(quote_client),
             settings: RwLock::new(settings),
             deep_backfilled: RwLock::new(HashSet::new()),
         })
@@ -386,7 +393,9 @@ pub async fn market_snapshot(&self) -> Result<Vec<MarketSnapshot>> {
     let symbols = repo::list_symbols(&self.db, false).await?;
     let mut out = Vec::with_capacity(symbols.len());
     for s in symbols {
-        let rows = repo::klines(&self.db, &s.code, "5m", None, None).await?;
+        // 快照只需要“最新收盘价 + 上一交易日收盘价”，最近 200 根 5m 足够，
+        // 不再把每个品种的全部K线读出来
+        let rows = repo::klines(&self.db, &s.code, "5m", Some(200), None).await?;
         let (latest, change_pct) = Self::snapshot_stats(&rows);
         out.push(MarketSnapshot {
             code: s.code,
@@ -422,6 +431,30 @@ fn snapshot_stats(rows: &[klines::Model]) -> (Option<f64>, Option<f64>) {
     let pct = (latest - prev) / prev * 100.0;
     (Some(latest), Some(pct))
 }
+
+/// 实时现价快照：从新浪批量行情接口拉取启用品种的实时价。
+/// 缺失/解析失败的品种返回 `latest: None`，由前端回退到库内旧数据。
+pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
+    let symbols = repo::list_symbols(&self.db, true).await?;
+    let codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let quotes =
+        crate::fetch::quotes::fetch_quotes(&*self.quote_client.read().await, &codes).await?;
+    Ok(symbols
+        .into_iter()
+        .map(|s| {
+            let q = quotes.get(&s.code);
+            MarketSnapshot {
+                code: s.code,
+                latest: q.map(|q| q.latest),
+                change_pct: q.and_then(|q| q.change_pct),
+            }
+        })
+        .collect())
+}
+
     /// 全品种扫描：15m 结构 + 60m 趋势 → 信号持久化。
     pub async fn run_scan(&self) -> Result<ScanResult> {
         let started = crate::analyze::time::now_display();

@@ -12,6 +12,12 @@ export interface SymbolRow {
   updated_at: string
 }
 
+export interface GroupRow {
+  id: number
+  name: string
+  sort_index: number
+}
+
 export interface KlineRow {
   symbol: string
   timeframe: string

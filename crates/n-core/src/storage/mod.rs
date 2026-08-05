@@ -46,6 +46,14 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .create_table_from_entity(entities::settings::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::groups::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::symbol_groups::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     for table in tables {

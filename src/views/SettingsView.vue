@@ -12,13 +12,12 @@ import {
   NSpace,
   NDivider,
   NText,
-  useMessage,
 } from 'naive-ui'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
+import { notify } from '../utils/notify'
 import type { Settings } from '../types'
 
-const message = useMessage()
 const settingsStore = useSettingsStore()
 const symbolsStore = useSymbolsStore()
 
@@ -38,9 +37,9 @@ async function save() {
   saving.value = true
   try {
     await settingsStore.save(form.value)
-    message.success('设置已保存')
+    notify.success('设置已保存')
   } catch (e) {
-    message.error(String(e))
+    notify.error(String(e))
   } finally {
     saving.value = false
   }
@@ -50,9 +49,9 @@ async function refreshSymbols() {
   refreshingSymbols.value = true
   try {
     const count = await symbolsStore.refreshList()
-    message.success(`已刷新品种列表，共 ${count} 个`)
+    notify.success(`已刷新品种列表，共 ${count} 个`)
   } catch (e) {
-    message.error(String(e))
+    notify.error(String(e))
   } finally {
     refreshingSymbols.value = false
   }

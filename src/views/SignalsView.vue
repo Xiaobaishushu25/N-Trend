@@ -8,13 +8,12 @@ import {
   NSpace,
   NTag,
   NText,
-  useMessage,
   type DataTableColumns,
 } from 'naive-ui'
 import { useScansStore } from '../stores/scans'
+import { notify } from '../utils/notify'
 import type { ScanRow, SignalRow } from '../types'
 
-const message = useMessage()
 const scansStore = useScansStore()
 const selectedScan = ref<ScanRow | null>(null)
 
@@ -73,7 +72,7 @@ async function openDetail(row: ScanRow) {
 
 async function runScan() {
   await scansStore.runScan()
-  message.success('扫描完成')
+  notify.success('扫描完成')
   if (selectedScan.value && scansStore.latest) {
     await openDetail(scansStore.latest as unknown as ScanRow)
   }

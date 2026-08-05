@@ -126,3 +126,47 @@ pub mod settings {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 品种分组。sort_index 为分组排序预留字段（后续支持手动排序）。
+pub mod groups {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "groups")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub name: String,
+        pub sort_index: i64,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// 品种与分组的关联（多对多）。sort_index 为组内品种排序预留字段。
+pub mod symbol_groups {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "symbol_groups")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub symbol: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub group_id: i64,
+        pub sort_index: i64,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+

@@ -13,18 +13,30 @@ import {
 } from 'naive-ui'
 import { ArrowLeft, Eye, EyeOff, List } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
-import { api, onDataUpdated, onScanCompleted } from '../services/api'
+import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
+import { useGroupsStore } from '../stores/groups'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
-import type { MarketSnapshot, PatternDto, SignalOutcome, Timeframe } from '../types'
+import { confirmAction } from '../utils/confirm'
+import { notify } from '../utils/notify'
+import { openSymbolContextMenu } from '../utils/symbolMenu'
+import type {
+  GroupRow,
+  KlineRow,
+  MarketSnapshot,
+  PatternDto,
+  SignalOutcome,
+  Timeframe,
+} from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const symbolsStore = useSymbolsStore()
 const klinesStore = useKlinesStore()
 const scansStore = useScansStore()
+const groupsStore = useGroupsStore()
 
 const symbol = computed(() => String(route.params.symbol || ''))
 const timeframe = ref<Timeframe>('15m')
@@ -74,10 +86,6 @@ const patternHistory = computed(() => {
   return map
 })
 
-const latestClose = computed(() =>
-  klinesStore.rows.length ? klinesStore.rows[klinesStore.rows.length - 1].close : null,
-)
-
 /** 被点击隐藏的形态编号（用于控制K线图上的展示） */
 const hiddenNumbers = ref<Set<number>>(new Set())
 
@@ -100,6 +108,191 @@ function applyDefaultHidden() {
 /** 左侧品种列表开关与行情快照 */
 const showList = ref(true)
 const snapshots = ref<Record<string, MarketSnapshot>>({})
+/** 品种行闪烁方向：up=上涨(红) / down=下跌(绿)，由实时行情跳动驱动 */
+const rowFlash = ref<Record<string, 'up' | 'down'>>({})
+const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const FLASH_MS = 1000
+/** 分钟级周期的长度（分钟），用于把实时报价对齐到当前正在形成的K线桶 */
+const TIMEFRAME_MINUTES: Record<string, number> = {
+  '5m': 5,
+  '15m': 15,
+  '30m': 30,
+  '60m': 60,
+  '120m': 120,
+  '240m': 240,
+}
+/**
+ * 实时拼出的K线：最后一个元素是「当前正在形成」的一根，
+ * 之前的元素是已收盘但库内还没落地的闭环；与后端分桶规则保持一致
+ * （按自然日分钟网格取整、桶末时间戳），切换品种/周期时清空。
+ */
+const liveBars = ref<KlineRow[]>([])
+
+/** 按后端相同规则计算当前正在形成的桶的结束时间（桶末时间戳） */
+function liveBucketLabel(date: Date, timeframe: string): string | null {
+  const minutes = TIMEFRAME_MINUTES[timeframe]
+  if (!minutes) return null
+  const elapsed = date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
+  const endMin = Math.max(1, Math.ceil(elapsed / minutes)) * minutes
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, endMin, 0, 0)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`
+}
+
+/** 用实时报价刷新当前正在形成的K线；进入新桶时把前一根自动转为“已收未落地” */
+function updateLiveBar(latest: number) {
+  if (!symbol.value) return
+  const label = liveBucketLabel(new Date(), timeframe.value)
+  if (!label) return
+  const arr = [...liveBars.value]
+  const last = arr[arr.length - 1]
+  if (last && last.ts === label) {
+    if (last.close === latest) return
+    arr[arr.length - 1] = {
+      ...last,
+      high: Math.max(last.high, latest),
+      low: Math.min(last.low, latest),
+      close: latest,
+    }
+  } else {
+    arr.push({
+      symbol: symbol.value,
+      timeframe: timeframe.value,
+      ts: label,
+      open: latest,
+      high: latest,
+      low: latest,
+      close: latest,
+      volume: 0,
+      hold: 0,
+      source: 'live',
+    })
+    // 只保留最近一小段，等库内每 5 分钟刷新后自然由历史序列接管
+    if (arr.length > 12) arr.splice(0, arr.length - 12)
+  }
+  liveBars.value = arr
+}
+
+/** 展示序列：历史完整K线 + 实时拼出的K线（时间戳重叠时以后者更新、保留库内成交量） */
+const displayRows = computed<KlineRow[]>(() => {
+  const rows = klinesStore.rows
+  const live = liveBars.value
+  if (!live.length) return rows
+  const liveByTs = new Map(live.map((b) => [b.ts, b]))
+  const rowByTs = new Map(rows.map((r) => [r.ts, r]))
+  const out: KlineRow[] = []
+  for (const r of rows) {
+    const bar = liveByTs.get(r.ts)
+    out.push(bar ? { ...bar, volume: r.volume, hold: r.hold } : r)
+  }
+  for (const bar of live) {
+    if (!rowByTs.has(bar.ts) && (!out.length || bar.ts > out[out.length - 1].ts)) {
+      out.push(bar)
+    }
+  }
+  return out
+})
+
+/** 顶栏/信息卡回退用的最新收盘价，优先取实时拼出的正在形成的K线 */
+const latestClose = computed(() =>
+  displayRows.value.length ? displayRows.value[displayRows.value.length - 1].close : null,
+)
+
+/** 当前分组内的品种代码；null 表示全部品种 */
+const groupCodes = ref<Set<string> | null>(null)
+
+async function loadGroupCodes() {
+  if (groupsStore.selectedId == null) {
+    groupCodes.value = null
+    return
+  }
+  const rows = await api.getGroupSymbols(groupsStore.selectedId)
+  groupCodes.value = new Set(rows.map((r) => r.code))
+}
+
+/** 左侧列表按当前分组过滤 */
+const visibleSymbols = computed(() =>
+  groupCodes.value
+    ? symbolsStore.symbols.filter((s) => groupCodes.value!.has(s.code))
+    : symbolsStore.symbols,
+)
+
+/** 左侧品种行右键菜单：与表格行一致（分组操作 + 彻底删除） */
+function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
+  openSymbolContextMenu(e, {
+    groups: groupsStore.groups,
+    selectedGroupId: groupsStore.selectedId,
+    symbol: row.code,
+    onRemoveFromGroup: () => handleRemoveFromGroup(row.code),
+    onCopyToGroup: (g) => handleCopyToGroup(row.code, g),
+    onMoveToGroup: (g) => handleMoveToGroup(row.code, g),
+    onDeleteSymbol: () => handleDeleteSymbol(row.code),
+  })
+}
+
+async function reloadSymbolList() {
+  await symbolsStore.load()
+  await loadGroupCodes()
+}
+
+async function handleRemoveFromGroup(code: string) {
+  const groupId = groupsStore.selectedId
+  if (groupId == null) return
+  try {
+    await api.removeSymbolFromGroup(code, groupId)
+    notify.success(`${code} 已从该组删除`)
+    await reloadSymbolList()
+  } catch (err) {
+    notify.error(String(err))
+  }
+}
+
+async function handleCopyToGroup(code: string, group: GroupRow) {
+  try {
+    await api.addSymbolToGroup(code, group.id)
+    notify.success(`${code} 已复制到「${group.name}」`)
+  } catch (err) {
+    notify.error(String(err))
+  }
+}
+
+async function handleMoveToGroup(code: string, group: GroupRow) {
+  const fromId = groupsStore.selectedId
+  if (fromId == null) return
+  try {
+    // 先加入目标组，再从原组移除：即使第二步失败，品种也不会丢失
+    await api.addSymbolToGroup(code, group.id)
+    await api.removeSymbolFromGroup(code, fromId)
+    notify.success(`${code} 已移动到「${group.name}」`)
+    await reloadSymbolList()
+  } catch (err) {
+    notify.error(String(err))
+  }
+}
+
+async function handleDeleteSymbol(code: string) {
+  const ok = await confirmAction({
+    title: '删除品种',
+    content: `确定删除 ${code} 吗？将同时删除其K线数据。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    type: 'warning',
+  })
+  if (!ok) return
+  try {
+    await symbolsStore.remove(code)
+    notify.success(`${code} 已删除`)
+    await reloadSymbolList()
+    // 删除的正是当前查看的品种时，跳到组内第一个品种；组空了回列表页
+    if (symbol.value === code) {
+      const first = visibleSymbols.value[0]
+      if (first) router.push({ name: 'chart', params: { symbol: first.code } })
+      else router.push({ name: 'dashboard' })
+    }
+  } catch (err) {
+    notify.error(String(err))
+  }
+}
 
 /** 行情快照：右侧信息卡的实时价与涨跌幅 */
 const snapshot = computed(() => snapshots.value[symbol.value] ?? null)
@@ -126,7 +319,7 @@ function fmtSigned(v: number | null) {
 }
 
 const listRows = computed(() =>
-  symbolsStore.symbols.map((s) => {
+  visibleSymbols.value.map((s) => {
     const signal = signalBySymbol.value[s.code] ?? null
     return {
       code: s.code,
@@ -224,6 +417,22 @@ async function loadSnapshots() {
   }
 }
 
+/** 让某个品种行闪烁一次，动画结束后自动熄灭，保证下一次跳动可重新触发 */
+function setRowFlash(code: string, dir: 'up' | 'down') {
+  rowFlash.value = { ...rowFlash.value, [code]: dir }
+  const prev = flashTimers.get(code)
+  if (prev) clearTimeout(prev)
+  flashTimers.set(
+    code,
+    setTimeout(() => {
+      const next = { ...rowFlash.value }
+      delete next[code]
+      rowFlash.value = next
+      flashTimers.delete(code)
+    }, FLASH_MS),
+  )
+}
+
 const visibleSignals = computed<PatternDto[]>(() =>
   signals.value.filter((s) => !hiddenNumbers.value.has(s.number)),
 )
@@ -239,7 +448,7 @@ const WHEEL_SWITCH_THRESHOLD = 20
 const WHEEL_SWITCH_INTERVAL = 150
 
 function switchSymbol(dir: number) {
-  const list = symbolsStore.symbols
+  const list = visibleSymbols.value
   if (!list.length || !symbol.value) return
   const idx = list.findIndex((s) => s.code === symbol.value)
   const next = list[(idx + dir + list.length) % list.length]
@@ -303,6 +512,7 @@ watch(signals, applyDefaultHidden, { immediate: true })
 watch([symbol, timeframe], async () => {
   hiddenApplied.value = ''
   applyDefaultHidden()
+  liveBars.value = []
   if (symbol.value) {
     await klinesStore.load(symbol.value, timeframe.value, 1200)
     scansStore.loadRecentSignals(symbol.value)
@@ -323,9 +533,31 @@ onMounted(async () => {
     await onDataUpdated(() => {
       loadSnapshots()
       scansStore.refreshLatestSignals()
+      // 定时入库后静默重载完整K线，让刚收盘的实时桶转正为历史K线
+      if (symbol.value) klinesStore.load(symbol.value, timeframe.value, 1200, true)
+    }),
+  )
+  // 实时现价：合并进快照表，缺失品种保留旧值，避免盘口跳动时整表闪空
+  unlisteners.push(
+    await onQuotesUpdated((list) => {
+      if (!list.length) return
+      const next: Record<string, MarketSnapshot> = { ...snapshots.value }
+      for (const s of list) {
+        const prev = snapshots.value[s.code]
+        // 价格实际跳动才闪烁：上涨红、下跌绿；首笔报价不闪
+        if (s.latest != null && prev?.latest != null && s.latest !== prev.latest) {
+          setRowFlash(s.code, s.latest > prev.latest ? 'up' : 'down')
+        }
+        // 用当前品种的实时报价拼出正在形成的K线
+        if (s.latest != null && s.code === symbol.value) updateLiveBar(s.latest)
+        next[s.code] = s
+      }
+      snapshots.value = next
     }),
   )
   await symbolsStore.load()
+  await groupsStore.load()
+  await loadGroupCodes()
   // 进入页面立即拉一次行情快照，避免左侧价格/涨幅要等下一次刷新或扫描事件才显示
   loadSnapshots()
   if (!scansStore.latest) {
@@ -345,6 +577,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  for (const timer of flashTimers.values()) clearTimeout(timer)
+  flashTimers.clear()
   for (const fn of unlisteners) fn()
 })
 </script>
@@ -391,8 +625,11 @@ onBeforeUnmount(() => {
               row.sigType === 'pending' ? 'has-pending' : '',
               row.sigType === 'triggered' ? 'has-triggered' : '',
               row.sigType === 'stale' ? 'has-stale' : '',
+              { 'is-flash-up': rowFlash[row.code] === 'up' },
+              { 'is-flash-down': rowFlash[row.code] === 'down' },
             ]"
             @click="router.push({ name: 'chart', params: { symbol: row.code } })"
+            @contextmenu="onSymbolContextMenu(row, $event)"
           >
             <div class="sl-main">
               <OverflowText class="sl-name" :text="row.name || row.code" />
@@ -423,7 +660,7 @@ onBeforeUnmount(() => {
           v-if="symbol && klinesStore.rows.length"
           :symbol="symbol"
           :timeframe="timeframe"
-          :rows="klinesStore.rows"
+          :rows="displayRows"
           :signals="visibleSignals"
           :loading="klinesStore.loading"
         />
@@ -604,6 +841,28 @@ onBeforeUnmount(() => {
 }
 .sl-row:hover {
   background: #f6f8fa;
+}
+.sl-row.is-flash-up {
+  animation: sl-row-flash-up 0.9s ease-out;
+}
+.sl-row.is-flash-down {
+  animation: sl-row-flash-down 0.9s ease-out;
+}
+@keyframes sl-row-flash-up {
+  0% {
+    background-color: rgba(224, 49, 49, 0.14);
+  }
+  100% {
+    background-color: #fff;
+  }
+}
+@keyframes sl-row-flash-down {
+  0% {
+    background-color: rgba(15, 157, 88, 0.14);
+  }
+  100% {
+    background-color: #fff;
+  }
 }
 .sl-row.active {
   background: rgba(22, 119, 255, 0.06);
@@ -1004,9 +1263,6 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
-
-
-
 
 
 

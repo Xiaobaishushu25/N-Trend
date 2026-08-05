@@ -1,7 +1,7 @@
 ﻿use std::sync::Arc;
 
 use n_core::service::{MarketSnapshot, RefreshStats, ScanResult, Settings};
-use n_core::storage::entities::{klines, scans, signals, symbols};
+use n_core::storage::entities::{groups, klines, scans, signals, symbols};
 use serde::Serialize;
 use tauri::State;
 
@@ -26,6 +26,73 @@ pub async fn app_info() -> AppInfo {
 #[tauri::command]
 pub async fn get_symbols(state: State<'_, Arc<AppState>>) -> Result<Vec<symbols::Model>, String> {
     n_core::storage::repo::list_symbols(&state.services.db, false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<groups::Model>, String> {
+    n_core::storage::repo::list_groups(&state.services.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn create_group(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> Result<groups::Model, String> {
+    n_core::storage::repo::create_group(&state.services.db, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn rename_group(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    name: String,
+) -> Result<(), String> {
+    n_core::storage::repo::rename_group(&state.services.db, id, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_group(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    n_core::storage::repo::delete_group(&state.services.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_group_symbols(
+    state: State<'_, Arc<AppState>>,
+    group_id: i64,
+) -> Result<Vec<symbols::Model>, String> {
+    n_core::storage::repo::group_symbols(&state.services.db, group_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn add_symbol_to_group(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+    group_id: i64,
+) -> Result<(), String> {
+    n_core::storage::repo::add_symbol_to_group(&state.services.db, &symbol, group_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn remove_symbol_from_group(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+    group_id: i64,
+) -> Result<(), String> {
+    n_core::storage::repo::remove_symbol_from_group(&state.services.db, &symbol, group_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -91,12 +158,16 @@ pub async fn get_market_snapshot(state: State<'_, Arc<AppState>>) -> Result<Vec<
 
 #[tauri::command]
 pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<RefreshStats, String> {
-    state.services.refresh_data().await.map_err(|e| e.to_string())
+    let stats = state.services.refresh_data().await.map_err(|e| e.to_string())?;
+    state.note_refresh_success().await;
+    Ok(stats)
 }
 
 #[tauri::command]
 pub async fn run_scan_now(state: State<'_, Arc<AppState>>) -> Result<ScanResult, String> {
-    state.services.run_scan().await.map_err(|e| e.to_string())
+    let result = state.services.run_scan().await.map_err(|e| e.to_string())?;
+    state.note_scan_success().await;
+    Ok(result)
 }
 
 #[tauri::command]
