@@ -174,17 +174,51 @@ export interface EmailSettings {
   smtp_password: string
 }
 
-export interface Settings {
+export interface AppConfig {
+  auto_start_scheduler: boolean
+}
+
+export interface SchedulerConfig {
   refresh_interval_secs: number
   scan_interval_secs: number
   trading_only: boolean
+}
+
+export interface FetchConfig {
   request_interval_ms: number
   minutely_budget: number
   backfill_count: number
   incremental_count: number
-  auto_start_scheduler: boolean
-  log_level: string
+}
+
+export interface QuoteConfig {
+  poll_interval_ms: number
+  request_interval_ms: number
+  minutely_budget: number
+}
+
+export interface LogConfig {
+  level: string
+}
+
+export interface UiConfig {
+  flash_ms: number
+  breathe_hold_ms: number
+  min_bar_spacing: number
+  /** 启用的K线周期，K线页切换栏只显示勾选的周期 */
+  timeframes: string[]
+  /** 上次打开的分组表格（null=全部品种），应用启动后恢复 */
+  last_group_id: number | null
+}
+
+export interface Config {
+  app_config: AppConfig
+  scheduler: SchedulerConfig
+  fetch: FetchConfig
+  quote: QuoteConfig
   email: EmailSettings
+  log: LogConfig
+  ui: UiConfig
 }
 
 export interface SchedulerStatus {

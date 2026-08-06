@@ -1,5 +1,12 @@
 ﻿<script setup lang="ts">
-import { NConfigProvider, NDialogProvider, NNotificationProvider, zhCN, dateZhCN } from 'naive-ui'
+import {
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  NNotificationProvider,
+  zhCN,
+  dateZhCN,
+} from 'naive-ui'
 import { onBeforeUnmount, onMounted } from 'vue'
 import AppLayout from './components/AppLayout.vue'
 import { useAppStore } from './stores/app'
@@ -25,7 +32,9 @@ onBeforeUnmount(() => {
   <n-config-provider :locale="zhCN" :date-locale="dateZhCN">
     <n-dialog-provider>
       <n-notification-provider>
-        <AppLayout />
+        <n-message-provider>
+          <AppLayout />
+        </n-message-provider>
       </n-notification-provider>
     </n-dialog-provider>
   </n-config-provider>

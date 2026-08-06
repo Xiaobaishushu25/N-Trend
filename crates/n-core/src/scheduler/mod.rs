@@ -9,6 +9,7 @@ use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SchedulerConfig {
     pub refresh_interval_secs: u64,
     pub scan_interval_secs: u64,

@@ -576,6 +576,19 @@ pub async fn set_settings(db: &DatabaseConnection, map: &std::collections::HashM
     Ok(())
 }
 
+/// 删除设置表中指定键（迁移配置到 JSON 后清理旧配置键用）。
+pub async fn delete_settings(db: &DatabaseConnection, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    settings::Entity::delete_many()
+        .filter(settings::Column::Key.is_in(keys.iter().map(|s| s.as_str())))
+        .exec(db)
+        .await
+        .context("删除设置键失败")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::DatabaseConnection;

@@ -1,9 +1,5 @@
 ﻿//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
-mod settings;
-
-pub use settings::{import_email_toml, Settings};
-
 use anyhow::{anyhow, Result};
 use chrono::Timelike;
 use sea_orm::{DatabaseConnection, Set};
@@ -13,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::analyze::dto::SignalOutcome;
 use crate::analyze::model::{Bar, DT, ATR_PERIOD};
+use crate::config::Config;
 use crate::derive::{aggregate, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::fetch::SinaClient;
@@ -53,49 +50,83 @@ pub struct Services {
     pub db: DatabaseConnection,
     client: RwLock<SinaClient>,
     /// 实时行情专用客户端：独立限速额度，避免与K线抓取互相排队。
-    /// 限速参数目前硬编码，后续接入设置模块后从配置读取。
     quote_client: RwLock<SinaClient>,
-    settings: RwLock<Settings>,
+    config: RwLock<Config>,
+    /// 配置文件路径（保存配置用）
+    config_path: std::path::PathBuf,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
 }
 
 impl Services {
-    pub async fn new(db: DatabaseConnection) -> Result<Self> {
-        let settings = Settings::load(&db).await?;
-        let client =
-            SinaClient::with_limits(settings.request_interval_ms, settings.minutely_budget);
+    pub async fn new(
+        db: DatabaseConnection,
+        config: Config,
+        config_path: std::path::PathBuf,
+    ) -> Result<Self> {
+        let client = SinaClient::with_limits(
+            config.fetch.request_interval_ms,
+            config.fetch.minutely_budget,
+        );
         // 实时行情轮询：单批最多 50 个品种、轮询间隔数秒，200ms/120次每分钟足够，
         // 且与K线抓取的 60/分钟预算互不影响。
-        let quote_client = SinaClient::with_limits(200, 120);
+        let quote_client = SinaClient::with_limits(
+            config.quote.request_interval_ms,
+            config.quote.minutely_budget,
+        );
         Ok(Self {
             db,
             client: RwLock::new(client),
             quote_client: RwLock::new(quote_client),
-            settings: RwLock::new(settings),
+            config: RwLock::new(config),
+            config_path,
             deep_backfilled: RwLock::new(HashSet::new()),
         })
     }
 
-    pub async fn settings(&self) -> Settings {
-        self.settings.read().await.clone()
+    pub async fn config(&self) -> Config {
+        self.config.read().await.clone()
     }
 
-    pub async fn apply_settings(&self, s: Settings) -> Result<()> {
+    /// 应用新配置：重建抓取/实时行情限速器，写 JSON 文件，更新内存。
+    pub async fn apply_config(&self, c: Config) -> Result<Config> {
         *self.client.write().await =
-            SinaClient::with_limits(s.request_interval_ms, s.minutely_budget);
-        s.save(&self.db).await?;
-        *self.settings.write().await = s;
-        Ok(())
+            SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
+        *self.quote_client.write().await =
+            SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
+        c.save(&self.config_path)?;
+        *self.config.write().await = c;
+        Ok(self.config().await)
+    }
+
+    /// 记录上次打开的分组 tab：仅更新 UI 配置并落盘，不重建限速器。
+    pub async fn set_last_group(&self, group_id: Option<i64>) -> Result<()> {
+        let mut c = self.config.write().await;
+        c.ui.last_group_id = group_id;
+        c.save(&self.config_path)
+    }
+
+    /// 更新启用的K线周期列表：去重并过滤未知周期，为空时回退为全部；仅落盘不重建限速器。
+    pub async fn set_timeframes(&self, timeframes: Vec<String>) -> Result<()> {
+        let mut c = self.config.write().await;
+        let mut next: Vec<String> = Vec::new();
+        for tf in timeframes {
+            if crate::config::DEFAULT_TIMEFRAMES.contains(&tf.as_str()) && !next.contains(&tf) {
+                next.push(tf);
+            }
+        }
+        if next.is_empty() {
+            next = crate::config::DEFAULT_TIMEFRAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+        c.ui.timeframes = next;
+        c.save(&self.config_path)
     }
 
     pub async fn scheduler_config(&self) -> SchedulerConfig {
-        let s = self.settings().await;
-        SchedulerConfig {
-            refresh_interval_secs: s.refresh_interval_secs,
-            scan_interval_secs: s.scan_interval_secs,
-            trading_only: s.trading_only,
-        }
+        self.config().await.scheduler
     }
 
     /// 品种表为空时，用内置/导入的代码表初始化。
@@ -237,7 +268,7 @@ impl Services {
             )
             .await?;
         }
-        let count = self.settings().await.backfill_count;
+        let count = self.config().await.fetch.backfill_count;
         self.backfill_symbol(&code, count).await
     }
 
@@ -264,7 +295,7 @@ impl Services {
     }
 
     async fn refresh_symbol_data(&self, code: &str) -> Result<()> {
-        let s = self.settings().await;
+        let s = self.config().await;
         let latest = repo::latest_ts(&self.db, code, "5m").await?;
         let stored = repo::raw_klines(&self.db, code).await?.len();
 
@@ -273,31 +304,34 @@ impl Services {
         let (gap_min, needed) = if let Some(latest_ts) = &latest {
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let gap = ts_gap_minutes(&now, latest_ts).unwrap_or(0).max(0);
-            (gap, ((gap / 5 + 2) as usize).clamp(s.incremental_count, s.backfill_count))
+            (
+                gap,
+                ((gap / 5 + 2) as usize).clamp(s.fetch.incremental_count, s.fetch.backfill_count),
+            )
         } else {
-            (0, s.backfill_count)
+            (0, s.fetch.backfill_count)
         };
         // 历史深度不足回填目标且本次进程还没整段回填过：一次性补齐深度，之后只按时间差增量抓取
         let deep_done = self.deep_backfilled.read().await.contains(code);
-        let count = if stored < s.backfill_count && !deep_done {
-            s.backfill_count
+        let count = if stored < s.fetch.backfill_count && !deep_done {
+            s.fetch.backfill_count
         } else {
             needed
         };
         let fetched =
             crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count).await?;
-        if count >= s.backfill_count {
+        if count >= s.fetch.backfill_count {
             self.deep_backfilled.write().await.insert(code.to_string());
         }
         // 长时间停机检查：缺口超过接口单次最大窗口（约1000根5m）时中间无法补齐，
         // 记录日志并仅保留接口能取到的最近窗口，避免做无效的二次全量请求。
         if let Some(latest_ts) = &latest {
-            let max_cover = (s.backfill_count * 5) as i64; // 接口窗口按分钟估算
+            let max_cover = (s.fetch.backfill_count * 5) as i64; // 接口窗口按分钟估算
             if gap_min > max_cover {
                 tracing::warn!(
                     "{code} 停机约 {:.1} 小时，超过接口回补窗口（{} 根5m），中间存在数据缺口，仅保留最近窗口",
                     gap_min as f64 / 60.0,
-                    s.backfill_count
+                    s.fetch.backfill_count
                 );
             } else if let Some(first) = fetched.first() {
                 let hole = ts_gap_minutes(latest_ts, &first.datetime).unwrap_or(0);
@@ -681,11 +715,6 @@ mod tests {
         );
     }
 }
-
-
-
-
-
 
 
 

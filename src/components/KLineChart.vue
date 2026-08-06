@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 // reactive 仅被下方被注释的调试面板使用；如取消注释调试面板，需把 reactive 加回 import
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin, NTooltip } from 'naive-ui'
 import {
   CandlestickSeries,
@@ -27,6 +27,7 @@ import {
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
 import type { KlineRow, PatternDto } from '../types'
+import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
   symbol: string
@@ -38,6 +39,8 @@ const props = defineProps<{
 
 const container = ref<HTMLDivElement | null>(null)
 const legend = ref<HTMLDivElement | null>(null)
+const settingsStore = useSettingsStore()
+const minBarSpacing = computed(() => settingsStore.settings.ui.min_bar_spacing)
 
 interface GapRect {
   from: Time
@@ -173,8 +176,6 @@ let priceExtent = 1
 /** 进入图表时默认展示的K线根数（从最新一根往前数）。根数越少单根K线越宽；
  *  想再宽就调小，想多看历史就调大。先写死便于手工调整，后续由配置传入 */
 const display_k_num = 140
-/** K线最小间距(px)：窗口较窄或视图拉得较宽时，防止K线细成一条线 */
-const MIN_BAR_SPACING = 8
 /** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，让最新K线不贴右边缘 */
 const display_right_gap = 10
 /** 右侧留白占可见K线根数的比例上限：数据量少的品种留白按此比例缩水，避免右侧出现大片空白 */
@@ -341,8 +342,8 @@ function clampMinBarSpacing(pendingRange?: { from: number; to: number }) {
   if (!width || total <= 0) return
   const ts = chart.timeScale()
   const logical = pendingRange ?? ts.getVisibleLogicalRange()
-  if (!logical || ts.options().barSpacing >= MIN_BAR_SPACING) return
-  const maxSpan = width / MIN_BAR_SPACING
+  if (!logical || ts.options().barSpacing >= minBarSpacing.value) return
+  const maxSpan = width / minBarSpacing.value
   const span = logical.to - logical.from
   if (span <= maxSpan) return
   const from = Math.max(-0.5, logical.to - maxSpan)

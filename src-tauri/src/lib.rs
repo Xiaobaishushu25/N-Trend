@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use chrono::{Local, NaiveDateTime};
+use n_core::config::Config;
 use n_core::service::Services;
 use n_core::storage;
 use serde::Serialize;
@@ -31,13 +32,10 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
     }
 }
 
-/// 日志过滤规则。
-/// 预留位置：后续实现设置模块后，从这里读取 settings.log_level 动态构造过滤串；
-/// 目前先硬编码默认级别，RUST_LOG 环境变量仍可整体覆盖。
-fn log_filter() -> tracing_subscriber::EnvFilter {
-    let hardcoded_level = "info";
+/// 日志过滤规则：读取配置中的日志级别；RUST_LOG 环境变量仍可整体覆盖。
+fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::try_new(hardcoded_level)
+        tracing_subscriber::EnvFilter::try_new(level)
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     })
 }
@@ -46,13 +44,18 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            init_logging(app)?;
-
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("ntrend.db");
             let db = tauri::async_runtime::block_on(storage::connect(&db_path))?;
-            let services = tauri::async_runtime::block_on(Services::new(db))?;
+
+            // 配置：JSON 文件优先，旧版 DB 设置首次启动自动迁移
+            let config_path = data_dir.join("config.json");
+            let config = tauri::async_runtime::block_on(Config::load(&config_path, &db))?;
+            init_logging(&data_dir, &config.log.level)?;
+
+            let services =
+                tauri::async_runtime::block_on(Services::new(db, config.clone(), config_path))?;
 
             // 首启种子：优先读取工程根目录 symbols.txt（若有），否则内置代码表
             let mut seed_text = DEFAULT_SYMBOLS.to_string();
@@ -64,17 +67,19 @@ pub fn run() {
             tauri::async_runtime::block_on(services.seed_symbols(&seed_text))?;
 
             // 首次运行兼容导入 email.toml
-            let settings = tauri::async_runtime::block_on(services.settings());
-            if settings.email.smtp_password.is_empty() && settings.email.from.is_empty() {
-                let imported = n_core::service::import_email_toml(std::path::Path::new("email.toml"))?;
+            let current = tauri::async_runtime::block_on(services.config());
+            if current.email.smtp_password.is_empty() && current.email.from.is_empty() {
+                let imported = n_core::config::import_email_toml(std::path::Path::new("email.toml"))?;
                 if !imported.smtp_password.is_empty() || imported.from != n_core::notify::email::EmailSettings::default().from {
-                    let mut next = settings;
+                    let mut next = current;
                     next.email = imported;
-                    tauri::async_runtime::block_on(services.apply_settings(next))?;
+                    tauri::async_runtime::block_on(services.apply_config(next))?;
                 }
             }
 
-            let auto_start = tauri::async_runtime::block_on(services.settings()).auto_start_scheduler;
+            let auto_start = tauri::async_runtime::block_on(services.config())
+                .app_config
+                .auto_start_scheduler;
             // 恢复上次运行记录的最后成功时间，避免应用重启后丢失
             let saved = tauri::async_runtime::block_on(n_core::storage::repo::all_settings(&services.db))
                 .unwrap_or_default();
@@ -173,8 +178,11 @@ pub fn run() {
             commands::get_scan_history,
             commands::get_scan_detail,
             commands::get_latest_signals,
-            commands::get_settings,
-            commands::update_settings,
+            commands::get_config,
+            commands::update_config,
+            commands::set_last_group,
+            commands::set_timeframes,
+            commands::open_log_directory,
             commands::scheduler_status,
             commands::set_scheduler_running,
             commands::app_info,
@@ -188,15 +196,14 @@ fn app_data_dir(app: &tauri::App) -> anyhow::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-fn init_logging(app: &tauri::App) -> anyhow::Result<()> {
-    let dir = app_data_dir(app)?;
-    std::fs::create_dir_all(&dir)?;
-    let file_appender = tracing_appender::rolling::daily(&dir, "ntrend.log");
+fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let file_appender = tracing_appender::rolling::daily(dir, "ntrend.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
     // 日志写线程随进程存活，guard 需要长期持有
     std::mem::forget(guard);
     tracing_subscriber::fmt()
-        .with_env_filter(log_filter())
+        .with_env_filter(log_filter(level))
         .with_timer(LocalTime)
         .with_writer(writer)
         .with_ansi(false)
@@ -254,19 +261,15 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
-/// 实时行情轮询间隔（毫秒）：目前硬编码，后续接入设置模块后从配置读取。
-/// 建议范围 3~5 秒或更长，新浪批量行情接口对低频轮询很宽容。
-const QUOTE_POLL_INTERVAL_MS: u64 = 3000;
-
-/// 实时现价轮询：交易时段内每 `QUOTE_POLL_INTERVAL_MS` 毫秒批量拉一次
+/// 实时现价轮询：交易时段内按配置的轮询间隔批量拉一次
 /// 新浪实时行情并推送 `quote-updated` 事件，前端订阅后原地更新价格。
 /// 与调度器共用“运行/暂停”开关；盘外价格不变化，不发起请求。
 fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(QUOTE_POLL_INTERVAL_MS));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            // 轮询间隔从配置实时读取，保存设置后下一轮即生效
+            let interval_ms = state.services.config().await.quote.poll_interval_ms;
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
             let now = Local::now();
             {
                 let rt = state.scheduler.read().await;
@@ -308,11 +311,10 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
             let _ = app.emit("scan-completed", &res);
             tracing::info!("定时扫描完成: 品种 {} 信号 {}", res.scanned, res.active_count);
             if res.active_count > 0 {
-                let _ = app.emit("signal-found", &res.signals);
-                let settings = state.services.settings().await;
-                if settings.email.enabled && settings.email.sendable() {
+                let cfg = state.services.config().await;
+                if cfg.email.enabled && cfg.email.sendable() {
                     let (subject, body) = n_core::notify::email::scan_email_payload(&res.summary);
-                    if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &settings.email) {
+                    if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
                         tracing::error!("邮件发送失败: {e}");
                     }
                 }
@@ -326,8 +328,9 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     use tauri::menu::{Menu, MenuItem};
 
     let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+    let menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .menu(&menu)
@@ -339,6 +342,9 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
                     let _ = w.unminimize();
                     let _ = w.set_focus();
                 }
+            }
+            "settings" => {
+                open_settings_window(app);
             }
             "quit" => {
                 QUITTING.store(true, Ordering::SeqCst);
@@ -365,6 +371,28 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+/// 打开设置窗口：已存在则聚焦，否则新建独立窗口。
+/// 沿用系统标题栏，暂不做自定义 titlebar。
+fn open_settings_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("settings") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return;
+    }
+    let _ = tauri::WebviewWindowBuilder::new(
+        app,
+        "settings",
+        tauri::WebviewUrl::App("index.html#/settings".into()),
+    )
+    .title("设置")
+    .inner_size(760.0, 640.0)
+    .min_inner_size(680.0, 520.0)
+    .center()
+    .resizable(true)
+    .build();
 }
 
 // 供命令层读取状态使用

@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
   AppInfo,
+  Config,
   GroupRow,
   KlineRow,
   MarketSnapshot,
@@ -11,8 +12,6 @@ import type {
   ScanResult,
   ScanRow,
   SchedulerStatus,
-  Settings,
-  SignalOutcome,
   SignalRow,
   SymbolRow,
 } from '../types'
@@ -56,8 +55,13 @@ export const api = {
   getScanDetail: (scanId: number) => invoke<SignalRow[]>('get_scan_detail', { scanId }),
   getLatestSignals: (limit?: number) => invoke<SignalRow[]>('get_latest_signals', { limit }),
 
-  getSettings: () => invoke<Settings>('get_settings'),
-  updateSettings: (settings: Settings) => invoke<Settings>('update_settings', { settings }),
+  getConfig: () => invoke<Config>('get_config'),
+  updateConfig: (config: Config) => invoke<Config>('update_config', { config }),
+  setLastGroup: (groupId: number | null) =>
+    invoke<void>('set_last_group', { groupId }),
+  setTimeframes: (timeframes: string[]) =>
+    invoke<void>('set_timeframes', { timeframes }),
+  openLogDirectory: () => invoke<void>('open_log_directory'),
   schedulerStatus: () => invoke<SchedulerStatus>('scheduler_status'),
   setSchedulerRunning: (running: boolean) =>
     invoke<SchedulerStatus>('set_scheduler_running', { running }),
@@ -73,10 +77,6 @@ export function onQuotesUpdated(cb: (snapshots: MarketSnapshot[]) => void) {
 
 export function onScanCompleted(cb: (result: ScanResult) => void) {
   return listen<ScanResult>('scan-completed', (e) => cb(e.payload))
-}
-
-export function onSignalFound(cb: (signals: SignalOutcome[]) => void) {
-  return listen<SignalOutcome[]>('signal-found', (e) => cb(e.payload))
 }
 
 

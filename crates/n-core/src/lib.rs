@@ -1,6 +1,7 @@
 ﻿//! ntrend core library: fetching, persistence, aggregation, analysis and scheduling.
 
 pub mod analyze;
+pub mod config;
 pub mod derive;
 pub mod fetch;
 pub mod notify;

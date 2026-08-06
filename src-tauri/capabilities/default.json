@@ -1,6 +1,13 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for the main window",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "description": "Default capabilities for main and settings windows",
+  "windows": ["main", "settings"],
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
+    "core:window:allow-close"
+  ]
 }

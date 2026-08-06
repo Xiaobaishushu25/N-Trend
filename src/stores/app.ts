@@ -1,8 +1,7 @@
 ﻿import { defineStore } from 'pinia'
 import { listen } from '@tauri-apps/api/event'
-import { onDataUpdated, onScanCompleted, onSignalFound, api } from '../services/api'
+import { onDataUpdated, onScanCompleted, api } from '../services/api'
 import { useSymbolsStore } from './symbols'
-import { notify } from '../utils/notify'
 import type { AppInfo } from '../types'
 
 export const useAppStore = defineStore('app', {
@@ -32,28 +31,6 @@ export const useAppStore = defineStore('app', {
           console.info('[scan-completed]', result)
         }),
       )
-      this.listeners.push(
-        await onSignalFound((signals) => {
-          console.info('[signal-found]', signals)
-          const active = signals[0]
-          if (active) {
-            notify.warning(
-              `${active.symbol} ${active.direction === 'up' ? '做多' : '做空'} ${active.level}N · 评分 ${active.score.toFixed(2)}`,
-              { title: 'N趋势 新信号', duration: 8000 },
-            )
-          }
-          if (typeof window !== 'undefined' && 'Notification' in window) {
-            if (active && Notification.permission === 'granted') {
-              new Notification(`N趋势 新信号 ${active.symbol}`, {
-                body: `${active.direction === 'up' ? '做多' : '做空'} ${active.level} N | 评分 ${active.score.toFixed(2)} | ${active.state}`,
-              })
-            }
-          }
-        }),
-      )
-      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-        Notification.requestPermission()
-      }
     },
   },
 })

@@ -1,11 +1,12 @@
 ﻿<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { NIcon, NLayout, NLayoutContent, NLayoutHeader, NTag, NText } from 'naive-ui'
-import { TrendingUp } from '@vicons/tabler'
+import { NButton, NIcon, NLayout, NLayoutContent, NLayoutHeader, NTag, NText } from 'naive-ui'
+import { Settings as SettingsIcon, TrendingUp } from '@vicons/tabler'
 import { onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
+import { openSettingsWindow } from '../utils/openSettingsWindow'
 
 const route = useRoute()
 const appStore = useAppStore()
@@ -18,8 +19,6 @@ const bare = computed(() => Boolean(route.meta.bare))
  * 一段时间没新事件就熄灭，起到实时指示效果。
  */
 const PREVIEW_ALWAYS_BREATHING = false
-/** 收到行情请求事件后保持呼吸的时间（毫秒）：现价轮询 3 秒一轮，5 秒内没新事件才熄灭 */
-const BREATHE_HOLD_MS = 5000
 
 const dataActive = ref(PREVIEW_ALWAYS_BREATHING)
 let breatheTimer: ReturnType<typeof setTimeout> | undefined
@@ -30,7 +29,7 @@ function kickBreathe() {
   if (breatheTimer) clearTimeout(breatheTimer)
   breatheTimer = setTimeout(() => {
     dataActive.value = false
-  }, BREATHE_HOLD_MS)
+  }, settingsStore.settings.ui.breathe_hold_ms)
 }
 
 const unlisteners: (() => void)[] = []
@@ -77,6 +76,18 @@ onBeforeUnmount(() => {
           <span>定时刷新扫描运行中</span>
         </div>
         <n-tag v-else type="warning" size="small" round>定时扫描已暂停</n-tag>
+        <n-button
+          quaternary
+          circle
+          size="small"
+          title="设置"
+          class="settings-button"
+          @click="openSettingsWindow"
+        >
+          <template #icon>
+            <n-icon :component="SettingsIcon" size="18" />
+          </template>
+        </n-button>
         <div class="status-meta">
           <div class="status-item">
             <span class="dot dot-data" />

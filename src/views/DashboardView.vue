@@ -7,6 +7,7 @@ import {
   NDataTable,
   NIcon,
   NInput,
+  NInputGroup,
   NModal,
   NSpace,
   NSwitch,
@@ -15,7 +16,18 @@ import {
   NText,
   type DataTableColumns,
 } from 'naive-ui'
-import { DeviceFloppy, GripVertical, Lock, Trash } from '@vicons/tabler'
+import {
+  DeviceFloppy,
+  FolderPlus,
+  GripVertical,
+  Lock,
+  Plus,
+  Refresh,
+  Scan,
+  Settings,
+  Tag,
+  Trash,
+} from '@vicons/tabler'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useGroupsStore } from '../stores/groups'
 import { useSettingsStore } from '../stores/settings'
@@ -24,7 +36,7 @@ import { useScansStore } from '../stores/scans'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
-import type { GroupRow, MarketSnapshot, SignalRow, SymbolRow } from '../types'
+import type { GroupRow, MarketSnapshot, SignalOutcome, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
 defineOptions({ name: 'DashboardView' })
@@ -40,7 +52,7 @@ interface WatchRow {
   latest: number | null
   changePct: number | null
   changePts: number | null
-  signal: SignalRow | null
+  signal: SignalOutcome | null
   /** 最近一次行情跳动的方向：up=上涨(红) / down=下跌(绿)，用于行呼吸闪烁 */
   flash: 'up' | 'down' | null
 }
@@ -51,6 +63,7 @@ const refreshing = ref(false)
 const scanning = ref(false)
 const enriching = ref(false)
 const newCode = ref('')
+const adding = ref(false)
 const groupModal = ref<'create' | 'manage' | null>(null)
 const newGroupName = ref('')
 const groupNameDrafts = ref<Record<number, string>>({})
@@ -90,7 +103,6 @@ let suppressOpenChart = false
 let unlisteners: (() => void)[] = []
 /** 行闪烁清除计时器：动画结束后把 flash 归零，保证下一次跳动能重新触发动画 */
 const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const FLASH_MS = 900
 
 /** 信号状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
 function signalStateRank(state: string): number {
@@ -102,14 +114,14 @@ function signalStateRank(state: string): number {
 }
 
 /** 每个品种取优先级最高的形态：先按状态（即将触发 > 已触发 > 接近时效），同状态按评分从高到低 */
-function bestSignal(signals: SignalRow[]): SignalRow | null {
+function bestSignal(signals: SignalOutcome[]): SignalOutcome | null {
   if (!signals.length) return null
   return [...signals].sort((a, b) => {
     const rankA = signalStateRank(a.state)
     const rankB = signalStateRank(b.state)
     if (rankA !== rankB) return rankA - rankB
     if (b.score !== a.score) return b.score - a.score
-    return a.id - b.id
+    return a.number - b.number
   })[0]
 }
 
@@ -122,8 +134,10 @@ async function loadAll() {
     if (groupsStore.selectedId != null) {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
     }
-    const signals = await api.getLatestSignals(500)
-    const bySymbol = new Map<string, SignalRow[]>()
+    // 与K线页共用同一份信号数据（scansStore.latestSignals），避免两处各自拉取不同步
+    await scansStore.refreshLatestSignals()
+    const signals = scansStore.latestSignals
+    const bySymbol = new Map<string, SignalOutcome[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
       arr.push(s)
@@ -184,7 +198,7 @@ function applyQuotes(snapshots: MarketSnapshot[]) {
             x.symbol.code === r.symbol.code && x.flash === flash ? { ...x, flash: null } : x,
           )
           flashTimers.delete(r.symbol.code)
-        }, FLASH_MS),
+        }, settingsStore.settings.ui.flash_ms),
       )
     }
     return { ...r, latest: snap.latest, changePct: snap.change_pct, changePts, flash }
@@ -600,11 +614,11 @@ const fmtPoints = (v: number | null | undefined) => {
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`
 }
 
-function dirLabel(s: SignalRow) {
+function dirLabel(s: SignalOutcome) {
   return s.direction === 'up' ? '做多' : s.direction === 'down' ? '做空' : s.direction
 }
 
-function levelLabel(s: SignalRow) {
+function levelLabel(s: SignalOutcome) {
   return s.level === 'fine' ? '精细' : s.level === 'large' ? '较大' : s.level
 }
 
@@ -827,6 +841,7 @@ async function doScan() {
 async function doAddSymbol() {
   const code = newCode.value.trim().toUpperCase()
   if (!code) return
+  adding.value = true
   try {
     const count = await symbolsStore.add(code)
     notify.success(`${code} 已添加，回填 ${count} 根K线`)
@@ -834,11 +849,22 @@ async function doAddSymbol() {
     await loadAll()
   } catch (e) {
     notify.error(String(e))
+  } finally {
+    adding.value = false
   }
 }
 
 onMounted(async () => {
+  try {
+    await settingsStore.load()
+  } catch {
+    // 浏览器预览环境下无后端命令，保持默认值
+  }
   await groupsStore.load()
+  // 恢复上次打开的分组表格；分组已不存在时回退到“全部品种”
+  const last = settingsStore.settings.ui.last_group_id
+  groupsStore.selectedId =
+    last != null && groupsStore.groups.some((g) => g.id === last) ? last : null
   unlisteners.push(
     await onDataUpdated(() => {
       if (listDragging.value) return
@@ -879,7 +905,11 @@ watch(groupModal, (v) => {
     groupSortable = null
   }
 })
-onActivated(() => setupTableSortable())
+// keep-alive 缓存页面：从K线图返回时重拉数据，避免表格停留在旧扫描结果
+onActivated(() => {
+  setupTableSortable()
+  loadAll()
+})
 
 onBeforeUnmount(() => {
   tableSortable?.destroy()
@@ -893,19 +923,43 @@ onBeforeUnmount(() => {
 <template>
   <div class="page">
     <div class="toolbar">
-      <n-space align="center">
-        <n-button type="primary" :loading="refreshing" @click="doRefresh">刷新数据</n-button>
-        <n-button type="success" :loading="scanning" @click="doScan">立即扫描</n-button>
-        <n-button :loading="enriching" @click="doEnrich">刷新名称</n-button>
-        <n-input
-          v-model:value="newCode"
-          placeholder="输入品种代码，如 RB0"
-          style="width: 180px"
-          @keyup.enter="doAddSymbol"
-        />
-        <n-button type="primary" ghost @click="doAddSymbol">添加品种</n-button>
-        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
+      <n-space align="center" :size="8" class="toolbar-actions">
+        <n-button type="primary" :loading="refreshing" @click="doRefresh">
+          <template #icon>
+            <n-icon :component="Refresh" />
+          </template>
+          刷新数据
+        </n-button>
+        <n-button type="success" :loading="scanning" @click="doScan">
+          <template #icon>
+            <n-icon :component="Scan" />
+          </template>
+          立即扫描
+        </n-button>
+        <n-button :loading="enriching" @click="doEnrich">
+          <template #icon>
+            <n-icon :component="Tag" />
+          </template>
+          刷新名称
+        </n-button>
       </n-space>
+      <div class="toolbar-right">
+        <n-input-group>
+          <n-input
+            v-model:value="newCode"
+            placeholder="输入品种代码，如 RB0"
+            style="width: 180px"
+            @keyup.enter="doAddSymbol"
+          />
+          <n-button type="primary" :loading="adding" @click="doAddSymbol">
+            <template #icon>
+              <n-icon :component="Plus" />
+            </template>
+            添加品种
+          </n-button>
+        </n-input-group>
+        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
+      </div>
     </div>
     <div class="group-bar">
       <n-tabs
@@ -920,14 +974,21 @@ onBeforeUnmount(() => {
           <n-tab v-else :name="String(t.g.id)">{{ t.g.name }}</n-tab>
         </template>
       </n-tabs>
-      <n-space align="center">
-        <n-button size="small" @click="openCreateGroup">新建分组</n-button>
+      <n-space align="center" :size="8">
+        <n-button size="small" type="primary" ghost @click="openCreateGroup">
+          <template #icon>
+            <n-icon :component="FolderPlus" />
+          </template>
+          新建分组
+        </n-button>
         <n-button
           size="small"
-          ghost
           :disabled="!groupsStore.groups.length"
           @click="openManageGroup"
         >
+          <template #icon>
+            <n-icon :component="Settings" />
+          </template>
           管理分组
         </n-button>
       </n-space>
@@ -1087,12 +1148,30 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  border: 1px solid #eef1f5;
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+.toolbar-actions {
+  flex: none;
+}
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
 }
 .group-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding: 6px 12px;
+  border: 1px solid #eef1f5;
+  border-radius: 10px;
+  background: #fbfcfe;
 }
 .group-tabs {
   flex: 1;

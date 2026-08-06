@@ -1,6 +1,22 @@
 ﻿import { defineStore } from 'pinia'
 import { api } from '../services/api'
+import { notify } from '../utils/notify'
+import { useSymbolsStore } from './symbols'
 import type { PatternDto, ScanResult, ScanRow, SignalOutcome, SignalRow } from '../types'
+
+/** 形态身份键：同一品种内用 方向+级别+s1/s2 索引 识别“同一个形态” */
+function signalKey(s: SignalOutcome): string {
+  return `${s.symbol}|${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
+}
+
+/** 对比上一次扫描，找出“新出现”的即将触发信号：本次是即将触发，且上次不是 */
+function newPendingSignals(prev: SignalOutcome[] | null, next: SignalOutcome[]): SignalOutcome[] {
+  const prevPending = new Set<string>()
+  for (const s of prev ?? []) {
+    if (s.state === '即将触发') prevPending.add(signalKey(s))
+  }
+  return next.filter((s) => s.state === '即将触发' && !prevPending.has(signalKey(s)))
+}
 
 export const useScansStore = defineStore('scans', {
   state: () => ({
@@ -20,8 +36,8 @@ export const useScansStore = defineStore('scans', {
     async runScan() {
       this.running = true
       try {
-        this.latest = await api.runScanNow()
-        await this.loadHistory(20)
+        const result = await api.runScanNow()
+        this.applyScanResult(result)
       } finally {
         this.running = false
       }
@@ -53,9 +69,35 @@ export const useScansStore = defineStore('scans', {
       }
       this.latestSignals = out
     },
-    ingest(result: ScanResult) {
+    /**
+     * 扫描完成后统一处理：更新内存中的最新扫描结果，并对比上一次扫描，
+     * 对“新出现”的即将触发信号弹出持久通知（不自动关闭）。
+     * 应用首次启动后的第一次扫描没有上一次结果可对比，不弹通知。
+     */
+    applyScanResult(result: ScanResult) {
+      const prev = this.latest
       this.latest = result
       this.loadHistory(20)
+      const pendings = newPendingSignals(prev?.signals ?? null, result.signals)
+      if (!pendings.length) return
+      const symbolsStore = useSymbolsStore()
+      for (const s of pendings) {
+        const sym = symbolsStore.symbols.find((x) => x.code === s.symbol)
+        notify.signal({
+          code: s.symbol,
+          name: sym && sym.name !== s.symbol ? sym.name : '',
+          direction: s.direction,
+          level: s.level,
+          grade: s.grade,
+          score: s.score,
+          entry: s.entry,
+          stop: s.stop,
+          target: s.target,
+        })
+      }
+    },
+    ingest(result: ScanResult) {
+      this.applyScanResult(result)
     },
   },
 })

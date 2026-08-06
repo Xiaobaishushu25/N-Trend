@@ -3,6 +3,7 @@
 
 import { createApp, reactive } from 'vue'
 import AppNotificationHost from '../components/AppNotificationHost.vue'
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 
 export type NotifyType = 'success' | 'info' | 'warning' | 'error'
 
@@ -15,6 +16,8 @@ export interface NotifyOptions {
   closable?: boolean
   /** 悬停时暂停自动关闭，默认 true */
   keepAliveOnHover?: boolean
+  /** 可选：结构化信号卡片内容（展示比纯文本更美观的信号通知） */
+  signal?: NotifyItem['signal']
 }
 
 export interface NotifyItem {
@@ -28,6 +31,20 @@ export interface NotifyItem {
   remaining: number
   /** 本轮计时起点（用于悬停暂停时计算已流逝时间） */
   startedAt: number
+  /** 结构化信号卡片内容；存在时优先以卡片形式展示 */
+  signal?: {
+    code: string
+    name: string
+    direction: string
+    level: string
+    grade: string
+    score: number
+    entry: number
+    stop: number
+    target: number
+    /** 通知时间（HH:mm）；未传入时自动取当前时间 */
+    time?: string
+  }
 }
 
 export const notifyItems = reactive<NotifyItem[]>([])
@@ -38,11 +55,22 @@ let hostApp: ReturnType<typeof createApp> | null = null
 
 function ensureHost() {
   if (hostApp) return
+  // 通知只在主窗口展示，设置窗口等子窗口不弹右下角通知
+  if (!isMainWindow()) return
   const container = document.createElement('div')
   container.className = 'app-notify-host-root'
   document.body.appendChild(container)
   hostApp = createApp(AppNotificationHost)
   hostApp.mount(container)
+}
+
+function isMainWindow(): boolean {
+  try {
+    return getCurrentWebviewWindow().label === 'main'
+  } catch {
+    // 浏览器预览等非 Tauri 环境，保持原有行为
+    return true
+  }
 }
 
 function schedule(item: NotifyItem) {
@@ -65,6 +93,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     keepAliveOnHover: options?.keepAliveOnHover ?? true,
     remaining: duration,
     startedAt: Date.now(),
+    signal: options?.signal,
   }
   notifyItems.push(item)
   schedule(item)
@@ -107,4 +136,16 @@ export const notify = {
   info: (content: string, options?: NotifyOptions) => push('info', content, options),
   warning: (content: string, options?: NotifyOptions) => push('warning', content, options),
   error: (content: string, options?: NotifyOptions) => push('error', content, options),
+  /** 持久化的信号卡片通知（不自动关闭，可手动关闭） */
+  signal: (data: NonNullable<NotifyItem['signal']>) =>
+    push('info', '', {
+      duration: 0,
+      signal: {
+        ...data,
+        time: data.time ?? new Date().toLocaleTimeString('zh-CN', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      },
+    }),
 }

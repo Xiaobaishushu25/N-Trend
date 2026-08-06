@@ -1,17 +1,27 @@
-﻿import { defineStore } from 'pinia'
+import { defineStore } from 'pinia'
 import { api } from '../services/api'
-import type { Settings, SchedulerStatus } from '../types'
+import type { Config, SchedulerStatus } from '../types'
 
-const defaultSettings = (): Settings => ({
-  refresh_interval_secs: 300,
-  scan_interval_secs: 900,
-  trading_only: true,
-  request_interval_ms: 400,
-  minutely_budget: 60,
-  backfill_count: 1000,
-  incremental_count: 10,
-  auto_start_scheduler: true,
-  log_level: 'info',
+const defaultConfig = (): Config => ({
+  app_config: {
+    auto_start_scheduler: true,
+  },
+  scheduler: {
+    refresh_interval_secs: 300,
+    scan_interval_secs: 900,
+    trading_only: true,
+  },
+  fetch: {
+    request_interval_ms: 400,
+    minutely_budget: 60,
+    backfill_count: 1000,
+    incremental_count: 10,
+  },
+  quote: {
+    poll_interval_ms: 3000,
+    request_interval_ms: 200,
+    minutely_budget: 120,
+  },
   email: {
     enabled: true,
     to: '2055761346@qq.com',
@@ -21,20 +31,30 @@ const defaultSettings = (): Settings => ({
     smtp_user: '',
     smtp_password: '',
   },
+  log: {
+    level: 'info',
+  },
+  ui: {
+    flash_ms: 900,
+    breathe_hold_ms: 5000,
+    min_bar_spacing: 8,
+    timeframes: ['5m', '15m', '30m', '60m', '120m', '240m', '1d'],
+    last_group_id: null,
+  },
 })
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
-    settings: defaultSettings() as Settings,
+    settings: defaultConfig() as Config,
     status: { running: false, last_refresh: null, last_scan: null } as SchedulerStatus,
   }),
   actions: {
     async load() {
-      this.settings = await api.getSettings()
+      this.settings = await api.getConfig()
       this.status = await api.schedulerStatus()
     },
-    async save(next: Settings) {
-      this.settings = await api.updateSettings(next)
+    async save(next: Config) {
+      this.settings = await api.updateConfig(next)
       this.status = await api.schedulerStatus()
     },
     async setRunning(running: boolean) {

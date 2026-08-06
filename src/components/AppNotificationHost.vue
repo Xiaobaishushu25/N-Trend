@@ -1,5 +1,14 @@
 <script setup lang="ts">
 import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
+import type { NotifyItem } from '../utils/notify'
+import router from '../router'
+
+/** 点击信号通知跳转到对应品种的K线图，并顺手关闭该通知 */
+function openSignalChart(item: NotifyItem) {
+  if (!item.signal) return
+  dismiss(item.id)
+  router.push({ name: 'chart', params: { symbol: item.signal.code } })
+}
 </script>
 
 <template>
@@ -9,7 +18,8 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
         v-for="item in notifyItems"
         :key="item.id"
         class="notify-item"
-        :class="`is-${item.type}`"
+        :class="[`is-${item.type}`, { 'is-clickable': item.signal }]"
+        @click="openSignalChart(item)"
         @mouseenter="item.keepAliveOnHover && suspend(item.id)"
         @mouseleave="item.keepAliveOnHover && resume(item.id)"
       >
@@ -58,8 +68,24 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
         </span>
 
         <div class="notify-body">
-          <div v-if="item.title" class="notify-title">{{ item.title }}</div>
-          <div class="notify-content">{{ item.content }}</div>
+          <template v-if="item.signal">
+            <div class="ns-inline">
+              <span class="ns-code">{{ item.signal.code }}</span>
+              <span class="ns-name">{{ item.signal.name || item.signal.code }}</span>
+              <span class="ns-dir" :class="item.signal.direction === 'up' ? 'is-up' : 'is-down'">
+                {{ item.signal.direction === 'up' ? '做多' : '做空' }}
+              </span>
+              <span class="ns-state">
+                <span class="ns-state-dot"></span>即将触发
+              </span>
+              <span class="ns-score">评分 <b>{{ item.signal.score.toFixed(2) }}</b></span>
+              <span class="ns-time">{{ item.signal.time }}</span>
+            </div>
+          </template>
+          <template v-else>
+            <div v-if="item.title" class="notify-title">{{ item.title }}</div>
+            <div class="notify-content">{{ item.content }}</div>
+          </template>
         </div>
 
         <button
@@ -67,7 +93,7 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
           type="button"
           class="notify-close"
           aria-label="关闭通知"
-          @click="dismiss(item.id)"
+          @click.stop="dismiss(item.id)"
         >
           <svg viewBox="0 0 12 12" width="10" height="10" fill="none">
             <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
@@ -96,9 +122,9 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: 280px;
-  max-width: 380px;
-  padding: 12px 12px 12px 14px;
+  min-width: 300px;
+  max-width: 420px;
+  padding: 10px 12px 10px 14px;
   background: #fff;
   border: 1px solid #eef0f3;
   border-radius: 6px;
@@ -110,6 +136,13 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
     "Microsoft YaHei",
     system-ui,
     sans-serif;
+}
+.notify-item.is-clickable {
+  cursor: pointer;
+}
+.notify-item.is-clickable:hover {
+  border-color: #dbe4ee;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.16);
 }
 .notify-icon {
   flex: none;
@@ -148,6 +181,90 @@ import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
   color: #475569;
   line-height: 1.55;
   word-break: break-word;
+}
+/* 信号卡片通知：单行紧凑布局，全部信息放在同一行 */
+.ns-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  min-width: 0;
+}
+.ns-code {
+  flex: none;
+  font-size: 12px;
+  color: #64748b;
+  font-variant-numeric: tabular-nums;
+}
+.ns-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: #1f2329;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ns-state {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #1677ff;
+  background: rgba(22, 119, 255, 0.08);
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.ns-state-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #1677ff;
+}
+.ns-dir {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.ns-dir.is-up {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+}
+.ns-dir.is-down {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.1);
+}
+.ns-score {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #7c5cff;
+  background: rgba(124, 92, 255, 0.08);
+  padding: 2px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.ns-score b {
+  font-size: 12px;
+  font-weight: 800;
+  color: #7c5cff;
+  font-variant-numeric: tabular-nums;
+}
+.ns-time {
+  flex: none;
+  font-size: 12px;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
 }
 .notify-close {
   flex: none;

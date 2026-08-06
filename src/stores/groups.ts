@@ -30,6 +30,11 @@ export const useGroupsStore = defineStore('groups', {
       const group = await api.createGroup(name)
       await this.load()
       this.selectedId = group.id
+      try {
+        await api.setLastGroup(group.id)
+      } catch {
+        // UI 状态记录失败不影响分组创建
+      }
       return group
     },
     async rename(id: number, name: string) {
@@ -39,6 +44,11 @@ export const useGroupsStore = defineStore('groups', {
     async remove(id: number) {
       await api.deleteGroup(id)
       if (this.selectedId === id) this.selectedId = null
+      try {
+        await api.setLastGroup(this.selectedId)
+      } catch {
+        // UI 状态记录失败不影响分组删除
+      }
       await this.load()
     },
     /**
@@ -68,6 +78,11 @@ export const useGroupsStore = defineStore('groups', {
     },
     async select(id: number | null) {
       this.selectedId = id
+      try {
+        await api.setLastGroup(id)
+      } catch {
+        // UI 状态记录失败不影响切换
+      }
     },
     bumpRevision() {
       this.revision++

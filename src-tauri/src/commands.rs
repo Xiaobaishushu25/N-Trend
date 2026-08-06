@@ -1,9 +1,10 @@
 ﻿use std::sync::Arc;
 
-use n_core::service::{MarketSnapshot, RefreshStats, ScanResult, Settings};
+use n_core::config::Config;
+use n_core::service::{MarketSnapshot, RefreshStats, ScanResult};
 use n_core::storage::entities::{groups, klines, scans, signals, symbols};
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 use crate::state::AppState;
 use crate::AppInfo;
@@ -222,9 +223,14 @@ pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<Refresh
 }
 
 #[tauri::command]
-pub async fn run_scan_now(state: State<'_, Arc<AppState>>) -> Result<ScanResult, String> {
+pub async fn run_scan_now(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ScanResult, String> {
     let result = state.services.run_scan().await.map_err(|e| e.to_string())?;
     state.note_scan_success().await;
+    // 与定时扫描一致：广播扫描完成事件，让表格/K线等页面立即刷新，避免停留在旧数据
+    let _ = app.emit("scan-completed", &result);
     Ok(result)
 }
 
@@ -259,21 +265,54 @@ pub async fn get_latest_signals(
 }
 
 #[tauri::command]
-pub async fn get_settings(state: State<'_, Arc<AppState>>) -> Result<Settings, String> {
-    Ok(state.services.settings().await)
+pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
+    Ok(state.services.config().await)
 }
 
 #[tauri::command]
-pub async fn update_settings(
+pub async fn update_config(
     state: State<'_, Arc<AppState>>,
-    settings: Settings,
-) -> Result<Settings, String> {
+    config: Config,
+) -> Result<Config, String> {
     state
         .services
-        .apply_settings(settings)
+        .apply_config(config)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(state.services.settings().await)
+        .map_err(|e| e.to_string())
+}
+
+/// 记录上次打开的分组表格（null=全部品种）。
+#[tauri::command]
+pub async fn set_last_group(
+    state: State<'_, Arc<AppState>>,
+    group_id: Option<i64>,
+) -> Result<(), String> {
+    state
+        .services
+        .set_last_group(group_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 设置启用的K线周期列表。
+#[tauri::command]
+pub async fn set_timeframes(
+    state: State<'_, Arc<AppState>>,
+    timeframes: Vec<String>,
+) -> Result<(), String> {
+    state
+        .services
+        .set_timeframes(timeframes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 打开日志目录（与日志文件同目录）。
+#[tauri::command]
+pub async fn open_log_directory(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    open::that(&dir).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

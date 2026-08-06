@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_RECIPIENT: &str = "2055761346@qq.com";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EmailSettings {
     pub enabled: bool,
     pub to: String,

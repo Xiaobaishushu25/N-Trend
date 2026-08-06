@@ -4,15 +4,13 @@ import { useRoute, useRouter } from 'vue-router'
 import draggable from 'vuedraggable'
 import {
   NButton,
+  NCheckbox,
   NEmpty,
   NIcon,
-  NRadioButton,
-  NRadioGroup,
+  NPopover,
   NScrollbar,
-  NSpace,
-  NText,
 } from 'naive-ui'
-import { ArrowLeft, Eye, EyeOff, List } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, List } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
@@ -20,6 +18,7 @@ import { useGroupsStore } from '../stores/groups'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
+import { useSettingsStore } from '../stores/settings'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
@@ -44,7 +43,25 @@ const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
 const timeframe = ref<Timeframe>('15m')
-const timeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
+const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
+const settingsStore = useSettingsStore()
+/** 按配置勾选过滤后显示的周期；全部未勾选时回退为全部 */
+const visibleTimeframes = computed<Timeframe[]>(() => {
+  const enabled = settingsStore.settings.ui.timeframes
+  const list = allTimeframes.filter((t) => enabled.includes(t))
+  return list.length ? list : allTimeframes
+})
+
+/** 弹层勾选周期：立即生效并落盘，至少保留一个 */
+function toggleTimeframe(t: Timeframe, checked: boolean) {
+  const cur = settingsStore.settings.ui.timeframes
+  const next = checked
+    ? [...new Set([...cur, t])]
+    : cur.filter((x) => x !== t)
+  if (!next.length) return
+  settingsStore.settings.ui.timeframes = next
+  api.setTimeframes(next).catch(() => {})
+}
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
 
@@ -707,30 +724,78 @@ onBeforeUnmount(() => {
 <template>
   <div class="chart-page">
     <div class="topbar">
-      <n-space align="center">
-        <n-button quaternary size="small" @click="router.push({ name: 'dashboard' })">
+      <div class="topbar-left">
+        <n-button quaternary size="small" class="nav-btn" @click="router.push({ name: 'dashboard' })">
           <template #icon>
             <n-icon :component="ArrowLeft" />
           </template>
           返回列表
         </n-button>
-        <n-button quaternary size="small" @click="showList = !showList">
+        <n-button quaternary size="small" class="nav-btn" @click="showList = !showList">
           <template #icon>
             <n-icon :component="List" />
           </template>
           {{ showList ? '收起列表' : '品种列表' }}
         </n-button>
-        <n-text strong style="font-size: 17px">{{ symbol }}</n-text>
-        <n-text depth="3">
-          {{ currentSymbol?.name && currentSymbol.name !== symbol ? currentSymbol.name : '' }}
-        </n-text>
-        <n-text v-if="latestClose !== null" strong style="font-size: 16px">
-          {{ latestClose.toFixed(1) }}
-        </n-text>
-      </n-space>
-      <n-radio-group v-model:value="timeframe" size="small">
-        <n-radio-button v-for="t in timeframes" :key="t" :value="t" :label="t" />
-      </n-radio-group>
+      </div>
+
+      <div class="topbar-symbol">
+        <span class="sym-code">{{ symbol }}</span>
+        <span v-if="currentSymbol?.name && currentSymbol.name !== symbol" class="sym-name">
+          {{ currentSymbol.name }}
+        </span>
+        <span class="sym-divider" />
+        <span v-if="quotePrice !== null" class="sym-price" :style="{ color: quoteColor }">
+          {{ quotePrice.toFixed(1) }}
+        </span>
+        <span
+          v-if="snapshot?.change_pct != null"
+          class="sym-change"
+          :style="{ color: quoteColor, background: quoteBg(snapshot.change_pct) }"
+        >
+          {{ fmtChange(snapshot.change_pct) }}
+        </span>
+      </div>
+
+      <div class="topbar-timeframes">
+        <div class="tf-group">
+          <button
+            v-for="t in visibleTimeframes"
+            :key="t"
+            type="button"
+            class="tf-btn"
+            :class="{ active: timeframe === t }"
+            @click="timeframe = t"
+          >
+            {{ t }}
+          </button>
+        </div>
+        <n-popover
+          placement="bottom-end"
+          trigger="click"
+          :show-arrow="false"
+          style="padding: 0"
+        >
+          <template #trigger>
+            <button type="button" class="tf-more" title="周期显示设置">
+              <n-icon :component="Adjustments" />
+            </button>
+          </template>
+          <div class="tf-settings">
+            <div class="tf-settings-title">更多周期选择</div>
+            <div class="tf-settings-list">
+              <label v-for="t in allTimeframes" :key="t" class="tf-check">
+                <n-checkbox
+                  :checked="settingsStore.settings.ui.timeframes.includes(t)"
+                  @update:checked="(v: boolean) => toggleTimeframe(t, v)"
+                />
+                <span>{{ t }}</span>
+              </label>
+            </div>
+            <div class="tf-settings-hint">勾选后立即生效，切换栏只显示勾选的周期</div>
+          </div>
+        </n-popover>
+      </div>
     </div>
 
     <div class="main">
@@ -948,9 +1013,155 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 16px;
+  gap: 16px;
+  padding: 8px 14px;
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
+}
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.nav-btn {
+  border-radius: 8px;
+}
+.topbar-symbol {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  margin: 0 auto;
+}
+.sym-code {
+  flex: none;
+  font-size: 13px;
+  font-weight: 500;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+}
+.sym-name {
+  flex: none;
+  font-size: 18px;
+  font-weight: 800;
+  color: #1f2329;
+  letter-spacing: 0.5px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sym-divider {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  background: #e5e9ef;
+}
+.sym-price {
+  font-size: 17px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.sym-change {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.topbar-timeframes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.tf-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: #f1f5f9;
+  border-radius: 8px;
+}
+.tf-btn {
+  border: none;
+  background: transparent;
+  padding: 4px 11px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #64748b;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
+}
+.tf-btn:hover {
+  color: #1f2329;
+  background: rgba(255, 255, 255, 0.7);
+}
+.tf-btn.active {
+  background: #fff;
+  color: #1677ff;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+}
+.tf-more {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: none;
+  border-radius: 8px;
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+.tf-more:hover {
+  background: #e8edf3;
+  color: #1f2329;
+}
+.tf-settings {
+  width: 240px;
+  padding: 12px 14px;
+}
+.tf-settings-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #1f2329;
+  padding: 0 2px 8px;
+}
+.tf-settings-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 8px;
+}
+.tf-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #3d4757;
+}
+.tf-check:hover {
+  background: #f6f8fa;
+}
+.tf-settings-hint {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #eef1f5;
+  font-size: 12px;
+  color: #94a3b8;
 }
 .main {
   flex: 1;
