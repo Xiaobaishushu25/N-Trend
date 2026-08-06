@@ -729,7 +729,7 @@ onBeforeUnmount(() => {
           <template #icon>
             <n-icon :component="ArrowLeft" />
           </template>
-          返回列表
+          返回
         </n-button>
         <n-button quaternary size="small" class="nav-btn" @click="showList = !showList">
           <template #icon>

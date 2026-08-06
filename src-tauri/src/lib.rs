@@ -182,6 +182,7 @@ pub fn run() {
             commands::update_config,
             commands::set_last_group,
             commands::set_timeframes,
+            commands::reset_config,
             commands::open_log_directory,
             commands::scheduler_status,
             commands::set_scheduler_running,

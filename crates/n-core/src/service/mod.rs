@@ -125,6 +125,18 @@ impl Services {
         c.save(&self.config_path)
     }
 
+    /// 将所有配置恢复为默认值：重建限速器、写 JSON、更新内存，返回新的默认配置。
+    pub async fn reset_config(&self) -> Result<Config> {
+        let c = Config::default();
+        *self.client.write().await =
+            SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
+        *self.quote_client.write().await =
+            SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
+        c.save(&self.config_path)?;
+        *self.config.write().await = c.clone();
+        Ok(c)
+    }
+
     pub async fn scheduler_config(&self) -> SchedulerConfig {
         self.config().await.scheduler
     }
@@ -715,6 +727,5 @@ mod tests {
         );
     }
 }
-
 
 

@@ -57,6 +57,7 @@ export const api = {
 
   getConfig: () => invoke<Config>('get_config'),
   updateConfig: (config: Config) => invoke<Config>('update_config', { config }),
+  resetConfig: () => invoke<Config>('reset_config'),
   setLastGroup: (groupId: number | null) =>
     invoke<void>('set_last_group', { groupId }),
   setTimeframes: (timeframes: string[]) =>

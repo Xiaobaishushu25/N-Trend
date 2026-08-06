@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { defineComponent, h, onMounted, ref } from 'vue'
+import { computed, defineComponent, h, onMounted, ref } from 'vue'
 import {
   NButton,
   NIcon,
@@ -12,6 +12,7 @@ import {
   NTabs,
   NText,
   NTooltip,
+  useDialog,
   useMessage,
 } from 'naive-ui'
 import {
@@ -30,6 +31,7 @@ import type { Config } from '../types'
 
 const settingsStore = useSettingsStore()
 const message = useMessage()
+const dialog = useDialog()
 
 /** 工具提示：参考模板的“?”小图标，悬停展示说明文字。 */
 const Tip = defineComponent({
@@ -60,6 +62,10 @@ const Tip = defineComponent({
 
 const form = ref<Config>(cloneConfig(settingsStore.settings))
 const saving = ref(false)
+/** 表单与当前已保存配置是否不同（有改动才允许保存） */
+const dirty = computed(
+  () => JSON.stringify(form.value) !== JSON.stringify(settingsStore.settings),
+)
 
 const logLevels = [
   { label: 'trace', value: 'trace' },
@@ -83,6 +89,25 @@ async function save() {
   } finally {
     saving.value = false
   }
+}
+
+/** 恢复默认设置：先弹窗确认，确认后重置并覆盖当前表单 */
+function confirmReset() {
+  dialog.warning({
+    title: '恢复默认设置',
+    content: '确定将所有设置恢复为默认值吗？当前配置将被覆盖，且无法撤销。',
+    positiveText: '恢复默认',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        settingsStore.settings = await api.resetConfig()
+        form.value = cloneConfig(settingsStore.settings)
+        message.success('已恢复默认设置')
+      } catch (e) {
+        message.error(String(e))
+      }
+    },
+  })
 }
 
 async function toggleRunning() {
@@ -449,7 +474,15 @@ onMounted(async () => {
 
     <div class="footer">
       <n-space justify="end">
-        <n-button type="primary" :loading="saving" @click="save">保存设置</n-button>
+        <n-button :disabled="saving" @click="confirmReset">恢复默认</n-button>
+        <n-button
+          type="primary"
+          :disabled="!dirty || saving"
+          :loading="saving"
+          @click="save"
+        >
+          保存设置
+        </n-button>
       </n-space>
     </div>
   </div>

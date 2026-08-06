@@ -307,6 +307,16 @@ pub async fn set_timeframes(
         .map_err(|e| e.to_string())
 }
 
+/// 将所有配置恢复为默认值，返回新的默认配置。
+#[tauri::command]
+pub async fn reset_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
+    state
+        .services
+        .reset_config()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 打开日志目录（与日志文件同目录）。
 #[tauri::command]
 pub async fn open_log_directory(app: tauri::AppHandle) -> Result<(), String> {
