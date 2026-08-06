@@ -13,6 +13,20 @@ const OPPOSING_PREV_BODY_ATR_MIN: f64 = 0.50;
 const ENTRY_BLOCK_TRIGGER_PENALTY: f64 = 0.70;
 const ENTRY_BLOCK_MOMENTUM_PENALTY: f64 = 0.35;
 const TRIGGER_OPPOSITION_PENALTY_MAX: f64 = 2.00;
+// ===== a段质量分标定参数 =====
+// 幅度满档：a_move 达到 10 倍 ATR 即得满分。
+// 幅度不足的短腿自然低分，不另设“最少根数”之类的硬门槛，避免针对个案。
+const A_LEG_AMPLITUDE_ATR_FULL: f64 = 10.0;
+// 强趋势K密度基准：长腿按 35% 密度折算；短腿保底 2 根。
+// 这样“长而干净”（大量光头阳线/光脚阴线）的腿仍能得高分，
+// 只有强K密度低的震荡/重叠腿被压低。
+const A_LEG_STRONG_DENSITY_BASE: f64 = 0.35;
+const A_LEG_STRONG_MIN_COUNT: f64 = 2.0;
+// 长度扣分：a 段过长消耗动能，分两档轻扣；只扣“动能”，不与质量混为一谈。
+const A_LEG_LONG_PENALTY_MIN_BARS: usize = 24;
+const A_LEG_LONG_PENALTY_LEVEL1: f64 = -0.4;
+const A_LEG_LONG_PENALTY_MAX_BARS: usize = 32;
+const A_LEG_LONG_PENALTY_LEVEL2: f64 = -0.8;
 // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不能确认b段结束
 const WEAK_CONFIRM_TRIGGER_PENALTY: f64 = 1.0;
 const WEAK_CONFIRM_MOMENTUM_PENALTY: f64 = 1.0;
@@ -47,44 +61,59 @@ fn score_60m(trend: &Trend60, dir: Dir) -> f64 {
     }
 }
 
-fn score_a(p: &NPattern, atr20: &[Option<f64>]) -> f64 {
+/// a段质量分：衡量“推动腿”的幅度与K线质量，采用乘法短板结构。
+///
+/// 公式：
+///   dim_a = 0.5 + 4.5 × min(1, a_move/(10·ATR)) × min(1, 强趋势K/密度基准) + 长度扣分
+///
+/// 设计要点（避免“各项中等、凑满高分”的加法漏洞）：
+/// 1. 幅度与强K质量相乘，任何一项弱都会按比例压低总分；
+/// 2. 强趋势K按密度折算：长腿按 35% 基准放宽，短腿保底 2 根——
+///    长而干净的腿（大量光头阳线/光脚阴线）仍得高分，震荡/重叠腿被压低；
+/// 3. 长度单独作为“动能消耗”轻扣，不与质量混为一谈。
+fn score_a(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
     let atr = atr_at(atr20, p.s1.index);
-    let speed = p.a_move / p.a_bars.max(1) as f64;
-    let speed_ratio = (speed / atr).min(1.5);
+    let strong = a_leg_relaxed_strong(bars, atr20, p);
+    a_leg_score_formula(p.a_move, p.a_bars, strong, atr)
+}
 
-    let mut s = 2.0;
-    if p.a_bars <= 6 {
-        s += 1.0;
-    } else if p.a_bars <= 10 {
-        s += 0.3;
-    } else if p.a_bars <= 16 {
-        s += 0.0;
-    } else {
-        s -= 0.5;
+/// a段内“形态方向强趋势K”的数量（宽松口径，与识别阶段的 a_leg_strong_count 一致）。
+///
+/// 注意：不能直接使用 NPattern.a_strong_trend——那是 make_pattern 里按严格趋势K
+/// 统计的，会把大量“光头阳线/光脚阴线”级别的干净推进漏掉，导致长而干净的腿被低估。
+fn a_leg_relaxed_strong(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> usize {
+    let flags = indicators::trend_flags_relaxed(bars, atr20);
+    let mut count = 0;
+    for i in p.s0.index + 1..=p.s1.index {
+        match p.dir {
+            Dir::Down if flags.get(i).is_some_and(|f| f.1) => count += 1,
+            Dir::Up if flags.get(i).is_some_and(|f| f.0) => count += 1,
+            _ => {}
+        }
     }
+    count
+}
 
-    s += speed_ratio * 0.8;
-    // a段内强趋势K数量是推动质量的重要信号：按数量阶梯加分（0~3.0），
-    // 不再只是“小加分”，让K线质量在a段评分中占实质权重。
-    s += match p.a_strong_trend {
-        0 => 0.0,
-        1 => 0.6,
-        2 => 1.2,
-        3 => 1.8,
-        4 => 2.4,
-        _ => 3.0,
-    };
-    s += if p.a_move >= 2.0 * atr {
-        0.8
-    } else if p.a_move >= 1.5 * atr {
-        0.6
-    } else if p.a_move >= atr {
-        0.4
+/// a段质量分的纯公式（抽出便于单测与标定）。
+fn a_leg_score_formula(a_move: f64, a_bars: usize, strong: usize, atr: f64) -> f64 {
+    if atr <= 0.0 {
+        return 0.0;
+    }
+    // 幅度分：a_move 达到 10 倍 ATR 视为满档（1.0）。
+    let amplitude = (a_move / (A_LEG_AMPLITUDE_ATR_FULL * atr)).min(1.0);
+    // 强趋势K密度分：短腿保底 2 根，长腿按 35% 密度折算。
+    let density_floor =
+        (A_LEG_STRONG_DENSITY_BASE * a_bars as f64).max(A_LEG_STRONG_MIN_COUNT);
+    let quality = (strong as f64 / density_floor).min(1.0);
+    // 长度扣分：a 段过长消耗动能，分两档轻扣。
+    let length_penalty = if a_bars > A_LEG_LONG_PENALTY_MAX_BARS {
+        A_LEG_LONG_PENALTY_LEVEL2
+    } else if a_bars > A_LEG_LONG_PENALTY_MIN_BARS {
+        A_LEG_LONG_PENALTY_LEVEL1
     } else {
         0.0
     };
-
-    clamp(s)
+    clamp(0.5 + 4.5 * amplitude * quality + length_penalty)
 }
 
 fn score_b(p: &NPattern) -> f64 {
@@ -95,7 +124,9 @@ fn score_b(p: &NPattern) -> f64 {
     if p.b_too_long {
         s -= 0.5;
     }
-    s -= (p.b_strong_reverse.min(2) as f64) * 0.3;
+    // 反向强K扣分：健康回撤里第一根反向强K是正常的，不惩罚；
+    // 从第 2 根起每根扣 0.3（至多按 2 根计），避免把正常回撤误判为弱结构。
+    s -= (p.b_strong_reverse.saturating_sub(1).min(2) as f64) * 0.3;
     clamp(s)
 }
 
@@ -449,7 +480,7 @@ fn compute_scores(
     weak_confirm: bool,
 ) -> ([f64; 6], f64) {
     let dim_trend = score_60m(trend, p.dir);
-    let dim_a = score_a(p, atr20);
+    let dim_a = score_a(bars, atr20, p);
     let dim_b = score_b(p);
     let mut dim_trigger = score_trigger(bars, atr20, warning, trigger, p, local_block_count);
     let mut dim_momentum = score_momentum(p, trend, atr20, entry_block_count);
@@ -984,24 +1015,44 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_strong_trend_candles_scale_with_count() {
-        // a段强趋势K按数量阶梯加分（最多3.0），且不会被基础分顶到截断上限。
-        let atr = vec![Some(10.0); 30];
-        let mk = |n: usize| NPattern {
-            a_move: 8.0,
-            a_bars: 20,
-            a_strong_trend: n,
+    fn a_leg_score_uses_amplitude_quality_and_length() {
+        // a段质量分=乘法短板：幅度×强K密度，长度单独轻扣（纯公式单测）。
+        // 幅度：10倍ATR满档；5倍ATR只有一半。
+        assert!((a_leg_score_formula(100.0, 8, 5, 10.0) - 5.0).abs() < 1e-9);
+        assert!((a_leg_score_formula(50.0, 8, 5, 10.0) - 2.75).abs() < 1e-9);
+        // 强K密度：0根只有地板分。
+        assert!((a_leg_score_formula(100.0, 8, 0, 10.0) - 0.5).abs() < 1e-9);
+        // 长腿动能扣分：33根、强K密度满也扣0.8。
+        assert!((a_leg_score_formula(100.0, 33, 12, 10.0) - 4.2).abs() < 1e-9);
+        // 短腿保底2根：3根腿只有1根强K → 质量0.5。
+        assert!((a_leg_score_formula(100.0, 3, 1, 10.0) - 2.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_relaxed_strong_counts_direction_candles() {
+        // 宽松强趋势K计数：实体占比、收盘位置、振幅、影线四条件全过才算。
+        let atr = vec![Some(10.0); 8];
+        let bars = vec![
+            bar(100.0, 108.0, 99.0, 106.0), // 强阳：实体67%、收盘位0.78、上影小 ✓
+            bar(100.0, 104.0, 95.0, 96.0),  // 弱阳：实体44% ✗
+            bar(96.0, 104.0, 96.0, 102.0),  // 强阳：实体75%、收盘位0.75 ✓
+            bar(102.0, 108.0, 101.0, 107.0), // 强阳：实体71%、收盘位0.86 ✓
+        ];
+        let p = NPattern {
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 3,
+                price: 102.0,
+                is_high: true,
+            },
             ..pattern()
         };
-        let s0 = score_a(&mk(0), &atr);
-        let s1 = score_a(&mk(1), &atr);
-        let s2 = score_a(&mk(2), &atr);
-        let s5 = score_a(&mk(5), &atr);
-        assert!(s1 > s0);
-        assert!(s2 > s1);
-        assert!(s5 > s2);
-        assert!((s5 - s0 - 3.0).abs() < 1e-9);
-        assert!(s5 <= 5.0);
+        assert_eq!(a_leg_relaxed_strong(&bars, &atr, &p), 2);
     }
 
     #[test]
@@ -1096,7 +1147,9 @@ mod tests {
 
     #[test]
     fn cumulative_reversal_confirms_but_downgrades_to_small_position() {
-        // 做空：第二根阴线收盘越过强趋势阳线开盘价 → 多K累积覆盖，允许预警但降级为小仓
+        // 做空：第二根阴线收盘越过强趋势阳线开盘价 → 多K累积覆盖，允许预警但降级为小仓。
+        // 故意把 a 段设成幅度足、强K够的形态（否则新评分会把 a 段质量分压得很低，
+        // 测不到“弱确认封顶 3.49 仍落小仓”的本意）。
         let atr = atrs(6, 70.0);
         let p = NPattern {
             dir: Dir::Down,
@@ -1110,6 +1163,9 @@ mod tests {
                 price: 14945.0,
                 is_high: true,
             },
+            a_move: 600.0,
+            a_bars: 5,
+            a_strong_trend: 3,
             ..pattern()
         };
         let bars = vec![
