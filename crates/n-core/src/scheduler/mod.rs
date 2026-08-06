@@ -1,7 +1,8 @@
 ﻿//! 调度状态机（纯逻辑，可单测）：数据刷新与扫描动作的时机判定。
 //!
-//! 默认节奏：每 5 分钟增量刷新 5m 数据；每 15 分钟边界（:00/:15/:30/:45）跑一次分析。
-//! 节奏从“上次尝试的开始时间”起算，拉取/分析耗时不会把下一次任务向后推。
+//! 默认节奏：每 5 分钟增量刷新 5m 数据，刷新按分钟网格边界对齐（间隔/60 的整数倍分钟，含整点）；
+//! 每 15 分钟边界（:00/:15/:30/:45）跑一次分析。
+//! 拉取/分析耗时不会把下一次任务向后推；App 启动时的首次独立补拉由调度循环层处理。
 //! 交易时段过滤默认开启：仅在国内期货日盘/夜盘窗口内触发，避免无效请求。
 
 use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike};
@@ -43,9 +44,13 @@ pub fn next_action(
         return SchedulerAction::None;
     }
 
-    let refresh_due = last_refresh.map_or(true, |t| {
-        (now - t).num_seconds() >= cfg.refresh_interval_secs as i64
-    });
+    // 刷新按分钟网格对齐：间隔 300 秒 → 分钟能被 5 整除（含 :00）才到期；
+    // 同时仍要求距上次刷新已满间隔，避免同一个边界时刻重复触发。
+    let align_min = (cfg.refresh_interval_secs / 60).max(1) as u32;
+    let refresh_due = now.minute() % align_min == 0
+        && last_refresh.map_or(true, |t| {
+            (now - t).num_seconds() >= cfg.refresh_interval_secs as i64
+        });
     let scan_due = now.minute() % 15 == 0
         && last_scan.map_or(true, |t| {
             (now - t).num_seconds() >= cfg.scan_interval_secs as i64
@@ -133,6 +138,35 @@ mod tests {
         assert_eq!(
             next_action(dt(2026, 8, 3, 9, 30), &cfg, Some(dt(2026, 8, 3, 9, 20)), Some(dt(2026, 8, 3, 9, 15))),
             SchedulerAction::RefreshAndScan
+        );
+    }
+
+    #[test]
+    fn refresh_aligned_to_minute_grid() {
+        let cfg = SchedulerConfig::default();
+        // 非 5 分钟边界：即使从未刷新过（last=None）也不会触发刷新
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 17), &cfg, None, None),
+            SchedulerAction::None
+        );
+        // 5 分钟边界且从未刷新：纯刷新
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 20), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        // 15 分钟边界（含整点 0 分）：刷新 + 扫描
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 30), &cfg, None, None),
+            SchedulerAction::RefreshAndScan
+        );
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 10, 0), &cfg, None, None),
+            SchedulerAction::RefreshAndScan
+        );
+        // 同一边界时刻已刷新过（不足一个间隔）：不再重复
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 20), &cfg, Some(dt(2026, 8, 3, 9, 20)), None),
+            SchedulerAction::None
         );
     }
 

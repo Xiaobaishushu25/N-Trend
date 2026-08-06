@@ -15,6 +15,8 @@ pub mod symbols {
         pub node: String,
         pub watchlist: bool,
         pub enabled: bool,
+        /// 全部品种视图的手动排序索引（拖拽排序落库用；默认按代码序回填）
+        pub sort_index: i64,
         pub created_at: String,
         pub updated_at: String,
     }

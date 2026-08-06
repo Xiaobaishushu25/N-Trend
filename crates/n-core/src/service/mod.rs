@@ -118,6 +118,7 @@ impl Services {
                 enabled: Set(true),
                 created_at: Set(now.clone()),
                 updated_at: Set(now.clone()),
+                ..Default::default()
             })
             .collect();
         let count = rows.len();
@@ -141,6 +142,7 @@ impl Services {
                 enabled: Set(true),
                 created_at: Set(now.clone()),
                 updated_at: Set(now.clone()),
+                ..Default::default()
             })
             .collect();
         let count = models.len();
@@ -183,6 +185,7 @@ impl Services {
                     enabled: Set(s.enabled),
                     created_at: Set(s.created_at.clone()),
                     updated_at: Set(now.clone()),
+                    ..Default::default()
                 })
             })
             .collect();
@@ -229,6 +232,7 @@ impl Services {
                     enabled: Set(true),
                     created_at: Set(now.clone()),
                     updated_at: Set(now),
+                    ..Default::default()
                 }],
             )
             .await?;

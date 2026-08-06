@@ -159,16 +159,22 @@ function updateLiveBar(latest: number) {
       close: latest,
     }
   } else {
+    // 桶起点基准：优先用库内同桶成形K线（定时/手动刷新已落库，带真实开盘与成交量），
+    // 否则用前一根收盘价保证连续——避免首笔实时报价来晚了导致
+    // “开盘价离前收很远、看起来像跳空”的假缺口
+    const prev = displayRows.value[displayRows.value.length - 1]
+    const seed = prev && prev.ts === label ? prev : null
+    const open = seed ? seed.open : prev ? prev.close : latest
     arr.push({
       symbol: symbol.value,
       timeframe: timeframe.value,
       ts: label,
-      open: latest,
-      high: latest,
-      low: latest,
+      open,
+      high: seed ? Math.max(seed.high, latest) : Math.max(open, latest),
+      low: seed ? Math.min(seed.low, latest) : Math.min(open, latest),
       close: latest,
-      volume: 0,
-      hold: 0,
+      volume: seed?.volume ?? 0,
+      hold: seed?.hold ?? 0,
       source: 'live',
     })
     // 只保留最近一小段，等库内每 5 分钟刷新后自然由历史序列接管
@@ -187,7 +193,19 @@ const displayRows = computed<KlineRow[]>(() => {
   const out: KlineRow[] = []
   for (const r of rows) {
     const bar = liveByTs.get(r.ts)
-    out.push(bar ? { ...bar, volume: r.volume, hold: r.hold } : r)
+    if (bar) {
+      // 库内已有同桶K线（刷新落库的成形桶）：保留真实开盘/成交量，
+      // 实时值只负责把高低扩展到已观测到的范围、并更新收盘
+      out.push({
+        ...r,
+        high: Math.max(r.high, bar.high),
+        low: Math.min(r.low, bar.low),
+        close: bar.close,
+        source: 'live',
+      })
+    } else {
+      out.push(r)
+    }
   }
   for (const bar of live) {
     if (!rowByTs.has(bar.ts) && (!out.length || bar.ts > out[out.length - 1].ts)) {
@@ -206,13 +224,19 @@ const latestClose = computed(() =>
 const groupSymbols = ref<SymbolRow[]>([])
 /** 拖拽结束后浏览器可能补发一次 click，用它临时抑制行点击跳转 */
 let symbolSuppressClick = false
+/** 插入线：将要插入到该代码行之前；null 表示插入到列表末尾 */
+const insertBeforeCode = ref<string | null>(null)
+const listDragging = ref(false)
 
 /** 拉取当前分组的成员（按组内 sort_index 顺序） */
 async function loadGroupSymbols() {
-  groupSymbols.value =
-    groupsStore.selectedId == null
-      ? [...symbolsStore.symbols]
-      : await api.getGroupSymbols(groupsStore.selectedId)
+  if (groupsStore.selectedId == null) {
+    // 全部品种视图：以服务端全局顺序为准（拖拽/别处重排后重拉）
+    await symbolsStore.load()
+    groupSymbols.value = [...symbolsStore.symbols]
+    return
+  }
+  groupSymbols.value = await api.getGroupSymbols(groupsStore.selectedId)
 }
 
 /** 左侧列表：分组视图按组内顺序，全部视图按代码序 */
@@ -223,23 +247,66 @@ const visibleSymbols = computed(() => groupSymbols.value)
  * 这里把顺序持久化并广播，让列表页表格同步重拉。
  */
 async function persistListOrder() {
+  listDragging.value = false
+  insertBeforeCode.value = null
   // 拖拽结束后浏览器可能补发一次 click，这里临时抑制行点击跳转
   symbolSuppressClick = true
   setTimeout(() => {
     symbolSuppressClick = false
   }, 0)
   const groupId = groupsStore.selectedId
-  if (groupId == null) return
+  const codes = groupSymbols.value.map((s) => s.code)
   try {
-    await api.reorderGroupSymbols(
-      groupId,
-      groupSymbols.value.map((s) => s.code),
-    )
+    // 分组视图写组内顺序；全部品种视图写全局顺序
+    if (groupId != null) {
+      await api.reorderGroupSymbols(groupId, codes)
+    } else {
+      await api.reorderSymbols(codes)
+    }
     groupsStore.bumpRevision()
   } catch (err) {
     notify.error(String(err))
     await loadGroupSymbols() // 落库失败则回滚为服务端顺序
   }
+}
+
+/** 拖拽开始：清掉上一次的插入线 */
+function onListDragStart() {
+  listDragging.value = true
+  insertBeforeCode.value = null
+}
+
+/**
+ * SortableJS 的移动判定：按「光标在目标行上半 → 插到该行之前；下半 → 插到该行之后」
+ * 主动决定插入方向，并让蓝线与该规则完全一致，实现所见即所得。
+ * 不能依赖 Sortable 默认的 willInsertAfter：它默认是交换语义（把拖拽项插到目标行所在的
+ * 位置），与按行边界理解的直觉差一行；返回 1/-1 会覆盖 Sortable 内部的插入方向。
+ */
+function onListMove(evt: {
+  related: HTMLElement | null
+  relatedRect: { top: number; bottom: number; height: number } | null
+  willInsertAfter?: boolean
+  originalEvent?: Event | null
+}): boolean | 1 | -1 {
+  const related = evt.related as HTMLElement | null
+  const isRow = !!related?.closest?.('.sl-row')
+  if (!isRow || !related) {
+    // 目标是容器本身（列表末尾的空区域）：按默认逻辑插到末尾
+    const boundary = evt.willInsertAfter ? related?.nextElementSibling : related
+    insertBeforeCode.value =
+      (boundary as HTMLElement | null)?.getAttribute('data-code') ?? null
+    return true
+  }
+  const rect =
+    evt.relatedRect ??
+    (related.getBoundingClientRect() as { top: number; bottom: number; height: number })
+  const mouseY = (evt.originalEvent as MouseEvent | null)?.clientY ?? rect.top + rect.height / 2
+  const after = mouseY > rect.top + rect.height / 2
+  // 插入 related 之后时，边界是 related 的下一行；插入 related 之前时，边界就是 related
+  const boundary = after ? related.nextElementSibling : related
+  insertBeforeCode.value =
+    (boundary as HTMLElement | null)?.getAttribute('data-code') ?? null
+  return after ? 1 : -1
 }
 
 /** 行点击进入K线图；拖拽结束后紧接着的 click 不触发跳转 */
@@ -435,6 +502,8 @@ function fmtChange(v: number | null) {
 }
 
 async function loadSnapshots() {
+  // 拖拽中暂停快照刷新，避免列表重渲染打断正在进行的拖拽排序
+  if (listDragging.value) return
   try {
     const list = await api.getMarketSnapshot()
     snapshots.value = Object.fromEntries(list.map((s) => [s.code, s]))
@@ -451,6 +520,7 @@ function setRowFlash(code: string, dir: 'up' | 'down') {
   flashTimers.set(
     code,
     setTimeout(() => {
+      if (listDragging.value) return
       const next = { ...rowFlash.value }
       delete next[code]
       rowFlash.value = next
@@ -570,6 +640,8 @@ onMounted(async () => {
   unlisteners.push(
     await onQuotesUpdated((list) => {
       if (!list.length) return
+      // 拖拽中暂停快照/闪烁/实时K线更新，避免列表重渲染打乱正在拖拽的 DOM
+      if (listDragging.value) return
       const next: Record<string, MarketSnapshot> = { ...snapshots.value }
       for (const s of list) {
         const prev = snapshots.value[s.code]
@@ -642,31 +714,31 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="main">
-      <div
-        v-if="showList"
-        class="symbol-list"
-        :class="{ 'can-reorder': groupsStore.selectedId != null }"
-      >
+      <div v-if="showList" class="symbol-list can-reorder">
         <div class="sl-title">品种</div>
         <n-scrollbar style="flex: 1">
           <VueDraggable
             v-model="groupSymbols"
             item-key="code"
             class="sl-list"
+            :class="{ 'insert-at-end': listDragging && insertBeforeCode === null }"
             :animation="150"
-            :disabled="groupsStore.selectedId == null"
             :force-fallback="true"
             fallback-on-body
             fallback-class="sl-row-fallback"
             ghost-class="sl-row-ghost"
             chosen-class="sl-row-chosen"
+            :move="onListMove"
+            @start="onListDragStart"
             @end="persistListOrder"
           >
             <template #item="{ element }">
               <div
                 class="sl-row"
+                :data-code="element.code"
                 :class="[
                   { active: element.code === symbol },
+                  { 'insert-before': insertBeforeCode === element.code },
                   { 'is-flash-up': rowFlash[element.code] === 'up' },
                   { 'is-flash-down': rowFlash[element.code] === 'down' },
                   signalBySymbol[element.code]?.state === '即将触发' ? 'has-pending' : '',
@@ -908,6 +980,17 @@ onBeforeUnmount(() => {
 }
 .sl-row-chosen {
   background: #dbe9ff;
+}
+/* 拖拽插入线：提示将要插入到该行之前（或列表末尾） */
+.sl-row.insert-before {
+  box-shadow: inset 0 2px 0 #1677ff;
+}
+.sl-list.insert-at-end::after {
+  content: '';
+  display: block;
+  height: 2px;
+  margin: 0 14px;
+  background: #1677ff;
 }
 .sl-row:hover {
   background: #f6f8fa;

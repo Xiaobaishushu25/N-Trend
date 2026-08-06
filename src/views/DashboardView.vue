@@ -55,6 +55,12 @@ const groupNameDrafts = ref<Record<number, string>>({})
 /** 表格外层容器（Sortable 挂载到其内部 tbody 上） */
 const tableWrapEl = ref<HTMLElement | null>(null)
 let tableSortable: Sortable | null = null
+/** 拖拽中：暂停行情/数据刷新，避免表格重渲染打断正在进行的拖拽 */
+const listDragging = ref(false)
+/** 插入线：将要插入到该代码行之前；null 表示插入到表格末尾 */
+const insertBeforeCode = ref<string | null>(null)
+/** 拖拽结束后短暂抑制双击跳转，避免松手时误开K线图 */
+let suppressOpenChart = false
 let unlisteners: (() => void)[] = []
 /** 行闪烁清除计时器：动画结束后把 flash 归零，保证下一次跳动能重新触发动画 */
 const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -119,7 +125,7 @@ async function loadAll() {
 
 /** 实时现价事件：只更新行情列（最新价/涨跌幅/涨跌点数），不重拉数据库 */
 function applyQuotes(snapshots: MarketSnapshot[]) {
-  if (!snapshots.length || !rows.value.length) return
+  if (!snapshots.length || !rows.value.length || listDragging.value) return
   const byCode = new Map(snapshots.map((s) => [s.code, s]))
   rows.value = rows.value.map((r) => {
     const snap = byCode.get(r.symbol.code)
@@ -142,6 +148,7 @@ function applyQuotes(snapshots: MarketSnapshot[]) {
       flashTimers.set(
         r.symbol.code,
         setTimeout(() => {
+          if (listDragging.value) return
           rows.value = rows.value.map((x) =>
             x.symbol.code === r.symbol.code && x.flash === flash ? { ...x, flash: null } : x,
           )
@@ -159,51 +166,108 @@ function openChart(row: WatchRow) {
 
 function rowProps(row: WatchRow): Record<string, unknown> {
   return {
-    style: `cursor: ${groupsStore.selectedId != null ? 'grab' : 'pointer'}`,
+    style: `cursor: ${listDragging.value ? 'grabbing' : 'grab'}`,
     class: [
       row.flash ? (row.flash === 'up' ? 'row-flash-up' : 'row-flash-down') : '',
+      { 'insert-before': listDragging.value && insertBeforeCode.value === row.symbol.code },
     ],
     'data-code': row.symbol.code,
-    onDblclick: () => openChart(row),
+    onDblclick: () => {
+      if (suppressOpenChart) return
+      openChart(row)
+    },
     onContextmenu: (e: MouseEvent) => onRowContextMenu(row, e),
   }
 }
 
 /**
  * Sortable 直接挂载到表格 tbody：行顺序变化后读取 DOM 新顺序落库并广播。
- * 只在分组视图启用（全部视图没有全局顺序字段）。
+ * 分组视图写组内顺序，全部品种视图写全局顺序，与K线页左侧列表一致。
  */
 function setupTableSortable() {
-  if (tableSortable) return
   const tbody = tableWrapEl.value?.querySelector<HTMLElement>('.watch-table tbody')
   if (!tbody) return
+  // 数据重载导致 tbody 被重建时，先销毁旧实例再挂到新 tbody 上
+  if (tableSortable?.el === tbody) return
+  tableSortable?.destroy()
   tableSortable = Sortable.create(tbody, {
     animation: 150,
     draggable: 'tr[data-code]',
+    // 排除启用开关等交互控件：点击开关正常切换，不触发拖拽
+    filter: '.n-switch, input, button, textarea, select, a',
+    preventOnFilter: false,
     forceFallback: true,
     fallbackClass: 'sl-table-fallback',
     fallbackOnBody: true,
     ghostClass: 'sl-table-ghost',
     chosenClass: 'sl-table-chosen',
-    disabled: groupsStore.selectedId == null,
-    onEnd: () => persistTableOrder(tbody),
+    onStart: () => {
+      listDragging.value = true
+      insertBeforeCode.value = null
+    },
+    onMove: onTableMove,
+    onEnd: () => persistTableOrder(),
   })
 }
 
-async function persistTableOrder(tbody: HTMLElement) {
-  const groupId = groupsStore.selectedId
-  if (groupId == null) return
+/**
+ * 拖拽移动判定：与K线页左侧列表同一套「光标在目标行上半 → 插到该行之前；
+ * 下半 → 插到该行之后」规则，蓝线提示与实际落点完全一致。
+ */
+function onTableMove(evt: {
+  related: HTMLElement | null
+  relatedRect: { top: number; bottom: number; height: number } | null
+  willInsertAfter?: boolean
+  originalEvent?: Event | null
+}): boolean | 1 | -1 {
+  const related = evt.related as HTMLElement | null
+  const isRow = !!related?.closest?.('tr[data-code]')
+  if (!isRow || !related) {
+    // 目标是表格体本身（末尾空区域）：按默认逻辑插到末尾
+    const boundary = evt.willInsertAfter ? related?.nextElementSibling : related
+    insertBeforeCode.value =
+      (boundary as HTMLElement | null)?.getAttribute('data-code') ?? null
+    return true
+  }
+  const rect =
+    evt.relatedRect ??
+    (related.getBoundingClientRect() as { top: number; bottom: number; height: number })
+  const mouseY = (evt.originalEvent as MouseEvent | null)?.clientY ?? rect.top + rect.height / 2
+  const after = mouseY > rect.top + rect.height / 2
+  // 插入 related 之后时，边界是 related 的下一行；插入之前时，边界就是 related
+  const boundary = after ? related.nextElementSibling : related
+  insertBeforeCode.value =
+    (boundary as HTMLElement | null)?.getAttribute('data-code') ?? null
+  return after ? 1 : -1
+}
+
+async function persistTableOrder() {
+  listDragging.value = false
+  insertBeforeCode.value = null
+  // 松手后短暂抑制双击跳转，避免误开K线图
+  suppressOpenChart = true
+  setTimeout(() => {
+    suppressOpenChart = false
+  }, 200)
+  const tbody = tableWrapEl.value?.querySelector<HTMLElement>('.watch-table tbody')
+  if (!tbody) return
   const codes = [...tbody.querySelectorAll<HTMLElement>('tr[data-code]')]
     .map((tr) => tr.dataset.code)
     .filter((c): c is string => c != null)
-  if (!codes.length) return
+  if (!codes.length || codes.length !== rows.value.length) return
   // 让 Vue 数据与 DOM 新顺序保持一致
   const byCode = new Map(rows.value.map((r) => [r.symbol.code, r]))
   const next = codes.map((c) => byCode.get(c)).filter((r): r is WatchRow => r != null)
-  if (!next.length) return
+  if (next.length !== rows.value.length) return
   rows.value = next
+  const groupId = groupsStore.selectedId
   try {
-    await api.reorderGroupSymbols(groupId, codes)
+    // 分组视图写组内顺序；全部品种视图写全局顺序
+    if (groupId != null) {
+      await api.reorderGroupSymbols(groupId, codes)
+    } else {
+      await api.reorderSymbols(codes)
+    }
     groupsStore.bumpRevision()
   } catch (err) {
     notify.error(String(err))
@@ -599,13 +663,18 @@ async function doAddSymbol() {
 
 onMounted(async () => {
   await groupsStore.load()
-  unlisteners.push(await onDataUpdated(() => loadAll()))
+  unlisteners.push(
+    await onDataUpdated(() => {
+      if (listDragging.value) return
+      loadAll()
+    }),
+  )
   unlisteners.push(await onQuotesUpdated(applyQuotes))
   // 扫描完成时同步更新内存里的最新扫描结果，避免图表页「全部N形态」停留在旧扫描
   unlisteners.push(
     await onScanCompleted((result) => {
       scansStore.ingest(result)
-      loadAll()
+      if (!listDragging.value) loadAll()
     }),
   )
   await loadAll()
@@ -614,19 +683,20 @@ onMounted(async () => {
 })
 
 // 组内顺序在别处被改动（如K线页左侧拖拽）时，重拉表格
-watch(() => groupsStore.revision, () => loadAll())
-// 切换分组时同步开关表格拖拽；keep-alive 回到页面时重建 Sortable（tbody 可能被重建）
+watch(() => groupsStore.revision, () => {
+  if (listDragging.value) return
+  loadAll()
+})
+// 数据从空到有、或 keep-alive 重新激活时 tbody 可能被重建，重建 Sortable
 watch(
-  () => groupsStore.selectedId,
-  () => {
-    tableSortable?.option('disabled', groupsStore.selectedId == null)
+  () => rows.value.length,
+  async (len) => {
+    if (!len) return
+    await nextTick()
+    setupTableSortable()
   },
 )
-onActivated(() => {
-  tableSortable?.destroy()
-  tableSortable = null
-  setupTableSortable()
-})
+onActivated(() => setupTableSortable())
 
 onBeforeUnmount(() => {
   tableSortable?.destroy()
@@ -651,7 +721,7 @@ onBeforeUnmount(() => {
           @keyup.enter="doAddSymbol"
         />
         <n-button type="primary" ghost @click="doAddSymbol">添加品种</n-button>
-        <n-text depth="3" style="font-size: 12px">双击行打开K线图</n-text>
+        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
       </n-space>
     </div>
     <div class="group-bar">
@@ -679,13 +749,18 @@ onBeforeUnmount(() => {
         </n-button>
       </n-space>
     </div>
-    <div ref="tableWrapEl" class="watch-table-wrap">
+    <div
+      ref="tableWrapEl"
+      class="watch-table-wrap"
+      :class="{ 'insert-at-end': listDragging && insertBeforeCode === null }"
+    >
       <n-data-table
         class="watch-table"
         :columns="columns"
         :data="rows"
         :loading="loading"
         :row-props="rowProps"
+        :row-key="(r: WatchRow) => r.symbol.code"
         size="small"
         :bordered="false"
         flex-height
@@ -773,6 +848,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 .watch-table {
   flex: 1;
@@ -791,6 +867,24 @@ onBeforeUnmount(() => {
 }
 .watch-table :deep(.n-data-table-td) {
   font-size: 14px;
+}
+/* 表格行拖拽：与K线页左侧列表一致的视觉反馈 */
+.watch-table :deep(tbody tr) {
+  user-select: none;
+}
+.watch-table :deep(tbody tr.sl-table-ghost td) {
+  opacity: 0.45;
+  background: #eaf2ff;
+}
+.watch-table :deep(tbody tr.sl-table-chosen td) {
+  background: #dbe9ff;
+}
+/* 拖拽插入线：提示将要插入到该行之前（或表格末尾） */
+.watch-table :deep(tbody tr.insert-before td) {
+  box-shadow: inset 0 2px 0 #1677ff;
+}
+.watch-table-wrap.insert-at-end :deep(.watch-table tbody tr:last-child td) {
+  box-shadow: inset 0 -2px 0 #1677ff;
 }
 </style>
 
@@ -929,17 +1023,6 @@ onBeforeUnmount(() => {
   }
 }
 
-/* 分组视图下表格行支持拖拽排序 */
-.watch-table :deep(tbody tr) {
-  user-select: none;
-}
-.watch-table :deep(tbody tr.sl-table-ghost td) {
-  opacity: 0.45;
-  background: #eaf2ff;
-}
-.watch-table :deep(tbody tr.sl-table-chosen td) {
-  background: #dbe9ff;
-}
 </style>
 
 

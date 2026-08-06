@@ -119,8 +119,17 @@ let priceExtent = 1
 const display_k_num = 140
 /** K线最小间距(px)：窗口较窄或视图拉得较宽时，防止K线细成一条线 */
 const MIN_BAR_SPACING = 8
-/** 默认视图右侧留出的空白（以K线根数为单位），相当于把图表向左拖一段，让最新K线不贴右边缘 */
+/** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，让最新K线不贴右边缘 */
 const display_right_gap = 10
+/** 右侧留白占可见K线根数的比例上限：数据量少的品种留白按此比例缩水，避免右侧出现大片空白 */
+const right_gap_ratio = 0.1
+
+/** 计算右侧留白根数：数据量足够时保持 display_right_gap 根；
+ *  数据量少时按可见根数的 right_gap_ratio 缩到最小1根，保证不同品种留白占屏比例一致 */
+function rightGapBars(visible: number): number {
+  if (visible <= 0) return display_right_gap
+  return Math.min(display_right_gap, Math.max(1, Math.round(visible * right_gap_ratio)))
+}
 /** N形态连线/标记颜色：与K线自身的红绿区分开并带透明度，减少对K线的遮挡 */
 const PATTERN_UP_COLOR = 'rgba(255, 135, 135, 0.9)' // 上涨：浅红
 const PATTERN_DOWN_COLOR = 'rgba(32, 201, 151, 0.9)' // 下跌：青绿
@@ -255,7 +264,7 @@ function applyDefaultView() {
   if (total === 0) return
   const visible = Math.min(display_k_num, total)
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
-  const to = total - 0.5 + display_right_gap
+  const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing()
@@ -325,7 +334,7 @@ function restoreView() {
   let from = lastView.from
   let to = lastView.to
   if (total > 0) {
-    const maxTo = total - 0.5 + display_right_gap
+    const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
     if (span >= total) {
       to = maxTo
       from = Math.max(-0.5, to - span)
@@ -345,7 +354,8 @@ function applySwitchView(span: number) {
   if (!chart) return
   const total = props.rows.length
   if (total === 0) return
-  const to = total - 0.5 + display_right_gap
+  const visible = Math.min(span, total)
+  const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - span)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing()
@@ -426,10 +436,20 @@ function syncGaps() {
 let prevSymbol: string | null = null
 let prevTimeframe: string | null = null
 
+/** 当前 rows 是否真的属于 props 指定的品种/周期。
+ *  切换品种/周期时后端尚未返回新数据前，组件会先收到「旧数据+新品种」的中间态，
+ *  用它判断可以避免中间态提前消耗掉切换状态、导致新数据到达后被当成普通刷新 */
+function rowsMatchRequest(): boolean {
+  const first = props.rows[0]
+  return !!first && first.symbol === props.symbol && first.timeframe === props.timeframe
+}
+
 /** 数据变化时：沿用当前缩放/平移状态（无记录则默认视图）；
- *  切换品种/周期则贴到新数据最右端并留出右侧空白，避免最新K线紧贴右边界 */
+ *  切换品种/周期则贴到新数据最右端并留出右侧空白，避免最新K线紧贴右边界。
+ *  数据与请求的品种/周期不一致（切换中间态）时跳过视图处理，等新数据到达再切换 */
 function renderData() {
   if (!chart || !candleSeries || !volumeSeries) return
+  if (!rowsMatchRequest()) return
   const isSwitch = prevSymbol !== props.symbol || prevTimeframe !== props.timeframe
   prevSymbol = props.symbol
   prevTimeframe = props.timeframe
@@ -713,7 +733,6 @@ onBeforeUnmount(() => {
   justify-content: center;
 }
 </style>
-
 
 
 

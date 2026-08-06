@@ -35,6 +35,7 @@ export const api = {
     invoke<void>('remove_symbol_from_group', { symbol, groupId }),
   reorderGroupSymbols: (groupId: number, codes: string[]) =>
     invoke<void>('reorder_group_symbols', { groupId, codes }),
+  reorderSymbols: (codes: string[]) => invoke<void>('reorder_symbols', { codes }),
   addSymbol: (code: string) => invoke<number>('add_symbol', { code }),
   removeSymbol: (code: string) => invoke<void>('remove_symbol', { code }),
   setSymbolFlags: (code: string, watchlist: boolean, enabled: boolean) =>

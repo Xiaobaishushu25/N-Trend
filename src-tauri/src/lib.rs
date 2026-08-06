@@ -158,6 +158,7 @@ pub fn run() {
             commands::add_symbol_to_group,
             commands::remove_symbol_from_group,
             commands::reorder_group_symbols,
+            commands::reorder_symbols,
             commands::add_symbol,
             commands::remove_symbol,
             commands::set_symbol_flags,
@@ -206,11 +207,14 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
         // 15 秒一跳：比 60 秒更接近计划时刻，长时间任务结束后也能尽快补上节奏
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 启动特例：刷新改为分钟网格对齐后，启动时若不在边界时刻会最多等一个周期才有数据，
+        // 因此在交易时段内的首次 tick 强制刷新一次，之后回到边界对齐节奏
+        let mut startup_refresh_done = false;
         loop {
             ticker.tick().await;
             let now = Local::now();
             let cfg = state.services.scheduler_config().await;
-            let action = {
+            let mut action = {
                 let rt = state.scheduler.read().await;
                 if !rt.running {
                     continue;
@@ -223,6 +227,14 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
                     .and_then(|t| t.and_local_timezone(Local).single());
                 n_core::scheduler::next_action(now, &cfg, last_refresh, last_scan)
             };
+            if !startup_refresh_done {
+                startup_refresh_done = true;
+                if action == n_core::scheduler::SchedulerAction::None
+                    && n_core::scheduler::is_trading_time(&now)
+                {
+                    action = n_core::scheduler::SchedulerAction::Refresh;
+                }
+            }
             match action {
                 n_core::scheduler::SchedulerAction::None => {}
                 n_core::scheduler::SchedulerAction::Refresh => {

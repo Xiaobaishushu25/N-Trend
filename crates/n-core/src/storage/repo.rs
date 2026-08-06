@@ -119,7 +119,10 @@ pub async fn list_symbols(
     db: &DatabaseConnection,
     only_enabled: bool,
 ) -> Result<Vec<symbols::Model>> {
-    let mut q = symbols::Entity::find().order_by_asc(symbols::Column::Code);
+    // 全部品种按手动排序索引排列（初始由迁移按代码序回填），代码序兜底
+    let mut q = symbols::Entity::find()
+        .order_by_asc(symbols::Column::SortIndex)
+        .order_by_asc(symbols::Column::Code);
     if only_enabled {
         q = q.filter(symbols::Column::Enabled.eq(true));
     }
@@ -138,6 +141,30 @@ pub async fn symbol_exists(db: &DatabaseConnection, code: &str) -> Result<bool> 
 pub async fn upsert_symbols(db: &DatabaseConnection, rows: Vec<symbols::ActiveModel>) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
+    }
+    // 新入库品种按“当前最大 sort_index + 1”追加到全部品种末尾；
+    // 已存在的品种走 ON CONFLICT 更新，sort_index 不在更新列里，不会被覆盖。
+    let existing_codes: std::collections::HashSet<String> = symbols::Entity::find()
+        .all(db)
+        .await
+        .context("查询已有品种失败")?
+        .into_iter()
+        .map(|s| s.code)
+        .collect();
+    let max_sort = symbols::Entity::find()
+        .order_by_desc(symbols::Column::SortIndex)
+        .one(db)
+        .await
+        .context("查询品种排序失败")?
+        .map_or(0, |s| s.sort_index);
+    let mut rows = rows;
+    let mut next = max_sort + 1;
+    for row in &mut rows {
+        let code = row.code.as_ref();
+        if !existing_codes.contains(code) {
+            row.sort_index = Set(next);
+            next += 1;
+        }
     }
     symbols::Entity::insert_many(rows)
         .on_conflict(
@@ -405,6 +432,23 @@ pub async fn reorder_group_symbols(
         let mut model: symbol_groups::ActiveModel = row.into();
         model.sort_index = Set(idx as i64);
         model.save(db).await.context("更新组内品种排序失败")?;
+    }
+    Ok(())
+}
+
+/// 批量重排全部品种：按传入的代码顺序重写 symbols.sort_index（供全部视图拖拽排序落库）。
+pub async fn reorder_symbols(db: &DatabaseConnection, codes: &[String]) -> Result<()> {
+    for (idx, code) in codes.iter().enumerate() {
+        let row = symbols::Entity::find_by_id(code)
+            .one(db)
+            .await
+            .context("查询品种失败")?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mut model: symbols::ActiveModel = row.into();
+        model.sort_index = Set(idx as i64);
+        model.save(db).await.context("更新品种排序失败")?;
     }
     Ok(())
 }

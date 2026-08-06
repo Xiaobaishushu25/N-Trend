@@ -119,6 +119,16 @@ pub async fn reorder_group_symbols(
 }
 
 #[tauri::command]
+pub async fn reorder_symbols(
+    state: State<'_, Arc<AppState>>,
+    codes: Vec<String>,
+) -> Result<(), String> {
+    n_core::storage::repo::reorder_symbols(&state.services.db, &codes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn add_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<usize, String> {
     state.services.add_symbol(&code).await.map_err(|e| e.to_string())
 }

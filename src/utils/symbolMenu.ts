@@ -48,7 +48,7 @@ export function openSymbolContextMenu(e: MouseEvent, ctx: SymbolMenuContext) {
   })
   if (inGroup) {
     items.push({
-      label: '移动到某组',
+      label: '移动自选至',
       children: moveChildren,
     })
   }
