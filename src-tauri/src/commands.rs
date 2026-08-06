@@ -108,6 +108,33 @@ pub async fn remove_symbol_from_group(
 }
 
 #[tauri::command]
+pub async fn reorder_groups(
+    state: State<'_, Arc<AppState>>,
+    ids: Vec<i64>,
+    all_position: i64,
+) -> Result<(), String> {
+    n_core::storage::repo::reorder_groups(&state.services.db, &ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 一并持久化「全部品种」在分组顺序中的位置（虚拟槽位）
+    let mut map = std::collections::HashMap::new();
+    map.insert("group_all_position".to_string(), all_position.to_string());
+    n_core::storage::repo::set_settings(&state.services.db, &map)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_group_all_position(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
+    let pos = n_core::storage::repo::get_setting(&state.services.db, "group_all_position")
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    Ok(pos)
+}
+
+#[tauri::command]
 pub async fn reorder_group_symbols(
     state: State<'_, Arc<AppState>>,
     group_id: i64,

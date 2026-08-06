@@ -64,10 +64,15 @@ fn score_a(p: &NPattern, atr20: &[Option<f64>]) -> f64 {
     }
 
     s += speed_ratio * 0.8;
+    // a段内强趋势K数量是推动质量的重要信号：按数量阶梯加分（0~3.0），
+    // 不再只是“小加分”，让K线质量在a段评分中占实质权重。
     s += match p.a_strong_trend {
         0 => 0.0,
-        1 => 0.3,
-        _ => 0.6,
+        1 => 0.6,
+        2 => 1.2,
+        3 => 1.8,
+        4 => 2.4,
+        _ => 3.0,
     };
     s += if p.a_move >= 2.0 * atr {
         0.8
@@ -454,12 +459,12 @@ fn compute_scores(
     }
     let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
 
-    let mut total = 0.15 * dim_trend
-        + 0.20 * dim_a
+    let mut total = 0.10 * dim_trend
+        + 0.40 * dim_a
         + 0.20 * dim_b
         + 0.15 * dim_trigger
-        + 0.10 * dim_rr
-        + 0.20 * dim_momentum;
+        + 0.05 * dim_rr
+        + 0.10 * dim_momentum;
     if weak_confirm {
         total = total.min(WEAK_CONFIRM_TOTAL_MAX);
     }
@@ -976,6 +981,27 @@ mod tests {
         assert!((sc.dims[3] - 1.0).abs() < 1e-9);
         assert!(sc.total > 0.0);
         assert!(sc.note.contains("继续等待"));
+    }
+
+    #[test]
+    fn a_leg_strong_trend_candles_scale_with_count() {
+        // a段强趋势K按数量阶梯加分（最多3.0），且不会被基础分顶到截断上限。
+        let atr = vec![Some(10.0); 30];
+        let mk = |n: usize| NPattern {
+            a_move: 8.0,
+            a_bars: 20,
+            a_strong_trend: n,
+            ..pattern()
+        };
+        let s0 = score_a(&mk(0), &atr);
+        let s1 = score_a(&mk(1), &atr);
+        let s2 = score_a(&mk(2), &atr);
+        let s5 = score_a(&mk(5), &atr);
+        assert!(s1 > s0);
+        assert!(s2 > s1);
+        assert!(s5 > s2);
+        assert!((s5 - s0 - 3.0).abs() < 1e-9);
+        assert!(s5 <= 5.0);
     }
 
     #[test]

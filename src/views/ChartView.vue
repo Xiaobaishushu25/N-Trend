@@ -48,11 +48,31 @@ const timeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
 
-/** 最近一次扫描识别出的该品种全部N形态（策略基于 15m/60m，与图表显示级别无关） */
+/** 形态状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
+function patternStateRank(state: string): number {
+  if (state === '即将触发') return 0
+  if (state === '当前已触发') return 1
+  if (state === '已触发，接近时效边界') return 2
+  if (state === '已过时，仅复盘') return 3
+  return 4
+}
+
+/**
+ * 最近一次扫描识别出的该品种全部N形态（策略基于 15m/60m，与图表显示级别无关）。
+ * 排序规则：先按状态（即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常），
+ * 同一状态内按评分从高到低，评分相同按编号小的优先。
+ */
 const signals = computed<PatternDto[]>(() => {
   return scansStore.latestSignals
     .filter((s) => s.symbol === symbol.value)
     .map((s) => s as unknown as PatternDto)
+    .sort((a, b) => {
+      const rankA = patternStateRank(a.state)
+      const rankB = patternStateRank(b.state)
+      if (rankA !== rankB) return rankA - rankB
+      if (b.score !== a.score) return b.score - a.score
+      return a.number - b.number
+    })
 })
 
 /**

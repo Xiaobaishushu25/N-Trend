@@ -25,6 +25,9 @@ export const api = {
   createGroup: (name: string) => invoke<GroupRow>('create_group', { name }),
   renameGroup: (id: number, name: string) => invoke<void>('rename_group', { id, name }),
   deleteGroup: (id: number) => invoke<void>('delete_group', { id }),
+  reorderGroups: (ids: number[], allPosition: number) =>
+    invoke<void>('reorder_groups', { ids, allPosition }),
+  getGroupAllPosition: () => invoke<number>('get_group_all_position'),
   getGroupSymbols: (groupId: number) =>
     invoke<SymbolRow[]>('get_group_symbols', { groupId }),
   listSymbolGroups: (symbol: string) =>

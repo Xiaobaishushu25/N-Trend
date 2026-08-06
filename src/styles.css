@@ -24,7 +24,8 @@ body {
 
 /* SortableJS 拖拽克隆体样式（克隆体挂在 body 上，须为全局样式） */
 .sl-row-fallback,
-.sl-table-fallback {
+.sl-table-fallback,
+.group-row-fallback {
   opacity: 0.85;
   box-shadow: 0 6px 16px rgba(15, 23, 42, 0.18);
   cursor: grabbing;

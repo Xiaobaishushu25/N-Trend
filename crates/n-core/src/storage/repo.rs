@@ -413,6 +413,23 @@ pub async fn remove_symbol_from_group(
     Ok(())
 }
 
+/// 批量重排分组：按传入的 id 顺序重写 groups.sort_index（供管理分组拖拽排序落库）。
+pub async fn reorder_groups(db: &DatabaseConnection, ids: &[i64]) -> Result<()> {
+    for (idx, id) in ids.iter().enumerate() {
+        let row = groups::Entity::find_by_id(*id)
+            .one(db)
+            .await
+            .context("查询分组失败")?;
+        let Some(row) = row else {
+            continue;
+        };
+        let mut model: groups::ActiveModel = row.into();
+        model.sort_index = Set(idx as i64);
+        model.save(db).await.context("更新分组排序失败")?;
+    }
+    Ok(())
+}
+
 /// 批量重排组内品种：按传入的代码顺序重写 sort_index（供拖拽排序落库）。
 pub async fn reorder_group_symbols(
     db: &DatabaseConnection,
@@ -526,6 +543,14 @@ pub async fn all_settings(db: &DatabaseConnection) -> Result<std::collections::H
         .await
         .context("读取设置失败")?;
     Ok(rows.into_iter().map(|r| (r.key, r.value)).collect())
+}
+
+pub async fn get_setting(db: &DatabaseConnection, key: &str) -> Result<Option<String>> {
+    let row = settings::Entity::find_by_id(key)
+        .one(db)
+        .await
+        .context("读取设置失败")?;
+    Ok(row.map(|r| r.value))
 }
 
 pub async fn set_settings(db: &DatabaseConnection, map: &std::collections::HashMap<String, String>) -> Result<()> {

@@ -1,10 +1,11 @@
 ﻿<script setup lang="ts">
-import { h, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, h, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
 import {
   NButton,
   NDataTable,
+  NIcon,
   NInput,
   NModal,
   NSpace,
@@ -14,6 +15,7 @@ import {
   NText,
   type DataTableColumns,
 } from 'naive-ui'
+import { DeviceFloppy, GripVertical, Lock, Trash } from '@vicons/tabler'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useGroupsStore } from '../stores/groups'
 import { useSettingsStore } from '../stores/settings'
@@ -52,6 +54,30 @@ const newCode = ref('')
 const groupModal = ref<'create' | 'manage' | null>(null)
 const newGroupName = ref('')
 const groupNameDrafts = ref<Record<number, string>>({})
+/** 管理分组弹窗里的分组列表容器（Sortable 挂载到它上面） */
+const groupListEl = ref<HTMLElement | null>(null)
+let groupSortable: Sortable | null = null
+/** 拖拽中：显示插入线提示 */
+const groupDragging = ref(false)
+/** 插入线：将要插入到该行（'all'=全部品种 / 分组 id）之前；null 表示插入到列表末尾 */
+const insertBeforeKey = ref<string | null>(null)
+/** 标签页/管理列表的统一顺序：「全部品种」插在 allPosition 处，与真实分组一起排序 */
+const groupTabs = computed<Array<{ kind: 'all' } | { kind: 'group'; g: GroupRow }>>(() => {
+  const groups = groupsStore.groups
+  const pos = Math.min(Math.max(groupsStore.allPosition, 0), groups.length)
+  const items: Array<{ kind: 'all' } | { kind: 'group'; g: GroupRow }> = []
+  for (let i = 0; i < groups.length; i++) {
+    if (i === pos) items.push({ kind: 'all' })
+    items.push({ kind: 'group', g: groups[i] })
+  }
+  if (pos >= groups.length) items.push({ kind: 'all' })
+  return items
+})
+/** 分组头像取色板：按 id 稳定取色 */
+const GROUP_COLORS = ['#1677ff', '#0f9d58', '#f5a623', '#7c5cff', '#e03131', '#0ca5e9', '#f272b0', '#18a058']
+function groupColor(g: GroupRow) {
+  return GROUP_COLORS[g.id % GROUP_COLORS.length]
+}
 /** 表格外层容器（Sortable 挂载到其内部 tbody 上） */
 const tableWrapEl = ref<HTMLElement | null>(null)
 let tableSortable: Sortable | null = null
@@ -66,19 +92,24 @@ let unlisteners: (() => void)[] = []
 const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const FLASH_MS = 900
 
-const ACTIVE_STATES = new Set(['即将触发', '当前已触发', '已触发，接近时效边界'])
-
-function isActive(s: SignalRow) {
-  return ACTIVE_STATES.has(s.state)
+/** 信号状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
+function signalStateRank(state: string): number {
+  if (state === '即将触发') return 0
+  if (state === '当前已触发') return 1
+  if (state === '已触发，接近时效边界') return 2
+  if (state === '已过时，仅复盘') return 3
+  return 4
 }
 
+/** 每个品种取优先级最高的形态：先按状态（即将触发 > 已触发 > 接近时效），同状态按评分从高到低 */
 function bestSignal(signals: SignalRow[]): SignalRow | null {
   if (!signals.length) return null
   return [...signals].sort((a, b) => {
-    const aa = isActive(a) ? 1 : 0
-    const ba = isActive(b) ? 1 : 0
-    if (aa !== ba) return ba - aa
-    return b.score - a.score
+    const rankA = signalStateRank(a.state)
+    const rankB = signalStateRank(b.state)
+    if (rankA !== rankB) return rankA - rankB
+    if (b.score !== a.score) return b.score - a.score
+    return a.id - b.id
   })[0]
 }
 
@@ -254,7 +285,33 @@ async function persistTableOrder() {
   const codes = [...tbody.querySelectorAll<HTMLElement>('tr[data-code]')]
     .map((tr) => tr.dataset.code)
     .filter((c): c is string => c != null)
-  if (!codes.length || codes.length !== rows.value.length) return
+  const currentCodes = rows.value.map((r) => r.symbol.code)
+  // 关键：Sortable 已直接移动了 DOM，Vue 并不知道。先把 tbody 恢复成 Vue 当前
+  // 渲染的顺序，随后 Vue 再基于新的数据顺序自己完成重排；否则 Vue 的 keyed diff
+  // 会拿“被手动移动过的 DOM”对比，产生重复/丢失的行。顺带做防御性去重。
+  const trsByCode = new Map<string, HTMLElement>()
+  for (const tr of [...tbody.querySelectorAll<HTMLElement>('tr[data-code]')]) {
+    const code = tr.dataset.code ?? ''
+    if (trsByCode.has(code)) {
+      tr.remove()
+    } else {
+      trsByCode.set(code, tr)
+    }
+  }
+  for (const code of currentCodes) {
+    const tr = trsByCode.get(code)
+    if (tr) tbody.appendChild(tr)
+  }
+  // 防御：codes 必须是当前行的完整排列（无重复、无缺失），否则回滚为服务端顺序
+  if (!codes.length || codes.length !== rows.value.length) {
+    await loadAll()
+    return
+  }
+  const uniqueCodes = new Set(codes)
+  if (!currentCodes.every((c) => uniqueCodes.has(c))) {
+    await loadAll()
+    return
+  }
   // 让 Vue 数据与 DOM 新顺序保持一致
   const byCode = new Map(rows.value.map((r) => [r.symbol.code, r]))
   const next = codes.map((c) => byCode.get(c)).filter((r): r is WatchRow => r != null)
@@ -379,16 +436,25 @@ function openManageGroup() {
     groupsStore.groups.map((g) => [g.id, g.name]),
   ) as Record<number, string>
   groupModal.value = 'manage'
+  // 等弹窗内容渲染完成后，再给分组列表挂载拖拽排序
+  nextTick(() => setupGroupSortable())
 }
 
 async function doRenameGroup(g: GroupRow) {
   const name = (groupNameDrafts.value[g.id] ?? '').trim()
-  if (!name || name === g.name) return
+  // 以 store 里的最新名称为准，避免失焦保存与点击保存图标重复提交
+  const current = groupsStore.groups.find((x) => x.id === g.id)?.name ?? g.name
+  if (!name || name === current) {
+    // 未修改或名称为空：还原为当前名称，避免输入框显示空白
+    groupNameDrafts.value[g.id] = current
+    return
+  }
   try {
     await groupsStore.rename(g.id, name)
     notify.success(`已重命名为「${name}」`)
   } catch (err) {
     notify.error(String(err))
+    groupNameDrafts.value[g.id] = current
   }
 }
 
@@ -405,6 +471,116 @@ async function doDeleteGroup(g: GroupRow) {
     await groupsStore.remove(g.id)
     notify.success(`已删除分组「${g.name}」`)
     await loadAll()
+  } catch (err) {
+    notify.error(String(err))
+  }
+}
+
+/**
+ * Sortable 挂载到管理弹窗的分组列表：拖动手柄重排分组。
+ * 顺序变化后先本地更新（标签页立即跟随），再落库并广播。
+ */
+function setupGroupSortable() {
+  const el = groupListEl.value
+  if (!el) return
+  if (groupSortable?.el === el) return
+  groupSortable?.destroy()
+  groupSortable = Sortable.create(el, {
+    animation: 150,
+    draggable: '.group-manage-row',
+    // 只允许拖动手柄触发拖拽，输入框/按钮不受影响
+    handle: '.group-drag-handle',
+    filter: 'input, button, textarea, select',
+    preventOnFilter: false,
+    forceFallback: true,
+    fallbackClass: 'group-row-fallback',
+    fallbackOnBody: true,
+    ghostClass: 'group-row-ghost',
+    chosenClass: 'group-row-chosen',
+    onStart: () => {
+      groupDragging.value = true
+      insertBeforeKey.value = null
+    },
+    onMove: onGroupMove,
+    onEnd: () => persistGroupOrder(),
+  })
+}
+
+/** 拖拽移动判定：与品种列表/表格同一套「上半插前、下半插后」规则 */
+function onGroupMove(evt: {
+  related: HTMLElement | null
+  relatedRect: { top: number; bottom: number; height: number } | null
+  willInsertAfter?: boolean
+  originalEvent?: Event | null
+}): boolean | 1 | -1 {
+  const related = evt.related as HTMLElement | null
+  const isRow = !!related?.closest?.('.group-manage-row')
+  if (!isRow || !related) {
+    // 目标是列表容器本身（末尾空区域）：按默认逻辑插到末尾
+    const boundary = evt.willInsertAfter ? related?.nextElementSibling : related
+    insertBeforeKey.value =
+      (boundary as HTMLElement | null)?.getAttribute('data-key') ?? null
+    return true
+  }
+  const rect =
+    evt.relatedRect ??
+    (related.getBoundingClientRect() as { top: number; bottom: number; height: number })
+  const mouseY = (evt.originalEvent as MouseEvent | null)?.clientY ?? rect.top + rect.height / 2
+  const after = mouseY > rect.top + rect.height / 2
+  // 插入 related 之后时，边界是 related 的下一行；插入之前时，边界就是 related
+  const boundary = after ? related.nextElementSibling : related
+  insertBeforeKey.value =
+    (boundary as HTMLElement | null)?.getAttribute('data-key') ?? null
+  return after ? 1 : -1
+}
+
+async function persistGroupOrder() {
+  groupDragging.value = false
+  insertBeforeKey.value = null
+  const el = groupListEl.value
+  if (!el) return
+  // 读取拖拽后的 DOM 新顺序：'all' 代表「全部品种」虚拟行，其余为分组 id
+  const order: Array<number | 'all'> = []
+  for (const row of el.querySelectorAll<HTMLElement>('.group-manage-row')) {
+    const key = row.getAttribute('data-key')
+    if (key === 'all') {
+      order.push('all')
+    } else if (key != null && /^\d+$/.test(key)) {
+      order.push(Number(key))
+    }
+  }
+  // 关键：Sortable 已直接移动了 DOM，Vue 并不知道。先把行恢复成 Vue 当前渲染的顺序
+  // （groupTabs 即 store 顺序），随后 Vue 再基于新的 store 顺序自己完成重排；
+  // 否则 Vue 的 keyed diff 会拿“被手动移动过的 DOM”对比，产生重复/丢失的行。
+  // 顺带做防御性去重，清理历史脏状态。
+  const rowsByKey = new Map<string, HTMLElement>()
+  for (const row of [...el.querySelectorAll<HTMLElement>('.group-manage-row')]) {
+    const key = row.getAttribute('data-key') ?? ''
+    if (rowsByKey.has(key)) {
+      row.remove()
+    } else {
+      rowsByKey.set(key, row)
+    }
+  }
+  const expectedKeys = groupTabs.value.map((t) =>
+    t.kind === 'all' ? 'all' : String(t.g.id),
+  )
+  for (const key of expectedKeys) {
+    const row = rowsByKey.get(key)
+    if (row) el.appendChild(row)
+  }
+  for (const row of [...el.querySelectorAll<HTMLElement>('.group-manage-row')]) {
+    if (!expectedKeys.includes(row.getAttribute('data-key') ?? '')) {
+      row.remove()
+    }
+  }
+  if (order.length !== groupsStore.groups.length + 1) return
+  const allPosition = order.indexOf('all')
+  if (allPosition < 0) return
+  const ids = order.filter((x): x is number => x !== 'all')
+  if (!ids.length) return
+  try {
+    await groupsStore.reorder(ids, allPosition)
   } catch (err) {
     notify.error(String(err))
   }
@@ -696,6 +872,13 @@ watch(
     setupTableSortable()
   },
 )
+// 关闭管理分组弹窗时销毁拖拽实例，避免占用已卸载的 DOM
+watch(groupModal, (v) => {
+  if (v !== 'manage') {
+    groupSortable?.destroy()
+    groupSortable = null
+  }
+})
 onActivated(() => setupTableSortable())
 
 onBeforeUnmount(() => {
@@ -732,10 +915,10 @@ onBeforeUnmount(() => {
         class="group-tabs"
         @update:value="onSelectGroup"
       >
-        <n-tab name="all">全部品种</n-tab>
-        <n-tab v-for="g in groupsStore.groups" :key="g.id" :name="String(g.id)">
-          {{ g.name }}
-        </n-tab>
+        <template v-for="t in groupTabs" :key="t.kind === 'all' ? 'all' : t.g.id">
+          <n-tab v-if="t.kind === 'all'" name="all">全部品种</n-tab>
+          <n-tab v-else :name="String(t.g.id)">{{ t.g.name }}</n-tab>
+        </template>
       </n-tabs>
       <n-space align="center">
         <n-button size="small" @click="openCreateGroup">新建分组</n-button>
@@ -798,19 +981,96 @@ onBeforeUnmount(() => {
       :show="groupModal === 'manage'"
       preset="card"
       title="管理分组"
-      style="width: 440px"
+      style="width: 480px"
       @update:show="(v: boolean) => { if (!v) groupModal = null }"
     >
-      <n-space vertical size="small">
-        <div v-for="g in groupsStore.groups" :key="g.id" class="group-manage-row">
-          <n-input v-model:value="groupNameDrafts[g.id]" size="small" style="flex: 1" />
-          <n-button size="small" @click="doRenameGroup(g)">保存</n-button>
-          <n-button size="small" type="error" ghost @click="doDeleteGroup(g)">删除</n-button>
+      <div class="group-manage-wrap">
+        <div class="group-manage-hint">
+          <n-icon :component="GripVertical" />
+          <n-text depth="3" style="font-size: 12px">
+            拖动手柄调整分组顺序；输入名称后回车或点击保存
+          </n-text>
         </div>
-        <n-text v-if="!groupsStore.groups.length" depth="3" style="text-align: center">
-          暂无分组
-        </n-text>
-      </n-space>
+        <div
+          ref="groupListEl"
+          class="group-manage-list"
+          :class="{ 'insert-at-end': groupDragging && insertBeforeKey === null }"
+        >
+          <template v-for="t in groupTabs" :key="t.kind === 'all' ? 'all' : t.g.id">
+            <div
+              v-if="t.kind === 'all'"
+              class="group-manage-row group-manage-row-default"
+              :data-key="'all'"
+              :class="{ 'insert-before': groupDragging && insertBeforeKey === 'all' }"
+            >
+              <span class="group-drag-handle" title="拖动「全部品种」调整顺序">
+                <n-icon :component="GripVertical" />
+              </span>
+              <span class="group-avatar group-avatar-all">全</span>
+              <span class="group-name-static">全部品种</span>
+              <span class="group-default-badge">
+                <n-icon :component="Lock" />
+                默认分组
+              </span>
+            </div>
+            <div
+              v-else
+              class="group-manage-row"
+              :data-key="String(t.g.id)"
+              :class="{ 'insert-before': groupDragging && insertBeforeKey === String(t.g.id) }"
+            >
+              <span class="group-drag-handle" :title="`拖动「${t.g.name}」调整顺序`">
+                <n-icon :component="GripVertical" />
+              </span>
+              <span class="group-avatar" :style="{ background: groupColor(t.g) }">
+                {{ t.g.name.charAt(0) }}
+              </span>
+              <n-input
+                v-model:value="groupNameDrafts[t.g.id]"
+                size="small"
+                class="group-name-input"
+                :placeholder="t.g.name"
+                @keyup.enter="doRenameGroup(t.g)"
+                @blur="doRenameGroup(t.g)"
+              />
+              <n-button
+                size="small"
+                text
+                type="primary"
+                class="group-save-btn"
+                title="保存名称"
+                @click="doRenameGroup(t.g)"
+              >
+                <template #icon>
+                  <n-icon :component="DeviceFloppy" />
+                </template>
+              </n-button>
+              <n-button
+                size="small"
+                text
+                type="error"
+                class="group-del-btn"
+                title="删除分组"
+                @click="doDeleteGroup(t.g)"
+              >
+                <template #icon>
+                  <n-icon :component="Trash" />
+                </template>
+              </n-button>
+            </div>
+          </template>
+        </div>
+        <div v-if="!groupsStore.groups.length" class="group-manage-empty">
+          <n-text depth="3">暂无分组，先在上方新建一个吧</n-text>
+        </div>
+      </div>
+      <template #footer>
+        <n-space justify="end">
+          <n-button size="small" type="primary" ghost @click="groupModal = null">
+            完成
+          </n-button>
+        </n-space>
+      </template>
     </n-modal>
   </div>
 </template>
@@ -838,10 +1098,136 @@ onBeforeUnmount(() => {
   flex: 1;
   min-width: 0;
 }
+.group-manage-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.group-manage-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #94a3b8;
+}
+.group-manage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 2px;
+}
 .group-manage-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #eef1f5;
+  border-radius: 8px;
+  background: #fff;
+  user-select: none;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.group-manage-row:hover {
+  background: #f8fafc;
+  border-color: #dbe4ee;
+}
+.group-manage-row :deep(.n-input) {
+  user-select: text;
+}
+.group-drag-handle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border-radius: 6px;
+  color: #94a3b8;
+  cursor: grab;
+}
+.group-drag-handle:hover {
+  color: #1677ff;
+  background: #eaf2ff;
+}
+.group-drag-handle:active {
+  cursor: grabbing;
+}
+.group-avatar {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+}
+.group-avatar-all {
+  background: linear-gradient(135deg, #1677ff, #69b1ff);
+}
+.group-name-input {
+  flex: 1;
+  min-width: 0;
+}
+.group-name-static {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2329;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.group-default-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #64748b;
+  background: #f1f5f9;
+}
+.group-manage-row-default {
+  background: #f8faff;
+  border-color: #dbe9ff;
+}
+.group-save-btn,
+.group-del-btn {
+  flex: none;
+}
+.group-manage-empty {
+  display: flex;
+  justify-content: center;
+  padding: 18px 0;
+}
+/* 拖拽插入线：提示将要插入到该行之前（或列表末尾） */
+.group-manage-row.insert-before {
+  box-shadow: inset 0 2px 0 #1677ff;
+}
+.group-manage-list.insert-at-end::after {
+  content: '';
+  display: block;
+  height: 2px;
+  margin: 0 8px;
+  border-radius: 1px;
+  background: #1677ff;
+}
+.group-row-ghost {
+  opacity: 0.45;
+  background: #eaf2ff;
+}
+.group-row-chosen {
+  background: #dbe9ff;
 }
 .watch-table-wrap {
   flex: 1;

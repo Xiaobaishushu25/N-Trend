@@ -157,6 +157,8 @@ pub fn run() {
             commands::list_symbol_groups,
             commands::add_symbol_to_group,
             commands::remove_symbol_from_group,
+            commands::reorder_groups,
+            commands::get_group_all_position,
             commands::reorder_group_symbols,
             commands::reorder_symbols,
             commands::add_symbol,
