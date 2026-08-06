@@ -1,4 +1,5 @@
 ﻿<script setup lang="ts">
+// reactive 仅被下方被注释的调试面板使用；如取消注释调试面板，需把 reactive 加回 import
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin, NTooltip } from 'naive-ui'
 import {
@@ -102,7 +103,10 @@ class GapPrimitive implements ISeriesPrimitive<Time> {
 }
 
 /** 同一品种/级别内的缩放/平移状态：切换品种或级别时沿用同样的横向视图，避免跳变 */
-let lastView: { from: number; to: number } | null = null
+let lastView: { from: number; to: number; totalAtCapture: number } | null = null
+/** 最近一次写入图表的数据量：captureView 用它标记视图取自多长的数据，
+ *  用于识别“数据不足被撑满”的短数据瞬态（详见 dropStaleView） */
+let lastDataCount = 0
 
 let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<'Candlestick'> | null = null
@@ -113,6 +117,58 @@ let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
+
+// ============================================================================
+// 【临时调试面板 — 已注释保留，供后续复测“进入K线图被放大成两根巨大K线”问题】
+// 问题现象：从列表/表格页点进K线图时，偶尔只显示最后两三根巨大的K线，
+//           退出重进才恢复正常。
+// 问题原因（已通过真实运行记录定位）：
+//   1) 挂载时全局K线数据里往往还留着上一品种的数据（与当前请求品种不匹配），
+//      首次渲染被跳过，图表处于“空图表”状态；
+//   2) 挂载后的“回退校准帧”在空图表上执行了默认视图设置（setVisibleLogicalRange），
+//      图表库会把“每根K线的像素间距”记为 width/跨度；若此时数据只有寥寥几根
+//      （或视图跨度极小），间距会被污染成 300~400px；
+//   3) 真正数据到达后，图表直接按被污染的间距渲染，只剩最后两三根巨大K线；
+//   4) 该极小视图又被保存为“用户缩放状态”，此后每次数据刷新都沿用，形成卡死。
+// 修复方法：
+//   1) 空图表（series 数据为空）时禁止任何视图设置，杜绝间距被污染；
+//   2) 保存缩放状态时记录当时的数据量，若“数据不足140根、视图被全部数据撑满、
+//      且现在数据明显变多”，判定为短数据瞬态，丢弃该状态回到默认视图。
+// 取消注释即可再次显示调试面板（需同时把上方 import 中的 reactive 加回）。
+// ============================================================================
+// const dbg = reactive({
+//   visible: true,
+//   renderCount: 0,
+//   mountCount: 0,
+//   unmountCount: 0,
+//   rowsLen: 0,
+//   candleLen: 0,
+//   inChartBefore: -1,
+//   lastView: '',
+//   logical: '',
+//   span: 0,
+//   barSpacing: 0,
+//   isSwitch: false,
+//   width: 0,
+//   history: [] as string[],
+// })
+// function updateDbg() {
+//   const ts = chart?.timeScale()
+//   const logical = ts?.getVisibleLogicalRange() ?? null
+//   dbg.renderCount += 1
+//   dbg.rowsLen = props.rows.length
+//   dbg.candleLen = buildCandles().length
+//   dbg.lastView = lastView ? `${lastView.from.toFixed(2)}~${lastView.to.toFixed(2)}` : 'null'
+//   dbg.logical = logical ? `${logical.from.toFixed(2)}~${logical.to.toFixed(2)}` : 'null'
+//   dbg.span = logical ? Number((logical.to - logical.from).toFixed(2)) : 0
+//   dbg.barSpacing = ts ? Number(ts.options().barSpacing.toFixed(2)) : 0
+//   dbg.width = container.value?.clientWidth ?? 0
+//   dbg.history.push(
+//     `#${dbg.renderCount} 行${dbg.rowsLen} 切换${dbg.isSwitch ? 'Y' : 'N'} ` +
+//       `图内${dbg.inChartBefore} 捕获${dbg.lastView} 视图${dbg.logical} 跨度${dbg.span} 间距${dbg.barSpacing}`,
+//   )
+//   if (dbg.history.length > 8) dbg.history.splice(0, dbg.history.length - 8)
+// }
 
 /** 进入图表时默认展示的K线根数（从最新一根往前数）。根数越少单根K线越宽；
  *  想再宽就调小，想多看历史就调大。先写死便于手工调整，后续由配置传入 */
@@ -260,24 +316,31 @@ function syncPatternLines() {
 
 function applyDefaultView() {
   if (!chart) return
+  // 空图表（数据尚未写入）上设置视图会污染时间轴的间距状态，等数据就位后再校准
+  if (!candleSeries || candleSeries.data().length === 0) return
   const total = props.rows.length
   if (total === 0) return
   const visible = Math.min(display_k_num, total)
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
+  // dbg.history.push(`== 默认视图: 行${total} 请求${from.toFixed(2)}~${to.toFixed(2)}`)
   chart.timeScale().setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing()
+  clampMinBarSpacing({ from, to })
 }
 
-/** 兜底：若当前K线间距小于 MIN_BAR_SPACING，收窄可见范围直到间距达标（右边缘不动） */
-function clampMinBarSpacing() {
+/** 兜底：若K线间距小于 MIN_BAR_SPACING，收窄可见范围直到间距达标（右边缘不动）。
+ *  pendingRange：刚调用 setVisibleLogicalRange 请求、尚未生效的范围。
+ *  必须基于“待应用的范围”而不是 setVisibleLogicalRange 之后立刻读取的旧范围，
+ *  否则旧范围（无右侧留白）会覆盖掉刚请求的带留白范围，导致右侧留白失效。 */
+function clampMinBarSpacing(pendingRange?: { from: number; to: number }) {
   if (!chart || !container.value) return
+  if (!candleSeries || candleSeries.data().length === 0) return
   const width = container.value.clientWidth
   const total = props.rows.length
   if (!width || total <= 0) return
   const ts = chart.timeScale()
-  const logical = ts.getVisibleLogicalRange()
+  const logical = pendingRange ?? ts.getVisibleLogicalRange()
   if (!logical || ts.options().barSpacing >= MIN_BAR_SPACING) return
   const maxSpan = width / MIN_BAR_SPACING
   const span = logical.to - logical.from
@@ -317,13 +380,36 @@ function captureView() {
   if (!chart || !props.rows.length) return
   const logical = chart.timeScale().getVisibleLogicalRange()
   if (!logical) return
-  lastView = { from: logical.from, to: logical.to }
+  lastView = { from: logical.from, to: logical.to, totalAtCapture: lastDataCount }
+}
+
+/** 丢弃短数据瞬态留下的缩放状态：
+ *  保存视图时数据量不足默认显示根数、且视图覆盖了当时全部K线（被“撑满”），
+ *  而现在数据明显变多——说明那是临时短数据（品种切换中间态/初始数据很少等）。
+ *  若继续沿用该跨度，图表会卡在“几根巨大K线”的放大状态。此时回到默认视图。 */
+function dropStaleView(total: number) {
+  if (!lastView) return
+  const span = lastView.to - lastView.from
+  const capturedTotal = lastView.totalAtCapture
+  if (
+    capturedTotal > 0 &&
+    capturedTotal < display_k_num &&
+    span >= capturedTotal - 0.5 &&
+    total > capturedTotal
+  ) {
+    lastView = null
+  }
 }
 
 /** 把全局视图套用到当前数据：优先保持原窗口位置（含右侧空白），数据不足时贴右端显示同样数量的K线 */
 function restoreView() {
   if (!chart) return
+  if (!candleSeries || candleSeries.data().length === 0) return
   const priceApi = chart.priceScale('right')
+  // dbg.history.push(
+  //   `== 恢复视图: 行${props.rows.length} 保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'}`,
+  // )
+  dropStaleView(props.rows.length)
   if (!lastView) {
     priceApi.setAutoScale(true)
     applyDefaultView()
@@ -344,7 +430,7 @@ function restoreView() {
     }
   }
   chart.timeScale().setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing()
+  clampMinBarSpacing({ from, to })
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
   priceApi.setAutoScale(true)
 }
@@ -352,13 +438,15 @@ function restoreView() {
 /** 切换品种/周期时：保留当前缩放级别（可见K线根数），但视图贴到新数据最右端并留出右侧空白 */
 function applySwitchView(span: number) {
   if (!chart) return
+  if (!candleSeries || candleSeries.data().length === 0) return
   const total = props.rows.length
   if (total === 0) return
   const visible = Math.min(span, total)
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - span)
+  // dbg.history.push(`== 切换视图: 行${total} 跨度请求${span} 请求${from.toFixed(2)}~${to.toFixed(2)}`)
   chart.timeScale().setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing()
+  clampMinBarSpacing({ from, to })
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
   chart.priceScale('right').setAutoScale(true)
 }
@@ -449,16 +537,26 @@ function rowsMatchRequest(): boolean {
  *  数据与请求的品种/周期不一致（切换中间态）时跳过视图处理，等新数据到达再切换 */
 function renderData() {
   if (!chart || !candleSeries || !volumeSeries) return
-  if (!rowsMatchRequest()) return
+  if (!rowsMatchRequest()) {
+    // dbg.history.push(
+    //   `== 跳过渲染: 行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} 请求${props.symbol}/${props.timeframe}`,
+    // )
+    return
+  }
   const isSwitch = prevSymbol !== props.symbol || prevTimeframe !== props.timeframe
+  // dbg.isSwitch = isSwitch
   prevSymbol = props.symbol
   prevTimeframe = props.timeframe
+  // dbg.inChartBefore = candleSeries.data().length
   captureView()
   updatePriceExtent()
   candleSeries.setData(buildCandles())
   volumeSeries.setData(buildVolumes())
+  lastDataCount = props.rows.length
   syncGaps()
+  // updateDbg()
   if (isSwitch) {
+    dropStaleView(props.rows.length)
     const span = lastView
       ? Math.min(lastView.to - lastView.from, props.rows.length)
       : Math.min(display_k_num, props.rows.length)
@@ -532,7 +630,16 @@ function handleWheel(e: WheelEvent) {
 onMounted(() => {
   if (!container.value) return
   // 每次进入图表页先回到默认视图（最新 display_k_num 根）；页内切换品种/级别沿用缩放
+  // dbg.mountCount += 1
+  // dbg.history.push(
+  //   `== 挂载#${dbg.mountCount} 上次保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'} ` +
+  //     `行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} ` +
+  //     `请求${props.symbol}/${props.timeframe} 匹配${rowsMatchRequest() ? 'Y' : 'N'} 旧图${chart ? '有' : '无'}`,
+  // )
   lastView = null
+  lastDataCount = 0
+  prevSymbol = null
+  prevTimeframe = null
   chart = createChart(container.value, {
     layout: {
       background: { type: ColorType.Solid, color: '#ffffff' },
@@ -607,13 +714,26 @@ onMounted(() => {
   // 兜底：确保图表拿到容器实际尺寸
   requestAnimationFrame(() => {
     if (container.value && chart) {
+      // dbg.history.push(
+      //   `== 回退帧: 宽${container.value.clientWidth} 行${props.rows.length} 保存${lastView ? '有' : '无'}`,
+      // )
       chart.applyOptions({
         width: container.value.clientWidth,
         height: container.value.clientHeight,
       })
       applyPaneHeights()
       // 尺寸定稿后再校准一次默认视图：防止初始化期间宽度变化把视图重置成全量
-      if (!lastView) applyDefaultView()
+      // 图表还没有数据时不能设置视图：空图表上应用视图会污染时间轴的间距状态，
+      // 等数据到达后 renderData 会用正确的数据长度校准视图
+      if (!lastView && candleSeries && candleSeries.data().length > 0) applyDefaultView()
+      // requestAnimationFrame(() => {
+      //   if (!chart) return
+      //   const lr = chart.timeScale().getVisibleLogicalRange()
+      //   dbg.history.push(
+      //     `== 终态: 视图${lr ? lr.from.toFixed(2) + '~' + lr.to.toFixed(2) : 'null'} ` +
+      //       `间距${Number(chart.timeScale().options().barSpacing.toFixed(2))}`,
+      //   )
+      // })
     }
   })
 })
@@ -637,6 +757,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  // dbg.unmountCount += 1
+  // dbg.history.push(`== 卸载#${dbg.unmountCount} 行${props.rows.length} 保存${lastView ? '有' : '无'}`)
   container.value?.removeEventListener('wheel', handleWheel)
   resizeObserver?.disconnect()
   if (gapPrimitive && candleSeries) {
@@ -659,6 +781,13 @@ onBeforeUnmount(() => {
   <div class="kline-wrap">
     <div ref="legend" class="legend">N趋势 K线</div>
     <div ref="container" class="kline-canvas"></div>
+    <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
+    <!-- <div v-if="dbg.visible" class="debug-info">
+      [挂载{{ dbg.mountCount }}] 渲染{{ dbg.renderCount }}
+      行{{ dbg.rowsLen }} 蜡烛{{ dbg.candleLen }} 图内{{ dbg.inChartBefore }} 视图{{ dbg.logical }} 跨度{{ dbg.span }}
+      间距{{ dbg.barSpacing }} 保存{{ dbg.lastView }} 切换{{ dbg.isSwitch ? 'Y' : 'N' }} 宽{{ dbg.width }}
+      <template v-for="(h, i) in dbg.history" :key="i">{{ h }}<br /></template>
+    </div> -->
     <n-spin v-if="loading" class="spin-mask" />
     <div class="help-hint">
       <n-tooltip trigger="hover" placement="bottom-end">
@@ -732,6 +861,23 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
 }
+/* 临时调试面板样式（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） */
+/* .debug-info {
+  position: absolute;
+  left: 8px;
+  bottom: 30px;
+  z-index: 9;
+  max-width: calc(100% - 16px);
+  padding: 4px 8px;
+  background: rgba(30, 30, 30, 0.85);
+  color: #ffd75e;
+  font-size: 11px;
+  line-height: 1.4;
+  border-radius: 6px;
+  white-space: pre-wrap;
+  pointer-events: none;
+  font-family: Consolas, monospace;
+} */
 </style>
 
 
