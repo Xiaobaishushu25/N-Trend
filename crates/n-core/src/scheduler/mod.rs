@@ -68,11 +68,13 @@ pub fn next_action(
 /// 国内期货常见交易窗口（近似）：
 /// - 日盘 09:00-10:15 / 10:30-11:30 / 13:30-15:00
 /// - 夜盘 21:00-23:30（周五夜盘顺延至周六 02:30）
+/// 右边界含收盘那一分钟（15:00/11:30/10:15/23:30/02:30），
+/// 保证收盘最后一根 5m K线能被定时刷新拉到。
 pub fn is_trading_time(now: &DateTime<Local>) -> bool {
     let weekday = now.weekday().num_days_from_monday(); // 0=周一 .. 6=周日
     let t = now.time();
     let fri_night = weekday == 4 && t >= NaiveTime::from_hms_opt(21, 0, 0).unwrap();
-    let early_sat = weekday == 5 && t <= NaiveTime::from_hms_opt(2, 30, 0).unwrap();
+    let early_sat = weekday == 5 && t < NaiveTime::from_hms_opt(2, 31, 0).unwrap();
     if fri_night || early_sat {
         return true;
     }
@@ -84,14 +86,16 @@ pub fn is_trading_time(now: &DateTime<Local>) -> bool {
 
 fn in_day_window(t: NaiveTime) -> bool {
     let open = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-    (t >= open(9, 0) && t < open(10, 15))
-        || (t >= open(10, 30) && t < open(11, 30))
-        || (t >= open(13, 30) && t < open(15, 0))
+    // 含收盘那一分钟：10:15 / 11:30 / 15:00
+    (t >= open(9, 0) && t < open(10, 16))
+        || (t >= open(10, 30) && t < open(11, 31))
+        || (t >= open(13, 30) && t < open(15, 1))
 }
 
 fn in_night_window(t: NaiveTime) -> bool {
     let open = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-    t >= open(21, 0) && t < open(23, 30)
+    // 含收盘那一分钟 23:30
+    t >= open(21, 0) && t < open(23, 31)
 }
 
 #[cfg(test)]
@@ -123,6 +127,37 @@ mod tests {
         assert!(!is_trading_time(&dt(2026, 8, 8, 3, 0))); // 周六凌晨休市
         assert!(!is_trading_time(&dt(2026, 8, 8, 10, 0))); // 周六白天
         assert!(!is_trading_time(&dt(2026, 8, 9, 21, 0))); // 周日无夜盘
+    }
+
+    #[test]
+    fn trading_windows_include_closing_minute() {
+        // 收盘那一分钟仍算交易时间，保证最后一根K线会被定时刷新拉到
+        assert!(is_trading_time(&dt(2026, 8, 3, 10, 15))); // 早盘收盘
+        assert!(is_trading_time(&dt(2026, 8, 3, 11, 30))); // 上午收盘
+        assert!(is_trading_time(&dt(2026, 8, 3, 15, 0))); // 下午收盘
+        assert!(is_trading_time(&dt(2026, 8, 3, 23, 30))); // 夜盘收盘
+        assert!(is_trading_time(&dt(2026, 8, 8, 2, 30))); // 周五夜盘收尾（周六凌晨）
+        // 收盘后下一分钟起不再是交易时间
+        assert!(!is_trading_time(&dt(2026, 8, 3, 10, 16)));
+        assert!(!is_trading_time(&dt(2026, 8, 3, 11, 31)));
+        assert!(!is_trading_time(&dt(2026, 8, 3, 15, 1)));
+        assert!(!is_trading_time(&dt(2026, 8, 3, 23, 31)));
+        assert!(!is_trading_time(&dt(2026, 8, 8, 2, 31)));
+    }
+
+    #[test]
+    fn refresh_fires_at_session_close() {
+        let cfg = SchedulerConfig::default();
+        // 14:55 已刷新过，15:00 收盘那一分钟仍触发刷新（补最后一根K线）+ 扫描
+        assert_eq!(
+            next_action(
+                dt(2026, 8, 3, 15, 0),
+                &cfg,
+                Some(dt(2026, 8, 3, 14, 55)),
+                Some(dt(2026, 8, 3, 14, 45)),
+            ),
+            SchedulerAction::RefreshAndScan
+        );
     }
 
     #[test]
