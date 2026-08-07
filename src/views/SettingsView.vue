@@ -16,18 +16,15 @@ import {
   useMessage,
 } from 'naive-ui'
 import {
-  Activity,
-  Clock,
+  Bell,
   Database,
-  FileText,
   Help,
-  Mail,
-  Palette,
+  Ruler,
   Settings as SettingsIcon,
 } from '@vicons/tabler'
 import { api } from '../services/api'
 import { useSettingsStore } from '../stores/settings'
-import type { Config } from '../types'
+import type { Config, SymbolRow } from '../types'
 
 const settingsStore = useSettingsStore()
 const message = useMessage()
@@ -62,10 +59,52 @@ const Tip = defineComponent({
 
 const form = ref<Config>(cloneConfig(settingsStore.settings))
 const saving = ref(false)
+const symbolRows = ref<SymbolRow[]>([])
+const symbolFilter = ref('')
 /** 表单与当前已保存配置是否不同（有改动才允许保存） */
 const dirty = computed(
   () => JSON.stringify(form.value) !== JSON.stringify(settingsStore.settings),
 )
+const filteredSymbols = computed(() => {
+  const kw = symbolFilter.value.trim().toUpperCase()
+  if (!kw) return symbolRows.value
+  return symbolRows.value.filter(
+    (r) =>
+      r.code.toUpperCase().includes(kw) ||
+      r.name.toUpperCase().includes(kw) ||
+      r.variety.toUpperCase().includes(kw),
+  )
+})
+
+async function loadSymbols() {
+  try {
+    symbolRows.value = await api.getSymbols()
+  } catch {
+    // 浏览器预览环境下无后端命令，忽略
+  }
+}
+
+function onTickChange(row: SymbolRow, value: number | null) {
+  const tick = value ?? 0
+  row.tick_size = tick
+  api.setSymbolTick(row.code, tick).catch((e) => message.error(String(e)))
+}
+
+/** 按小数位精度取步进（0.02→0.01，1/50→1，0.005→0.001），避免步进随当前值漂移 */
+function tickStep(tick: number): number {
+  if (tick <= 0) return 1
+  const text = String(tick)
+  const dot = text.indexOf('.')
+  if (dot < 0) return 1
+  return Math.pow(10, -(text.length - dot - 1))
+}
+
+/** 品种列只在名称里没体现品种名时才显示，避免“甲醇连续 + 甲醇”重复 */
+function showVariety(row: SymbolRow): boolean {
+  const v = row.variety.trim()
+  if (!v) return false
+  return row.name !== v && !row.name.includes(v)
+}
 
 const logLevels = [
   { label: 'trace', value: 'trace' },
@@ -132,6 +171,7 @@ onMounted(async () => {
   } catch {
     // 浏览器预览环境下无后端命令，保持默认值
   }
+  await loadSymbols()
   form.value = cloneConfig(settingsStore.settings)
 })
 </script>
@@ -157,17 +197,60 @@ onMounted(async () => {
               <n-switch v-model:value="form.app_config.auto_start_scheduler" />
             </div>
           </div>
+
+          <label class="section-title">日志</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                日志级别
+                <Tip text="修改后重启应用生效；RUST_LOG 环境变量仍可整体覆盖。" />
+              </div>
+              <n-select v-model:value="form.log.level" :options="logLevels" style="width: 200px" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                日志存储位置
+                <Tip text="点击查看应用日志文件所在目录。" />
+              </div>
+              <n-button size="small" @click="openLogDirectory">打开日志目录</n-button>
+            </div>
+          </div>
         </div>
       </n-tab-pane>
 
-      <n-tab-pane name="ui">
+      <n-tab-pane name="notify">
         <template #tab>
           <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Palette" /></span>
-            <span>界面</span>
+            <span class="tab-icon"><n-icon :component="Bell" /></span>
+            <span>通知</span>
           </div>
         </template>
         <div class="tab-body">
+          <label class="section-title">通知</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                局内新形态通知
+                <Tip text="扫描发现新的“即将触发”形态时，在应用内右下角弹出信号卡片通知。" />
+              </div>
+              <n-switch v-model:value="form.notify.in_app_new_pattern" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                局内触发价通知
+                <Tip text="实时行情轮询发现最新价已触及形态入场价时弹出通知（做空为跌破入场价，做多为突破入场价）；通知不自动消失，需手动关闭。" />
+              </div>
+              <n-switch v-model:value="form.notify.in_app_entry_trigger" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                系统触发价通知
+                <Tip text="入场价提醒同时发送系统级通知，需要操作系统通知权限。" />
+              </div>
+              <n-switch v-model:value="form.notify.system_entry_trigger" />
+            </div>
+          </div>
+
           <label class="section-title">界面</label>
           <div class="setting-card">
             <div class="setting-card-row">
@@ -207,189 +290,7 @@ onMounted(async () => {
               />
             </div>
           </div>
-        </div>
-      </n-tab-pane>
 
-      <n-tab-pane name="scheduler">
-        <template #tab>
-          <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Clock" /></span>
-            <span>定时任务</span>
-          </div>
-        </template>
-        <div class="tab-body">
-          <label class="section-title">定时任务</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                数据刷新间隔（秒）
-                <Tip text="定时增量刷新5分钟K线的间隔，按分钟网格对齐，保存后立即生效。" />
-              </div>
-              <n-input-number
-                v-model:value="form.scheduler.refresh_interval_secs"
-                :min="60"
-                :max="3600"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                扫描间隔（秒）
-                <Tip text="定时运行N形态扫描的间隔；扫描结果会持久化并推送通知。" />
-              </div>
-              <n-input-number
-                v-model:value="form.scheduler.scan_interval_secs"
-                :min="300"
-                :max="7200"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                仅交易时段运行
-                <Tip text="仅在国内期货日盘/夜盘窗口内触发刷新与扫描，避免无效请求。" />
-              </div>
-              <n-switch v-model:value="form.scheduler.trading_only" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">定时任务当前状态</div>
-              <n-space align="center" :size="12">
-                <n-text :type="settingsStore.status.running ? 'success' : 'warning'">
-                  {{ settingsStore.status.running ? '运行中' : '已暂停' }}
-                </n-text>
-                <n-button
-                  size="small"
-                  :type="settingsStore.status.running ? 'warning' : 'success'"
-                  @click="toggleRunning"
-                >
-                  {{ settingsStore.status.running ? '暂停' : '启动' }}
-                </n-button>
-              </n-space>
-            </div>
-          </div>
-        </div>
-      </n-tab-pane>
-
-      <n-tab-pane name="fetch">
-        <template #tab>
-          <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Database" /></span>
-            <span>数据抓取</span>
-          </div>
-        </template>
-        <div class="tab-body">
-          <label class="section-title">数据抓取</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                单请求间隔（毫秒）
-                <Tip text="K线抓取的相邻请求最小间隔，越小越快但越容易被接口限流。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.request_interval_ms"
-                :min="100"
-                :max="10000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                每分钟请求上限
-                <Tip text="K线抓取的每分钟请求预算，超过后会在窗口内排队等待。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.minutely_budget"
-                :min="5"
-                :max="300"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                首抓/回补根数
-                <Tip text="新品种建档及历史深度不足时一次性回填的5分钟K线根数。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.backfill_count"
-                :min="50"
-                :max="2000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                增量抓取根数
-                <Tip text="定时刷新时按距上次数据的时间差估算需补的根数，至少抓取该数量；缺口过大时自动按回补上限拉取。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.incremental_count"
-                :min="3"
-                :max="100"
-                style="width: 200px"
-              />
-            </div>
-          </div>
-        </div>
-      </n-tab-pane>
-
-      <n-tab-pane name="quote">
-        <template #tab>
-          <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Activity" /></span>
-            <span>实时行情</span>
-          </div>
-        </template>
-        <div class="tab-body">
-          <label class="section-title">实时行情</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                轮询间隔（毫秒）
-                <Tip text="交易时段内拉取实时现价的间隔，建议3秒或更长；修改后下一轮即生效。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.poll_interval_ms"
-                :min="1000"
-                :max="30000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                单请求间隔（毫秒）
-                <Tip text="实时行情批量接口的相邻请求最小间隔。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.request_interval_ms"
-                :min="100"
-                :max="5000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                每分钟请求上限
-                <Tip text="实时行情请求的每分钟预算，与K线抓取的预算互不影响。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.minutely_budget"
-                :min="10"
-                :max="600"
-                style="width: 200px"
-              />
-            </div>
-          </div>
-        </div>
-      </n-tab-pane>
-
-      <n-tab-pane name="email">
-        <template #tab>
-          <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Mail" /></span>
-            <span>邮件通知</span>
-          </div>
-        </template>
-        <div class="tab-body">
           <label class="section-title">邮件通知</label>
           <div class="setting-card">
             <div class="setting-card-row">
@@ -442,29 +343,199 @@ onMounted(async () => {
         </div>
       </n-tab-pane>
 
-      <n-tab-pane name="log">
+      <n-tab-pane name="data">
         <template #tab>
           <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="FileText" /></span>
-            <span>日志</span>
+            <span class="tab-icon"><n-icon :component="Database" /></span>
+            <span>数据</span>
           </div>
         </template>
         <div class="tab-body">
-          <label class="section-title">日志</label>
+          <label class="section-title">定时任务</label>
           <div class="setting-card">
             <div class="setting-card-row">
               <div class="row-label">
-                日志级别
-                <Tip text="修改后重启应用生效；RUST_LOG 环境变量仍可整体覆盖。" />
+                数据刷新间隔（秒）
+                <Tip text="定时增量刷新5分钟K线的间隔，按分钟网格对齐，保存后立即生效。" />
               </div>
-              <n-select v-model:value="form.log.level" :options="logLevels" style="width: 200px" />
+              <n-input-number
+                v-model:value="form.scheduler.refresh_interval_secs"
+                :min="60"
+                :max="3600"
+                style="width: 200px"
+              />
             </div>
             <div class="setting-card-row">
               <div class="row-label">
-                日志存储位置
-                <Tip text="点击查看应用日志文件所在目录。" />
+                扫描间隔（秒）
+                <Tip text="定时运行N形态扫描的间隔；扫描结果会持久化并推送通知。" />
               </div>
-              <n-button size="small" @click="openLogDirectory">打开日志目录</n-button>
+              <n-input-number
+                v-model:value="form.scheduler.scan_interval_secs"
+                :min="300"
+                :max="7200"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                仅交易时段运行
+                <Tip text="仅在国内期货日盘/夜盘窗口内触发刷新与扫描，避免无效请求。" />
+              </div>
+              <n-switch v-model:value="form.scheduler.trading_only" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">定时任务当前状态</div>
+              <n-space align="center" :size="12">
+                <n-text :type="settingsStore.status.running ? 'success' : 'warning'">
+                  {{ settingsStore.status.running ? '运行中' : '已暂停' }}
+                </n-text>
+                <n-button
+                  size="small"
+                  :type="settingsStore.status.running ? 'warning' : 'success'"
+                  @click="toggleRunning"
+                >
+                  {{ settingsStore.status.running ? '暂停' : '启动' }}
+                </n-button>
+              </n-space>
+            </div>
+          </div>
+
+          <label class="section-title">数据抓取</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                单请求间隔（毫秒）
+                <Tip text="K线抓取的相邻请求最小间隔，越小越快但越容易被接口限流。" />
+              </div>
+              <n-input-number
+                v-model:value="form.fetch.request_interval_ms"
+                :min="100"
+                :max="10000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                每分钟请求上限
+                <Tip text="K线抓取的每分钟请求预算，超过后会在窗口内排队等待。" />
+              </div>
+              <n-input-number
+                v-model:value="form.fetch.minutely_budget"
+                :min="5"
+                :max="300"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                首抓/回补根数
+                <Tip text="新品种建档及历史深度不足时一次性回填的5分钟K线根数。" />
+              </div>
+              <n-input-number
+                v-model:value="form.fetch.backfill_count"
+                :min="50"
+                :max="2000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                增量抓取根数
+                <Tip text="定时刷新时按距上次数据的时间差估算需补的根数，至少抓取该数量；缺口过大时自动按回补上限拉取。" />
+              </div>
+              <n-input-number
+                v-model:value="form.fetch.incremental_count"
+                :min="3"
+                :max="100"
+                style="width: 200px"
+              />
+            </div>
+          </div>
+
+          <label class="section-title">实时行情</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                轮询间隔（毫秒）
+                <Tip text="交易时段内拉取实时现价的间隔，建议3秒或更长；修改后下一轮即生效。" />
+              </div>
+              <n-input-number
+                v-model:value="form.quote.poll_interval_ms"
+                :min="1000"
+                :max="30000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                单请求间隔（毫秒）
+                <Tip text="实时行情批量接口的相邻请求最小间隔。" />
+              </div>
+              <n-input-number
+                v-model:value="form.quote.request_interval_ms"
+                :min="100"
+                :max="5000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                每分钟请求上限
+                <Tip text="实时行情请求的每分钟预算，与K线抓取的预算互不影响。" />
+              </div>
+              <n-input-number
+                v-model:value="form.quote.minutely_budget"
+                :min="10"
+                :max="600"
+                style="width: 200px"
+              />
+            </div>
+          </div>
+        </div>
+      </n-tab-pane>
+
+      <n-tab-pane name="symbols">
+        <template #tab>
+          <div class="custom-tab-label">
+            <span class="tab-icon"><n-icon :component="Ruler" /></span>
+            <span>品种</span>
+          </div>
+        </template>
+        <div class="tab-body">
+          <label class="section-title">品种精度</label>
+          <div class="setting-card symbol-tick-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                品种最小变动价位（tick）
+                <Tip text="入场价会在预警K线极值基础上按此 tick 偏移（做多=高点+tick，做空=低点-tick）。未显式设置的品种使用内置默认表；填 0 恢复默认。" />
+              </div>
+              <n-input
+                v-model:value="symbolFilter"
+                placeholder="搜索代码 / 名称 / 品种"
+                clearable
+                size="small"
+                style="width: 240px"
+              />
+            </div>
+          </div>
+          <div class="symbol-tick-list">
+            <div v-for="row in filteredSymbols" :key="row.code" class="symbol-tick-row">
+              <span class="st-code">{{ row.code }}</span>
+              <span class="st-name">{{ row.name || '—' }}</span>
+              <span v-if="showVariety(row)" class="st-variety">{{ row.variety }}</span>
+              <n-input-number
+                :value="row.tick_size"
+                :min="0"
+                :step="tickStep(row.tick_size)"
+                :precision="3"
+                size="small"
+                style="width: 110px"
+                @update:value="(v: number | null) => onTickChange(row, v)"
+              />
+            </div>
+            <div v-if="!filteredSymbols.length" class="symbol-tick-empty">
+              <n-text depth="3">暂无匹配的品种</n-text>
             </div>
           </div>
         </div>
@@ -497,6 +568,7 @@ onMounted(async () => {
   padding: 10px 12px 8px;
   gap: 8px;
   background: #fff;
+  overflow: hidden;
 }
 
 .setting-tabs {
@@ -519,8 +591,27 @@ onMounted(async () => {
 
 .tab-body {
   height: 100%;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 10px;
+}
+
+/* 内容区统一使用细滚动条，观感更接近原生应用 */
+.tab-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.tab-body::-webkit-scrollbar-thumb {
+  background: #d3dae3;
+  border-radius: 4px;
+}
+
+.tab-body::-webkit-scrollbar-thumb:hover {
+  background: #b9c2cd;
+}
+
+.tab-body::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .section-title {
@@ -529,6 +620,10 @@ onMounted(async () => {
   font-weight: 700;
   color: #1f2329;
   margin: 2px 0 10px 4px;
+}
+
+.tab-body .section-title:not(:first-child) {
+  margin-top: 20px;
 }
 
 .setting-card {
@@ -563,6 +658,63 @@ onMounted(async () => {
 .help-icon {
   color: #94a3b8;
   cursor: help;
+}
+
+.symbol-tick-card {
+  margin-bottom: 10px;
+}
+
+.symbol-tick-list {
+  border: 1px solid #eef1f5;
+  border-radius: 10px;
+  padding: 2px 14px;
+  background: #fff;
+}
+
+.symbol-tick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 0;
+  border-bottom: 1px solid #f1f3f6;
+}
+
+.symbol-tick-row:last-child {
+  border-bottom: none;
+}
+
+.st-code {
+  flex: none;
+  width: 76px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+
+.st-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: #3d4757;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.st-variety {
+  flex: none;
+  width: 76px;
+  font-size: 12px;
+  color: #94a3b8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.symbol-tick-empty {
+  padding: 18px 0;
+  text-align: center;
 }
 
 .footer {

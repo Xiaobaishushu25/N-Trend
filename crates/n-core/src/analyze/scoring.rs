@@ -513,11 +513,23 @@ fn compute_scores(
     )
 }
 
+/// 使用默认 tick（1.0）评估信号（测试与旧路径共用）。
 pub fn evaluate_signal(
     bars: &[Bar],
     atr20: &[Option<f64>],
     p: &NPattern,
     trend: &Trend60,
+) -> SignalCheck {
+    evaluate_signal_with_tick(bars, atr20, p, trend, 1.0)
+}
+
+/// 按品种最小变动价位（tick）评估信号：入场价在预警K线极值基础上偏移一个 tick。
+pub fn evaluate_signal_with_tick(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    trend: &Trend60,
+    tick: f64,
 ) -> SignalCheck {
     let mut sc = SignalCheck::new();
 
@@ -626,8 +638,9 @@ pub fn evaluate_signal(
         let atr_now = atr_at(atr20, p.s2.index);
         let buffer = (0.1 * atr_now).max(1.0);
         sc.entry = match p.dir {
-            Dir::Down => bars[w].low,
-            Dir::Up => bars[w].high,
+            // 入场价 = 预警K线极值再偏移一个 tick：做空=低点-tick，做多=高点+tick
+            Dir::Down => bars[w].low - tick,
+            Dir::Up => bars[w].high + tick,
         };
         sc.stop = match p.dir {
             Dir::Down => p.s2.price + buffer,
@@ -755,8 +768,8 @@ pub fn evaluate_signal(
     let buffer = (0.1 * atr_now).max(1.0);
 
     let (entry, stop, decision_target) = match p.dir {
-        Dir::Down => (bars[w].low, p.s2.price + buffer, p.s1.price),
-        Dir::Up => (bars[w].high, p.s2.price - buffer, p.s1.price),
+        Dir::Down => (bars[w].low - tick, p.s2.price + buffer, p.s1.price),
+        Dir::Up => (bars[w].high + tick, p.s2.price - buffer, p.s1.price),
     };
 
     sc.entry = entry;
@@ -995,15 +1008,19 @@ mod tests {
 
     #[test]
     fn pending_signal_uses_default_trigger_score() {
-        let p = pattern();
+        let mut p = pattern();
+        // 入场价偏移一档后，决策点需高于预警K线极值，这里把价格平移到正常量级
+        p.s0.price = 4500.0;
+        p.s1.price = 4503.0;
+        p.s2.price = 4500.5;
         let trend = trend60();
         let atr = vec![Some(10.0); 5];
         let bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.6, 1.0, 0.5, 0.7),
-            bar(0.7, 0.95, 0.65, 0.9),
-            bar(0.9, 0.9, 0.8, 0.85),
+            bar(4500.0, 4501.0, 4500.0, 4500.5),
+            bar(4500.5, 4501.0, 4500.4, 4500.6),
+            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.7, 4500.95, 4500.65, 4500.9),
+            bar(4500.9, 4500.9, 4500.8, 4500.85),
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend);
@@ -1073,15 +1090,18 @@ mod tests {
 
     #[test]
     fn pending_signal_invalidated_when_b_leg_broken() {
-        let p = pattern();
+        let mut p = pattern();
+        p.s0.price = 4500.0;
+        p.s1.price = 4503.0;
+        p.s2.price = 4500.5;
         let trend = trend60();
         let atr = vec![Some(10.0); 10];
         let bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.6, 1.0, 0.5, 0.7),
-            bar(0.7, 0.9, 0.55, 0.75),
-            bar(0.6, 0.7, 0.4, 0.45),
+            bar(4500.0, 4501.0, 4500.0, 4500.5),
+            bar(4500.5, 4501.0, 4500.4, 4500.6),
+            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.7, 4500.9, 4500.55, 4500.75),
+            bar(4500.6, 4500.7, 4500.4, 4500.45),
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend);
@@ -1093,17 +1113,20 @@ mod tests {
 
     #[test]
     fn pending_signal_goes_stale_after_too_many_bars() {
-        let p = pattern();
+        let mut p = pattern();
+        p.s0.price = 4500.0;
+        p.s1.price = 4503.0;
+        p.s2.price = 4500.5;
         let trend = trend60();
         let atr = vec![Some(10.0); 20];
         let mut bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.6, 1.0, 0.5, 0.7),
-            bar(0.7, 0.9, 0.6, 0.75),
+            bar(4500.0, 4501.0, 4500.0, 4500.5),
+            bar(4500.5, 4501.0, 4500.4, 4500.6),
+            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.7, 4500.9, 4500.6, 4500.75),
         ];
         for _ in 0..14 {
-            bars.push(bar(0.6, 0.8, 0.55, 0.65));
+            bars.push(bar(4500.6, 4500.8, 4500.55, 4500.65));
         }
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend);
@@ -1275,7 +1298,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(2));
         assert_eq!(sc.trigger, Some(3));
-        assert_eq!(sc.entry, 4019.0);
+        assert_eq!(sc.entry, 4018.0);
         assert_eq!(sc.state, "当前已触发");
         assert!(!sc.note.contains("累积确认"));
     }
@@ -1308,7 +1331,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(2));
         assert_eq!(sc.trigger, Some(3));
-        assert_eq!(sc.entry, 4009.0);
+        assert_eq!(sc.entry, 4008.0);
     }
 
     #[test]
@@ -1339,7 +1362,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(2));
         assert_eq!(sc.trigger, Some(3));
-        assert_eq!(sc.entry, 4015.0);
+        assert_eq!(sc.entry, 4016.0);
         assert_eq!(sc.state, "当前已触发");
     }
 
@@ -1371,7 +1394,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(2));
         assert_eq!(sc.trigger, Some(3));
-        assert_eq!(sc.entry, 4013.0);
+        assert_eq!(sc.entry, 4014.0);
     }
 
     #[test]
@@ -1438,7 +1461,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(4));
         assert_eq!(sc.trigger, Some(5));
-        assert_eq!(sc.entry, 14800.0);
+        assert_eq!(sc.entry, 14799.0);
         assert!(!sc.note.contains("累积确认"));
     }
 
@@ -1508,7 +1531,7 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(4));
         assert_eq!(sc.trigger, Some(5));
-        assert_eq!(sc.entry, 14870.0);
+        assert_eq!(sc.entry, 14871.0);
     }
 
     #[test]
@@ -1574,5 +1597,37 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, None);
         assert_eq!(sc.state, "等待预警");
+    }
+
+    #[test]
+    fn entry_offsets_by_symbol_tick() {
+        let atr = atrs(4, 15.4);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 4025.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 3995.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(3985.0, 3990.0, 3985.0, 3988.0),
+            bar(4025.0, 4026.0, 4020.0, 4021.0), // s1 高点
+            bar(4010.0, 4015.0, 3995.0, 4013.0), // s2 收阳长下影线（预警）
+            bar(4013.0, 4025.0, 4012.0, 4022.0), // 触发：突破s2高点
+        ];
+        // 默认 tick=1：入场 = 预警高点 + 1
+        assert_eq!(evaluate_signal(&bars, &atr, &p, &trend60()).entry, 4016.0);
+        // 0.5 tick：入场 = 预警高点 + 0.5
+        assert_eq!(
+            evaluate_signal_with_tick(&bars, &atr, &p, &trend60(), 0.5).entry,
+            4015.5
+        );
     }
 }

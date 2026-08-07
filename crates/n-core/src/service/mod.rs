@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use chrono::Timelike;
 use sea_orm::{DatabaseConnection, Set};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 use crate::analyze::dto::SignalOutcome;
@@ -46,6 +46,20 @@ pub struct MarketSnapshot {
     pub latest: Option<f64>,
     pub change_pct: Option<f64>,
 }
+
+/// 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EntryTriggerHit {
+    pub signal_id: i64,
+    pub symbol: String,
+    pub name: String,
+    pub direction: String,
+    pub level: String,
+    pub grade: String,
+    pub entry: f64,
+    pub latest: f64,
+}
+
 pub struct Services {
     pub db: DatabaseConnection,
     client: RwLock<SinaClient>,
@@ -54,6 +68,8 @@ pub struct Services {
     config: RwLock<Config>,
     /// 配置文件路径（保存配置用）
     config_path: std::path::PathBuf,
+    /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
+    entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
 }
@@ -80,6 +96,7 @@ impl Services {
             quote_client: RwLock::new(quote_client),
             config: RwLock::new(config),
             config_path,
+            entry_notified: RwLock::new(HashSet::new()),
             deep_backfilled: RwLock::new(HashSet::new()),
         })
     }
@@ -104,6 +121,66 @@ impl Services {
         let mut c = self.config.write().await;
         c.ui.last_group_id = group_id;
         c.save(&self.config_path)
+    }
+
+    /// 每次行情轮询后对比最新价与形态入场点：做空最新价跌破入场点、做多最新价突破入场点
+    /// 即视为命中；同一形态只通知一次（跨轮询、跨扫描都不重复）。
+    /// 两个触发价通知开关都关闭时不检测。
+    pub async fn entry_trigger_hits(
+        &self,
+        snapshots: &[MarketSnapshot],
+    ) -> Result<Vec<EntryTriggerHit>> {
+        let cfg = self.config().await;
+        if !cfg.notify.in_app_entry_trigger && !cfg.notify.system_entry_trigger {
+            return Ok(Vec::new());
+        }
+        let rows = repo::latest_signals(&self.db, 500).await?;
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let name_by_code: HashMap<String, String> = symbols
+            .iter()
+            .map(|s| (s.code.clone(), s.name.clone()))
+            .collect();
+        let by_code: HashMap<&str, f64> = snapshots
+            .iter()
+            .filter_map(|s| s.latest.map(|v| (s.code.as_str(), v)))
+            .collect();
+        let mut notified = self.entry_notified.write().await;
+        let mut hits = Vec::new();
+        for row in rows {
+            if !is_active_signal_state(&row.state) {
+                continue;
+            }
+            let Some(latest) = by_code.get(row.symbol.as_str()).copied() else {
+                continue;
+            };
+            let crossed = match row.direction.as_str() {
+                "down" => latest < row.entry,
+                _ => latest > row.entry,
+            };
+            if !crossed {
+                continue;
+            }
+            let name = name_by_code.get(&row.symbol).cloned().unwrap_or_default();
+            let key = (
+                row.symbol.clone(),
+                row.direction.clone(),
+                row.level.clone(),
+                row.entry.to_bits(),
+            );
+            if notified.insert(key) {
+                hits.push(EntryTriggerHit {
+                    signal_id: row.id,
+                    symbol: row.symbol,
+                    name,
+                    direction: row.direction,
+                    level: row.level,
+                    grade: row.grade,
+                    entry: row.entry,
+                    latest,
+                });
+            }
+        }
+        Ok(hits)
     }
 
     /// 更新启用的K线周期列表：去重并过滤未知周期，为空时回退为全部；仅落盘不重建限速器。
@@ -159,6 +236,7 @@ impl Services {
                 node: Set(String::new()),
                 watchlist: Set(true),
                 enabled: Set(true),
+                tick_size: Set(crate::precision::default_tick(&code, "")),
                 created_at: Set(now.clone()),
                 updated_at: Set(now.clone()),
                 ..Default::default()
@@ -175,17 +253,21 @@ impl Services {
         let now = crate::analyze::time::now_display();
         let models: Vec<symbols::ActiveModel> = rows
             .into_iter()
-            .map(|r| symbols::ActiveModel {
-                code: Set(r.code),
-                name: Set(r.name),
-                variety: Set(r.variety),
-                exchange: Set(r.exchange),
-                node: Set(r.node),
-                watchlist: Set(false),
-                enabled: Set(true),
-                created_at: Set(now.clone()),
-                updated_at: Set(now.clone()),
-                ..Default::default()
+            .map(|r| {
+                let tick = crate::precision::default_tick(&r.code, &r.variety);
+                symbols::ActiveModel {
+                    code: Set(r.code),
+                    name: Set(r.name),
+                    variety: Set(r.variety),
+                    exchange: Set(r.exchange),
+                    node: Set(r.node),
+                    watchlist: Set(false),
+                    enabled: Set(true),
+                    tick_size: Set(tick),
+                    created_at: Set(now.clone()),
+                    updated_at: Set(now.clone()),
+                    ..Default::default()
+                }
             })
             .collect();
         let count = models.len();
@@ -226,6 +308,11 @@ impl Services {
                     node: Set(s.node.clone()),
                     watchlist: Set(s.watchlist),
                     enabled: Set(s.enabled),
+                    tick_size: Set(if s.tick_size > 0.0 {
+                        s.tick_size
+                    } else {
+                        crate::precision::default_tick(&s.code, &s.variety)
+                    }),
                     created_at: Set(s.created_at.clone()),
                     updated_at: Set(now.clone()),
                     ..Default::default()
@@ -241,6 +328,21 @@ impl Services {
     pub async fn needs_name_enrich(&self) -> Result<bool> {
         let existing = repo::list_symbols(&self.db, false).await?;
         Ok(existing.iter().any(|s| s.name.is_empty() || s.name == s.code))
+    }
+
+    /// 为 tick_size 未设置（0）的品种补齐内置默认精度；已显式设置的不覆盖。
+    pub async fn backfill_tick_sizes(&self) -> Result<usize> {
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let mut updated = 0usize;
+        for s in symbols {
+            if s.tick_size > 0.0 {
+                continue;
+            }
+            let tick = crate::precision::default_tick(&s.code, &s.variety);
+            repo::set_symbol_tick(&self.db, &s.code, tick).await?;
+            updated += 1;
+        }
+        Ok(updated)
     }
     /// 新品种一次性回填历史 5m 并派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
@@ -273,6 +375,7 @@ impl Services {
                     node: Set(String::new()),
                     watchlist: Set(true),
                     enabled: Set(true),
+                    tick_size: Set(crate::precision::default_tick(&code, "")),
                     created_at: Set(now.clone()),
                     updated_at: Set(now),
                     ..Default::default()
@@ -523,7 +626,8 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
                 });
                 continue;
             }
-            match crate::analyze::analyze_bars(&sym.code, &bars15, &bars60) {
+            let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
+            match crate::analyze::analyze_bars(&sym.code, &bars15, &bars60, tick) {
                 Ok(outcome) => {
                     scanned += 1;
                     active.extend(crate::analyze::collect_active(&outcome));
@@ -624,6 +728,11 @@ fn ts_gap_minutes(later: &str, earlier: &str) -> Option<i64> {
     let a = chrono::NaiveDateTime::parse_from_str(later, fmt).ok()?;
     let b = chrono::NaiveDateTime::parse_from_str(earlier, fmt).ok()?;
     Some((a - b).num_minutes())
+}
+
+/// 信号是否处于关注中（未过期/未失效），入场价提醒只针对这些信号。
+fn is_active_signal_state(state: &str) -> bool {
+    matches!(state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
 }
 
 pub fn model_to_fetch(m: &klines::Model) -> Kline {
@@ -727,5 +836,3 @@ mod tests {
         );
     }
 }
-
-

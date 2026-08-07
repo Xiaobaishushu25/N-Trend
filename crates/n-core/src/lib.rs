@@ -5,6 +5,7 @@ pub mod config;
 pub mod derive;
 pub mod fetch;
 pub mod notify;
+pub mod precision;
 pub mod scheduler;
 pub mod service;
 pub mod storage;

@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   AppInfo,
   Config,
+  EntryTriggerHit,
   GroupRow,
   KlineRow,
   MarketSnapshot,
@@ -42,6 +43,8 @@ export const api = {
   removeSymbol: (code: string) => invoke<void>('remove_symbol', { code }),
   setSymbolFlags: (code: string, watchlist: boolean, enabled: boolean) =>
     invoke<void>('set_symbol_flags', { code, watchlist, enabled }),
+  setSymbolTick: (code: string, tick: number) =>
+    invoke<void>('set_symbol_tick', { code, tick }),
   refreshSymbolList: () => invoke<number>('refresh_symbol_list'),
   enrichSymbolNames: () => invoke<number>('enrich_symbol_names'),
 
@@ -78,6 +81,10 @@ export function onQuotesUpdated(cb: (snapshots: MarketSnapshot[]) => void) {
 
 export function onScanCompleted(cb: (result: ScanResult) => void) {
   return listen<ScanResult>('scan-completed', (e) => cb(e.payload))
+}
+
+export function onEntryTrigger(cb: (hits: EntryTriggerHit[]) => void) {
+  return listen<EntryTriggerHit[]>('entry-trigger', (e) => cb(e.payload))
 }
 
 

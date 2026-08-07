@@ -5,9 +5,15 @@ import router from '../router'
 
 /** 点击信号通知跳转到对应品种的K线图，并顺手关闭该通知 */
 function openSignalChart(item: NotifyItem) {
-  if (!item.signal) return
+  const code = item.signal?.code ?? item.entryTrigger?.symbol
+  if (!code) return
   dismiss(item.id)
-  router.push({ name: 'chart', params: { symbol: item.signal.code } })
+  router.push({ name: 'chart', params: { symbol: code } })
+}
+
+/** 价格显示：整数不带小数，否则保留 1 位 */
+function fmtPrice(v: number): string {
+  return Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)
 }
 </script>
 
@@ -18,7 +24,7 @@ function openSignalChart(item: NotifyItem) {
         v-for="item in notifyItems"
         :key="item.id"
         class="notify-item"
-        :class="[`is-${item.type}`, { 'is-clickable': item.signal }]"
+        :class="[`is-${item.type}`, { 'is-clickable': item.signal || item.entryTrigger }]"
         @click="openSignalChart(item)"
         @mouseenter="item.keepAliveOnHover && suspend(item.id)"
         @mouseleave="item.keepAliveOnHover && resume(item.id)"
@@ -68,7 +74,31 @@ function openSignalChart(item: NotifyItem) {
         </span>
 
         <div class="notify-body">
-          <template v-if="item.signal">
+          <template v-if="item.entryTrigger">
+            <div class="ns-entry">
+              <div class="ns-entry-head">
+                <span class="ns-entry-name">
+                  {{ item.entryTrigger.name || item.entryTrigger.symbol }}
+                </span>
+                <span
+                  class="ns-entry-dir"
+                  :class="item.entryTrigger.direction === 'up' ? 'is-up' : 'is-down'"
+                >
+                  {{ item.entryTrigger.direction === 'up' ? '做多' : '做空' }}
+                </span>
+              </div>
+              <div class="ns-entry-prices">
+                <span class="ns-entry-price">
+                  入场价 <b>{{ fmtPrice(item.entryTrigger.entry) }}</b>
+                </span>
+                <span class="ns-entry-arrow">→</span>
+                <span class="ns-entry-price">
+                  最新 <b>{{ fmtPrice(item.entryTrigger.latest) }}</b>
+                </span>
+              </div>
+            </div>
+          </template>
+          <template v-else-if="item.signal">
             <div class="ns-inline">
               <span class="ns-code">{{ item.signal.code }}</span>
               <span class="ns-name">{{ item.signal.name || item.signal.code }}</span>
@@ -265,6 +295,59 @@ function openSignalChart(item: NotifyItem) {
   font-size: 12px;
   color: #94a3b8;
   font-variant-numeric: tabular-nums;
+}
+/* 入场价提醒卡片：名称 + 方向 + 入场/最新价 */
+.ns-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.ns-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ns-entry-name {
+  font-size: 15px;
+  font-weight: 800;
+  color: #1f2329;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ns-entry-dir {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.ns-entry-dir.is-up {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+}
+.ns-entry-dir.is-down {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.1);
+}
+.ns-entry-prices {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+.ns-entry-price b {
+  font-size: 14px;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.ns-entry-arrow {
+  color: #c2c9d4;
 }
 .notify-close {
   flex: none;

@@ -31,6 +31,11 @@ const defaultConfig = (): Config => ({
     smtp_user: '',
     smtp_password: '',
   },
+  notify: {
+    in_app_new_pattern: true,
+    in_app_entry_trigger: true,
+    system_entry_trigger: false,
+  },
   log: {
     level: 'info',
   },

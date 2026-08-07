@@ -1,6 +1,7 @@
 ﻿import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
+import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import type { PatternDto, ScanResult, ScanRow, SignalOutcome, SignalRow } from '../types'
 
@@ -80,6 +81,8 @@ export const useScansStore = defineStore('scans', {
       this.loadHistory(20)
       const pendings = newPendingSignals(prev?.signals ?? null, result.signals)
       if (!pendings.length) return
+      // 局内新形态通知开关
+      if (!useSettingsStore().settings.notify.in_app_new_pattern) return
       const symbolsStore = useSymbolsStore()
       for (const s of pendings) {
         const sym = symbolsStore.symbols.find((x) => x.code === s.symbol)

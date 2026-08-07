@@ -18,6 +18,8 @@ export interface NotifyOptions {
   keepAliveOnHover?: boolean
   /** 可选：结构化信号卡片内容（展示比纯文本更美观的信号通知） */
   signal?: NotifyItem['signal']
+  /** 可选：结构化入场价提醒内容 */
+  entryTrigger?: NotifyItem['entryTrigger']
 }
 
 export interface NotifyItem {
@@ -45,6 +47,14 @@ export interface NotifyItem {
     /** 通知时间（HH:mm）；未传入时自动取当前时间 */
     time?: string
   }
+  /** 结构化入场价提醒内容：突出品种名称、方向与价格 */
+  entryTrigger?: {
+    symbol: string
+    name: string
+    direction: string
+    entry: number
+    latest: number
+  }
 }
 
 export const notifyItems = reactive<NotifyItem[]>([])
@@ -64,7 +74,7 @@ function ensureHost() {
   hostApp.mount(container)
 }
 
-function isMainWindow(): boolean {
+export function isMainWindow(): boolean {
   try {
     return getCurrentWebviewWindow().label === 'main'
   } catch {
@@ -94,6 +104,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     remaining: duration,
     startedAt: Date.now(),
     signal: options?.signal,
+    entryTrigger: options?.entryTrigger,
   }
   notifyItems.push(item)
   schedule(item)
@@ -125,7 +136,7 @@ export function resume(id: number) {
   if (!item) return
   item.startedAt = Date.now()
   if (item.remaining <= 0) {
-    dismiss(id)
+    // 持久通知（remaining=0，如信号卡片/入场价提醒）：悬停移开也不消失，只能手动关闭
     return
   }
   schedule(item)
@@ -148,4 +159,7 @@ export const notify = {
         }),
       },
     }),
+  /** 持久化的入场价提醒（不自动关闭，可手动关闭） */
+  entryTrigger: (data: NonNullable<NotifyItem['entryTrigger']>) =>
+    push('info', '', { duration: 0, entryTrigger: data }),
 }

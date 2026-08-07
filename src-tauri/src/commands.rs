@@ -178,6 +178,18 @@ pub async fn set_symbol_flags(
         .map_err(|e| e.to_string())
 }
 
+/// 更新品种最小变动价位（tick）。
+#[tauri::command]
+pub async fn set_symbol_tick(
+    state: State<'_, Arc<AppState>>,
+    code: String,
+    tick: f64,
+) -> Result<(), String> {
+    n_core::storage::repo::set_symbol_tick(&state.services.db, &code, tick)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn enrich_symbol_names(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
     state

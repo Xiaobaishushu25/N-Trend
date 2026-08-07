@@ -22,7 +22,13 @@ pub struct AnalysisOutcome {
 }
 
 /// 对一组 15m/60m bar 运行完整分析（核心逻辑，与旧 CSV 路径共用）。
-pub fn analyze_bars(symbol: &str, bars15: &[Bar], bars60: &[Bar]) -> Result<AnalysisOutcome> {
+/// `tick` 为品种最小变动价位，用于入场价偏移。
+pub fn analyze_bars(
+    symbol: &str,
+    bars15: &[Bar],
+    bars60: &[Bar],
+    tick: f64,
+) -> Result<AnalysisOutcome> {
     let atr15 = indicators::atr(bars15, ATR_PERIOD);
     let trend_k = indicators::trend_flags(bars15, &atr15);
     let trend60 = indicators::analyze_60m(bars60);
@@ -68,16 +74,16 @@ pub fn analyze_bars(symbol: &str, bars15: &[Bar], bars60: &[Bar]) -> Result<Anal
 
     let mut candidates: Vec<SignalTuple> = Vec::new();
     if let Some(p) = latest_down_large {
-        candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
+        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
     }
     if let Some(p) = latest_down_fine {
-        candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
+        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
     }
     if let Some(p) = latest_up_fine {
-        candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
+        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
     }
     if let Some(p) = latest_up_large {
-        candidates.push((0, p, scoring::evaluate_signal(bars15, &atr15, p, &trend60)));
+        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
     }
     let signals = dedup_signals(candidates);
 
@@ -138,7 +144,7 @@ pub fn analyze_csv_pair(
 ) -> Result<AnalysisOutcome> {
     let bars15 = io::load_csv(&path15.to_string_lossy())?;
     let bars60 = io::load_csv(&path60.to_string_lossy())?;
-    analyze_bars(symbol, &bars15, &bars60)
+    analyze_bars(symbol, &bars15, &bars60, 1.0)
 }
 
 pub struct SummaryBlock {

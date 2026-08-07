@@ -8,6 +8,8 @@ export interface SymbolRow {
   node: string
   watchlist: boolean
   enabled: boolean
+  /** 最小变动价位（tick）；0 表示未显式设置，扫描时用内置默认表兜底 */
+  tick_size: number
   created_at: string
   updated_at: string
 }
@@ -197,6 +199,15 @@ export interface QuoteConfig {
   minutely_budget: number
 }
 
+export interface NotifyConfig {
+  /** 局内新形态通知：扫描发现新的即将触发形态时弹卡片通知 */
+  in_app_new_pattern: boolean
+  /** 局内触发价通知：实时行情触及形态入场价时弹右下角通知（持久，需手动关闭） */
+  in_app_entry_trigger: boolean
+  /** 系统级触发价通知：入场价提醒同时发送系统通知 */
+  system_entry_trigger: boolean
+}
+
 export interface LogConfig {
   level: string
 }
@@ -217,8 +228,21 @@ export interface Config {
   fetch: FetchConfig
   quote: QuoteConfig
   email: EmailSettings
+  notify: NotifyConfig
   log: LogConfig
   ui: UiConfig
+}
+
+/** 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破） */
+export interface EntryTriggerHit {
+  signal_id: number
+  symbol: string
+  name: string
+  direction: string
+  level: string
+  grade: string
+  entry: number
+  latest: number
 }
 
 export interface SchedulerStatus {

@@ -65,6 +65,8 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     // 老库升级：symbols 表补 sort_index 列（全部品种拖拽排序用）。
     // create_table 是 if_not_exists，不会给已存在的表加列，这里单独做幂等迁移。
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
+    // 品种精度列：0 表示未显式设置，扫描时用内置默认表兜底
+    ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
     info!("数据库表结构已就绪");
     Ok(())
 }

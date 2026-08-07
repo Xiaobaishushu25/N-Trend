@@ -43,6 +43,7 @@ fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
@@ -76,6 +77,9 @@ pub fn run() {
                     tauri::async_runtime::block_on(services.apply_config(next))?;
                 }
             }
+
+            // 补齐品种默认精度（未显式设置的行）
+            let _ = tauri::async_runtime::block_on(services.backfill_tick_sizes());
 
             let auto_start = tauri::async_runtime::block_on(services.config())
                 .app_config
@@ -169,6 +173,7 @@ pub fn run() {
             commands::add_symbol,
             commands::remove_symbol,
             commands::set_symbol_flags,
+            commands::set_symbol_tick,
             commands::refresh_symbol_list,
             commands::enrich_symbol_names,
             commands::get_klines,
@@ -283,6 +288,12 @@ fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
             }
             match state.services.realtime_quotes().await {
                 Ok(snapshots) => {
+                    // 每次轮询后对比形态入场点，命中则广播事件（去重在前端/后端均处理）
+                    if let Ok(hits) = state.services.entry_trigger_hits(&snapshots).await {
+                        if !hits.is_empty() {
+                            let _ = app.emit("entry-trigger", &hits);
+                        }
+                    }
                     let _ = app.emit("quote-updated", &snapshots);
                 }
                 Err(e) => tracing::warn!("实时行情轮询失败: {e}"),

@@ -52,6 +52,8 @@ pub struct Config {
     pub quote: QuoteConfig,
     /// 邮件通知
     pub email: EmailSettings,
+    /// 通知开关
+    pub notify: NotifyConfig,
     /// 日志
     pub log: LogConfig,
     /// 界面细节
@@ -66,6 +68,7 @@ impl Default for Config {
             fetch: FetchConfig::default(),
             quote: QuoteConfig::default(),
             email: EmailSettings::default(),
+            notify: NotifyConfig::default(),
             log: LogConfig::default(),
             ui: UiConfig::default(),
         }
@@ -163,10 +166,32 @@ impl Config {
                 smtp_user: get_str(map, "email.smtp_user", &d.email.smtp_user),
                 smtp_password: get_str(map, "email.smtp_password", &d.email.smtp_password),
             },
+            notify: NotifyConfig::default(),
             log: LogConfig {
                 level: get_str(map, "log_level", &d.log.level),
             },
             ui: UiConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// 局内新形态通知：扫描发现新的即将触发形态时弹卡片通知
+    pub in_app_new_pattern: bool,
+    /// 局内触发价通知：实时行情触及形态入场价时弹右下角通知（持久，需手动关闭）
+    pub in_app_entry_trigger: bool,
+    /// 系统级触发价通知：入场价提醒同时发送系统通知
+    pub system_entry_trigger: bool,
+}
+
+impl Default for NotifyConfig {
+    fn default() -> Self {
+        Self {
+            in_app_new_pattern: true,
+            in_app_entry_trigger: true,
+            system_entry_trigger: false,
         }
     }
 }
@@ -390,6 +415,9 @@ mod tests {
         assert_eq!(back.quote.poll_interval_ms, 3000);
         assert_eq!(back.quote.request_interval_ms, 200);
         assert_eq!(back.quote.minutely_budget, 120);
+        assert_eq!(back.notify.in_app_new_pattern, true);
+        assert_eq!(back.notify.in_app_entry_trigger, true);
+        assert_eq!(back.notify.system_entry_trigger, false);
         assert_eq!(back.log.level, "info");
         assert_eq!(back.ui.flash_ms, 900);
         assert_eq!(back.ui.breathe_hold_ms, 5000);

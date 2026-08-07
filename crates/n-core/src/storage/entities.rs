@@ -17,6 +17,8 @@ pub mod symbols {
         pub enabled: bool,
         /// 全部品种视图的手动排序索引（拖拽排序落库用；默认按代码序回填）
         pub sort_index: i64,
+        /// 最小变动价位（tick）；0 表示未显式设置，查询时用内置默认表
+        pub tick_size: f64,
         pub created_at: String,
         pub updated_at: String,
     }

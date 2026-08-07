@@ -203,6 +203,20 @@ pub async fn set_symbol_flags(
     Ok(())
 }
 
+/// 更新品种的最小变动价位（tick）。
+pub async fn set_symbol_tick(db: &DatabaseConnection, code: &str, tick: f64) -> Result<()> {
+    let row = symbols::Entity::find_by_id(code)
+        .one(db)
+        .await
+        .context("查询品种失败")?
+        .ok_or_else(|| anyhow!("品种不存在: {code}"))?;
+    let mut model: symbols::ActiveModel = row.into();
+    model.tick_size = Set(tick.max(0.0));
+    model.updated_at = Set(crate::analyze::time::now_display());
+    model.save(db).await.context("更新品种精度失败")?;
+    Ok(())
+}
+
 pub async fn remove_symbol(db: &DatabaseConnection, code: &str) -> Result<()> {
     // 删除品种的同时清理它在所有分组中的关联
     symbol_groups::Entity::delete_many()
