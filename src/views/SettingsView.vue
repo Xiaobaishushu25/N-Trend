@@ -18,7 +18,9 @@ import {
 import {
   Bell,
   Database,
+  DeviceFloppy,
   Help,
+  RotateClockwise,
   Ruler,
   Settings as SettingsIcon,
 } from '@vicons/tabler'
@@ -544,17 +546,23 @@ onMounted(async () => {
     </n-tabs>
 
     <div class="footer">
-      <n-space justify="end">
-        <n-button :disabled="saving" @click="confirmReset">恢复默认</n-button>
-        <n-button
-          type="primary"
-          :disabled="!dirty || saving"
-          :loading="saving"
-          @click="save"
-        >
-          保存设置
-        </n-button>
-      </n-space>
+      <n-button size="small" quaternary :disabled="saving" @click="confirmReset">
+        <template #icon>
+          <n-icon :component="RotateClockwise" />
+        </template>
+        恢复默认
+      </n-button>
+      <n-button
+        type="primary"
+        :disabled="!dirty || saving"
+        :loading="saving"
+        @click="save"
+      >
+        <template #icon>
+          <n-icon :component="DeviceFloppy" />
+        </template>
+        保存设置
+      </n-button>
     </div>
   </div>
 </template>
@@ -563,10 +571,10 @@ onMounted(async () => {
 .settings-page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   box-sizing: border-box;
-  padding: 10px 12px 8px;
-  gap: 8px;
+  padding: 0;
+  gap: 0;
   background: #fff;
   overflow: hidden;
 }
@@ -574,6 +582,7 @@ onMounted(async () => {
 .setting-tabs {
   flex: 1;
   min-height: 0;
+  padding: 8px 12px;
   --n-tab-border-radius: 6px;
   --n-text-color-primary: #1f2329;
   --n-text-color-hover: #1677ff;
@@ -718,8 +727,12 @@ onMounted(async () => {
 }
 
 .footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   flex: none;
-  padding: 4px 8px 0;
+  padding: 8px 12px 12px;
+  border-top: 1px solid #f0f2f5;
 }
 
 /* 左侧标签样式：图标 + 文字，参考模板的结构，配色用当前项目的蓝色系 */

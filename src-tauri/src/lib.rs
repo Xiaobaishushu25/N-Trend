@@ -171,6 +171,7 @@ pub fn run() {
             commands::reorder_group_symbols,
             commands::reorder_symbols,
             commands::add_symbol,
+            commands::search_contracts,
             commands::remove_symbol,
             commands::set_symbol_flags,
             commands::set_symbol_tick,
@@ -386,7 +387,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
 }
 
 /// 打开设置窗口：已存在则聚焦，否则新建独立窗口。
-/// 沿用系统标题栏，暂不做自定义 titlebar。
+/// 与主窗口一致使用自定义 titlebar（无系统装饰）。
 fn open_settings_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
@@ -404,6 +405,7 @@ fn open_settings_window(app: &tauri::AppHandle) {
     .min_inner_size(680.0, 520.0)
     .center()
     .resizable(true)
+    .decorations(false)
     .build();
 }
 

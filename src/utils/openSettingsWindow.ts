@@ -24,6 +24,7 @@ export async function openSettingsWindow() {
     minWidth: 680,
     minHeight: 520,
     resizable: true,
+    decorations: false,
     dragDropEnabled: false,
     visible: false,
   })

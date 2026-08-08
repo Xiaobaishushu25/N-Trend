@@ -284,7 +284,8 @@ impl Services {
         }
         let missing: Vec<String> = existing
             .iter()
-            .filter(|s| s.name.is_empty() || s.name == s.code)
+            // 名称为空、等于代码、或过短（如历史版本误存的“连”）都视为待补齐
+            .filter(|s| s.name.is_empty() || s.name == s.code || s.name.chars().count() <= 2)
             .map(|s| s.code.clone())
             .collect();
         if missing.is_empty() {
@@ -364,12 +365,24 @@ impl Services {
             return Err(anyhow!("品种代码不能为空"));
         }
         if !repo::symbol_exists(&self.db, &code).await? {
+            // 新代码先向行情接口确认存在并取中文名：
+            // 无效代码在这里就给出明确提示，避免建档后回填时报「接口没有返回K线数据」这类模糊错误
+            let names = crate::fetch::symbols::fetch_quote_names(
+                &*self.client.read().await,
+                &[code.clone()],
+            )
+            .await?;
+            let Some(name) = names.get(&code) else {
+                return Err(anyhow!(
+                    "未找到品种「{code}」，请检查代码（示例：RB0、AU0、IF0）"
+                ));
+            };
             let now = crate::analyze::time::now_display();
             repo::upsert_symbols(
                 &self.db,
                 vec![symbols::ActiveModel {
                     code: Set(code.clone()),
-                    name: Set(code.clone()),
+                    name: Set(name.clone()),
                     variety: Set(String::new()),
                     exchange: Set(String::new()),
                     node: Set(String::new()),
@@ -385,6 +398,14 @@ impl Services {
         }
         let count = self.config().await.fetch.backfill_count;
         self.backfill_symbol(&code, count).await
+    }
+
+    /// 标题栏搜索提示用：按前缀搜索新浪期货合约（如 RB → RB0、RB2609、RB2608…）。
+    pub async fn search_contracts(
+        &self,
+        keyword: &str,
+    ) -> Result<Vec<crate::fetch::symbols::FuturesSymbol>> {
+        crate::fetch::symbols::search_contracts(&*self.client.read().await, keyword).await
     }
 
     /// 删除品种及其K线数据。

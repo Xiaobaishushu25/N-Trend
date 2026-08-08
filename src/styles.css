@@ -92,3 +92,35 @@ body {
   background-color: rgba(224, 49, 49, 0.1);
   color: #e03131;
 }
+
+/* ===== 标题栏品种搜索/添加的自动补全下拉选项 ===== */
+.sym-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  min-width: 170px;
+}
+.sym-option-code {
+  flex: none;
+  font-weight: 600;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.sym-option-name {
+  flex: 1;
+  min-width: 0;
+  color: #667085;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sym-option-added {
+  flex: none;
+  font-size: 11px;
+  color: #1677ff;
+  background: rgba(22, 119, 255, 0.1);
+  border-radius: 4px;
+  padding: 1px 6px;
+}

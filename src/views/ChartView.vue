@@ -1006,7 +1006,7 @@ onBeforeUnmount(() => {
 .chart-page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
   background: #f5f7fa;
 }
 .topbar {

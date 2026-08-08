@@ -7,7 +7,6 @@ import {
   NDataTable,
   NIcon,
   NInput,
-  NInputGroup,
   NModal,
   NSpace,
   NSwitch,
@@ -21,11 +20,7 @@ import {
   FolderPlus,
   GripVertical,
   Lock,
-  Plus,
-  Refresh,
-  Scan,
   Settings,
-  Tag,
   Trash,
 } from '@vicons/tabler'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -33,6 +28,7 @@ import { useGroupsStore } from '../stores/groups'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
 import { useScansStore } from '../stores/scans'
+import { useActionsStore } from '../stores/actions'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
@@ -46,6 +42,7 @@ const symbolsStore = useSymbolsStore()
 const scansStore = useScansStore()
 const settingsStore = useSettingsStore()
 const groupsStore = useGroupsStore()
+const actionsStore = useActionsStore()
 
 interface WatchRow {
   symbol: SymbolRow
@@ -59,11 +56,6 @@ interface WatchRow {
 
 const rows = ref<WatchRow[]>([])
 const loading = ref(false)
-const refreshing = ref(false)
-const scanning = ref(false)
-const enriching = ref(false)
-const newCode = ref('')
-const adding = ref(false)
 const groupModal = ref<'create' | 'manage' | null>(null)
 const newGroupName = ref('')
 const groupNameDrafts = ref<Record<number, string>>({})
@@ -788,72 +780,6 @@ const columns: DataTableColumns<WatchRow> = [
   },
 ]
 
-async function doRefresh() {
-  refreshing.value = true
-  try {
-    const stats = await api.refreshDataNow()
-    notify.success(`数据刷新完成：成功 ${stats.succeeded}，失败 ${stats.failures}`)
-    try {
-      await settingsStore.refreshStatus()
-    } catch {
-      // 顶部时间同步失败不影响本次操作
-    }
-    await loadAll()
-  } catch (e) {
-    notify.error(String(e))
-  } finally {
-    refreshing.value = false
-  }
-}
-
-async function doEnrich() {
-  enriching.value = true
-  try {
-    const n = await symbolsStore.enrichNames()
-    notify.success(`已补齐 ${n} 个品种名称`)
-    await loadAll()
-  } catch (e) {
-    notify.error(String(e))
-  } finally {
-    enriching.value = false
-  }
-}
-
-async function doScan() {
-  scanning.value = true
-  try {
-    await scansStore.runScan()
-    const result = scansStore.latest
-    notify.success(`扫描完成：${result?.scanned ?? 0} 个品种，${result?.active_count ?? 0} 个信号`)
-    try {
-      await settingsStore.refreshStatus()
-    } catch {
-      // 顶部时间同步失败不影响本次操作
-    }
-    await loadAll()
-  } catch (e) {
-    notify.error(String(e))
-  } finally {
-    scanning.value = false
-  }
-}
-
-async function doAddSymbol() {
-  const code = newCode.value.trim().toUpperCase()
-  if (!code) return
-  adding.value = true
-  try {
-    const count = await symbolsStore.add(code)
-    notify.success(`${code} 已添加，回填 ${count} 根K线`)
-    newCode.value = ''
-    await loadAll()
-  } catch (e) {
-    notify.error(String(e))
-  } finally {
-    adding.value = false
-  }
-}
-
 onMounted(async () => {
   try {
     await settingsStore.load()
@@ -889,6 +815,14 @@ watch(() => groupsStore.revision, () => {
   if (listDragging.value) return
   loadAll()
 })
+// 标题栏操作完成（刷新/添加品种/刷新名称）后重拉表格；扫描由 scan-completed 事件驱动
+watch(
+  () => actionsStore.reloadTick,
+  () => {
+    if (listDragging.value) return
+    loadAll()
+  },
+)
 // 数据从空到有、或 keep-alive 重新激活时 tbody 可能被重建，重建 Sortable
 watch(
   () => rows.value.length,
@@ -922,45 +856,6 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="page">
-    <div class="toolbar">
-      <n-space align="center" :size="8" class="toolbar-actions">
-        <n-button type="primary" :loading="refreshing" @click="doRefresh">
-          <template #icon>
-            <n-icon :component="Refresh" />
-          </template>
-          刷新数据
-        </n-button>
-        <n-button type="success" :loading="scanning" @click="doScan">
-          <template #icon>
-            <n-icon :component="Scan" />
-          </template>
-          立即扫描
-        </n-button>
-        <n-button :loading="enriching" @click="doEnrich">
-          <template #icon>
-            <n-icon :component="Tag" />
-          </template>
-          刷新名称
-        </n-button>
-      </n-space>
-      <div class="toolbar-right">
-        <n-input-group>
-          <n-input
-            v-model:value="newCode"
-            placeholder="输入品种代码，如 RB0"
-            style="width: 180px"
-            @keyup.enter="doAddSymbol"
-          />
-          <n-button type="primary" :loading="adding" @click="doAddSymbol">
-            <template #icon>
-              <n-icon :component="Plus" />
-            </template>
-            添加品种
-          </n-button>
-        </n-input-group>
-        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
-      </div>
-    </div>
     <div class="group-bar">
       <n-tabs
         :value="groupsStore.selectedId == null ? 'all' : String(groupsStore.selectedId)"
@@ -975,6 +870,7 @@ onBeforeUnmount(() => {
         </template>
       </n-tabs>
       <n-space align="center" :size="8">
+        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
         <n-button size="small" type="primary" ghost @click="openCreateGroup">
           <template #icon>
             <n-icon :component="FolderPlus" />
@@ -1143,25 +1039,6 @@ onBeforeUnmount(() => {
   gap: 12px;
   height: 100%;
   min-height: 0;
-}
-.toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 8px 12px;
-  border: 1px solid #eef1f5;
-  border-radius: 10px;
-  background: #fbfcfe;
-}
-.toolbar-actions {
-  flex: none;
-}
-.toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
 }
 .group-bar {
   display: flex;

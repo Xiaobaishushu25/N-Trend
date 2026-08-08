@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import type {
   AppInfo,
   Config,
+  ContractSuggestion,
   EntryTriggerHit,
   GroupRow,
   KlineRow,
@@ -40,6 +41,8 @@ export const api = {
     invoke<void>('reorder_group_symbols', { groupId, codes }),
   reorderSymbols: (codes: string[]) => invoke<void>('reorder_symbols', { codes }),
   addSymbol: (code: string) => invoke<number>('add_symbol', { code }),
+  searchContracts: (keyword: string) =>
+    invoke<ContractSuggestion[]>('search_contracts', { keyword }),
   removeSymbol: (code: string) => invoke<void>('remove_symbol', { code }),
   setSymbolFlags: (code: string, watchlist: boolean, enabled: boolean) =>
     invoke<void>('set_symbol_flags', { code, watchlist, enabled }),

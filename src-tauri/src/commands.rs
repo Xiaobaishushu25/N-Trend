@@ -162,6 +162,18 @@ pub async fn add_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result
 }
 
 #[tauri::command]
+pub async fn search_contracts(
+    state: State<'_, Arc<AppState>>,
+    keyword: String,
+) -> Result<Vec<n_core::fetch::symbols::FuturesSymbol>, String> {
+    state
+        .services
+        .search_contracts(&keyword)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn remove_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<(), String> {
     state.services.remove_symbol(&code).await.map_err(|e| e.to_string())
 }

@@ -14,6 +14,15 @@ export interface SymbolRow {
   updated_at: string
 }
 
+/** 新浪期货合约搜索结果（标题栏搜索提示用），可能包含不同月份的合约 */
+export interface ContractSuggestion {
+  code: string
+  name: string
+  variety: string
+  exchange: string
+  node: string
+}
+
 export interface GroupRow {
   id: number
   name: string
