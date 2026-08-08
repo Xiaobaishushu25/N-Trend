@@ -191,6 +191,8 @@ pub mod signal_outcomes {
         pub outcome: String,
         /// stop / target / no_follow / time_exit / （空）
         pub exit_reason: String,
+        /// 模拟回放找到的入场触达时间（快照 trigger_ts 缺失时用于图上补画触发标记）
+        pub entry_ts: Option<String>,
         pub exit_ts: Option<String>,
         pub exit_price: Option<f64>,
         pub r_multiple: Option<f64>,

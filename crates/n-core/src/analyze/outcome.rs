@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 3;
+pub const SIM_VERSION: i64 = 4;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -130,6 +130,8 @@ pub struct SignalAnnotation {
     pub sim_version: i64,
     pub outcome: Outcome,
     pub exit_reason: ExitReason,
+    /// 模拟回放找到的入场触达时间（入场价被触及的那根 15m bar）
+    pub entry_ts: Option<String>,
     pub exit_ts: Option<String>,
     pub exit_price: Option<f64>,
     pub r_multiple: Option<f64>,
@@ -168,6 +170,7 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         sim_version: SIM_VERSION,
         outcome,
         exit_reason: ExitReason::None,
+        entry_ts: None,
         exit_ts: None,
         exit_price: None,
         r_multiple: None,
@@ -453,6 +456,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         sim_version: SIM_VERSION,
         outcome,
         exit_reason,
+        entry_ts: Some(bars15[ec].dt.to_string()),
         exit_ts,
         exit_price,
         r_multiple,
@@ -865,6 +869,8 @@ mod tests {
         assert_eq!(ann.exit_price, Some(103.0));
         assert_eq!(ann.bars_held, Some(2));
         assert_eq!(ann.mae_r, Some(-0.5));
+        // 入场触达时间 = 入场bar（09:30）的时间戳
+        assert_eq!(ann.entry_ts.as_deref(), Some("2026-08-03 09:30"));
     }
 
     #[test]
@@ -979,6 +985,7 @@ mod tests {
         let bars = timed_bars(&specs);
         let ann = annotate(&input(), &bars, &[]).unwrap();
         assert_eq!(ann.outcome, Outcome::NoTrigger);
+        assert_eq!(ann.entry_ts, None);
     }
 
     #[test]

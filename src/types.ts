@@ -309,6 +309,8 @@ export interface OutcomeDetail {
   created_at: string
   outcome: string
   exit_reason: string
+  /** 模拟回放找到的入场触达时间（快照 trigger_ts 缺失时补画触发标记用） */
+  entry_ts: string | null
   exit_ts: string | null
   exit_price: number | null
   r_multiple: number | null
@@ -334,17 +336,18 @@ export interface ReviewSignalDetail {
 export interface ReviewExitOverlay {
   price: number | null
   ts: string | null
+  entryTs: string | null
   outcome: string
   r: number | null
 }
 
 /** 最近信号明细筛选条件（全部可选，空值不过滤） */
 export interface RecentOutcomeFilters {
-  symbol?: string
-  direction?: string
-  level?: string
-  grade?: string
-  outcome?: string
+  symbol?: string | null
+  direction?: string | null
+  level?: string | null
+  grade?: string | null
+  outcome?: string | null
   scoreMin?: number | null
   scoreMax?: number | null
 }

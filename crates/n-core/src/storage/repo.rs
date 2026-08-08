@@ -569,10 +569,11 @@ pub async fn upsert_outcomes(
             .on_conflict(
                 OnConflict::column(signal_outcomes::Column::SignalId)
                     .update_columns([
-                        signal_outcomes::Column::SimVersion,
-                        signal_outcomes::Column::Outcome,
-                        signal_outcomes::Column::ExitReason,
-                        signal_outcomes::Column::ExitTs,
+                    signal_outcomes::Column::SimVersion,
+                    signal_outcomes::Column::Outcome,
+                    signal_outcomes::Column::ExitReason,
+                    signal_outcomes::Column::EntryTs,
+                    signal_outcomes::Column::ExitTs,
                         signal_outcomes::Column::ExitPrice,
                         signal_outcomes::Column::RMultiple,
                         signal_outcomes::Column::MfeR,

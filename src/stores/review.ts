@@ -21,10 +21,11 @@ export const useReviewStore = defineStore('review', {
     recent: [] as OutcomeDetail[],
     recentFilters: {
       symbol: '',
-      direction: '',
-      level: '',
-      grade: '',
-      outcome: '',
+      // 下拉筛选用 null 作为"未选择"，naive-ui 才会显示 placeholder
+      direction: null,
+      level: null,
+      grade: null,
+      outcome: null,
       scoreMin: null,
       scoreMax: null,
     } as RecentOutcomeFilters,
@@ -64,10 +65,10 @@ export const useReviewStore = defineStore('review', {
     async resetRecentFilters() {
       this.recentFilters = {
         symbol: '',
-        direction: '',
-        level: '',
-        grade: '',
-        outcome: '',
+        direction: null,
+        level: null,
+        grade: null,
+        outcome: null,
         scoreMin: null,
         scoreMax: null,
       }

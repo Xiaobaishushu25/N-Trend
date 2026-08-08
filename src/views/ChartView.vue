@@ -76,7 +76,13 @@ const reviewSignalId = computed(() => {
 const reviewExit = computed<ReviewExitOverlay | null>(() => {
   const o = reviewOverlay.value?.outcome
   if (!o) return null
-  return { price: o.exit_price, ts: o.exit_ts, outcome: o.outcome, r: o.r_multiple }
+  return {
+    price: o.exit_price,
+    ts: o.exit_ts,
+    entryTs: o.entry_ts,
+    outcome: o.outcome,
+    r: o.r_multiple,
+  }
 })
 
 async function loadReviewOverlay() {

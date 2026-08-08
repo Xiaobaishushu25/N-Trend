@@ -229,6 +229,7 @@ function buildVolumes(): HistogramData[] {
 
 function buildMarkers(): SeriesMarker<Time>[] {
   const markers: SeriesMarker<Time>[] = []
+  const ex = props.reviewExit
   for (const s of props.signals) {
     const color = s.direction === 'up' ? PATTERN_UP_COLOR : PATTERN_DOWN_COLOR
     markers.push({
@@ -269,9 +270,17 @@ function buildMarkers(): SeriesMarker<Time>[] {
         shape: 'arrowDown',
         text: '触发',
       })
+    } else if (ex?.entryTs) {
+      // 快照落库时仍是"即将触发"没有 trigger_ts：用回放找到的入场触达时间补画
+      markers.push({
+        time: toTs(ex.entryTs),
+        position: 'aboveBar',
+        color: '#fb8c00',
+        shape: 'arrowDown',
+        text: '回放触发',
+      })
     }
   }
-  const ex = props.reviewExit
   if (ex?.ts) {
     const rText = ex.r == null ? '' : ` ${ex.r >= 0 ? '+' : ''}${ex.r.toFixed(2)}R`
     markers.push({

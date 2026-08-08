@@ -71,6 +71,8 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
     // 品种精度列：0 表示未显式设置，扫描时用内置默认表兜底
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
+    // 复盘回放触发时间：快照 trigger_ts 缺失时图表用它补画触发标记
+    ensure_column(db, "signal_outcomes", "entry_ts", "TEXT").await?;
     info!("数据库表结构已就绪");
     Ok(())
 }

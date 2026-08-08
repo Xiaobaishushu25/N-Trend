@@ -209,18 +209,12 @@ const actionOptions = computed<DropdownOption[]>(() => [
     icon: () => h(NIcon, { component: Tag, size: 16 }),
     disabled: actionsStore.enriching,
   },
-  {
-    label: '复盘统计',
-    key: 'review',
-    icon: () => h(NIcon, { component: History, size: 16 }),
-  },
 ])
 
 function onActionSelect(key: string) {
   if (key === 'refresh') void actionsStore.refreshData()
   else if (key === 'scan') void actionsStore.scanNow()
   else if (key === 'enrich') void actionsStore.enrichNames()
-  else if (key === 'review') void openReviewWindow()
 }
 
 /** 状态时间只显示「MM-DD HH:mm:ss」，完整时间放 tooltip */
@@ -386,6 +380,18 @@ onBeforeUnmount(() => {
             </template>
           </n-button>
         </n-dropdown>
+        <n-button
+          quaternary
+          circle
+          size="small"
+          title="复盘统计"
+          class="review-button"
+          @click="openReviewWindow"
+        >
+          <template #icon>
+            <n-icon :component="History" size="18" />
+          </template>
+        </n-button>
         <n-button
           quaternary
           circle
