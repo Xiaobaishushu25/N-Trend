@@ -271,6 +271,73 @@ export interface AppInfo {
   version: string
 }
 
+/** 复盘统计：单个分组（总体或某个维度分组） */
+export interface GroupStat {
+  key: string
+  /** 实例数（结构键去重后） */
+  n: number
+  /** 未结算（open/数据不足） */
+  pending: number
+  no_trigger: number
+  /** 已结算（win + loss，含 time_exit/no_follow 按 R 正负计入） */
+  settled: number
+  wins: number
+  losses: number
+  win_rate: number | null
+  avg_r: number | null
+  avg_bars: number | null
+}
+
+export interface ReviewStats {
+  sim_version: number
+  overall: GroupStat
+  groups: GroupStat[]
+}
+
+/** 复盘页明细表一行 */
+export interface OutcomeDetail {
+  signal_id: number
+  symbol: string
+  direction: string
+  level: string
+  grade: string
+  score: number
+  entry: number
+  stop: number
+  target: number
+  rr: number
+  created_at: string
+  outcome: string
+  exit_reason: string
+  exit_ts: string | null
+  exit_price: number | null
+  r_multiple: number | null
+  mfe_r: number | null
+  mae_r: number | null
+  bars_held: number | null
+  vol_ratio: number | null
+  oi_increase: boolean | null
+  trend60_score: number | null
+}
+
+export interface OutcomeRefresh {
+  updated: number
+}
+
+/** 复盘明细跳转K线图：完整形态结构 + 结局 */
+export interface ReviewSignalDetail {
+  pattern: PatternDto
+  outcome: OutcomeDetail | null
+}
+
+/** K线图上重绘复盘点位所需的出场信息 */
+export interface ReviewExitOverlay {
+  price: number | null
+  ts: string | null
+  outcome: string
+  r: number | null
+}
+
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
 

@@ -10,7 +10,11 @@ import type {
   GroupRow,
   KlineRow,
   MarketSnapshot,
+  OutcomeDetail,
+  OutcomeRefresh,
   RefreshStats,
+  ReviewSignalDetail,
+  ReviewStats,
   ScanResult,
   ScanRow,
   SchedulerStatus,
@@ -60,6 +64,14 @@ export const api = {
   getScanHistory: (limit?: number) => invoke<ScanRow[]>('get_scan_history', { limit }),
   getScanDetail: (scanId: number) => invoke<SignalRow[]>('get_scan_detail', { scanId }),
   getLatestSignals: (limit?: number) => invoke<SignalRow[]>('get_latest_signals', { limit }),
+
+  refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
+  getReviewStats: (dimension: string) =>
+    invoke<ReviewStats>('get_review_stats', { dimension }),
+  getRecentOutcomes: (limit?: number) =>
+    invoke<OutcomeDetail[]>('get_recent_outcomes', { limit }),
+  getReviewSignal: (signalId: number) =>
+    invoke<ReviewSignalDetail | null>('get_review_signal', { signalId }),
 
   getConfig: () => invoke<Config>('get_config'),
   updateConfig: (config: Config) => invoke<Config>('update_config', { config }),

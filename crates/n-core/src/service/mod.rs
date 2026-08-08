@@ -8,13 +8,14 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 use crate::analyze::dto::SignalOutcome;
+use crate::analyze::outcome;
 use crate::analyze::model::{Bar, DT, ATR_PERIOD};
 use crate::config::Config;
 use crate::derive::{aggregate, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::fetch::SinaClient;
 use crate::scheduler::SchedulerConfig;
-use crate::storage::entities::{klines, signals, symbols};
+use crate::storage::entities::{klines, signal_outcomes, signals, symbols};
 use crate::storage::repo;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -37,6 +38,134 @@ pub struct ScanResult {
     pub summary: String,
     pub signals: Vec<SignalOutcome>,
     pub failed: Vec<SymbolFailure>,
+}
+
+/// 结局回填结果（复盘页刷新按钮返回值）。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutcomeRefresh {
+    pub updated: usize,
+}
+
+/// 复盘页明细表的一行（信号快照 + 结局 + 特征）。
+#[derive(Debug, Clone, Serialize)]
+pub struct OutcomeDetail {
+    pub signal_id: i64,
+    pub symbol: String,
+    pub direction: String,
+    pub level: String,
+    pub grade: String,
+    pub score: f64,
+    pub entry: f64,
+    pub stop: f64,
+    pub target: f64,
+    pub rr: f64,
+    pub created_at: String,
+    pub outcome: String,
+    pub exit_reason: String,
+    pub exit_ts: Option<String>,
+    pub exit_price: Option<f64>,
+    pub r_multiple: Option<f64>,
+    pub mfe_r: Option<f64>,
+    pub mae_r: Option<f64>,
+    pub bars_held: Option<i64>,
+    pub vol_ratio: Option<f64>,
+    pub oi_increase: Option<bool>,
+    pub trend60_score: Option<f64>,
+}
+
+/// 复盘明细跳转K线图所需：完整形态结构 + 结局。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewSignalDetail {
+    pub pattern: crate::analyze::dto::PatternDto,
+    pub outcome: Option<OutcomeDetail>,
+}
+
+/// 从 signals.detail JSON 读取预警时间与结构两端时间戳。
+fn parse_detail_ts(detail: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
+        return (None, None, None);
+    };
+    let get = |path: &[&str]| -> Option<String> {
+        let mut cur: &serde_json::Value = &v;
+        for p in path {
+            cur = cur.get(p)?;
+        }
+        cur.as_str().map(|s| s.to_string())
+    };
+    (
+        get(&["warning_ts"]),
+        get(&["s1", "ts"]),
+        get(&["s2", "ts"]),
+    )
+}
+
+fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
+    let (warning_ts, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+    Some(outcome::SignalInput {
+        symbol: s.symbol.clone(),
+        direction: s.direction.clone(),
+        level: s.level.clone(),
+        entry: s.entry,
+        stop: s.stop,
+        target: s.target,
+        risk: (s.entry - s.stop).abs(),
+        created_at: s.created_at.clone(),
+        warning_ts,
+        s1_ts,
+        s2_ts,
+    })
+}
+
+fn stat_row_from(
+    s: &signals::Model,
+    o: Option<&signal_outcomes::Model>,
+) -> Option<outcome::StatRow> {
+    let (warning_ts, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+    Some(outcome::StatRow {
+        signal_id: s.id,
+        symbol: s.symbol.clone(),
+        direction: s.direction.clone(),
+        level: s.level.clone(),
+        grade: s.grade.clone(),
+        score: s.score,
+        created_at: s.created_at.clone(),
+        warning_ts,
+        s1_ts,
+        s2_ts,
+        outcome: o.and_then(|x| outcome::Outcome::parse(&x.outcome)),
+        r_multiple: o.and_then(|x| x.r_multiple),
+        bars_held: o.and_then(|x| x.bars_held.map(|b| b as usize)),
+        vol_ratio: o.and_then(|x| x.vol_ratio),
+        oi_increase: o.and_then(|x| x.oi_increase),
+        trend60_score: o.and_then(|x| x.trend60_score),
+    })
+}
+
+fn outcome_detail_from(s: &signals::Model, o: &signal_outcomes::Model) -> OutcomeDetail {
+    OutcomeDetail {
+        signal_id: s.id,
+        symbol: s.symbol.clone(),
+        direction: s.direction.clone(),
+        level: s.level.clone(),
+        grade: s.grade.clone(),
+        score: s.score,
+        entry: s.entry,
+        stop: s.stop,
+        target: s.target,
+        rr: s.rr,
+        created_at: s.created_at.clone(),
+        outcome: o.outcome.clone(),
+        exit_reason: o.exit_reason.clone(),
+        exit_ts: o.exit_ts.clone(),
+        exit_price: o.exit_price,
+        r_multiple: o.r_multiple,
+        mfe_r: o.mfe_r,
+        mae_r: o.mae_r,
+        bars_held: o.bars_held,
+        vol_ratio: o.vol_ratio,
+        oi_increase: o.oi_increase,
+        trend60_score: o.trend60_score,
+    }
 }
 
 /// 单个品种的行情快照（最新价 + 相对上一交易日的涨跌幅）。
@@ -703,6 +832,11 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
             .collect();
         repo::insert_signals(&self.db, rows).await?;
 
+        // 扫描后顺手刷新信号结局：新增信号第一次回填，在途信号按最新K线更新
+        if let Err(e) = self.refresh_outcomes().await {
+            tracing::warn!("信号结局回填失败: {e}");
+        }
+
         Ok(ScanResult {
             scan_id,
             scanned,
@@ -711,6 +845,142 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
             signals: active,
             failed,
         })
+    }
+
+    /// 结局回填：对尚无终局（或 open / 数据不足）的信号重新模拟并落库。
+    pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
+        let sigs = repo::all_signals(&self.db).await?;
+        let outs = repo::all_outcomes(&self.db).await?;
+        // 只跳过"当前规则版本下已终结"的信号；旧版本结果或未终结信号一律重算
+        let current_version = outcome::SIM_VERSION;
+        let terminal: std::collections::HashSet<i64> = outs
+            .iter()
+            .filter(|o| {
+                o.sim_version == current_version
+                    && outcome::Outcome::parse(&o.outcome).is_some_and(|x| x.is_terminal())
+            })
+            .map(|o| o.signal_id)
+            .collect();
+        let need: Vec<signals::Model> = sigs
+            .into_iter()
+            .filter(|s| !terminal.contains(&s.id))
+            .collect();
+        if need.is_empty() {
+            return Ok(OutcomeRefresh { updated: 0 });
+        }
+
+        let mut by_symbol: HashMap<String, Vec<signals::Model>> = HashMap::new();
+        for s in need {
+            by_symbol.entry(s.symbol.clone()).or_default().push(s);
+        }
+        let mut annotations: Vec<(i64, outcome::SignalAnnotation)> = Vec::new();
+        for (symbol, list) in by_symbol {
+            let bars15 = self.bars_for(&symbol, "15m").await?;
+            let bars60 = self.bars_for(&symbol, "60m").await?;
+            if bars15.len() < 3 {
+                continue;
+            }
+            for s in list {
+                if let Some(input) = signal_input_from(&s) {
+                    if let Some(ann) = outcome::annotate(&input, &bars15, &bars60) {
+                        annotations.push((s.id, ann));
+                    }
+                }
+            }
+        }
+
+        let now = crate::analyze::time::now_display();
+        let rows: Vec<signal_outcomes::ActiveModel> = annotations
+            .into_iter()
+            .map(|(id, ann)| signal_outcomes::ActiveModel {
+                signal_id: Set(id),
+                sim_version: Set(ann.sim_version),
+                outcome: Set(ann.outcome.as_str().to_string()),
+                exit_reason: Set(ann.exit_reason.as_str().to_string()),
+                exit_ts: Set(ann.exit_ts),
+                exit_price: Set(ann.exit_price),
+                r_multiple: Set(ann.r_multiple),
+                mfe_r: Set(ann.mfe_r),
+                mae_r: Set(ann.mae_r),
+                bars_held: Set(ann.bars_held.map(|b| b as i64)),
+                vol_ratio: Set(ann.vol_ratio),
+                oi_increase: Set(ann.oi_increase),
+                trend60_score: Set(ann.trend60_score),
+                updated_at: Set(now.clone()),
+                ..Default::default()
+            })
+            .collect();
+        let updated = rows.len();
+        repo::upsert_outcomes(&self.db, rows).await?;
+        Ok(OutcomeRefresh { updated })
+    }
+
+    /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总。
+    pub async fn review_stats(&self, dimension: &str) -> Result<outcome::ReviewStats> {
+        let sigs = repo::all_signals(&self.db).await?;
+        let outs = repo::all_outcomes(&self.db).await?;
+        let by_id: HashMap<i64, signal_outcomes::Model> = outs
+            .into_iter()
+            .map(|o| (o.signal_id, o))
+            .collect();
+        let rows: Vec<outcome::StatRow> = sigs
+            .iter()
+            .filter_map(|s| stat_row_from(s, by_id.get(&s.id)))
+            .collect();
+        Ok(outcome::aggregate_stats(
+            &rows,
+            outcome::GroupBy::parse(dimension),
+        ))
+    }
+
+    /// 最近信号明细（复盘页明细表）：已回填结局的信号，按 signal_id 倒序。
+    pub async fn recent_outcomes(&self, limit: usize) -> Result<Vec<OutcomeDetail>> {
+        let sigs = repo::all_signals(&self.db).await?;
+        let outs = repo::all_outcomes(&self.db).await?;
+        let by_id: HashMap<i64, signal_outcomes::Model> = outs
+            .into_iter()
+            .map(|o| (o.signal_id, o))
+            .collect();
+        // 与统计口径一致：同一结构（品种+方向+级别+s1/s2 时间）只保留首次识别的快照
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut rows: Vec<OutcomeDetail> = Vec::new();
+        for s in &sigs {
+            let Some(o) = by_id.get(&s.id) else {
+                continue;
+            };
+            let (_, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+            let key = match (&s1_ts, &s2_ts) {
+                (Some(a), Some(b)) => {
+                    format!("{}|{}|{}|{}|{}", s.symbol, s.direction, s.level, a, b)
+                }
+                // 旧数据缺少结构时间戳时退回信号自身，不做合并
+                _ => format!("{}|{}|{}|id{}", s.symbol, s.direction, s.level, s.id),
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            rows.push(outcome_detail_from(s, o));
+        }
+        rows.sort_by(|a, b| b.signal_id.cmp(&a.signal_id));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    /// 复盘跳转K线图：按 signal_id 返回完整形态 + 结局。
+    pub async fn review_signal(&self, signal_id: i64) -> Result<Option<ReviewSignalDetail>> {
+        let Some(row) = repo::signal_by_id(&self.db, signal_id).await? else {
+            return Ok(None);
+        };
+        let Ok(pattern) =
+            serde_json::from_str::<crate::analyze::dto::PatternDto>(&row.detail)
+        else {
+            return Ok(None);
+        };
+        let outcome = match repo::outcome_by_signal(&self.db, signal_id).await? {
+            Some(o) => Some(outcome_detail_from(&row, &o)),
+            None => None,
+        };
+        Ok(Some(ReviewSignalDetail { pattern, outcome }))
     }
 }
 

@@ -26,7 +26,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
-import type { KlineRow, PatternDto } from '../types'
+import type { KlineRow, PatternDto, ReviewExitOverlay } from '../types'
 import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
@@ -35,6 +35,8 @@ const props = defineProps<{
   rows: KlineRow[]
   signals: PatternDto[]
   loading?: boolean
+  /** 复盘跳转模式：额外绘制出场价位与出场标记 */
+  reviewExit?: ReviewExitOverlay | null
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
@@ -269,6 +271,17 @@ function buildMarkers(): SeriesMarker<Time>[] {
       })
     }
   }
+  const ex = props.reviewExit
+  if (ex?.ts) {
+    const rText = ex.r == null ? '' : ` ${ex.r >= 0 ? '+' : ''}${ex.r.toFixed(2)}R`
+    markers.push({
+      time: toTs(ex.ts),
+      position: 'aboveBar',
+      color: '#7c3aed',
+      shape: 'circle',
+      text: `出场${rText}`,
+    })
+  }
   return markers
 }
 
@@ -281,6 +294,10 @@ function syncPriceLines() {
     if (s.entry > 0) lines.push({ price: s.entry, color: '#1565c0', title: '入场' })
     if (s.stop > 0) lines.push({ price: s.stop, color: '#e53935', title: '止损' })
     if (s.target > 0) lines.push({ price: s.target, color: '#2e7d32', title: '目标' })
+  }
+  const ex = props.reviewExit
+  if (ex?.price && ex.price > 0) {
+    lines.push({ price: ex.price, color: '#7c3aed', title: '出场' })
   }
   priceLines = lines.map((l) =>
     candleSeries!.createPriceLine({
@@ -755,6 +772,12 @@ watch(
     if (chart) renderOverlays()
   },
   { deep: true },
+)
+watch(
+  () => props.reviewExit,
+  () => {
+    if (chart) renderOverlays()
+  },
 )
 
 onBeforeUnmount(() => {

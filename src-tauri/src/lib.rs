@@ -8,6 +8,7 @@ use n_core::storage;
 use serde::Serialize;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 use tokio::time::Duration;
 
 mod commands;
@@ -43,7 +44,27 @@ fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例：重复启动时不再创建新进程，而是唤起已有实例的主窗口
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
+        // 开机自启：Windows 写注册表 Run 项，macOS 用 LaunchAgent（当前仅在 Windows 部署）
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        // 记住窗口位置/大小/最大化状态；不保存 VISIBLE（本应用关闭是隐藏到托盘，
+        // 若保存可见性，退出时窗口处于隐藏状态会导致下次启动时窗口不可见）
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .build(),
+        )
         .setup(|app| {
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
@@ -184,6 +205,10 @@ pub fn run() {
             commands::get_scan_history,
             commands::get_scan_detail,
             commands::get_latest_signals,
+            commands::refresh_outcomes_now,
+            commands::get_review_stats,
+            commands::get_recent_outcomes,
+            commands::get_review_signal,
             commands::get_config,
             commands::update_config,
             commands::set_last_group,
@@ -361,6 +386,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             }
             "quit" => {
                 QUITTING.store(true, Ordering::SeqCst);
+                let _ = app.save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
                 app.exit(0);
             }
             _ => {}

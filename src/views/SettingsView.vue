@@ -24,6 +24,12 @@ import {
   Ruler,
   Settings as SettingsIcon,
 } from '@vicons/tabler'
+import { isTauri } from '@tauri-apps/api/core'
+import {
+  disable as disableAutoLaunch,
+  enable as enableAutoLaunch,
+  isEnabled as isAutoLaunchEnabled,
+} from '@tauri-apps/plugin-autostart'
 import { api } from '../services/api'
 import { useSettingsStore } from '../stores/settings'
 import type { Config, SymbolRow } from '../types'
@@ -63,6 +69,11 @@ const form = ref<Config>(cloneConfig(settingsStore.settings))
 const saving = ref(false)
 const symbolRows = ref<SymbolRow[]>([])
 const symbolFilter = ref('')
+/** 浏览器预览（纯前端 npm run dev）下不调用任何 Tauri 插件 API */
+const inTauri = isTauri()
+/** 开机自启状态（由操作系统注册项读取，不写入 config.json） */
+const autoLaunch = ref(false)
+const autoLaunchBusy = ref(false)
 /** 表单与当前已保存配置是否不同（有改动才允许保存） */
 const dirty = computed(
   () => JSON.stringify(form.value) !== JSON.stringify(settingsStore.settings),
@@ -167,6 +178,33 @@ async function openLogDirectory() {
   }
 }
 
+/** 读取系统当前的开机自启状态，用于同步开关 */
+async function syncAutoLaunch() {
+  if (!inTauri) return
+  try {
+    autoLaunch.value = await isAutoLaunchEnabled()
+  } catch (e) {
+    console.warn('读取开机自启状态失败', e)
+  }
+}
+
+/** 切换开机自启：写入系统注册项；失败时回滚开关状态 */
+async function toggleAutoLaunch(value: boolean) {
+  if (!inTauri || autoLaunchBusy.value) return
+  autoLaunchBusy.value = true
+  try {
+    if (value) await enableAutoLaunch()
+    else await disableAutoLaunch()
+    autoLaunch.value = value
+    message.success(value ? '已开启开机自启' : '已关闭开机自启')
+  } catch (e) {
+    autoLaunch.value = !value
+    message.error(String(e))
+  } finally {
+    autoLaunchBusy.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     await settingsStore.load()
@@ -175,6 +213,7 @@ onMounted(async () => {
   }
   await loadSymbols()
   form.value = cloneConfig(settingsStore.settings)
+  await syncAutoLaunch()
 })
 </script>
 
@@ -191,6 +230,17 @@ onMounted(async () => {
         <div class="tab-body">
           <label class="section-title">应用</label>
           <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                开机自动启动
+                <Tip text="登录 Windows 后自动启动本应用；可在设置界面或系统任务管理器中随时关闭。" />
+              </div>
+              <n-switch
+                :value="autoLaunch"
+                :loading="autoLaunchBusy"
+                @update:value="toggleAutoLaunch"
+              />
+            </div>
             <div class="setting-card-row">
               <div class="row-label">
                 启动时自动运行定时任务

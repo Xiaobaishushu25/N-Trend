@@ -174,3 +174,41 @@ pub mod symbol_groups {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 信号结局与首批诊断特征（复盘统计用）。
+/// 每个信号一行（signal_id 主键），由扫描后的结局回填任务写入/覆盖。
+pub mod signal_outcomes {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "signal_outcomes")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub signal_id: i64,
+        /// 模拟规则版本（简化出场规则 = 1），规则升级后按版本重新回填
+        pub sim_version: i64,
+        /// win / loss / no_trigger / open / insufficient_data
+        pub outcome: String,
+        /// stop / target / no_follow / time_exit / （空）
+        pub exit_reason: String,
+        pub exit_ts: Option<String>,
+        pub exit_price: Option<f64>,
+        pub r_multiple: Option<f64>,
+        pub mfe_r: Option<f64>,
+        pub mae_r: Option<f64>,
+        pub bars_held: Option<i64>,
+        /// 触发 bar 成交量 / 前 20 根均量（15m）
+        pub vol_ratio: Option<f64>,
+        /// 触发 bar 持仓量较前一根增加
+        pub oi_increase: Option<bool>,
+        /// 60m 连续趋势分 0~5（信号时刻截断计算）
+        pub trend60_score: Option<f64>,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+

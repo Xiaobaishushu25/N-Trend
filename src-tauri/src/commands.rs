@@ -1,7 +1,10 @@
 ﻿use std::sync::Arc;
 
 use n_core::config::Config;
-use n_core::service::{MarketSnapshot, RefreshStats, ScanResult};
+use n_core::service::{
+    MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail, ScanResult,
+};
+use n_core::analyze::outcome::ReviewStats;
 use n_core::storage::entities::{groups, klines, scans, signals, symbols};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
@@ -284,6 +287,55 @@ pub async fn get_latest_signals(
     limit: Option<u64>,
 ) -> Result<Vec<signals::Model>, String> {
     n_core::storage::repo::latest_signals(&state.services.db, limit.unwrap_or(50))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
+#[tauri::command]
+pub async fn refresh_outcomes_now(state: State<'_, Arc<AppState>>) -> Result<OutcomeRefresh, String> {
+    state
+        .services
+        .refresh_outcomes()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 复盘统计：按维度分组（score_band/grade/direction/level/hour/symbol/vol_confirm/oi/trend60）。
+#[tauri::command]
+pub async fn get_review_stats(
+    state: State<'_, Arc<AppState>>,
+    dimension: String,
+) -> Result<ReviewStats, String> {
+    state
+        .services
+        .review_stats(&dimension)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 最近信号明细（复盘页明细表）。
+#[tauri::command]
+pub async fn get_recent_outcomes(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<u64>,
+) -> Result<Vec<OutcomeDetail>, String> {
+    state
+        .services
+        .recent_outcomes(limit.unwrap_or(100) as usize)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 复盘明细跳转K线图：按 signal_id 返回完整形态结构 + 结局。
+#[tauri::command]
+pub async fn get_review_signal(
+    state: State<'_, Arc<AppState>>,
+    signal_id: i64,
+) -> Result<Option<ReviewSignalDetail>, String> {
+    state
+        .services
+        .review_signal(signal_id)
         .await
         .map_err(|e| e.to_string())
 }

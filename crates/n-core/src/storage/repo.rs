@@ -7,7 +7,9 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
-use crate::storage::entities::{groups, klines, scans, settings, signals, symbol_groups, symbols};
+use crate::storage::entities::{
+    groups, klines, scans, settings, signal_outcomes, signals, symbol_groups, symbols,
+};
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
     if rows.is_empty() {
@@ -514,6 +516,79 @@ pub async fn insert_signals(db: &DatabaseConnection, rows: Vec<signals::ActiveMo
         .exec(db)
         .await
         .context("写入信号失败")?;
+    Ok(())
+}
+
+/// 全部信号（复盘统计/结局回填用；量级为万级以内，内存过滤足够）。
+pub async fn all_signals(db: &DatabaseConnection) -> Result<Vec<signals::Model>> {
+    Ok(signals::Entity::find()
+        .order_by_asc(signals::Column::Id)
+        .all(db)
+        .await
+        .context("查询信号失败")?)
+}
+
+/// 按 id 查询单条信号（复盘跳转K线图用）。
+pub async fn signal_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<signals::Model>> {
+    Ok(signals::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .context("查询信号失败")?)
+}
+
+/// 按 signal_id 查询单条结局（复盘跳转K线图用）。
+pub async fn outcome_by_signal(
+    db: &DatabaseConnection,
+    id: i64,
+) -> Result<Option<signal_outcomes::Model>> {
+    Ok(signal_outcomes::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .context("查询信号结局失败")?)
+}
+
+/// 全部信号结局（与 all_signals 在内存中按 signal_id 关联）。
+pub async fn all_outcomes(db: &DatabaseConnection) -> Result<Vec<signal_outcomes::Model>> {
+    Ok(signal_outcomes::Entity::find()
+        .all(db)
+        .await
+        .context("查询信号结局失败")?)
+}
+
+/// 批量 upsert 信号结局：同一 signal_id 覆盖为最新模拟结果。
+pub async fn upsert_outcomes(
+    db: &DatabaseConnection,
+    rows: Vec<signal_outcomes::ActiveModel>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    // 批量插入时列数 × 行数会超过 SQLite 变量上限（约 999/32766），分块写入
+    for chunk in rows.chunks(200) {
+        signal_outcomes::Entity::insert_many(chunk.to_vec())
+            .on_conflict(
+                OnConflict::column(signal_outcomes::Column::SignalId)
+                    .update_columns([
+                        signal_outcomes::Column::SimVersion,
+                        signal_outcomes::Column::Outcome,
+                        signal_outcomes::Column::ExitReason,
+                        signal_outcomes::Column::ExitTs,
+                        signal_outcomes::Column::ExitPrice,
+                        signal_outcomes::Column::RMultiple,
+                        signal_outcomes::Column::MfeR,
+                        signal_outcomes::Column::MaeR,
+                        signal_outcomes::Column::BarsHeld,
+                        signal_outcomes::Column::VolRatio,
+                        signal_outcomes::Column::OiIncrease,
+                        signal_outcomes::Column::Trend60Score,
+                        signal_outcomes::Column::UpdatedAt,
+                    ])
+                    .to_owned(),
+            )
+            .exec(db)
+            .await
+            .context("写入信号结局失败")?;
+    }
     Ok(())
 }
 

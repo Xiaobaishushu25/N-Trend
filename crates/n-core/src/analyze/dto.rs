@@ -1,11 +1,11 @@
 ﻿//! 面向前端展示的结构化分析结果 DTO。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::analyze::model::{Bar, Dir, NPattern, SignalCheck, Trend60};
 use crate::analyze::report;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwingDto {
     pub index: usize,
     pub price: f64,
@@ -13,7 +13,7 @@ pub struct SwingDto {
     pub ts: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatternDto {
     pub number: usize,
     pub level: String,

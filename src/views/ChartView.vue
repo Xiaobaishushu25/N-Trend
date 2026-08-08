@@ -27,6 +27,8 @@ import type {
   KlineRow,
   MarketSnapshot,
   PatternDto,
+  ReviewExitOverlay,
+  ReviewSignalDetail,
   SignalOutcome,
   SymbolRow,
   Timeframe,
@@ -64,6 +66,34 @@ function toggleTimeframe(t: Timeframe, checked: boolean) {
 }
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
+
+/** 复盘跳转模式：从 /chart/:symbol?review=<signalId> 进入时重绘该信号形态与进出场点位 */
+const reviewOverlay = ref<ReviewSignalDetail | null>(null)
+const reviewSignalId = computed(() => {
+  const q = route.query.review
+  return q ? Number(q) : null
+})
+const reviewExit = computed<ReviewExitOverlay | null>(() => {
+  const o = reviewOverlay.value?.outcome
+  if (!o) return null
+  return { price: o.exit_price, ts: o.exit_ts, outcome: o.outcome, r: o.r_multiple }
+})
+
+async function loadReviewOverlay() {
+  const id = reviewSignalId.value
+  if (!id || !symbol.value) {
+    reviewOverlay.value = null
+    return
+  }
+  try {
+    const detail = await api.getReviewSignal(id)
+    reviewOverlay.value = detail ?? null
+    // 形态基于 15m，复盘视图固定到 15m
+    if (detail) timeframe.value = '15m'
+  } catch {
+    reviewOverlay.value = null
+  }
+}
 
 /** 形态状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
 function patternStateRank(state: string): number {
@@ -566,9 +596,10 @@ function setRowFlash(code: string, dir: 'up' | 'down') {
   )
 }
 
-const visibleSignals = computed<PatternDto[]>(() =>
-  signals.value.filter((s) => !hiddenNumbers.value.has(s.number)),
-)
+const visibleSignals = computed<PatternDto[]>(() => {
+  if (reviewOverlay.value) return [reviewOverlay.value.pattern]
+  return signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
+})
 
 function isHidden(num: number) {
   return hiddenNumbers.value.has(num)
@@ -641,6 +672,11 @@ let unlisteners: (() => void)[] = []
 
 // 形态列表就绪后（含进入页面、扫描完成刷新）按默认规则隐藏非首个形态
 watch(signals, applyDefaultHidden, { immediate: true })
+
+// 复盘模式：query.review 变化（或切换品种）时重新加载复盘点位
+watch([symbol, reviewSignalId], () => {
+  void loadReviewOverlay()
+}, { immediate: true })
 
 watch([symbol, timeframe], async () => {
   hiddenApplied.value = ''
@@ -875,6 +911,7 @@ onBeforeUnmount(() => {
           :timeframe="timeframe"
           :rows="displayRows"
           :signals="visibleSignals"
+          :review-exit="reviewExit"
           :loading="klinesStore.loading"
         />
         <n-empty

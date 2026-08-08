@@ -2,6 +2,7 @@
 pub mod indicators;
 pub mod io;
 pub mod model;
+pub mod outcome;
 pub mod pattern;
 pub mod report;
 pub mod scoring;

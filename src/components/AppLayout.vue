@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { listen } from '@tauri-apps/api/event'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
   NAutoComplete,
   NButton,
@@ -14,6 +16,7 @@ import {
 } from 'naive-ui'
 import {
   DotsVertical,
+  History,
   Plus,
   Refresh,
   Scan,
@@ -27,6 +30,7 @@ import { useActionsStore } from '../stores/actions'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
+import { openReviewWindow } from '../utils/openReviewWindow'
 import { openSettingsWindow } from '../utils/openSettingsWindow'
 import { notify } from '../utils/notify'
 import TitleBar from './TitleBar.vue'
@@ -40,7 +44,10 @@ const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
 
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
-const isSettingsWindow = computed(() => route.name === 'settings')
+const isStandaloneWindow = computed(() => route.name === 'settings' || route.name === 'review')
+const windowTitle = computed(() =>
+  route.name === 'settings' ? '设置' : route.name === 'review' ? '复盘统计' : '',
+)
 
 /** bare 路由（K线图/设置）：内容区不额外加内边距，由页面自行布局 */
 const bare = computed(() => Boolean(route.meta.bare))
@@ -202,12 +209,18 @@ const actionOptions = computed<DropdownOption[]>(() => [
     icon: () => h(NIcon, { component: Tag, size: 16 }),
     disabled: actionsStore.enriching,
   },
+  {
+    label: '复盘统计',
+    key: 'review',
+    icon: () => h(NIcon, { component: History, size: 16 }),
+  },
 ])
 
 function onActionSelect(key: string) {
   if (key === 'refresh') void actionsStore.refreshData()
   else if (key === 'scan') void actionsStore.scanNow()
   else if (key === 'enrich') void actionsStore.enrichNames()
+  else if (key === 'review') void openReviewWindow()
 }
 
 /** 状态时间只显示「MM-DD HH:mm:ss」，完整时间放 tooltip */
@@ -236,6 +249,25 @@ function kickBreathe() {
 const unlisteners: (() => void)[] = []
 
 onMounted(async () => {
+  // 复盘窗口点击明细行时：主窗口接收事件并打开对应K线图（复盘点位重绘见 ChartView）
+  try {
+    if (getCurrentWindow().label === 'main') {
+      unlisteners.push(
+        await listen<{ symbol: string; signalId: number }>('open-review-chart', (e) => {
+          const { symbol: sym, signalId } = e.payload
+          if (sym) {
+            void router.push({
+              name: 'chart',
+              params: { symbol: sym },
+              query: { review: String(signalId) },
+            })
+          }
+        }),
+      )
+    }
+  } catch {
+    // 浏览器预览等环境无 Tauri 事件 API，忽略
+  }
   try {
     await settingsStore.load()
   } catch {
@@ -267,8 +299,8 @@ onBeforeUnmount(() => {
 
 <template>
   <n-layout position="absolute" style="--app-header-h: 40px">
-    <TitleBar :title="isSettingsWindow ? '设置' : ''">
-      <template v-if="!isSettingsWindow" #left>
+    <TitleBar :title="windowTitle">
+      <template v-if="!isStandaloneWindow" #left>
         <div class="brand">
           <n-icon :component="TrendingUp" size="20" color="#f5c23f" />
           <span class="brand-name">N趋势</span>
@@ -308,7 +340,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <template v-if="!isSettingsWindow" #center>
+      <template v-if="!isStandaloneWindow" #center>
         <div class="status-area">
           <div
             v-if="settingsStore.status.running"
@@ -346,7 +378,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
 
-      <template v-if="!isSettingsWindow" #right>
+      <template v-if="!isStandaloneWindow" #right>
         <n-dropdown trigger="click" :options="actionOptions" @select="onActionSelect">
           <n-button quaternary circle size="small" title="更多操作">
             <template #icon>
