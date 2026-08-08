@@ -7,6 +7,7 @@ import {
   NCard,
   NDataTable,
   NEmpty,
+  NInput,
   NSelect,
   NSpace,
   NTag,
@@ -21,6 +22,10 @@ import type { GroupStat, OutcomeDetail } from '../types'
 const review = useReviewStore()
 const loading = ref(false)
 const error = ref('')
+/** 品种筛选本地输入（防抖后再生效） */
+const symbolInput = ref('')
+/** 评分段筛选（映射为 scoreMin/scoreMax） */
+const scoreBand = ref<string | null>(null)
 
 const dirLabel = (d: string) => (d === 'up' ? '做多' : d === 'down' ? '做空' : d)
 const levelLabel = (l: string) => (l === 'fine' ? '精细' : l === 'large' ? '较大' : l)
@@ -189,6 +194,34 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   },
 ]
 
+const directionOptions = [
+  { label: '做多', value: 'up' },
+  { label: '做空', value: 'down' },
+]
+const levelOptions = [
+  { label: '精细', value: 'fine' },
+  { label: '较大', value: 'large' },
+]
+const gradeOptions = [
+  { label: 'A级', value: 'A级' },
+  { label: 'B级', value: 'B级' },
+  { label: 'C级', value: 'C级' },
+  { label: '回撤过浅', value: '回撤过浅' },
+  { label: '回撤过深', value: '回撤过深' },
+]
+const scoreOptions = [
+  { label: '<2.5', value: '<2.5' },
+  { label: '2.5-3.5', value: '2.5-3.5' },
+  { label: '3.5-5.0', value: '3.5-5.0' },
+]
+const outcomeOptions = [
+  { label: '盈利', value: 'win' },
+  { label: '亏损', value: 'loss' },
+  { label: '持仓中', value: 'open' },
+  { label: '未触发', value: 'no_trigger' },
+  { label: '数据不足', value: 'insufficient_data' },
+]
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -209,6 +242,32 @@ async function refresh() {
   } catch (e) {
     notify.error(String(e))
   }
+}
+
+let symbolTimer: ReturnType<typeof setTimeout> | undefined
+function onSymbolInput() {
+  if (symbolTimer) clearTimeout(symbolTimer)
+  symbolTimer = setTimeout(() => {
+    void review.setRecentFilter({ symbol: symbolInput.value.trim() })
+  }, 400)
+}
+
+function applyScoreBand(v: string | null) {
+  if (!v) {
+    void review.setRecentFilter({ scoreMin: null, scoreMax: null })
+  } else if (v === '<2.5') {
+    void review.setRecentFilter({ scoreMin: null, scoreMax: 2.5 })
+  } else if (v === '2.5-3.5') {
+    void review.setRecentFilter({ scoreMin: 2.5, scoreMax: 3.5 })
+  } else {
+    void review.setRecentFilter({ scoreMin: 3.5, scoreMax: null })
+  }
+}
+
+async function resetFilters() {
+  scoreBand.value = ''
+  symbolInput.value = ''
+  await review.resetRecentFilters()
 }
 
 /** 点击明细行：通知主窗口打开对应K线图并重绘形态与进出场点位，同时聚焦主窗口 */
@@ -248,6 +307,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  if (symbolTimer) clearTimeout(symbolTimer)
   unlisten?.()
 })
 </script>
@@ -340,6 +400,62 @@ onBeforeUnmount(() => {
         class="details-card"
         :content-style="{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }"
       >
+        <div class="filter-bar">
+          <n-input
+            v-model:value="symbolInput"
+            size="small"
+            clearable
+            placeholder="品种，如 RB"
+            style="width: 140px"
+            @update:value="onSymbolInput"
+          />
+          <n-select
+            v-model:value="review.recentFilters.direction"
+            size="small"
+            clearable
+            placeholder="方向"
+            style="width: 100px"
+            :options="directionOptions"
+            @update:value="() => review.loadRecent()"
+          />
+          <n-select
+            v-model:value="review.recentFilters.level"
+            size="small"
+            clearable
+            placeholder="级别"
+            style="width: 100px"
+            :options="levelOptions"
+            @update:value="() => review.loadRecent()"
+          />
+          <n-select
+            v-model:value="review.recentFilters.grade"
+            size="small"
+            clearable
+            placeholder="等级"
+            style="width: 110px"
+            :options="gradeOptions"
+            @update:value="() => review.loadRecent()"
+          />
+          <n-select
+            v-model:value="scoreBand"
+            size="small"
+            clearable
+            placeholder="评分"
+            style="width: 110px"
+            :options="scoreOptions"
+            @update:value="applyScoreBand"
+          />
+          <n-select
+            v-model:value="review.recentFilters.outcome"
+            size="small"
+            clearable
+            placeholder="结局"
+            style="width: 110px"
+            :options="outcomeOptions"
+            @update:value="() => review.loadRecent()"
+          />
+          <n-button size="small" @click="resetFilters">重置</n-button>
+        </div>
         <n-data-table
           class="details-table"
           :columns="recentColumns"
@@ -349,7 +465,7 @@ onBeforeUnmount(() => {
           :bordered="false"
           :scroll-x="1500"
           flex-height
-          :loading="loading"
+          :loading="loading || review.recentLoading"
         />
         <n-empty
           v-if="!loading && !review.recent.length"
@@ -396,6 +512,13 @@ onBeforeUnmount(() => {
 .details-table {
   flex: 1;
   min-height: 0;
+}
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
 }
 .stat-item {
   display: flex;

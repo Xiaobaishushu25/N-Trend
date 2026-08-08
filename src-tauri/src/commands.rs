@@ -319,10 +319,26 @@ pub async fn get_review_stats(
 pub async fn get_recent_outcomes(
     state: State<'_, Arc<AppState>>,
     limit: Option<u64>,
+    symbol: Option<String>,
+    direction: Option<String>,
+    level: Option<String>,
+    grade: Option<String>,
+    score_min: Option<f64>,
+    score_max: Option<f64>,
+    outcome: Option<String>,
 ) -> Result<Vec<OutcomeDetail>, String> {
+    let filter = n_core::service::OutcomeFilter {
+        symbol,
+        direction,
+        level,
+        grade,
+        score_min,
+        score_max,
+        outcome,
+    };
     state
         .services
-        .recent_outcomes(limit.unwrap_or(100) as usize)
+        .recent_outcomes(limit.unwrap_or(2000) as usize, &filter)
         .await
         .map_err(|e| e.to_string())
 }

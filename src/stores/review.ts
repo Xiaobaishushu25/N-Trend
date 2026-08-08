@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
-import type { OutcomeDetail, ReviewStats } from '../types'
+import type { OutcomeDetail, RecentOutcomeFilters, ReviewStats } from '../types'
 
 export const REVIEW_DIMENSIONS = [
   { key: 'score_band', label: '评分段' },
@@ -19,23 +19,59 @@ export const useReviewStore = defineStore('review', {
     dimension: 'score_band' as string,
     stats: null as ReviewStats | null,
     recent: [] as OutcomeDetail[],
+    recentFilters: {
+      symbol: '',
+      direction: '',
+      level: '',
+      grade: '',
+      outcome: '',
+      scoreMin: null,
+      scoreMax: null,
+    } as RecentOutcomeFilters,
     loading: false,
     refreshing: false,
+    recentLoading: false,
   }),
   actions: {
     async load(dim?: string) {
       this.dimension = dim ?? this.dimension
       this.loading = true
       try {
-        const [stats, recent] = await Promise.all([
+        const [stats] = await Promise.all([
           api.getReviewStats(this.dimension),
-          api.getRecentOutcomes(100),
+          this.loadRecent(),
         ])
         this.stats = stats
-        this.recent = recent
       } finally {
         this.loading = false
       }
+    },
+    /** 只刷新明细（保留当前筛选） */
+    async loadRecent() {
+      this.recentLoading = true
+      try {
+        this.recent = await api.getRecentOutcomes(2000, this.recentFilters)
+      } finally {
+        this.recentLoading = false
+      }
+    },
+    /** 更新筛选条件并重新请求明细 */
+    async setRecentFilter(patch: Partial<RecentOutcomeFilters>) {
+      this.recentFilters = { ...this.recentFilters, ...patch }
+      await this.loadRecent()
+    },
+    /** 清空明细筛选 */
+    async resetRecentFilters() {
+      this.recentFilters = {
+        symbol: '',
+        direction: '',
+        level: '',
+        grade: '',
+        outcome: '',
+        scoreMin: null,
+        scoreMax: null,
+      }
+      await this.loadRecent()
     },
     /** 先回填未终结信号的结局，再重新拉取统计 */
     async refresh() {

@@ -12,6 +12,7 @@ import type {
   MarketSnapshot,
   OutcomeDetail,
   OutcomeRefresh,
+  RecentOutcomeFilters,
   RefreshStats,
   ReviewSignalDetail,
   ReviewStats,
@@ -68,8 +69,17 @@ export const api = {
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
   getReviewStats: (dimension: string) =>
     invoke<ReviewStats>('get_review_stats', { dimension }),
-  getRecentOutcomes: (limit?: number) =>
-    invoke<OutcomeDetail[]>('get_recent_outcomes', { limit }),
+  getRecentOutcomes: (limit?: number, filters?: RecentOutcomeFilters) =>
+    invoke<OutcomeDetail[]>('get_recent_outcomes', {
+      limit,
+      symbol: filters?.symbol || null,
+      direction: filters?.direction || null,
+      level: filters?.level || null,
+      grade: filters?.grade || null,
+      scoreMin: filters?.scoreMin ?? null,
+      scoreMax: filters?.scoreMax ?? null,
+      outcome: filters?.outcome || null,
+    }),
   getReviewSignal: (signalId: number) =>
     invoke<ReviewSignalDetail | null>('get_review_signal', { signalId }),
 

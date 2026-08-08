@@ -338,6 +338,17 @@ export interface ReviewExitOverlay {
   r: number | null
 }
 
+/** 最近信号明细筛选条件（全部可选，空值不过滤） */
+export interface RecentOutcomeFilters {
+  symbol?: string
+  direction?: string
+  level?: string
+  grade?: string
+  outcome?: string
+  scoreMin?: number | null
+  scoreMax?: number | null
+}
+
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
 

@@ -80,6 +80,66 @@ pub struct ReviewSignalDetail {
     pub outcome: Option<OutcomeDetail>,
 }
 
+/// 最近信号明细的筛选条件（均为可选，空值不过滤）。
+#[derive(Debug, Clone, Default)]
+pub struct OutcomeFilter {
+    /// 品种代码包含匹配（不区分大小写）
+    pub symbol: Option<String>,
+    /// up / down
+    pub direction: Option<String>,
+    /// fine / large
+    pub level: Option<String>,
+    /// A级 / B级 / C级 / 回撤过浅 / 回撤过深
+    pub grade: Option<String>,
+    pub score_min: Option<f64>,
+    pub score_max: Option<f64>,
+    /// win / loss / no_trigger / open / insufficient_data
+    pub outcome: Option<String>,
+}
+
+fn matches_outcome_filter(
+    s: &signals::Model,
+    o: &signal_outcomes::Model,
+    f: &OutcomeFilter,
+) -> bool {
+    if let Some(sym) = f.symbol.as_deref().filter(|x| !x.is_empty()) {
+        if !s.symbol.to_lowercase().contains(&sym.to_lowercase()) {
+            return false;
+        }
+    }
+    if let Some(d) = f.direction.as_deref().filter(|x| !x.is_empty()) {
+        if s.direction != d {
+            return false;
+        }
+    }
+    if let Some(l) = f.level.as_deref().filter(|x| !x.is_empty()) {
+        if s.level != l {
+            return false;
+        }
+    }
+    if let Some(g) = f.grade.as_deref().filter(|x| !x.is_empty()) {
+        if s.grade != g {
+            return false;
+        }
+    }
+    if let Some(min) = f.score_min {
+        if s.score < min {
+            return false;
+        }
+    }
+    if let Some(max) = f.score_max {
+        if s.score > max {
+            return false;
+        }
+    }
+    if let Some(out) = f.outcome.as_deref().filter(|x| !x.is_empty()) {
+        if o.outcome != out {
+            return false;
+        }
+    }
+    true
+}
+
 /// 从 signals.detail JSON 读取预警时间与结构两端时间戳。
 fn parse_detail_ts(detail: &str) -> (Option<String>, Option<String>, Option<String>) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
@@ -934,7 +994,11 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
     }
 
     /// 最近信号明细（复盘页明细表）：已回填结局的信号，按 signal_id 倒序。
-    pub async fn recent_outcomes(&self, limit: usize) -> Result<Vec<OutcomeDetail>> {
+    pub async fn recent_outcomes(
+        &self,
+        limit: usize,
+        filter: &OutcomeFilter,
+    ) -> Result<Vec<OutcomeDetail>> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> = outs
@@ -957,6 +1021,9 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
                 _ => format!("{}|{}|{}|id{}", s.symbol, s.direction, s.level, s.id),
             };
             if !seen.insert(key) {
+                continue;
+            }
+            if !matches_outcome_filter(s, o, filter) {
                 continue;
             }
             rows.push(outcome_detail_from(s, o));
