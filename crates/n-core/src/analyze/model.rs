@@ -31,6 +31,8 @@ pub struct Bar {
     pub close: f64,
     pub volume: f64,
     pub hold: f64,
+    /// 该 bar 是连续合约换月后的第一根（跨合约跳空，不计入真实行情）。
+    pub rollover: bool,
 }
 
 #[derive(Clone, Copy, Debug)]

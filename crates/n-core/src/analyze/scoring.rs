@@ -868,6 +868,7 @@ mod tests {
             close,
             volume: 0.0,
             hold: 0.0,
+            rollover: false,
         }
     }
 

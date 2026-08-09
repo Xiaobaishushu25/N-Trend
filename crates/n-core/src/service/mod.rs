@@ -1139,6 +1139,7 @@ fn model_to_bar(m: &klines::Model) -> Option<Bar> {
         close: m.close,
         volume: m.volume,
         hold: m.hold,
+        rollover: false,
     })
 }
 
@@ -1152,6 +1153,7 @@ fn fetch_to_bar(k: &Kline) -> Option<Bar> {
         close: k.close,
         volume: k.volume,
         hold: k.hold,
+        rollover: false,
     })
 }
 

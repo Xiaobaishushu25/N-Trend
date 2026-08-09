@@ -801,6 +801,7 @@ mod tests {
             close,
             volume: 100.0,
             hold: 1000.0,
+            rollover: false,
         }
     }
 
@@ -850,6 +851,7 @@ mod tests {
                 close: c,
                 volume: 100.0,
                 hold: 1000.0,
+                rollover: false,
             })
             .collect()
     }
@@ -1064,6 +1066,7 @@ mod tests {
                 close,
                 volume: 100.0,
                 hold: 1000.0,
+                rollover: false,
             });
         }
         let up_score = trend60_score_at(&up, "2026-08-03 10:00", Dir::Up).unwrap();
@@ -1087,6 +1090,7 @@ mod tests {
                 close: 100.0,
                 volume: 100.0,
                 hold: 1000.0,
+                rollover: false,
             })
             .collect();
         let flat_score = trend60_score_at(&flat, "2026-08-03 10:00", Dir::Up).unwrap();

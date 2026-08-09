@@ -82,6 +82,7 @@ pub fn load_csv(path: &str) -> Result<Vec<Bar>> {
             close: row.close,
             volume: row.volume,
             hold: row.hold,
+            rollover: false,
         });
     }
 
