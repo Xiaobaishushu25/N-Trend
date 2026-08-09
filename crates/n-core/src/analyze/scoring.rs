@@ -102,8 +102,7 @@ fn a_leg_score_formula(a_move: f64, a_bars: usize, strong: usize, atr: f64) -> f
     // 幅度分：a_move 达到 10 倍 ATR 视为满档（1.0）。
     let amplitude = (a_move / (A_LEG_AMPLITUDE_ATR_FULL * atr)).min(1.0);
     // 强趋势K密度分：短腿保底 2 根，长腿按 35% 密度折算。
-    let density_floor =
-        (A_LEG_STRONG_DENSITY_BASE * a_bars as f64).max(A_LEG_STRONG_MIN_COUNT);
+    let density_floor = (A_LEG_STRONG_DENSITY_BASE * a_bars as f64).max(A_LEG_STRONG_MIN_COUNT);
     let quality = (strong as f64 / density_floor).min(1.0);
     // 长度扣分：a 段过长消耗动能，分两档轻扣。
     let length_penalty = if a_bars > A_LEG_LONG_PENALTY_MAX_BARS {
@@ -268,8 +267,8 @@ fn entry_block_flags(
             && wick >= OPPOSING_WICK_RANGE_MIN * range
     });
 
-    let prev_block = trigger > 0
-        && strong_opposite_body_at(bars, atr20, dir, trigger - 1).is_some();
+    let prev_block =
+        trigger > 0 && strong_opposite_body_at(bars, atr20, dir, trigger - 1).is_some();
 
     (wick_block, prev_block)
 }
@@ -501,14 +500,7 @@ fn compute_scores(
     }
 
     (
-        [
-            dim_trend,
-            dim_a,
-            dim_b,
-            dim_trigger,
-            dim_rr,
-            dim_momentum,
-        ],
+        [dim_trend, dim_a, dim_b, dim_trigger, dim_rr, dim_momentum],
         total,
     )
 }
@@ -580,8 +572,9 @@ pub fn evaluate_signal_with_tick(
             // A级允许首根反向收盘直接作为预警，但仍要求收盘在反向一半内，
             // 排除小实体+长反向影线的K线；其余情况（强b向趋势K顶、B/C级）
             // 都要求单根反转形态自证。
-            let single_ok = (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
-                || single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
+            let single_ok =
+                (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
+                    || single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
             // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
             let cumul_ok = (anchor_strong || strict_confirm)
                 && cumulative_coverage(bars, run_start, j, anchor_open, p.dir);
@@ -694,7 +687,16 @@ pub fn evaluate_signal_with_tick(
 
         sc.state = "即将触发";
         let (dims, total) = compute_scores(
-            bars, atr20, p, trend, sc.rr, Some(w), None, 0, 0, weak_confirm,
+            bars,
+            atr20,
+            p,
+            trend,
+            sc.rr,
+            Some(w),
+            None,
+            0,
+            0,
+            weak_confirm,
         );
         sc.dims = dims;
         sc.total = total;
@@ -704,20 +706,22 @@ pub fn evaluate_signal_with_tick(
         let last_close = bars.last().map(|b| b.close).unwrap_or(0.0);
         let entry_distance = (last_close - sc.entry).abs();
         let pending_age = bars.len().saturating_sub(w + 1);
-        let base_note = format!("{}{}", weak_confirm_prefix(weak_confirm), build_note(p, sc.rr));
+        let base_note = format!(
+            "{}{}",
+            weak_confirm_prefix(weak_confirm),
+            build_note(p, sc.rr)
+        );
         if entry_distance >= STOP_FOLLOW_DISTANCE_RISK * sc.risk {
             sc.state = "已过时，仅复盘";
             sc.note = format!(
                 "{}；预警后尚未触发，现价距入场{:.1}点，触发位已偏离，仅用于复盘",
-                base_note,
-                entry_distance
+                base_note, entry_distance
             );
         } else if pending_age > PENDING_MAX_AGE {
             sc.state = "已过时，仅复盘";
             sc.note = format!(
                 "{}；预警后{}根K线未触发，信号已过时，仅用于复盘",
-                base_note,
-                pending_age
+                base_note, pending_age
             );
         } else {
             sc.note = format!("{}；预警后尚未完成突破，继续等待", base_note);
@@ -726,8 +730,7 @@ pub fn evaluate_signal_with_tick(
     };
     sc.trigger = Some(t);
     let (wick_block, prev_block) = entry_block_flags(bars, atr20, p.dir, t);
-    let b_end_block =
-        strong_opposite_body_at(bars, atr20, p.dir, p.s2.index).is_some();
+    let b_end_block = strong_opposite_body_at(bars, atr20, p.dir, p.s2.index).is_some();
     let local_block_count = wick_block as u8 + prev_block as u8;
     let entry_block_count = local_block_count + b_end_block as u8;
     if entry_block_count > 0 {
@@ -826,7 +829,11 @@ pub fn evaluate_signal_with_tick(
 
     sc.total = total;
     sc.category = score_category(total);
-    sc.note = format!("{}{}", weak_confirm_prefix(weak_confirm), build_note(p, sc.rr));
+    sc.note = format!(
+        "{}{}",
+        weak_confirm_prefix(weak_confirm),
+        build_note(p, sc.rr)
+    );
     if sc.entry_block_count > 0 {
         let verb = match p.dir {
             Dir::Up => "追多",
@@ -850,8 +857,8 @@ pub fn evaluate_signal_with_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::model::{Bar, Dir, Swing, DT};
     use crate::analyze::report::is_active_signal;
-    use crate::analyze::model::{Bar, Dir, DT, Swing};
 
     fn bar(open: f64, high: f64, low: f64, close: f64) -> Bar {
         Bar {
@@ -962,10 +969,7 @@ mod tests {
         ];
         let atr = atr20(30.0);
 
-        assert_eq!(
-            entry_block_flags(&bars, &atr, Dir::Up, 1),
-            (false, false)
-        );
+        assert_eq!(entry_block_flags(&bars, &atr, Dir::Up, 1), (false, false));
     }
 
     #[test]
@@ -1051,9 +1055,9 @@ mod tests {
         // 宽松强趋势K计数：实体占比、收盘位置、振幅、影线四条件全过才算。
         let atr = vec![Some(10.0); 8];
         let bars = vec![
-            bar(100.0, 108.0, 99.0, 106.0), // 强阳：实体67%、收盘位0.78、上影小 ✓
-            bar(100.0, 104.0, 95.0, 96.0),  // 弱阳：实体44% ✗
-            bar(96.0, 104.0, 96.0, 102.0),  // 强阳：实体75%、收盘位0.75 ✓
+            bar(100.0, 108.0, 99.0, 106.0),  // 强阳：实体67%、收盘位0.78、上影小 ✓
+            bar(100.0, 104.0, 95.0, 96.0),   // 弱阳：实体44% ✗
+            bar(96.0, 104.0, 96.0, 102.0),   // 强阳：实体75%、收盘位0.75 ✓
             bar(102.0, 108.0, 101.0, 107.0), // 强阳：实体71%、收盘位0.86 ✓
         ];
         let p = NPattern {

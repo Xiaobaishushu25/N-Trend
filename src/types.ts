@@ -283,6 +283,8 @@ export interface GroupStat {
   settled: number
   wins: number
   losses: number
+  /** 窗口内跨过换月、不计入盈亏统计 */
+  rollover: number
   win_rate: number | null
   avg_r: number | null
   avg_bars: number | null
@@ -320,6 +322,8 @@ export interface OutcomeDetail {
   vol_ratio: number | null
   oi_increase: boolean | null
   trend60_score: number | null
+  /** 模拟窗口内跨过连续合约换月 */
+  rollover_crossed: boolean
 }
 
 export interface OutcomeRefresh {

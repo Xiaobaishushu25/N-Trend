@@ -1,4 +1,4 @@
-﻿//! 调度状态机（纯逻辑，可单测）：数据刷新与扫描动作的时机判定。
+//! 调度状态机（纯逻辑，可单测）：数据刷新与扫描动作的时机判定。
 //!
 //! 默认节奏：每 5 分钟增量刷新 5m 数据，刷新按分钟网格边界对齐（间隔/60 的整数倍分钟，含整点）；
 //! 每 15 分钟边界（:00/:15/:30/:45）跑一次分析。
@@ -137,7 +137,7 @@ mod tests {
         assert!(is_trading_time(&dt(2026, 8, 3, 15, 0))); // 下午收盘
         assert!(is_trading_time(&dt(2026, 8, 3, 23, 30))); // 夜盘收盘
         assert!(is_trading_time(&dt(2026, 8, 8, 2, 30))); // 周五夜盘收尾（周六凌晨）
-        // 收盘后下一分钟起不再是交易时间
+                                                          // 收盘后下一分钟起不再是交易时间
         assert!(!is_trading_time(&dt(2026, 8, 3, 10, 16)));
         assert!(!is_trading_time(&dt(2026, 8, 3, 11, 31)));
         assert!(!is_trading_time(&dt(2026, 8, 3, 15, 1)));
@@ -168,11 +168,21 @@ mod tests {
             SchedulerAction::RefreshAndScan
         );
         assert_eq!(
-            next_action(dt(2026, 8, 3, 9, 20), &cfg, Some(dt(2026, 8, 3, 9, 16)), Some(dt(2026, 8, 3, 9, 15))),
+            next_action(
+                dt(2026, 8, 3, 9, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 16)),
+                Some(dt(2026, 8, 3, 9, 15))
+            ),
             SchedulerAction::None
         );
         assert_eq!(
-            next_action(dt(2026, 8, 3, 9, 30), &cfg, Some(dt(2026, 8, 3, 9, 20)), Some(dt(2026, 8, 3, 9, 15))),
+            next_action(
+                dt(2026, 8, 3, 9, 30),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 20)),
+                Some(dt(2026, 8, 3, 9, 15))
+            ),
             SchedulerAction::RefreshAndScan
         );
     }
@@ -201,7 +211,12 @@ mod tests {
         );
         // 同一边界时刻已刷新过（不足一个间隔）：不再重复
         assert_eq!(
-            next_action(dt(2026, 8, 3, 9, 20), &cfg, Some(dt(2026, 8, 3, 9, 20)), None),
+            next_action(
+                dt(2026, 8, 3, 9, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 20)),
+                None
+            ),
             SchedulerAction::None
         );
     }
@@ -221,4 +236,3 @@ mod tests {
         );
     }
 }
-

@@ -1,12 +1,12 @@
-﻿//! Futures symbol discovery from the Sina node table.
+//! Futures symbol discovery from the Sina node table.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::fetch::SinaClient;
 
@@ -97,7 +97,9 @@ pub async fn fetch_quote_names(
         for line in text.lines() {
             let Some(eq) = line.find('=') else { continue };
             let prefix = line[..eq].trim();
-            let Some(code) = prefix.rsplit('_').next() else { continue };
+            let Some(code) = prefix.rsplit('_').next() else {
+                continue;
+            };
             if code.is_empty() || code == "hq_str" {
                 continue;
             }
@@ -139,9 +141,7 @@ fn parse_futures_nodes(text: &str) -> Result<Vec<FuturesNode>> {
         .ok_or_else(|| anyhow!("未找到 ARRFUTURESNODES 结尾"))?;
     let object_text = &body[..end_rel + 2];
 
-    let re = Regex::new(
-        r"\[\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'(\d+)'(?:\s*,\s*'([^']+)')?\s*\]",
-    )?;
+    let re = Regex::new(r"\[\s*'([^']+)'\s*,\s*'([^']+)'\s*,\s*'(\d+)'(?:\s*,\s*'([^']+)')?\s*\]")?;
     let mut nodes = Vec::new();
     for cap in re.captures_iter(object_text) {
         nodes.push(FuturesNode {
@@ -168,30 +168,36 @@ fn node_bases(base: &Option<String>) -> Vec<String> {
 
 fn hq_data_urls(node: &str, base: &str) -> Vec<String> {
     let gbk = encode_gbk_query(node);
-    let utf8 = percent_encoding::utf8_percent_encode(node, percent_encoding::NON_ALPHANUMERIC)
-        .to_string();
+    let utf8 =
+        percent_encoding::utf8_percent_encode(node, percent_encoding::NON_ALPHANUMERIC).to_string();
     let base = encode_gbk_query(base);
 
     let gbk_url = HQ_DATA_URL.replace("{node}", &gbk).replace("{base}", &base);
     if gbk == utf8 {
         vec![gbk_url]
     } else {
-        let utf8_url = HQ_DATA_URL.replace("{node}", &utf8).replace("{base}", &base);
+        let utf8_url = HQ_DATA_URL
+            .replace("{node}", &utf8)
+            .replace("{base}", &base);
         vec![gbk_url, utf8_url]
     }
 }
 
 fn hq_all_data_urls(node: &str, base: &str) -> Vec<String> {
     let gbk = encode_gbk_query(node);
-    let utf8 = percent_encoding::utf8_percent_encode(node, percent_encoding::NON_ALPHANUMERIC)
-        .to_string();
+    let utf8 =
+        percent_encoding::utf8_percent_encode(node, percent_encoding::NON_ALPHANUMERIC).to_string();
     let base = encode_gbk_query(base);
 
-    let gbk_url = HQ_ALL_DATA_URL.replace("{node}", &gbk).replace("{base}", &base);
+    let gbk_url = HQ_ALL_DATA_URL
+        .replace("{node}", &gbk)
+        .replace("{base}", &base);
     if gbk == utf8 {
         vec![gbk_url]
     } else {
-        let utf8_url = HQ_ALL_DATA_URL.replace("{node}", &utf8).replace("{base}", &base);
+        let utf8_url = HQ_ALL_DATA_URL
+            .replace("{node}", &utf8)
+            .replace("{base}", &base);
         vec![gbk_url, utf8_url]
     }
 }
@@ -210,14 +216,8 @@ fn first_symbol_from_json(body: &str, node: &FuturesNode) -> Option<FuturesSymbo
     };
     let obj = first.as_object()?;
     let code = obj.get("symbol")?.as_str()?;
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let exchange = obj
-        .get("exchange")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let exchange = obj.get("exchange").and_then(|v| v.as_str()).unwrap_or("");
 
     Some(FuturesSymbol {
         code: code.to_string(),
@@ -239,14 +239,8 @@ fn symbols_from_json(body: &str, node: &FuturesNode) -> Option<Vec<FuturesSymbol
     for item in items {
         let obj = item.as_object()?;
         let code = obj.get("symbol")?.as_str()?;
-        let name = obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let exchange = obj
-            .get("exchange")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let exchange = obj.get("exchange").and_then(|v| v.as_str()).unwrap_or("");
         rows.push(FuturesSymbol {
             code: code.to_string(),
             name: name.to_string(),
@@ -281,10 +275,7 @@ pub async fn search_contracts(client: &SinaClient, keyword: &str) -> Result<Vec<
     fallback_contract_search(client, &kw).await
 }
 
-async fn search_contracts_via_nodes(
-    client: &SinaClient,
-    kw: &str,
-) -> Result<Vec<FuturesSymbol>> {
+async fn search_contracts_via_nodes(client: &SinaClient, kw: &str) -> Result<Vec<FuturesSymbol>> {
     // 先取缓存并立刻释放锁，避免 MutexGuard 跨 await
     let cached = {
         let guard = NODE_CACHE.get_or_init(|| Mutex::new(None)).lock().unwrap();
@@ -366,7 +357,10 @@ async fn fallback_contract_search(client: &SinaClient, kw: &str) -> Result<Vec<F
     Ok(out)
 }
 
-async fn fetch_node_contracts(client: &SinaClient, node: &FuturesNode) -> Result<Vec<FuturesSymbol>> {
+async fn fetch_node_contracts(
+    client: &SinaClient,
+    node: &FuturesNode,
+) -> Result<Vec<FuturesSymbol>> {
     let cache = CONTRACT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
         let guard = cache.lock().unwrap();
@@ -396,7 +390,10 @@ async fn fetch_node_contracts(client: &SinaClient, node: &FuturesNode) -> Result
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    cache.lock().unwrap().insert(node.node.clone(), (Instant::now(), rows.clone()));
+    cache
+        .lock()
+        .unwrap()
+        .insert(node.node.clone(), (Instant::now(), rows.clone()));
     Ok(rows)
 }
 
@@ -406,7 +403,8 @@ mod tests {
 
     #[test]
     fn parses_futures_nodes_js() {
-        let text = "var ARRFUTURESNODES={data:[['黄金','AU0','1000','futures'],['白银','AG0','1000']]};";
+        let text =
+            "var ARRFUTURESNODES={data:[['黄金','AU0','1000','futures'],['白银','AG0','1000']]};";
         let nodes = parse_futures_nodes(text).unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].node, "AU0");
@@ -430,10 +428,8 @@ mod tests {
         );
         // 纯字母数字的合约名（如 PVC2609）也必须能取到，而不是捡到末尾的“连”字
         assert_eq!(
-            extract_quote_name(
-                "PVC2609,6500.000,6600.000,6400.000,0.000,2026-08-08,15:00:00"
-            )
-            .as_deref(),
+            extract_quote_name("PVC2609,6500.000,6600.000,6400.000,0.000,2026-08-08,15:00:00")
+                .as_deref(),
             Some("PVC2609")
         );
         let if0_body = "4526.400,4538.000,4494.200,0.000,2026-08-03,15:00:00,300,1,4514.968,沪深300指数期货连续";
@@ -458,6 +454,3 @@ mod tests {
         assert_eq!(row.variety, "黄金");
     }
 }
-
-
-

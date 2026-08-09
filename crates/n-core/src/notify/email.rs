@@ -1,4 +1,4 @@
-﻿//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
+//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -56,10 +56,7 @@ pub fn send_summary(subject: &str, body: &str, s: &EmailSettings) -> Result<()> 
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SmtpTransport, Transport};
 
-    let from = s
-        .from
-        .parse::<Mailbox>()
-        .context("发件人邮箱格式错误")?;
+    let from = s.from.parse::<Mailbox>().context("发件人邮箱格式错误")?;
     let mut builder = Message::builder().from(from).subject(subject.to_string());
     for address in s.to.split(',').map(str::trim).filter(|a| !a.is_empty()) {
         let mailbox = address
@@ -69,10 +66,8 @@ pub fn send_summary(subject: &str, body: &str, s: &EmailSettings) -> Result<()> 
     }
     let email = builder.body(body.to_string()).context("构造邮件内容失败")?;
 
-    let tls_params =
-        TlsParameters::new(s.smtp_host.clone()).with_context(|| {
-            format!("创建TLS参数失败: {}", s.smtp_host)
-        })?;
+    let tls_params = TlsParameters::new(s.smtp_host.clone())
+        .with_context(|| format!("创建TLS参数失败: {}", s.smtp_host))?;
     let tls = match s.smtp_port {
         465 => Tls::Wrapper(tls_params),
         25 => Tls::None,
@@ -120,4 +115,3 @@ mod tests {
         assert!(s.sendable());
     }
 }
-

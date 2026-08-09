@@ -1,10 +1,10 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 
+use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
     MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail, ScanResult,
 };
-use n_core::analyze::outcome::ReviewStats;
 use n_core::storage::entities::{groups, klines, scans, signals, symbols};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
@@ -161,7 +161,11 @@ pub async fn reorder_symbols(
 
 #[tauri::command]
 pub async fn add_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<usize, String> {
-    state.services.add_symbol(&code).await.map_err(|e| e.to_string())
+    state
+        .services
+        .add_symbol(&code)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -178,7 +182,11 @@ pub async fn search_contracts(
 
 #[tauri::command]
 pub async fn remove_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<(), String> {
-    state.services.remove_symbol(&code).await.map_err(|e| e.to_string())
+    state
+        .services
+        .remove_symbol(&code)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -238,13 +246,23 @@ pub async fn get_klines(
 }
 
 #[tauri::command]
-pub async fn get_market_snapshot(state: State<'_, Arc<AppState>>) -> Result<Vec<MarketSnapshot>, String> {
-    state.services.market_snapshot().await.map_err(|e| e.to_string())
+pub async fn get_market_snapshot(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<MarketSnapshot>, String> {
+    state
+        .services
+        .market_snapshot()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<RefreshStats, String> {
-    let stats = state.services.refresh_data().await.map_err(|e| e.to_string())?;
+    let stats = state
+        .services
+        .refresh_data()
+        .await
+        .map_err(|e| e.to_string())?;
     state.note_refresh_success().await;
     Ok(stats)
 }
@@ -293,7 +311,9 @@ pub async fn get_latest_signals(
 
 /// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
 #[tauri::command]
-pub async fn refresh_outcomes_now(state: State<'_, Arc<AppState>>) -> Result<OutcomeRefresh, String> {
+pub async fn refresh_outcomes_now(
+    state: State<'_, Arc<AppState>>,
+) -> Result<OutcomeRefresh, String> {
     state
         .services
         .refresh_outcomes()
@@ -435,7 +455,3 @@ pub async fn set_scheduler_running(
     state.scheduler.write().await.running = running;
     scheduler_status(state).await
 }
-
-
-
-

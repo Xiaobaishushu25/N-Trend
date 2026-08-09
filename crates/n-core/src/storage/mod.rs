@@ -1,4 +1,4 @@
-﻿//! SQLite connection and schema migration.
+//! SQLite connection and schema migration.
 
 use std::path::Path;
 
@@ -60,6 +60,10 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .create_table_from_entity(entities::signal_outcomes::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::rollovers::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     for table in tables {
@@ -73,6 +77,8 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
     // 复盘回放触发时间：快照 trigger_ts 缺失时图表用它补画触发标记
     ensure_column(db, "signal_outcomes", "entry_ts", "TEXT").await?;
+    // 换月标记：信号在回放窗口内跨过连续合约换月时置 1，不计入盈亏统计
+    ensure_column(db, "signal_outcomes", "rollover_crossed", "INTEGER").await?;
     info!("数据库表结构已就绪");
     Ok(())
 }
@@ -89,9 +95,7 @@ async fn ensure_column(
     let found = db
         .query_one(Statement::from_string(
             backend,
-            format!(
-                "SELECT 1 AS x FROM pragma_table_info('{table}') WHERE name = '{column}'"
-            ),
+            format!("SELECT 1 AS x FROM pragma_table_info('{table}') WHERE name = '{column}'"),
         ))
         .await
         .ok()
@@ -112,5 +116,3 @@ async fn ensure_column(
     }
     Ok(())
 }
-
-

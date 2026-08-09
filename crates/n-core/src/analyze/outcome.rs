@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 4;
+pub const SIM_VERSION: i64 = 5;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -48,6 +48,8 @@ pub enum Outcome {
     NoTrigger,
     Open,
     InsufficientData,
+    /// 模拟窗口内跨过连续合约换月：不计入盈亏统计，单独计数
+    Rollover,
 }
 
 impl Outcome {
@@ -58,6 +60,7 @@ impl Outcome {
             Outcome::NoTrigger => "no_trigger",
             Outcome::Open => "open",
             Outcome::InsufficientData => "insufficient_data",
+            Outcome::Rollover => "rollover",
         }
     }
 
@@ -68,12 +71,16 @@ impl Outcome {
             "no_trigger" => Some(Outcome::NoTrigger),
             "open" => Some(Outcome::Open),
             "insufficient_data" => Some(Outcome::InsufficientData),
+            "rollover" => Some(Outcome::Rollover),
             _ => None,
         }
     }
 
     pub fn is_terminal(self) -> bool {
-        matches!(self, Outcome::Win | Outcome::Loss | Outcome::NoTrigger)
+        matches!(
+            self,
+            Outcome::Win | Outcome::Loss | Outcome::NoTrigger | Outcome::Rollover
+        )
     }
 }
 
@@ -83,6 +90,7 @@ pub enum ExitReason {
     Target,
     NoFollow,
     TimeExit,
+    Rollover,
     None,
 }
 
@@ -93,6 +101,7 @@ impl ExitReason {
             ExitReason::Target => "target",
             ExitReason::NoFollow => "no_follow",
             ExitReason::TimeExit => "time_exit",
+            ExitReason::Rollover => "rollover",
             ExitReason::None => "",
         }
     }
@@ -103,6 +112,7 @@ impl ExitReason {
             "target" => ExitReason::Target,
             "no_follow" => ExitReason::NoFollow,
             "time_exit" => ExitReason::TimeExit,
+            "rollover" => ExitReason::Rollover,
             _ => ExitReason::None,
         }
     }
@@ -141,6 +151,7 @@ pub struct SignalAnnotation {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    pub rollover_crossed: bool,
 }
 
 fn dt_minute(b: &Bar) -> (i32, i32, i32, i32, i32) {
@@ -151,7 +162,13 @@ fn dt_minute(b: &Bar) -> (i32, i32, i32, i32, i32) {
 pub fn parse_minute(ts: &str) -> Option<(i32, i32, i32, i32, i32)> {
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, fmt) {
-            return Some((dt.year(), dt.month() as i32, dt.day() as i32, dt.hour() as i32, dt.minute() as i32));
+            return Some((
+                dt.year(),
+                dt.month() as i32,
+                dt.day() as i32,
+                dt.hour() as i32,
+                dt.minute() as i32,
+            ));
         }
     }
     None
@@ -180,6 +197,7 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         vol_ratio: None,
         oi_increase: None,
         trend60_score,
+        rollover_crossed: false,
     }
 }
 
@@ -294,11 +312,28 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     let Some(start) = start else {
         return Some(empty_annotation(Outcome::InsufficientData, trend60_score));
     };
-
     // 预警后 12 根内寻找入场触发（做多突破 entry、做空跌破 entry）
     let scan_end = (start + 1 + PENDING_BARS).min(bars15.len());
     let mut ec = None;
     for j in start + 1..scan_end {
+        if bars15[j].rollover {
+            return Some(SignalAnnotation {
+                sim_version: SIM_VERSION,
+                outcome: Outcome::Rollover,
+                exit_reason: ExitReason::Rollover,
+                entry_ts: None,
+                exit_ts: Some(bars15[j].dt.to_string()),
+                exit_price: None,
+                r_multiple: None,
+                mfe_r: None,
+                mae_r: None,
+                bars_held: None,
+                vol_ratio: vol_ratio_at(bars15, j),
+                oi_increase: oi_increase_at(bars15, j),
+                trend60_score,
+                rollover_crossed: true,
+            });
+        }
         let hit = match dir {
             Dir::Up => bars15[j].high >= input.entry,
             Dir::Down => bars15[j].low <= input.entry,
@@ -316,7 +351,6 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
             empty_annotation(Outcome::InsufficientData, trend60_score)
         });
     };
-
     let vol_ratio = vol_ratio_at(bars15, ec);
     let oi_increase = oi_increase_at(bars15, ec);
 
@@ -332,7 +366,11 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     };
     let extend = target_rr > 1.0;
     // 第二止盈位 TP2 相对 entry 的距离（R 倍数），不低于 1R
-    let tp2_r = if extend { (0.8 * target_rr).max(1.0) } else { 0.0 };
+    let tp2_r = if extend {
+        (0.8 * target_rr).max(1.0)
+    } else {
+        0.0
+    };
     let tp2_price = match dir {
         Dir::Up => input.entry + tp2_r * risk,
         Dir::Down => input.entry - tp2_r * risk,
@@ -345,6 +383,24 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
 
     for i in ec..bars15.len() {
         let bar = &bars15[i];
+        if bar.rollover {
+            return Some(SignalAnnotation {
+                sim_version: SIM_VERSION,
+                outcome: Outcome::Rollover,
+                exit_reason: ExitReason::Rollover,
+                entry_ts: Some(bars15[ec].dt.to_string()),
+                exit_ts: Some(bar.dt.to_string()),
+                exit_price: None,
+                r_multiple: None,
+                mfe_r: None,
+                mae_r: None,
+                bars_held: None,
+                vol_ratio,
+                oi_increase,
+                trend60_score,
+                rollover_crossed: true,
+            });
+        }
         let held = i - ec + 1;
         let mfe_contrib = match dir {
             Dir::Up => (bar.high - input.entry) / risk,
@@ -466,6 +522,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         vol_ratio,
         oi_increase,
         trend60_score,
+        rollover_crossed: false,
     })
 }
 
@@ -519,6 +576,7 @@ pub struct StatRow {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    pub rollover_crossed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +588,7 @@ pub struct GroupStat {
     pub settled: usize,
     pub wins: usize,
     pub losses: usize,
+    pub rollover: usize,
     pub win_rate: Option<f64>,
     pub avg_r: Option<f64>,
     pub avg_bars: Option<f64>,
@@ -547,10 +606,9 @@ fn dedup_first_seen(rows: &[StatRow]) -> Vec<&StatRow> {
     let mut seen: HashMap<String, &StatRow> = HashMap::new();
     for r in rows {
         let key = match (&r.s1_ts, &r.s2_ts) {
-            (Some(s1), Some(s2)) => format!(
-                "{}|{}|{}|{}|{}",
-                r.symbol, r.direction, r.level, s1, s2
-            ),
+            (Some(s1), Some(s2)) => {
+                format!("{}|{}|{}|{}|{}", r.symbol, r.direction, r.level, s1, s2)
+            }
             // 旧数据缺少结构时间戳时退回信号自身，不做合并
             _ => format!("{}|{}|{}|id{}", r.symbol, r.direction, r.level, r.signal_id),
         };
@@ -572,6 +630,7 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
     let mut settled = 0usize;
     let mut wins = 0usize;
     let mut losses = 0usize;
+    let mut rollover = 0usize;
     let mut no_trigger = 0usize;
     let mut pending = 0usize;
     let mut r_sum = 0.0_f64;
@@ -606,6 +665,7 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
                 }
             }
             Some(Outcome::NoTrigger) => no_trigger += 1,
+            Some(Outcome::Rollover) => rollover += 1,
             Some(Outcome::Open) | Some(Outcome::InsufficientData) => pending += 1,
             None => {}
         }
@@ -619,6 +679,7 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
         settled,
         wins,
         losses,
+        rollover,
         win_rate: if settled > 0 {
             Some(wins as f64 / settled as f64)
         } else {
@@ -1002,6 +1063,40 @@ mod tests {
     }
 
     #[test]
+    fn rollover_before_entry_counts_separately() {
+        // 预警后尚未触发入场，先跨过换月：直接记为 Rollover，不带盈亏
+        let mut bars = timed_bars(&[(100.0, 100.0, 100.0, 100.0), (100.0, 100.5, 99.5, 100.0)]);
+        bars[1].rollover = true;
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert_eq!(ann.outcome, Outcome::Rollover);
+        assert_eq!(ann.exit_reason, ExitReason::Rollover);
+        assert_eq!(ann.entry_ts, None);
+        assert!(ann.mfe_r.is_none());
+        assert!(ann.mae_r.is_none());
+        assert!(ann.bars_held.is_none());
+        assert!(ann.rollover_crossed);
+    }
+
+    #[test]
+    fn rollover_after_entry_clears_mfe_mae() {
+        let mut bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0),
+            (100.0, 102.0, 100.0, 101.0), // entry-cross
+            (101.0, 101.5, 100.5, 101.0),
+        ]);
+        bars[2].rollover = true;
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert_eq!(ann.outcome, Outcome::Rollover);
+        assert_eq!(ann.exit_reason, ExitReason::Rollover);
+        assert_eq!(ann.entry_ts.as_deref(), Some("2026-08-03 09:30"));
+        assert!(ann.r_multiple.is_none());
+        assert!(ann.mfe_r.is_none());
+        assert!(ann.mae_r.is_none());
+        assert!(ann.bars_held.is_none());
+        assert!(ann.rollover_crossed);
+    }
+
+    #[test]
     fn short_direction_symmetric() {
         let mut inp = input();
         inp.direction = "down".to_string();
@@ -1012,7 +1107,7 @@ mod tests {
         let bars = timed_bars(&[
             (101.0, 101.0, 101.0, 101.0),
             (101.0, 101.0, 99.0, 100.0), // entry-cross (low <= 100)
-            (99.0, 99.5, 95.0, 96.0),     // target hit
+            (99.0, 99.5, 95.0, 96.0),    // target hit
         ]);
         let ann = annotate(&inp, &bars, &[]).unwrap();
         assert_eq!(ann.outcome, Outcome::Win);
@@ -1033,10 +1128,7 @@ mod tests {
     #[test]
     fn features_volume_and_oi() {
         // 触发 bar：成交量 500（前一根 100），持仓量较前一根增加
-        let specs = vec![
-            (100.0, 100.0, 100.0, 100.0),
-            (100.0, 102.0, 100.0, 101.0),
-        ];
+        let specs = vec![(100.0, 100.0, 100.0, 100.0), (100.0, 102.0, 100.0, 101.0)];
         let mut bars = timed_bars(&specs);
         bars[0].volume = 100.0;
         bars[0].hold = 900.0;
@@ -1099,7 +1191,12 @@ mod tests {
 
     #[test]
     fn stats_dedup_and_grouping() {
-        let mk = |id: i64, symbol: &str, score: f64, outcome: Option<Outcome>, r: Option<f64>, s2_ts: &'static str| {
+        let mk = |id: i64,
+                  symbol: &str,
+                  score: f64,
+                  outcome: Option<Outcome>,
+                  r: Option<f64>,
+                  s2_ts: &'static str| {
             StatRow {
                 signal_id: id,
                 symbol: symbol.to_string(),
@@ -1117,15 +1214,51 @@ mod tests {
                 vol_ratio: Some(2.0),
                 oi_increase: Some(true),
                 trend60_score: Some(3.8),
+                rollover_crossed: false,
             }
         };
         // 同一结构键重复 3 次（id 递增），应只保留首条；另一结构 2 条
         let rows = vec![
-            mk(1, "RB0", 3.2, Some(Outcome::Win), Some(1.5), "2026-08-03 09:15"),
-            mk(2, "RB0", 3.2, Some(Outcome::Loss), Some(-1.0), "2026-08-03 09:15"),
-            mk(3, "RB0", 3.2, Some(Outcome::Win), Some(2.0), "2026-08-03 09:15"),
-            mk(4, "RB0", 2.0, Some(Outcome::Loss), Some(-1.0), "2026-08-03 10:30"),
-            mk(5, "RB0", 2.0, Some(Outcome::Win), Some(1.0), "2026-08-03 10:30"),
+            mk(
+                1,
+                "RB0",
+                3.2,
+                Some(Outcome::Win),
+                Some(1.5),
+                "2026-08-03 09:15",
+            ),
+            mk(
+                2,
+                "RB0",
+                3.2,
+                Some(Outcome::Loss),
+                Some(-1.0),
+                "2026-08-03 09:15",
+            ),
+            mk(
+                3,
+                "RB0",
+                3.2,
+                Some(Outcome::Win),
+                Some(2.0),
+                "2026-08-03 09:15",
+            ),
+            mk(
+                4,
+                "RB0",
+                2.0,
+                Some(Outcome::Loss),
+                Some(-1.0),
+                "2026-08-03 10:30",
+            ),
+            mk(
+                5,
+                "RB0",
+                2.0,
+                Some(Outcome::Win),
+                Some(1.0),
+                "2026-08-03 10:30",
+            ),
         ];
         let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
         assert_eq!(stats.overall.n, 2); // 去重后 2 个实例

@@ -1,4 +1,4 @@
-﻿//! Sina futures data fetching with a polite rate limiter.
+//! Sina futures data fetching with a polite rate limiter.
 
 pub mod kline;
 pub mod quotes;
@@ -61,8 +61,10 @@ impl RateLimiter {
             }
             let oldest = *hits.front().expect("预算满时队列非空");
             drop(hits);
-            sleep(self.window.saturating_sub(now.duration_since(oldest)) + Duration::from_millis(1))
-                .await;
+            sleep(
+                self.window.saturating_sub(now.duration_since(oldest)) + Duration::from_millis(1),
+            )
+            .await;
         }
     }
 }
@@ -98,7 +100,8 @@ impl SinaClient {
 
     /// 带 Referer 头（新浪行情接口要求）的文本请求。
     pub async fn get_text_with_referer(&self, url: &str, referer: &str) -> Result<String> {
-        self.get_text_with_headers(url, &[("Referer", referer)]).await
+        self.get_text_with_headers(url, &[("Referer", referer)])
+            .await
     }
 
     async fn get_text_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<String> {
@@ -183,5 +186,3 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(50));
     }
 }
-
-

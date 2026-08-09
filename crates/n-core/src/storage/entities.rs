@@ -1,4 +1,4 @@
-﻿//! SeaORM entities for the SQLite database.
+//! SeaORM entities for the SQLite database.
 
 pub mod symbols {
     use sea_orm::entity::prelude::*;
@@ -205,6 +205,8 @@ pub mod signal_outcomes {
         pub oi_increase: Option<bool>,
         /// 60m 连续趋势分 0~5（信号时刻截断计算）
         pub trend60_score: Option<f64>,
+        /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
+        pub rollover_crossed: Option<bool>,
         pub updated_at: String,
     }
 
@@ -214,3 +216,27 @@ pub mod signal_outcomes {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 连续合约换月记录：5m 断点时间为主键，确认后标记断点后第一根 bar 为换月。
+pub mod rollovers {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "rollovers")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub symbol: String,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub ts: String,
+        pub from_contract: String,
+        pub to_contract: String,
+        pub confirmed: bool,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

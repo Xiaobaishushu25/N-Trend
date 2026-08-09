@@ -1,4 +1,4 @@
-﻿//! K-line parsing and fetching from the Sina futures minute API.
+//! K-line parsing and fetching from the Sina futures minute API.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
@@ -42,8 +42,8 @@ pub async fn fetch_minute(
 }
 
 pub fn read_symbols(path: &std::path::Path) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("无法读取 {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("无法读取 {}", path.display()))?;
     let symbols = parse_symbol_list(&text);
     if symbols.is_empty() {
         bail!("{} 中没有找到品种代码", path.display());
@@ -61,9 +61,7 @@ pub fn parse_symbol_list(text: &str) -> Vec<String> {
             continue;
         }
         let token = line.split_whitespace().next().unwrap_or("");
-        let symbol = token
-            .trim_matches(|c| c == ',' || c == ';')
-            .to_uppercase();
+        let symbol = token.trim_matches(|c| c == ',' || c == ';').to_uppercase();
         if symbol.is_empty() || symbols.contains(&symbol) {
             continue;
         }
@@ -86,9 +84,7 @@ fn parse_jsonp(text: &str) -> Result<Vec<Kline>> {
         .trim_end_matches(|c: char| c == ')' || c == ';' || c.is_whitespace())
         .trim_end();
     let value: Value = serde_json::from_str(json_text).context("解析 JSONP 数据失败")?;
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow!("响应不是数组"))?;
+    let items = value.as_array().ok_or_else(|| anyhow!("响应不是数组"))?;
 
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
@@ -217,8 +213,8 @@ fn latest_rows(mut rows: Vec<Kline>, count: usize) -> Vec<Kline> {
 
 /// 把K线写成 CSV（仅用于开发期与旧数据交叉校验）。
 pub fn write_csv(path: &std::path::Path, rows: &[Kline]) -> Result<()> {
-    let mut writer = csv::Writer::from_path(path)
-        .with_context(|| format!("创建 {}", path.display()))?;
+    let mut writer =
+        csv::Writer::from_path(path).with_context(|| format!("创建 {}", path.display()))?;
     writer.write_record(["datetime", "open", "high", "low", "close", "volume", "hold"])?;
 
     for row in rows {
@@ -303,9 +299,7 @@ mod tests {
 
     #[test]
     fn symbol_list_skips_comments_and_duplicates() {
-        let symbols = parse_symbol_list(
-            "# 注释\nRB0\nAU0\nRB0\n\nIF0 // 行尾注释\n,AU0,\n",
-        );
+        let symbols = parse_symbol_list("# 注释\nRB0\nAU0\nRB0\n\nIF0 // 行尾注释\n,AU0,\n");
         assert_eq!(symbols, vec!["RB0", "AU0", "IF0"]);
     }
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-use crate::analyze::model::{ATR_PERIOD, Bar, DT};
+use crate::analyze::model::{Bar, ATR_PERIOD, DT};
 
 #[derive(Debug, Deserialize)]
 struct CsvRow {
@@ -106,7 +106,8 @@ pub struct CsvPair {
 pub fn discover_pairs(dir: &Path) -> Result<Vec<CsvPair>> {
     let mut found: HashMap<String, Vec<(String, Option<PathBuf>, Option<PathBuf>)>> =
         HashMap::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("无法读取目录 {}", dir.display()))? {
+    for entry in fs::read_dir(dir).with_context(|| format!("无法读取目录 {}", dir.display()))?
+    {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
@@ -121,11 +122,19 @@ pub fn discover_pairs(dir: &Path) -> Result<Vec<CsvPair>> {
                 .find(|(s, _, _)| *s == suffix)
                 .unwrap();
             if is15 {
-                if item.1.as_ref().map_or(true, |old| file_is_newer(&path, old)) {
+                if item
+                    .1
+                    .as_ref()
+                    .map_or(true, |old| file_is_newer(&path, old))
+                {
                     item.1 = Some(path);
                 }
             } else {
-                if item.2.as_ref().map_or(true, |old| file_is_newer(&path, old)) {
+                if item
+                    .2
+                    .as_ref()
+                    .map_or(true, |old| file_is_newer(&path, old))
+                {
                     item.2 = Some(path);
                 }
             }
@@ -200,9 +209,7 @@ fn pair_is_better(a15: &Path, a60: &Path, b15: &Path, b60: &Path) -> bool {
         file_last_dt(b15),
         file_last_dt(b60),
     ) {
-        (Some(x15), Some(x60), Some(y15), Some(y60)) => {
-            x15.min(x60) > y15.min(y60)
-        }
+        (Some(x15), Some(x60), Some(y15), Some(y60)) => x15.min(x60) > y15.min(y60),
         _ => {
             let ma = mtime_secs(a15) + mtime_secs(a60);
             let mb = mtime_secs(b15) + mtime_secs(b60);
@@ -221,6 +228,10 @@ fn file_is_newer(a: &Path, b: &Path) -> bool {
 fn mtime_secs(path: &Path) -> u128 {
     fs::metadata(path)
         .and_then(|m| m.modified())
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0))
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        })
         .unwrap_or(0)
 }

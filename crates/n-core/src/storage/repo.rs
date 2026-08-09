@@ -1,14 +1,14 @@
-﻿//! Repository layer over the SeaORM entities.
+//! Repository layer over the SeaORM entities.
 
 use anyhow::{anyhow, Context, Result};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 
 use crate::storage::entities::{
-    groups, klines, scans, settings, signal_outcomes, signals, symbol_groups, symbols,
+    groups, klines, rollovers, scans, settings, signal_outcomes, signals, symbol_groups, symbols,
 };
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
@@ -55,6 +55,52 @@ pub async fn delete_symbol_klines(db: &DatabaseConnection, symbol: &str) -> Resu
         .exec(db)
         .await
         .context("删除品种K线失败")?;
+    Ok(())
+}
+
+pub async fn delete_symbol_rollovers(db: &DatabaseConnection, symbol: &str) -> Result<()> {
+    rollovers::Entity::delete_many()
+        .filter(rollovers::Column::Symbol.eq(symbol))
+        .exec(db)
+        .await
+        .context("删除品种换月记录失败")?;
+    Ok(())
+}
+
+pub async fn symbol_rollovers(
+    db: &DatabaseConnection,
+    symbol: &str,
+) -> Result<Vec<rollovers::Model>> {
+    Ok(rollovers::Entity::find()
+        .filter(rollovers::Column::Symbol.eq(symbol))
+        .order_by_asc(rollovers::Column::Ts)
+        .all(db)
+        .await
+        .context("查询换月记录失败")?)
+}
+
+/// 批量 upsert 换月记录：同一 symbol+ts 覆盖为最新确认结果。
+pub async fn upsert_rollovers(
+    db: &DatabaseConnection,
+    rows: Vec<rollovers::ActiveModel>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    rollovers::Entity::insert_many(rows)
+        .on_conflict(
+            OnConflict::columns([rollovers::Column::Symbol, rollovers::Column::Ts])
+                .update_columns([
+                    rollovers::Column::FromContract,
+                    rollovers::Column::ToContract,
+                    rollovers::Column::Confirmed,
+                    rollovers::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("写入换月记录失败")?;
     Ok(())
 }
 pub async fn latest_ts(
@@ -140,7 +186,10 @@ pub async fn symbol_exists(db: &DatabaseConnection, code: &str) -> Result<bool> 
     Ok(count > 0)
 }
 
-pub async fn upsert_symbols(db: &DatabaseConnection, rows: Vec<symbols::ActiveModel>) -> Result<()> {
+pub async fn upsert_symbols(
+    db: &DatabaseConnection,
+    rows: Vec<symbols::ActiveModel>,
+) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -504,11 +553,17 @@ pub async fn insert_scan(
         active_count: Set(active_count),
         summary: Set(summary),
     };
-    let res = scans::Entity::insert(model).exec(db).await.context("写入扫描记录失败")?;
+    let res = scans::Entity::insert(model)
+        .exec(db)
+        .await
+        .context("写入扫描记录失败")?;
     Ok(res.last_insert_id)
 }
 
-pub async fn insert_signals(db: &DatabaseConnection, rows: Vec<signals::ActiveModel>) -> Result<()> {
+pub async fn insert_signals(
+    db: &DatabaseConnection,
+    rows: Vec<signals::ActiveModel>,
+) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -569,11 +624,11 @@ pub async fn upsert_outcomes(
             .on_conflict(
                 OnConflict::column(signal_outcomes::Column::SignalId)
                     .update_columns([
-                    signal_outcomes::Column::SimVersion,
-                    signal_outcomes::Column::Outcome,
-                    signal_outcomes::Column::ExitReason,
-                    signal_outcomes::Column::EntryTs,
-                    signal_outcomes::Column::ExitTs,
+                        signal_outcomes::Column::SimVersion,
+                        signal_outcomes::Column::Outcome,
+                        signal_outcomes::Column::ExitReason,
+                        signal_outcomes::Column::EntryTs,
+                        signal_outcomes::Column::ExitTs,
                         signal_outcomes::Column::ExitPrice,
                         signal_outcomes::Column::RMultiple,
                         signal_outcomes::Column::MfeR,
@@ -582,6 +637,7 @@ pub async fn upsert_outcomes(
                         signal_outcomes::Column::VolRatio,
                         signal_outcomes::Column::OiIncrease,
                         signal_outcomes::Column::Trend60Score,
+                        signal_outcomes::Column::RolloverCrossed,
                         signal_outcomes::Column::UpdatedAt,
                     ])
                     .to_owned(),
@@ -627,7 +683,9 @@ pub async fn latest_signals(db: &DatabaseConnection, _limit: u64) -> Result<Vec<
     signals_for_scan(db, latest.id).await
 }
 
-pub async fn all_settings(db: &DatabaseConnection) -> Result<std::collections::HashMap<String, String>> {
+pub async fn all_settings(
+    db: &DatabaseConnection,
+) -> Result<std::collections::HashMap<String, String>> {
     let rows = settings::Entity::find()
         .all(db)
         .await
@@ -643,7 +701,10 @@ pub async fn get_setting(db: &DatabaseConnection, key: &str) -> Result<Option<St
     Ok(row.map(|r| r.value))
 }
 
-pub async fn set_settings(db: &DatabaseConnection, map: &std::collections::HashMap<String, String>) -> Result<()> {
+pub async fn set_settings(
+    db: &DatabaseConnection,
+    map: &std::collections::HashMap<String, String>,
+) -> Result<()> {
     let rows: Vec<settings::ActiveModel> = map
         .iter()
         .map(|(key, value)| settings::ActiveModel {
@@ -706,10 +767,16 @@ mod tests {
             hold: Set(100.0),
             source: Set("raw".to_string()),
         };
-        upsert_klines(&db, vec![row("2026-08-03 09:00:00", 1.5)]).await.unwrap();
+        upsert_klines(&db, vec![row("2026-08-03 09:00:00", 1.5)])
+            .await
+            .unwrap();
         // 相同主键再次 upsert，close 被覆盖
-        upsert_klines(&db, vec![row("2026-08-03 09:00:00", 1.8)]).await.unwrap();
-        upsert_klines(&db, vec![row("2026-08-03 09:05:00", 1.9)]).await.unwrap();
+        upsert_klines(&db, vec![row("2026-08-03 09:00:00", 1.8)])
+            .await
+            .unwrap();
+        upsert_klines(&db, vec![row("2026-08-03 09:05:00", 1.9)])
+            .await
+            .unwrap();
 
         let rows = klines(&db, "RB0", "5m", None, None).await.unwrap();
         assert_eq!(rows.len(), 2);
@@ -734,7 +801,35 @@ mod tests {
         assert_eq!(all.get("a").map(String::as_str), Some("9"));
         assert_eq!(all.get("b").map(String::as_str), Some("2"));
     }
+
+    #[tokio::test]
+    async fn rollovers_roundtrip_and_delete() {
+        let db = test_db().await;
+        let row = |from: &str, to: &str, confirmed: bool| rollovers::ActiveModel {
+            symbol: Set("BU0".to_string()),
+            ts: Set("2026-08-05 21:05:00".to_string()),
+            from_contract: Set(from.to_string()),
+            to_contract: Set(to.to_string()),
+            confirmed: Set(confirmed),
+            created_at: Set("2026-08-05 21:10:00".to_string()),
+            updated_at: Set("2026-08-05 21:10:00".to_string()),
+        };
+        upsert_rollovers(
+            &db,
+            vec![
+                row("BU2609", "BU2610", false),
+                row("BU2609", "BU2610", true),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let rows = symbol_rollovers(&db, "BU0").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].confirmed);
+        assert_eq!(rows[0].from_contract, "BU2609");
+
+        delete_symbol_rollovers(&db, "BU0").await.unwrap();
+        assert!(symbol_rollovers(&db, "BU0").await.unwrap().is_empty());
+    }
 }
-
-
-

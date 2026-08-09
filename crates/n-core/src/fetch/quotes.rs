@@ -29,10 +29,7 @@ pub struct Quote {
 
 /// 批量拉取实时行情：每个品种对应 `nf_{code}`，每批最多 50 个代码。
 /// 单条解析失败只跳过该品种，不影响整批结果。
-pub async fn fetch_quotes(
-    client: &SinaClient,
-    codes: &[String],
-) -> Result<HashMap<String, Quote>> {
+pub async fn fetch_quotes(client: &SinaClient, codes: &[String]) -> Result<HashMap<String, Quote>> {
     let mut out = HashMap::new();
     for chunk in codes.chunks(BATCH_SIZE) {
         let joined = chunk
@@ -122,7 +119,10 @@ mod tests {
         assert_eq!(q.name, "螺纹钢连续");
         assert_eq!(q.latest, 2990.0);
         assert_eq!(q.prev_settle, 2983.0);
-        assert!(approx(q.change_pct.unwrap(), (2990.0 - 2983.0) / 2983.0 * 100.0));
+        assert!(approx(
+            q.change_pct.unwrap(),
+            (2990.0 - 2983.0) / 2983.0 * 100.0
+        ));
     }
 
     #[test]

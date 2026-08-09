@@ -41,12 +41,7 @@ fn write_pattern_body(out: &mut dyn Write, bars: &[Bar], p: &NPattern) -> io::Re
     writeln!(
         out,
         "a段: {} {:.1} -> {} {:.1} | {}根K | {:.1}点",
-        bars[p.s0.index].dt,
-        p.s0.price,
-        bars[p.s1.index].dt,
-        p.s1.price,
-        p.a_bars,
-        p.a_move
+        bars[p.s0.index].dt, p.s0.price, bars[p.s1.index].dt, p.s1.price, p.a_bars, p.a_move
     )?;
     writeln!(
         out,
@@ -192,10 +187,7 @@ pub fn is_active_signal(sc: &SignalCheck) -> bool {
     if sc.total <= 0.0 {
         return false;
     }
-    matches!(
-        sc.state,
-        "即将触发" | "当前已触发" | "已触发，接近时效边界"
-    )
+    matches!(sc.state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,4 +1,4 @@
-﻿//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
+//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
 use anyhow::{anyhow, Result};
 use chrono::Timelike;
@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::RwLock;
 
 use crate::analyze::dto::SignalOutcome;
+use crate::analyze::model::{Bar, ATR_PERIOD, DT};
 use crate::analyze::outcome;
-use crate::analyze::model::{Bar, DT, ATR_PERIOD};
 use crate::config::Config;
-use crate::derive::{aggregate, Timeframe};
+use crate::derive::{aggregate, rollover, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::fetch::SinaClient;
 use crate::scheduler::SchedulerConfig;
@@ -73,6 +73,8 @@ pub struct OutcomeDetail {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
+    pub rollover_crossed: bool,
 }
 
 /// 复盘明细跳转K线图所需：完整形态结构 + 结局。
@@ -154,11 +156,7 @@ fn parse_detail_ts(detail: &str) -> (Option<String>, Option<String>, Option<Stri
         }
         cur.as_str().map(|s| s.to_string())
     };
-    (
-        get(&["warning_ts"]),
-        get(&["s1", "ts"]),
-        get(&["s2", "ts"]),
-    )
+    (get(&["warning_ts"]), get(&["s1", "ts"]), get(&["s2", "ts"]))
 }
 
 fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
@@ -200,6 +198,7 @@ fn stat_row_from(
         vol_ratio: o.and_then(|x| x.vol_ratio),
         oi_increase: o.and_then(|x| x.oi_increase),
         trend60_score: o.and_then(|x| x.trend60_score),
+        rollover_crossed: o.is_some_and(|x| x.rollover_crossed.unwrap_or(false)),
     })
 }
 
@@ -228,6 +227,7 @@ fn outcome_detail_from(s: &signals::Model, o: &signal_outcomes::Model) -> Outcom
         vol_ratio: o.vol_ratio,
         oi_increase: o.oi_increase,
         trend60_score: o.trend60_score,
+        rollover_crossed: o.rollover_crossed.unwrap_or(false),
     }
 }
 
@@ -520,7 +520,9 @@ impl Services {
     /// 是否存在需要补齐名称的品种（名称为空或等于代码）。
     pub async fn needs_name_enrich(&self) -> Result<bool> {
         let existing = repo::list_symbols(&self.db, false).await?;
-        Ok(existing.iter().any(|s| s.name.is_empty() || s.name == s.code))
+        Ok(existing
+            .iter()
+            .any(|s| s.name.is_empty() || s.name == s.code))
     }
 
     /// 为 tick_size 未设置（0）的品种补齐内置默认精度；已显式设置的不覆盖。
@@ -540,7 +542,8 @@ impl Services {
     /// 新品种一次性回填历史 5m 并派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
         let rows =
-            crate::fetch::kline::fetch_minute(&*self.client.read().await, symbol, "5", count).await?;
+            crate::fetch::kline::fetch_minute(&*self.client.read().await, symbol, "5", count)
+                .await?;
         let models: Vec<_> = rows
             .iter()
             .map(|k| fetch_to_model(symbol, "5m", "raw", k))
@@ -604,6 +607,7 @@ impl Services {
     pub async fn remove_symbol(&self, code: &str) -> Result<()> {
         repo::remove_symbol(&self.db, code).await?;
         repo::delete_symbol_klines(&self.db, code).await?;
+        repo::delete_symbol_rollovers(&self.db, code).await?;
         Ok(())
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
@@ -692,6 +696,98 @@ impl Services {
         }
         repo::delete_derived_klines(&self.db, symbol).await?;
         repo::upsert_klines(&self.db, models).await?;
+        self.sync_rollovers(symbol, &bars).await?;
+        Ok(())
+    }
+
+    /// 轻量换月识别：只在连续 5m 上找候选断点，对少量月合约拉数据做价格确认。
+    /// 网络失败时保留已有记录，不阻塞行情派生。
+    async fn sync_rollovers(&self, symbol: &str, bars: &[Kline]) -> Result<()> {
+        let candidates = rollover::detect_candidates(symbol, bars);
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let existing = repo::symbol_rollovers(&self.db, symbol).await?;
+        let confirmed_ts: HashSet<String> = existing
+            .iter()
+            .filter(|r| r.confirmed)
+            .map(|r| r.ts.clone())
+            .collect();
+        let pending: Vec<rollover::RolloverCandidate> = candidates
+            .into_iter()
+            .filter(|c| !confirmed_ts.contains(&c.ts))
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let prefix = contract_prefix(symbol);
+        let contracts = match self.search_contracts(&prefix).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("{symbol} 换月确认跳过（合约列表获取失败）: {e}");
+                return Ok(());
+            }
+        };
+        let mut month_codes: Vec<String> = contracts
+            .into_iter()
+            .map(|r| r.code)
+            .filter(|code| rollover::is_month_contract(code))
+            .collect();
+        month_codes.sort();
+        month_codes.dedup();
+        if month_codes.is_empty() {
+            tracing::warn!("{symbol} 换月确认跳过（未找到月合约）");
+            return Ok(());
+        }
+
+        // 一次按最早断点估足抓取深度，避免对同一合约重复请求。
+        let count = pending
+            .iter()
+            .map(|c| bars_needed_for(&c.before.datetime))
+            .max()
+            .unwrap_or(300)
+            .max(300);
+        let mut month_bars: HashMap<String, Vec<Kline>> = HashMap::new();
+        for code in &month_codes {
+            match crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count)
+                .await
+            {
+                Ok(rows) => {
+                    month_bars.insert(code.clone(), rows);
+                }
+                Err(e) => {
+                    tracing::debug!("{code} 换月确认拉取失败（跳过）: {e}");
+                }
+            }
+        }
+
+        let now = crate::analyze::time::now_display();
+        let mut rows = Vec::new();
+        for c in &pending {
+            match rollover::confirm_candidate(c, &month_bars) {
+                Ok(Some((from, to))) => {
+                    tracing::info!("{symbol} 识别换月 {from} -> {to} @ {}", c.ts);
+                    rows.push(rollover_row(
+                        symbol,
+                        &c.ts,
+                        Some(&from),
+                        Some(&to),
+                        true,
+                        &now,
+                    ));
+                }
+                Ok(None) => {
+                    tracing::debug!("{symbol} 候选断点 {} 未获月合约确认，落库为待确认", c.ts);
+                    rows.push(rollover_row(symbol, &c.ts, None, None, false, &now));
+                }
+                Err(e) => {
+                    tracing::warn!("{symbol} 候选断点 {} 确认失败: {e}", c.ts);
+                    rows.push(rollover_row(symbol, &c.ts, None, None, false, &now));
+                }
+            }
+        }
+        repo::upsert_rollovers(&self.db, rows).await?;
         Ok(())
     }
 
@@ -699,6 +795,8 @@ impl Services {
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
         let rows = repo::klines(&self.db, symbol, timeframe, None, None).await?;
         let mut bars: Vec<Bar> = rows.iter().filter_map(model_to_bar).collect();
+        let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
+        mark_rollover_bars(&mut bars, &rollovers, timeframe);
         if bars.len() >= ATR_PERIOD + 2 {
             return Ok(bars);
         }
@@ -711,6 +809,7 @@ impl Services {
             .collect();
         if fallback.len() > bars.len() {
             bars = fallback;
+            mark_rollover_bars(&mut bars, &rollovers, timeframe);
         }
         Ok(bars)
     }
@@ -753,73 +852,74 @@ impl Services {
         Ok(apply_limit(rows, limit))
     }
 
-
-/// 全部品种的最新价与涨跌幅（供左侧品种列表展示）。
-pub async fn market_snapshot(&self) -> Result<Vec<MarketSnapshot>> {
-    let symbols = repo::list_symbols(&self.db, false).await?;
-    let mut out = Vec::with_capacity(symbols.len());
-    for s in symbols {
-        // 快照只需要“最新收盘价 + 上一交易日收盘价”，最近 200 根 5m 足够，
-        // 不再把每个品种的全部K线读出来
-        let rows = repo::klines(&self.db, &s.code, "5m", Some(200), None).await?;
-        let (latest, change_pct) = Self::snapshot_stats(&rows);
-        out.push(MarketSnapshot {
-            code: s.code,
-            latest,
-            change_pct,
-        });
-    }
-    Ok(out)
-}
-
-fn snapshot_stats(rows: &[klines::Model]) -> (Option<f64>, Option<f64>) {
-    let fmt = "%Y-%m-%d %H:%M:%S";
-    let mut by_day: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
-    for r in rows {
-        let Some(dt) = chrono::NaiveDateTime::parse_from_str(&r.ts, fmt).ok() else {
-            continue;
-        };
-        let day = if dt.hour() >= 20 {
-            (dt.date() + chrono::Days::new(1)).format("%Y-%m-%d").to_string()
-        } else {
-            dt.date().format("%Y-%m-%d").to_string()
-        };
-        by_day.insert(day, r.close);
-    }
-    let Some(latest) = rows.last().map(|r| r.close) else {
-        return (None, None);
-    };
-    if by_day.len() < 2 {
-        return (Some(latest), None);
-    }
-    let days: Vec<&String> = by_day.keys().collect();
-    let prev = by_day[days[days.len() - 2]];
-    let pct = (latest - prev) / prev * 100.0;
-    (Some(latest), Some(pct))
-}
-
-/// 实时现价快照：从新浪批量行情接口拉取启用品种的实时价。
-/// 缺失/解析失败的品种返回 `latest: None`，由前端回退到库内旧数据。
-pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
-    let symbols = repo::list_symbols(&self.db, true).await?;
-    let codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
-    if codes.is_empty() {
-        return Ok(Vec::new());
-    }
-    let quotes =
-        crate::fetch::quotes::fetch_quotes(&*self.quote_client.read().await, &codes).await?;
-    Ok(symbols
-        .into_iter()
-        .map(|s| {
-            let q = quotes.get(&s.code);
-            MarketSnapshot {
+    /// 全部品种的最新价与涨跌幅（供左侧品种列表展示）。
+    pub async fn market_snapshot(&self) -> Result<Vec<MarketSnapshot>> {
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let mut out = Vec::with_capacity(symbols.len());
+        for s in symbols {
+            // 快照只需要“最新收盘价 + 上一交易日收盘价”，最近 200 根 5m 足够，
+            // 不再把每个品种的全部K线读出来
+            let rows = repo::klines(&self.db, &s.code, "5m", Some(200), None).await?;
+            let (latest, change_pct) = Self::snapshot_stats(&rows);
+            out.push(MarketSnapshot {
                 code: s.code,
-                latest: q.map(|q| q.latest),
-                change_pct: q.and_then(|q| q.change_pct),
-            }
-        })
-        .collect())
-}
+                latest,
+                change_pct,
+            });
+        }
+        Ok(out)
+    }
+
+    fn snapshot_stats(rows: &[klines::Model]) -> (Option<f64>, Option<f64>) {
+        let fmt = "%Y-%m-%d %H:%M:%S";
+        let mut by_day: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+        for r in rows {
+            let Some(dt) = chrono::NaiveDateTime::parse_from_str(&r.ts, fmt).ok() else {
+                continue;
+            };
+            let day = if dt.hour() >= 20 {
+                (dt.date() + chrono::Days::new(1))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            } else {
+                dt.date().format("%Y-%m-%d").to_string()
+            };
+            by_day.insert(day, r.close);
+        }
+        let Some(latest) = rows.last().map(|r| r.close) else {
+            return (None, None);
+        };
+        if by_day.len() < 2 {
+            return (Some(latest), None);
+        }
+        let days: Vec<&String> = by_day.keys().collect();
+        let prev = by_day[days[days.len() - 2]];
+        let pct = (latest - prev) / prev * 100.0;
+        (Some(latest), Some(pct))
+    }
+
+    /// 实时现价快照：从新浪批量行情接口拉取启用品种的实时价。
+    /// 缺失/解析失败的品种返回 `latest: None`，由前端回退到库内旧数据。
+    pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let quotes =
+            crate::fetch::quotes::fetch_quotes(&*self.quote_client.read().await, &codes).await?;
+        Ok(symbols
+            .into_iter()
+            .map(|s| {
+                let q = quotes.get(&s.code);
+                MarketSnapshot {
+                    code: s.code,
+                    latest: q.map(|q| q.latest),
+                    change_pct: q.and_then(|q| q.change_pct),
+                }
+            })
+            .collect())
+    }
 
     /// 全品种扫描：15m 结构 + 60m 趋势 → 信号持久化。
     pub async fn run_scan(&self) -> Result<ScanResult> {
@@ -970,6 +1070,7 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
                 vol_ratio: Set(ann.vol_ratio),
                 oi_increase: Set(ann.oi_increase),
                 trend60_score: Set(ann.trend60_score),
+                rollover_crossed: Set(Some(ann.rollover_crossed)),
                 updated_at: Set(now.clone()),
                 ..Default::default()
             })
@@ -983,10 +1084,8 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
     pub async fn review_stats(&self, dimension: &str) -> Result<outcome::ReviewStats> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
-        let by_id: HashMap<i64, signal_outcomes::Model> = outs
-            .into_iter()
-            .map(|o| (o.signal_id, o))
-            .collect();
+        let by_id: HashMap<i64, signal_outcomes::Model> =
+            outs.into_iter().map(|o| (o.signal_id, o)).collect();
         let rows: Vec<outcome::StatRow> = sigs
             .iter()
             .filter_map(|s| stat_row_from(s, by_id.get(&s.id)))
@@ -1005,10 +1104,8 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
     ) -> Result<Vec<OutcomeDetail>> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
-        let by_id: HashMap<i64, signal_outcomes::Model> = outs
-            .into_iter()
-            .map(|o| (o.signal_id, o))
-            .collect();
+        let by_id: HashMap<i64, signal_outcomes::Model> =
+            outs.into_iter().map(|o| (o.signal_id, o)).collect();
         // 与统计口径一致：同一结构（品种+方向+级别+s1/s2 时间）只保留首次识别的快照
         let mut seen: HashSet<String> = HashSet::new();
         let mut rows: Vec<OutcomeDetail> = Vec::new();
@@ -1042,8 +1139,7 @@ pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
         let Some(row) = repo::signal_by_id(&self.db, signal_id).await? else {
             return Ok(None);
         };
-        let Ok(pattern) =
-            serde_json::from_str::<crate::analyze::dto::PatternDto>(&row.detail)
+        let Ok(pattern) = serde_json::from_str::<crate::analyze::dto::PatternDto>(&row.detail)
         else {
             return Ok(None);
         };
@@ -1066,7 +1162,9 @@ fn build_scan_summary(
     out.push_str("=== 综合结论 ===\n");
     out.push_str(&format!("扫描时间: {started}\n"));
     out.push_str(&format!("完成时间: {finished}\n"));
-    out.push_str(&format!("共扫描 {scanned} 个品种，{active_count} 个品种有关注信号\n"));
+    out.push_str(&format!(
+        "共扫描 {scanned} 个品种，{active_count} 个品种有关注信号\n"
+    ));
     if !failed.is_empty() {
         let list = failed
             .iter()
@@ -1157,6 +1255,88 @@ fn fetch_to_bar(k: &Kline) -> Option<Bar> {
     })
 }
 
+/// 连续合约代码取品种前缀（BU0 -> BU；已存在的非连续代码原样返回）。
+fn contract_prefix(symbol: &str) -> String {
+    let trimmed = symbol.trim_end_matches(|c: char| c.is_ascii_digit());
+    if trimmed.is_empty() {
+        symbol.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 断点距今的分钟数折算成 5m 根数，保证月合约切片能覆盖断点两侧。
+fn bars_needed_for(ts: &str) -> usize {
+    let fmt = "%Y-%m-%d %H:%M:%S";
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, fmt) else {
+        return 300;
+    };
+    let now = chrono::Local::now().naive_local();
+    let mins = (now - dt).num_minutes().max(0);
+    ((mins / 5) as usize).max(300)
+}
+
+fn rollover_row(
+    symbol: &str,
+    ts: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    confirmed: bool,
+    now: &str,
+) -> crate::storage::entities::rollovers::ActiveModel {
+    use crate::storage::entities::rollovers;
+    use sea_orm::Set;
+    rollovers::ActiveModel {
+        symbol: Set(symbol.to_string()),
+        ts: Set(ts.to_string()),
+        from_contract: Set(from.unwrap_or("").to_string()),
+        to_contract: Set(to.unwrap_or("").to_string()),
+        confirmed: Set(confirmed),
+        created_at: Set(now.to_string()),
+        updated_at: Set(now.to_string()),
+    }
+}
+
+/// 把 rollovers 表的时间戳标记到目标级别的 bar 上：5m 精确到该根，
+/// 15m/60m 标记换月后第一根聚合 bar（如 21:05 -> 15m 的 21:15、60m 的 22:00）。
+fn mark_rollover_bars(
+    bars: &mut [Bar],
+    rollovers: &[crate::storage::entities::rollovers::Model],
+    timeframe: &str,
+) {
+    if bars.is_empty() || rollovers.is_empty() {
+        return;
+    }
+    let is_5m = timeframe == "5m";
+    let mut ri = 0usize;
+    for bar in bars.iter_mut() {
+        while ri < rollovers.len() {
+            if !rollovers[ri].confirmed {
+                ri += 1;
+                continue;
+            }
+            let ts = &rollovers[ri].ts;
+            let bar_start = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:00",
+                bar.dt.year, bar.dt.month, bar.dt.day, bar.dt.hour, bar.dt.minute
+            );
+            let hit = if is_5m {
+                bar_start == *ts
+            } else {
+                bar_start >= *ts
+            };
+            if hit {
+                bar.rollover = true;
+                ri += 1;
+            } else if bar_start < *ts {
+                break;
+            } else {
+                ri += 1;
+            }
+        }
+    }
+}
+
 fn parse_dt(s: &str) -> Option<DT> {
     let mut parts = s.split_whitespace();
     let date = parts.next()?;
@@ -1198,5 +1378,63 @@ mod tests {
             ts_gap_minutes("2026-08-03 10:00:00", "2026-08-03 08:00:00"),
             Some(120)
         );
+    }
+
+    #[test]
+    fn mark_rollover_bars_5m_exact_and_aggregated_first_after() {
+        use crate::storage::entities::rollovers;
+        let rollover = |ts: &str| rollovers::Model {
+            symbol: "BU0".to_string(),
+            ts: ts.to_string(),
+            from_contract: "BU2609".to_string(),
+            to_contract: "BU2610".to_string(),
+            confirmed: true,
+            created_at: "2026-08-05 21:10:00".to_string(),
+            updated_at: "2026-08-05 21:10:00".to_string(),
+        };
+        let mut bars = vec![
+            parse_dt("2026-08-05 15:00:00").map(dt_to_bar),
+            parse_dt("2026-08-05 21:00:00").map(dt_to_bar),
+            parse_dt("2026-08-05 21:15:00").map(dt_to_bar),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        mark_rollover_bars(&mut bars, &[rollover("2026-08-05 21:05:00")], "5m");
+        assert!(bars.iter().all(|b| !b.rollover)); // 5m 没有 21:05 这根时不标记
+
+        let mut bars = vec![
+            parse_dt("2026-08-05 15:00:00").map(dt_to_bar),
+            parse_dt("2026-08-05 21:00:00").map(dt_to_bar),
+            parse_dt("2026-08-05 21:15:00").map(dt_to_bar),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        mark_rollover_bars(&mut bars, &[rollover("2026-08-05 21:05:00")], "15m");
+        assert!(!bars[0].rollover);
+        assert!(!bars[1].rollover);
+        assert!(bars[2].rollover);
+    }
+
+    #[test]
+    fn contract_prefix_strips_continuous_digits() {
+        assert_eq!(contract_prefix("BU0"), "BU");
+        assert_eq!(contract_prefix("RB2610"), "RB");
+        assert_eq!(contract_prefix("0"), "0");
+    }
+}
+
+#[cfg(test)]
+fn dt_to_bar(dt: DT) -> Bar {
+    Bar {
+        dt,
+        open: 0.0,
+        high: 0.0,
+        low: 0.0,
+        close: 0.0,
+        volume: 0.0,
+        hold: 0.0,
+        rollover: false,
     }
 }

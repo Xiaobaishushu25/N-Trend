@@ -1,4 +1,4 @@
-﻿//! 面向前端展示的结构化分析结果 DTO。
+//! 面向前端展示的结构化分析结果 DTO。
 
 use serde::{Deserialize, Serialize};
 
@@ -45,11 +45,7 @@ pub struct PatternDto {
 
 impl PatternDto {
     pub fn from_parts(bars: &[Bar], number: usize, p: &NPattern, sc: &SignalCheck) -> Self {
-        let ts = |i: usize| {
-            bars.get(i)
-                .map(|b| b.dt.to_string())
-                .unwrap_or_default()
-        };
+        let ts = |i: usize| bars.get(i).map(|b| b.dt.to_string()).unwrap_or_default();
         Self {
             number,
             level: p.level.to_string(),
@@ -162,4 +158,3 @@ pub fn build_detail(
         full_report: full_report.to_string(),
     }
 }
-

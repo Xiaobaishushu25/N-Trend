@@ -1,10 +1,11 @@
-use crate::analyze::model::{ATR_PERIOD, Bar, Swing, Trend60};
+use crate::analyze::model::{Bar, Swing, Trend60, ATR_PERIOD};
 
 pub fn atr(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
     let n = bars.len();
     let mut tr = vec![0.0; n];
     for i in 0..n {
-        tr[i] = if i == 0 {
+        tr[i] = if i == 0 || bars[i].rollover {
+            // 换月 bar 的“前收盘”来自旧合约，跨合约 gap 不构成真实波动
             bars[i].high - bars[i].low
         } else {
             let pc = bars[i - 1].close;
@@ -33,31 +34,33 @@ pub fn trend_flags(bars: &[Bar], atr20: &[Option<f64>]) -> Vec<(bool, bool)> {
     for i in 0..bars.len() {
         let mut up = false;
         let mut down = false;
-        if let Some(a) = atr20[i] {
-            let range = bars[i].high - bars[i].low;
-            if range > 0.0 {
-                let body = (bars[i].close - bars[i].open).abs();
-                let body_ratio = body / range;
-                let up_pos = (bars[i].close - bars[i].low) / range;
-                let down_pos = (bars[i].high - bars[i].close) / range;
-                let upper = bars[i].high - bars[i].open.max(bars[i].close);
-                let lower = bars[i].open.min(bars[i].close) - bars[i].low;
+        if !bars[i].rollover {
+            if let Some(a) = atr20[i] {
+                let range = bars[i].high - bars[i].low;
+                if range > 0.0 {
+                    let body = (bars[i].close - bars[i].open).abs();
+                    let body_ratio = body / range;
+                    let up_pos = (bars[i].close - bars[i].low) / range;
+                    let down_pos = (bars[i].high - bars[i].close) / range;
+                    let upper = bars[i].high - bars[i].open.max(bars[i].close);
+                    let lower = bars[i].open.min(bars[i].close) - bars[i].low;
 
-                if bars[i].close > bars[i].open
-                    && body_ratio >= 0.75
-                    && up_pos >= 0.80
-                    && range >= 0.8 * a
-                    && upper <= body
-                {
-                    up = true;
-                }
-                if bars[i].close < bars[i].open
-                    && body_ratio >= 0.75
-                    && down_pos >= 0.80
-                    && range >= 0.8 * a
-                    && lower <= body
-                {
-                    down = true;
+                    if bars[i].close > bars[i].open
+                        && body_ratio >= 0.75
+                        && up_pos >= 0.80
+                        && range >= 0.8 * a
+                        && upper <= body
+                    {
+                        up = true;
+                    }
+                    if bars[i].close < bars[i].open
+                        && body_ratio >= 0.75
+                        && down_pos >= 0.80
+                        && range >= 0.8 * a
+                        && lower <= body
+                    {
+                        down = true;
+                    }
                 }
             }
         }
@@ -77,31 +80,33 @@ pub fn trend_flags_relaxed(bars: &[Bar], atr20: &[Option<f64>]) -> Vec<(bool, bo
     for i in 0..bars.len() {
         let mut up = false;
         let mut down = false;
-        if let Some(a) = atr20[i] {
-            let range = bars[i].high - bars[i].low;
-            if range > 0.0 {
-                let body = (bars[i].close - bars[i].open).abs();
-                let body_ratio = body / range;
-                let up_pos = (bars[i].close - bars[i].low) / range;
-                let down_pos = (bars[i].high - bars[i].close) / range;
-                let upper = bars[i].high - bars[i].open.max(bars[i].close);
-                let lower = bars[i].open.min(bars[i].close) - bars[i].low;
+        if !bars[i].rollover {
+            if let Some(a) = atr20[i] {
+                let range = bars[i].high - bars[i].low;
+                if range > 0.0 {
+                    let body = (bars[i].close - bars[i].open).abs();
+                    let body_ratio = body / range;
+                    let up_pos = (bars[i].close - bars[i].low) / range;
+                    let down_pos = (bars[i].high - bars[i].close) / range;
+                    let upper = bars[i].high - bars[i].open.max(bars[i].close);
+                    let lower = bars[i].open.min(bars[i].close) - bars[i].low;
 
-                if bars[i].close > bars[i].open
-                    && body_ratio >= A_LEG_BODY_RATIO_MIN
-                    && up_pos >= A_LEG_CLOSE_POS_MIN
-                    && range >= A_LEG_RANGE_ATR_MIN * a
-                    && upper <= A_LEG_WICK_RATIO_MAX * body
-                {
-                    up = true;
-                }
-                if bars[i].close < bars[i].open
-                    && body_ratio >= A_LEG_BODY_RATIO_MIN
-                    && down_pos >= A_LEG_CLOSE_POS_MIN
-                    && range >= A_LEG_RANGE_ATR_MIN * a
-                    && lower <= A_LEG_WICK_RATIO_MAX * body
-                {
-                    down = true;
+                    if bars[i].close > bars[i].open
+                        && body_ratio >= A_LEG_BODY_RATIO_MIN
+                        && up_pos >= A_LEG_CLOSE_POS_MIN
+                        && range >= A_LEG_RANGE_ATR_MIN * a
+                        && upper <= A_LEG_WICK_RATIO_MAX * body
+                    {
+                        up = true;
+                    }
+                    if bars[i].close < bars[i].open
+                        && body_ratio >= A_LEG_BODY_RATIO_MIN
+                        && down_pos >= A_LEG_CLOSE_POS_MIN
+                        && range >= A_LEG_RANGE_ATR_MIN * a
+                        && lower <= A_LEG_WICK_RATIO_MAX * body
+                    {
+                        down = true;
+                    }
                 }
             }
         }
@@ -169,9 +174,7 @@ pub fn find_swings(
                 let atr_now = atr20[s.index].unwrap_or(1.0);
                 let tol = (0.5 * atr_now).max(2.0);
                 if (last.price - s.price).abs() <= tol {
-                    if (s.is_high && s.price > last.price)
-                        || (!s.is_high && s.price < last.price)
-                    {
+                    if (s.is_high && s.price > last.price) || (!s.is_high && s.price < last.price) {
                         *last = s;
                     }
                     skip = true;
@@ -277,5 +280,22 @@ mod tests {
         let atr = vec![Some(10.0)];
         assert!(!trend_flags_relaxed(&bars, &atr)[0].0);
         assert!(!trend_flags_relaxed(&bars, &atr)[0].1);
+    }
+
+    #[test]
+    fn rollover_bar_has_no_trend_flags_and_uses_own_range_for_atr() {
+        // 换月 bar 高 120、低 80：若把旧合约前收盘 100 计入 TR 会得到 20，
+        // 只用自己的 high-low 时应为 40
+        let mut bars = vec![
+            bar(100.0, 101.0, 99.0, 100.0),
+            bar(80.0, 120.0, 80.0, 110.0),
+        ];
+        bars[1].rollover = true;
+        let atr = crate::analyze::indicators::atr(&bars, 2);
+        assert_eq!(atr[1], Some(21.0));
+        assert!(!trend_flags(&bars, &atr)[1].0);
+        assert!(!trend_flags(&bars, &atr)[1].1);
+        assert!(!trend_flags_relaxed(&bars, &atr)[1].0);
+        assert!(!trend_flags_relaxed(&bars, &atr)[1].1);
     }
 }

@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{Local, NaiveDateTime};
@@ -25,10 +25,7 @@ const DEFAULT_SYMBOLS: &str = "# 每行一个期货代码\nRB0\nAU0\nIF0\n";
 struct LocalTime;
 
 impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
-    fn format_time(
-        &self,
-        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f"))
     }
 }
@@ -91,8 +88,11 @@ pub fn run() {
             // 首次运行兼容导入 email.toml
             let current = tauri::async_runtime::block_on(services.config());
             if current.email.smtp_password.is_empty() && current.email.from.is_empty() {
-                let imported = n_core::config::import_email_toml(std::path::Path::new("email.toml"))?;
-                if !imported.smtp_password.is_empty() || imported.from != n_core::notify::email::EmailSettings::default().from {
+                let imported =
+                    n_core::config::import_email_toml(std::path::Path::new("email.toml"))?;
+                if !imported.smtp_password.is_empty()
+                    || imported.from != n_core::notify::email::EmailSettings::default().from
+                {
                     let mut next = current;
                     next.email = imported;
                     tauri::async_runtime::block_on(services.apply_config(next))?;
@@ -106,8 +106,9 @@ pub fn run() {
                 .app_config
                 .auto_start_scheduler;
             // 恢复上次运行记录的最后成功时间，避免应用重启后丢失
-            let saved = tauri::async_runtime::block_on(n_core::storage::repo::all_settings(&services.db))
-                .unwrap_or_default();
+            let saved =
+                tauri::async_runtime::block_on(n_core::storage::repo::all_settings(&services.db))
+                    .unwrap_or_default();
             let last_refresh = saved
                 .get(KEY_LAST_REFRESH)
                 .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
@@ -335,7 +336,11 @@ async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
         Ok(stats) => {
             state.note_refresh_success().await;
             let _ = app.emit("data-updated", &stats);
-            tracing::info!("定时刷新完成: 成功 {} 失败 {}", stats.succeeded, stats.failures);
+            tracing::info!(
+                "定时刷新完成: 成功 {} 失败 {}",
+                stats.succeeded,
+                stats.failures
+            );
         }
         Err(e) => tracing::error!("定时刷新失败: {e}"),
     }
@@ -347,12 +352,17 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
         Ok(res) => {
             state.note_scan_success().await;
             let _ = app.emit("scan-completed", &res);
-            tracing::info!("定时扫描完成: 品种 {} 信号 {}", res.scanned, res.active_count);
+            tracing::info!(
+                "定时扫描完成: 品种 {} 信号 {}",
+                res.scanned,
+                res.active_count
+            );
             if res.active_count > 0 {
                 let cfg = state.services.config().await;
                 if cfg.email.enabled && cfg.email.sendable() {
                     let (subject, body) = n_core::notify::email::scan_email_payload(&res.summary);
-                    if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                    if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email)
+                    {
                         tracing::error!("邮件发送失败: {e}");
                     }
                 }

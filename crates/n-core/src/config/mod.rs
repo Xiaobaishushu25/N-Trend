@@ -378,9 +378,7 @@ fn get_str(map: &HashMap<String, String>, key: &str, default: &str) -> String {
 }
 
 fn get_bool(map: &HashMap<String, String>, key: &str, default: bool) -> bool {
-    map.get(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    map.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn get_u64(map: &HashMap<String, String>, key: &str, default: u64) -> u64 {
@@ -473,14 +471,15 @@ mod tests {
         map.insert("email.smtp_user".into(), "user".into());
         map.insert("email.smtp_password".into(), "secret".into());
         // 运行时键：迁移后必须保留
-        map.insert("scheduler_last_refresh".into(), "2026-08-06 09:00:00".into());
+        map.insert(
+            "scheduler_last_refresh".into(),
+            "2026-08-06 09:00:00".into(),
+        );
         map.insert("names_enriched".into(), "1".into());
         repo::set_settings(&db, &map).await.unwrap();
 
-        let dir = std::env::temp_dir().join(format!(
-            "ntrend-config-test-{}-migrate",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ntrend-config-test-{}-migrate", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
 
@@ -518,10 +517,8 @@ mod tests {
         let db = crate::storage::connect(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "ntrend-config-test-{}-corrupt",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ntrend-config-test-{}-corrupt", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         std::fs::write(&path, "{ not json }").unwrap();

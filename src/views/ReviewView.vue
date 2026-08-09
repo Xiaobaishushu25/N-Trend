@@ -36,6 +36,7 @@ const outcomeLabel: Record<string, { text: string; type: 'success' | 'error' | '
   no_trigger: { text: '未触发', type: 'default' },
   open: { text: '持仓中', type: 'warning' },
   insufficient_data: { text: '数据不足', type: 'default' },
+  rollover: { text: '换月', type: 'warning' },
 }
 
 const exitLabel: Record<string, string> = {
@@ -43,6 +44,7 @@ const exitLabel: Record<string, string> = {
   target: '止盈',
   no_follow: '无跟随退出',
   time_exit: '时间退出',
+  rollover: '换月',
   '': '—',
 }
 
@@ -108,6 +110,7 @@ const groupColumns: DataTableColumns<GroupStat> = [
   },
   { title: '在途', key: 'pending', width: 70, align: 'right' },
   { title: '未触发', key: 'no_trigger', width: 80, align: 'right' },
+  { title: '换月', key: 'rollover', width: 70, align: 'right' },
 ]
 
 const recentColumns: DataTableColumns<OutcomeDetail> = [
@@ -173,6 +176,12 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   },
   { title: 'K线', key: 'bars_held', width: 70, align: 'right', render: (r) => r.bars_held ?? '—' },
   {
+    title: '换月',
+    key: 'rollover_crossed',
+    width: 70,
+    render: (r) => (r.rollover_crossed ? '是' : '—'),
+  },
+  {
     title: '量能',
     key: 'vol_ratio',
     width: 80,
@@ -220,6 +229,7 @@ const outcomeOptions = [
   { label: '持仓中', value: 'open' },
   { label: '未触发', value: 'no_trigger' },
   { label: '数据不足', value: 'insufficient_data' },
+  { label: '换月', value: 'rollover' },
 ]
 
 async function load() {

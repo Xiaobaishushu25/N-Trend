@@ -31,14 +31,7 @@ mod local {
         unsafe {
             let mut st: SystemTime = zeroed();
             GetLocalTime(&mut st);
-            (
-                st.year,
-                st.month,
-                st.day,
-                st.hour,
-                st.minute,
-                st.second,
-            )
+            (st.year, st.month, st.day, st.hour, st.minute, st.second)
         }
     }
 }

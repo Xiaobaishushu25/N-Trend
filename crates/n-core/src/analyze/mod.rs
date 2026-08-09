@@ -1,4 +1,4 @@
-﻿pub mod dto;
+pub mod dto;
 pub mod indicators;
 pub mod io;
 pub mod model;
@@ -57,9 +57,11 @@ pub fn analyze_bars(
 
     // a段有效性校验：过滤微型N、过滤a段没有同向趋势K线的伪结构
     let trend_k_relaxed = indicators::trend_flags_relaxed(bars15, &atr15);
+    // 结构窗口内跨过连续合约换月时，跳空不是真实行情，直接过滤该形态。
     let keep_valid = |p: &NPattern| {
         !pattern::is_small_n(p, &atr15)
             && pattern::a_leg_strong_count(p, &trend_k_relaxed) >= pattern::MIN_STRONG_A_LEG
+            && !pattern_window_has_rollover(bars15, p)
     };
     let fine: Vec<NPattern> = fine.into_iter().filter(|p| keep_valid(p)).collect();
     let large: Vec<NPattern> = large.into_iter().filter(|p| keep_valid(p)).collect();
@@ -75,16 +77,32 @@ pub fn analyze_bars(
 
     let mut candidates: Vec<SignalTuple> = Vec::new();
     if let Some(p) = latest_down_large {
-        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
+        candidates.push((
+            0,
+            p,
+            scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick),
+        ));
     }
     if let Some(p) = latest_down_fine {
-        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
+        candidates.push((
+            0,
+            p,
+            scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick),
+        ));
     }
     if let Some(p) = latest_up_fine {
-        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
+        candidates.push((
+            0,
+            p,
+            scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick),
+        ));
     }
     if let Some(p) = latest_up_large {
-        candidates.push((0, p, scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick)));
+        candidates.push((
+            0,
+            p,
+            scoring::evaluate_signal_with_tick(bars15, &atr15, p, &trend60, tick),
+        ));
     }
     let signals = dedup_signals(candidates);
 
@@ -126,7 +144,9 @@ pub fn analyze_bars(
     let summary = if blocks.is_empty() {
         None
     } else {
-        Some(render_single_summary(symbol, bars15, bars60, &trend60, &blocks))
+        Some(render_single_summary(
+            symbol, bars15, bars60, &trend60, &blocks,
+        ))
     };
 
     let detail = dto::build_detail(symbol, bars15, &trend60, &signals, &full);
@@ -135,6 +155,18 @@ pub fn analyze_bars(
         summary,
         detail,
     })
+}
+
+/// 形态结构窗口（s0 到 s2 后 6 根）内是否跨过换月 bar。
+fn pattern_window_has_rollover(bars: &[Bar], p: &NPattern) -> bool {
+    let Some(start) = bars.get(p.s0.index) else {
+        return false;
+    };
+    if start.rollover {
+        return true;
+    }
+    let end = (p.s2.index + 6).min(bars.len().saturating_sub(1));
+    bars[p.s0.index..=end].iter().any(|b| b.rollover)
 }
 
 /// 旧 CSV 路径：保持与历史行为一致，供回归测试与交叉校验。
@@ -330,5 +362,34 @@ mod tests {
         let out = dedup_signals(vec![(0, &p1, sc1), (0, &p2, sc2)]);
         assert_eq!(out.len(), 2);
     }
-}
 
+    #[test]
+    fn pattern_window_with_rollover_is_filtered() {
+        let dt = crate::analyze::model::DT {
+            year: 2026,
+            month: 8,
+            day: 3,
+            hour: 9,
+            minute: 15,
+        };
+        let mut bars: Vec<Bar> = (0..16)
+            .map(|i| Bar {
+                dt,
+                open: 100.0,
+                high: 102.0,
+                low: 98.0,
+                close: 100.0,
+                volume: 100.0,
+                hold: 1000.0,
+                rollover: i == 7,
+            })
+            .collect();
+        let (p, _) = mk("fine", Dir::Down, 3, 5, 4.0);
+        assert!(pattern_window_has_rollover(&bars, &p));
+
+        for b in &mut bars {
+            b.rollover = false;
+        }
+        assert!(!pattern_window_has_rollover(&bars, &p));
+    }
+}
