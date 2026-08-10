@@ -51,6 +51,71 @@ interface GapRect {
   bottom: number
 }
 
+interface VolumeLabelData {
+  time: Time
+  text: string
+  color: string
+}
+
+class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
+  private chart: IChartApi
+  private labels: VolumeLabelData[]
+  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
+    this.chart = chart
+    this.labels = labels
+  }
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.labels.length) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const timeScale = this.chart.timeScale()
+      context.font = '600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+      context.textBaseline = 'middle'
+      context.textAlign = 'center'
+      for (const label of this.labels) {
+        const x = timeScale.timeToCoordinate(label.time)
+        if (x == null) continue
+        const textWidth = context.measureText(label.text).width
+        const padX = 6
+        const boxW = textWidth + padX * 2
+        const boxH = 22
+        const boxX = Math.min(
+          Math.max(2, x - boxW / 2),
+          Math.max(2, mediaSize.width - boxW - 2),
+        )
+        const boxY = 5
+        context.fillStyle = 'rgba(30, 41, 59, 0.86)'
+        context.fillRect(boxX, boxY, boxW, boxH)
+        context.fillStyle = label.color
+        context.fillText(label.text, x, boxY + boxH / 2 + 1)
+      }
+    })
+  }
+}
+
+class VolumeLabelPaneView implements IPrimitivePaneView {
+  private paneRenderer: VolumeLabelPaneRenderer
+  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
+    this.paneRenderer = new VolumeLabelPaneRenderer(chart, labels)
+  }
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'top'
+  }
+}
+
+class VolumeLabelPrimitive implements ISeriesPrimitive<Time> {
+  private view: VolumeLabelPaneView
+  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
+    this.view = new VolumeLabelPaneView(chart, labels)
+  }
+  paneViews(): readonly IPrimitivePaneView[] {
+    return [this.view]
+  }
+}
+
 class GapPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
   private source: ISeriesApi<'Candlestick'>
@@ -175,6 +240,7 @@ let priceLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
+let volumeLabelPrimitive: VolumeLabelPrimitive | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
 
@@ -318,14 +384,12 @@ function buildMarkers(): SeriesMarker<Time>[] {
       })
     }
     if (s.trigger_ts) {
-      const volSuffix =
-        s.vol_ratio != null && s.vol_confirmed ? ` 量${s.vol_ratio.toFixed(1)}×` : ''
       markers.push({
         time: toTs(s.trigger_ts),
         position: 'aboveBar',
         color: '#e53935',
         shape: 'arrowDown',
-        text: `触发${volSuffix}`,
+        text: '触发',
       })
     } else if (ex?.entryTs) {
       // 快照落库时仍是"即将触发"没有 trigger_ts：用回放找到的入场触达时间补画
@@ -622,6 +686,32 @@ function syncRollovers() {
   candleSeries.attachPrimitive(rolloverPrimitive)
 }
 
+function buildVolumeLabels(): VolumeLabelData[] {
+  const labels: VolumeLabelData[] = []
+  for (const s of props.signals) {
+    if (!s.trigger_ts || s.vol_ratio == null || !s.vol_confirmed) continue
+    labels.push({
+      time: toTs(s.trigger_ts),
+      text: `量能${s.vol_ratio.toFixed(1)}×`,
+      color: '#e03131',
+    })
+  }
+  return labels
+}
+
+/** 触发量能文字画在成交量窗格顶部，避免和K线价格标记挤在一起 */
+function syncVolumeLabels() {
+  if (!chart || !volumeSeries) return
+  if (volumeLabelPrimitive) {
+    volumeSeries.detachPrimitive(volumeLabelPrimitive)
+    volumeLabelPrimitive = null
+  }
+  const labels = buildVolumeLabels()
+  if (!labels.length) return
+  volumeLabelPrimitive = new VolumeLabelPrimitive(chart, labels)
+  volumeSeries.attachPrimitive(volumeLabelPrimitive)
+}
+
 let prevSymbol: string | null = null
 let prevTimeframe: string | null = null
 
@@ -674,6 +764,7 @@ function renderOverlays() {
   markersApi?.setMarkers(buildMarkers())
   syncPriceLines()
   syncPatternLines()
+  syncVolumeLabels()
 }
 
 /** Ctrl+滚轮缩放：向上(deltaY<0)放大、向下(deltaY>0)缩小；时间轴与价格轴按光标位置同步缩放。
@@ -876,6 +967,10 @@ onBeforeUnmount(() => {
   if (rolloverPrimitive && candleSeries) {
     candleSeries.detachPrimitive(rolloverPrimitive)
     rolloverPrimitive = null
+  }
+  if (volumeLabelPrimitive && volumeSeries) {
+    volumeSeries.detachPrimitive(volumeLabelPrimitive)
+    volumeLabelPrimitive = null
   }
   markersApi?.detach()
   markersApi = null
