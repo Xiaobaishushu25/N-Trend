@@ -119,9 +119,11 @@ class RolloverPaneRenderer implements IPrimitivePaneRenderer {
     target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
       const { context, mediaSize } = scope
       const timeScale = this.chart.timeScale()
-      context.strokeStyle = 'rgba(148, 163, 184, 0.9)'
-      context.lineWidth = 1
-      context.setLineDash([4, 4])
+
+      // 先画一层宽的半透明衬线，让换月断点从远处也一眼可见
+      context.strokeStyle = 'rgba(245, 158, 11, 0.28)'
+      context.lineWidth = 6
+      context.setLineDash([2, 7])
       context.beginPath()
       for (const t of this.times) {
         const x = timeScale.timeToCoordinate(t)
@@ -130,6 +132,20 @@ class RolloverPaneRenderer implements IPrimitivePaneRenderer {
         context.lineTo(x, mediaSize.height)
       }
       context.stroke()
+
+      // 主虚线用深琥珀色加粗，压过白色背景和普通网格线
+      context.strokeStyle = '#d97706'
+      context.lineWidth = 2
+      context.setLineDash([8, 5])
+      context.beginPath()
+      for (const t of this.times) {
+        const x = timeScale.timeToCoordinate(t)
+        if (x == null) continue
+        context.moveTo(x, 0)
+        context.lineTo(x, mediaSize.height)
+      }
+      context.stroke()
+
       context.setLineDash([])
     })
   }
