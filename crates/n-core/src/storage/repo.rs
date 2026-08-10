@@ -647,6 +647,8 @@ pub async fn upsert_outcomes(
                         signal_outcomes::Column::Trend60Score,
                         signal_outcomes::Column::AtrPercentile,
                         signal_outcomes::Column::RolloverCrossed,
+                        signal_outcomes::Column::GapCrossedEntry,
+                        signal_outcomes::Column::GapCrossedExit,
                         signal_outcomes::Column::UpdatedAt,
                     ])
                     .to_owned(),

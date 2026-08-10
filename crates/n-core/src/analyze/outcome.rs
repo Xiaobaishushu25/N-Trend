@@ -1,7 +1,8 @@
 //! 信号结局回填与复盘统计。
 //!
-//! 简化出场规则（SIM_VERSION = 3）：
+//! 简化出场规则（SIM_VERSION = 7）：
 //! - 入场价 = 信号落库时的 entry（预警K线极值 ± tick），不重算、不回看；
+//! - 入场/止损被跳空穿越时按更保守的 current.open 成交，并标记 gap_crossed；
 //! - 在 15m 上逐根模拟：先到 stop → −1R；
 //! - 第一止盈位 TP1 = 1R（entry ± 1R）；
 //! - 若落库目标位（前高/前低）对应 R 倍数 > 1：第二止盈位 TP2 = max(0.8 × 目标R, 1)R，
@@ -25,7 +26,7 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 6;
+pub const SIM_VERSION: i64 = 7;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -155,6 +156,8 @@ pub struct SignalAnnotation {
     pub trend60_score: Option<f64>,
     pub atr_percentile: Option<f64>,
     pub rollover_crossed: bool,
+    pub gap_crossed_entry: bool,
+    pub gap_crossed_exit: bool,
 }
 
 fn dt_minute(b: &Bar) -> (i32, i32, i32, i32, i32) {
@@ -202,6 +205,8 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         trend60_score,
         atr_percentile: None,
         rollover_crossed: false,
+        gap_crossed_entry: false,
+        gap_crossed_exit: false,
     }
 }
 
@@ -358,6 +363,8 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 trend60_score,
                 atr_percentile: atr_percentile_at(&atr15, j),
                 rollover_crossed: true,
+                gap_crossed_entry: false,
+                gap_crossed_exit: false,
             });
         }
         let hit = match dir {
@@ -380,6 +387,21 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     let vol_ratio = vol_ratio_at(bars15, ec);
     let oi_increase = oi_increase_at(bars15, ec);
     let atr_percentile = atr_percentile_at(&atr15, ec);
+    let mut entry_fill = input.entry;
+    let mut gap_crossed_entry = false;
+    let mut gap_crossed_exit = false;
+    if ec > 0 && !bars15[ec - 1].rollover {
+        let prev_close = bars15[ec - 1].close;
+        let cur_open = bars15[ec].open;
+        let crossed = match dir {
+            Dir::Up => prev_close < input.entry && cur_open > input.entry,
+            Dir::Down => prev_close > input.entry && cur_open < input.entry,
+        };
+        if crossed {
+            entry_fill = cur_open;
+            gap_crossed_entry = true;
+        }
+    }
 
     // 第一止盈位 TP1 = 1R
     let base_tp = match dir {
@@ -427,16 +449,18 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 trend60_score,
                 atr_percentile,
                 rollover_crossed: true,
+                gap_crossed_entry: false,
+                gap_crossed_exit: false,
             });
         }
         let held = i - ec + 1;
         let mfe_contrib = match dir {
-            Dir::Up => (bar.high - input.entry) / risk,
-            Dir::Down => (input.entry - bar.low) / risk,
+            Dir::Up => (bar.high - entry_fill) / risk,
+            Dir::Down => (entry_fill - bar.low) / risk,
         };
         let mae_contrib = match dir {
-            Dir::Up => (bar.low - input.entry) / risk,
-            Dir::Down => (input.entry - bar.high) / risk,
+            Dir::Up => (bar.low - entry_fill) / risk,
+            Dir::Down => (entry_fill - bar.high) / risk,
         };
         mfe = mfe.max(mfe_contrib);
         mae = mae.min(mae_contrib);
@@ -447,7 +471,17 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         };
         // 同一根 bar 双触按止损优先（保守）
         if stop_hit {
-            result = Some((ExitReason::Stop, input.stop, i, held));
+            let stop_gap = i > 0
+                && !bars15[i - 1].rollover
+                && match dir {
+                    Dir::Up => bars15[i - 1].close > input.stop && bar.open < input.stop,
+                    Dir::Down => bars15[i - 1].close < input.stop && bar.open > input.stop,
+                };
+            if stop_gap {
+                gap_crossed_exit = true;
+            }
+            let exit_price = if stop_gap { bar.open } else { input.stop };
+            result = Some((ExitReason::Stop, exit_price, i, held));
             break;
         }
 
@@ -493,24 +527,11 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
 
     let (outcome, exit_reason, exit_price, exit_ts, r_multiple, bars_held) = match result {
         Some((reason, price, i, held)) => {
-            let r = match reason {
-                ExitReason::Stop => -1.0,
-                _ => match dir {
-                    Dir::Up => (price - input.entry) / risk,
-                    Dir::Down => (input.entry - price) / risk,
-                },
+            let r = match dir {
+                Dir::Up => (price - entry_fill) / risk,
+                Dir::Down => (entry_fill - price) / risk,
             };
-            let outcome = match reason {
-                ExitReason::Stop => Outcome::Loss,
-                ExitReason::Target => Outcome::Win,
-                _ => {
-                    if r > 0.0 {
-                        Outcome::Win
-                    } else {
-                        Outcome::Loss
-                    }
-                }
-            };
+            let outcome = if r > 0.0 { Outcome::Win } else { Outcome::Loss };
             (
                 outcome,
                 reason,
@@ -552,6 +573,8 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         trend60_score,
         atr_percentile,
         rollover_crossed: false,
+        gap_crossed_entry,
+        gap_crossed_exit,
     })
 }
 
@@ -656,6 +679,8 @@ pub struct StatRow {
     pub trend60_score: Option<f64>,
     pub atr_percentile: Option<f64>,
     pub rollover_crossed: bool,
+    pub gap_crossed_entry: bool,
+    pub gap_crossed_exit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -668,6 +693,8 @@ pub struct GroupStat {
     pub wins: usize,
     pub losses: usize,
     pub rollover: usize,
+    pub gap_entry: usize,
+    pub gap_exit: usize,
     pub win_rate: Option<f64>,
     pub avg_r: Option<f64>,
     pub avg_bars: Option<f64>,
@@ -710,6 +737,8 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
     let mut wins = 0usize;
     let mut losses = 0usize;
     let mut rollover = 0usize;
+    let mut gap_entry = 0usize;
+    let mut gap_exit = 0usize;
     let mut no_trigger = 0usize;
     let mut pending = 0usize;
     let mut r_sum = 0.0_f64;
@@ -718,6 +747,12 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
     let mut bars_count = 0usize;
 
     for r in rows {
+        if r.gap_crossed_entry {
+            gap_entry += 1;
+        }
+        if r.gap_crossed_exit {
+            gap_exit += 1;
+        }
         match r.outcome {
             Some(Outcome::Win) => {
                 settled += 1;
@@ -759,6 +794,8 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
         wins,
         losses,
         rollover,
+        gap_entry,
+        gap_exit,
         win_rate: if settled > 0 {
             Some(wins as f64 / settled as f64)
         } else {
@@ -1060,6 +1097,22 @@ mod tests {
     }
 
     #[test]
+    fn entry_gap_fills_at_open_and_marks() {
+        // 前一根 close=100，当前 open=102 跳过 entry=101：按 open 成交并标记缺口。
+        let bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0), // warning
+            (102.0, 102.5, 101.8, 102.2), // 跳空越过 entry
+            (102.2, 104.0, 102.0, 103.5), // 触及 TP1=103 后回落平仓
+        ]);
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert!(ann.gap_crossed_entry);
+        assert!(!ann.gap_crossed_exit);
+        assert_eq!(ann.exit_reason, ExitReason::Target);
+        assert!((ann.exit_price.unwrap() - 103.0).abs() < 1e-9);
+        assert!((ann.r_multiple.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn long_extends_to_second_target() {
         // 目标位 105 → 目标R=2.0 > 1，TP2 = max(0.8×2, 1) = 1.6R = 104.2
         let bars = timed_bars(&[
@@ -1104,6 +1157,23 @@ mod tests {
         assert_eq!(ann.outcome, Outcome::Loss);
         assert_eq!(ann.exit_reason, ExitReason::Stop);
         assert_eq!(ann.r_multiple, Some(-1.0));
+    }
+
+    #[test]
+    fn stop_gap_fills_at_open_and_marks() {
+        // 前一根 close=101.5，当前 open=98.5 跳过 stop=99：按 open 成交并标记止损缺口。
+        let bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0), // warning
+            (100.0, 102.0, 99.5, 101.5),  // entry，无入场缺口
+            (98.5, 99.0, 98.0, 98.2),     // 跳空跌破 stop
+        ]);
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert!(!ann.gap_crossed_entry);
+        assert!(ann.gap_crossed_exit);
+        assert_eq!(ann.outcome, Outcome::Loss);
+        assert_eq!(ann.exit_reason, ExitReason::Stop);
+        assert!((ann.exit_price.unwrap() - 98.5).abs() < 1e-9);
+        assert!((ann.r_multiple.unwrap() + 1.25).abs() < 1e-9);
     }
 
     #[test]
@@ -1241,6 +1311,27 @@ mod tests {
     }
 
     #[test]
+    fn short_entry_gap_fills_at_open_and_marks() {
+        let mut inp = input();
+        inp.direction = "down".to_string();
+        inp.entry = 100.0;
+        inp.stop = 102.0;
+        inp.target = 96.5;
+        inp.risk = 2.0;
+        let bars = timed_bars(&[
+            (101.0, 101.0, 101.0, 101.0), // warning
+            (98.0, 98.5, 98.1, 98.2),     // 跳空跌破 entry，但未触及 TP1
+            (98.2, 99.0, 96.5, 97.0),     // 触及 TP2=97.2
+        ]);
+        let ann = annotate(&inp, &bars, &[]).unwrap();
+        assert!(ann.gap_crossed_entry);
+        assert!(!ann.gap_crossed_exit);
+        assert_eq!(ann.exit_reason, ExitReason::Target);
+        assert!((ann.exit_price.unwrap() - 97.2).abs() < 1e-9);
+        assert!((ann.r_multiple.unwrap() - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
     fn invalid_risk_skipped() {
         let mut inp = input();
         inp.risk = 0.0; // 入场=止损
@@ -1354,6 +1445,8 @@ mod tests {
                 trend60_score: Some(3.8),
                 atr_percentile: Some(0.6),
                 rollover_crossed: false,
+                gap_crossed_entry: false,
+                gap_crossed_exit: false,
             }
         };
         // 同一结构键重复 3 次（id 递增），应只保留首条；另一结构 2 条
@@ -1435,6 +1528,8 @@ mod tests {
                 trend60_score: Some(3.0),
                 atr_percentile: atr,
                 rollover_crossed: false,
+                gap_crossed_entry: false,
+                gap_crossed_exit: false,
             };
         let rows = vec![
             mk(1, "RB0", "2026-08-03 09:15", 3.8, 2.0, Some(0.8)),
@@ -1461,6 +1556,36 @@ mod tests {
     }
 
     #[test]
+    fn stats_count_gap_crossed() {
+        let mk = |id: i64, gap_entry: bool, gap_exit: bool| StatRow {
+            signal_id: id,
+            symbol: format!("RB{id}"),
+            direction: "up".to_string(),
+            level: "fine".to_string(),
+            grade: "A级".to_string(),
+            score: 3.5,
+            created_at: "2026-08-03 09:15".to_string(),
+            warning_ts: Some("2026-08-03 09:15".to_string()),
+            s1_ts: Some("2026-08-03 08:45".to_string()),
+            s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            outcome: Some(Outcome::Win),
+            r_multiple: Some(1.0),
+            bars_held: Some(3),
+            vol_ratio: Some(1.0),
+            oi_increase: Some(false),
+            trend60_score: Some(3.0),
+            atr_percentile: Some(0.4),
+            rollover_crossed: false,
+            gap_crossed_entry: gap_entry,
+            gap_crossed_exit: gap_exit,
+        };
+        let rows = vec![mk(1, true, false), mk(2, false, true), mk(3, true, true)];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.gap_entry, 2);
+        assert_eq!(stats.overall.gap_exit, 2);
+    }
+
+    #[test]
     fn stats_scope_filters_score_bands() {
         let mk = |id: i64, score: f64, outcome: Outcome, r: f64| StatRow {
             signal_id: id,
@@ -1481,6 +1606,8 @@ mod tests {
             trend60_score: Some(2.0),
             atr_percentile: Some(0.4),
             rollover_crossed: false,
+            gap_crossed_entry: false,
+            gap_crossed_exit: false,
         };
         let rows = vec![
             mk(1, 1.5, Outcome::Loss, -1.0),

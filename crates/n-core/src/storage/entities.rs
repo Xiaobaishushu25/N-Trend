@@ -209,6 +209,10 @@ pub mod signal_outcomes {
         pub atr_percentile: Option<f64>,
         /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
         pub rollover_crossed: Option<bool>,
+        /// 入场价被跳空穿越：按更保守的 current.open 成交
+        pub gap_crossed_entry: Option<bool>,
+        /// 止损价被跳空穿越：按 current.open 成交
+        pub gap_crossed_exit: Option<bool>,
         pub updated_at: String,
     }
 

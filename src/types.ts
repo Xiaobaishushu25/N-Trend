@@ -287,6 +287,10 @@ export interface GroupStat {
   losses: number
   /** 窗口内跨过换月、不计入盈亏统计 */
   rollover: number
+  /** 入场被跳空穿越的笔数 */
+  gap_entry: number
+  /** 止损被跳空穿越的笔数 */
+  gap_exit: number
   win_rate: number | null
   avg_r: number | null
   avg_bars: number | null
@@ -326,6 +330,10 @@ export interface OutcomeDetail {
   trend60_score: number | null
   /** 模拟窗口内跨过连续合约换月 */
   rollover_crossed: boolean
+  /** 入场价被跳空穿越，按当前 bar open 成交 */
+  gap_crossed_entry: boolean
+  /** 止损价被跳空穿越，按当前 bar open 成交 */
+  gap_crossed_exit: boolean
 }
 
 export interface OutcomeRefresh {

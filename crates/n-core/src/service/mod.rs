@@ -75,6 +75,10 @@ pub struct OutcomeDetail {
     pub trend60_score: Option<f64>,
     /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
     pub rollover_crossed: bool,
+    /// 入场价被跳空穿越
+    pub gap_crossed_entry: bool,
+    /// 止损价被跳空穿越
+    pub gap_crossed_exit: bool,
 }
 
 /// 复盘明细跳转K线图所需：完整形态结构 + 结局。
@@ -216,6 +220,8 @@ fn stat_row_from(
         trend60_score: o.and_then(|x| x.trend60_score),
         atr_percentile: o.and_then(|x| x.atr_percentile),
         rollover_crossed: o.is_some_and(|x| x.rollover_crossed.unwrap_or(false)),
+        gap_crossed_entry: o.is_some_and(|x| x.gap_crossed_entry.unwrap_or(false)),
+        gap_crossed_exit: o.is_some_and(|x| x.gap_crossed_exit.unwrap_or(false)),
     })
 }
 
@@ -245,6 +251,8 @@ fn outcome_detail_from(s: &signals::Model, o: &signal_outcomes::Model) -> Outcom
         oi_increase: o.oi_increase,
         trend60_score: o.trend60_score,
         rollover_crossed: o.rollover_crossed.unwrap_or(false),
+        gap_crossed_entry: o.gap_crossed_entry.unwrap_or(false),
+        gap_crossed_exit: o.gap_crossed_exit.unwrap_or(false),
     }
 }
 
@@ -1110,6 +1118,8 @@ impl Services {
                 trend60_score: Set(ann.trend60_score),
                 atr_percentile: Set(ann.atr_percentile),
                 rollover_crossed: Set(Some(ann.rollover_crossed)),
+                gap_crossed_entry: Set(Some(ann.gap_crossed_entry)),
+                gap_crossed_exit: Set(Some(ann.gap_crossed_exit)),
                 updated_at: Set(now.clone()),
                 ..Default::default()
             })
@@ -1623,6 +1633,8 @@ fn outcome_model(outcome: &str, sim_version: i64, updated_at: &str) -> signal_ou
         trend60_score: None,
         atr_percentile: None,
         rollover_crossed: Some(false),
+        gap_crossed_entry: Some(false),
+        gap_crossed_exit: Some(false),
         updated_at: updated_at.to_string(),
     }
 }

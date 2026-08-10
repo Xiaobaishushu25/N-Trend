@@ -118,6 +118,13 @@ const groupColumns: DataTableColumns<GroupStat> = [
   { title: '在途', key: 'pending', width: 70, align: 'right' },
   { title: '未触发', key: 'no_trigger', width: 80, align: 'right' },
   { title: '换月', key: 'rollover', width: 70, align: 'right' },
+  {
+    title: '缺口成交',
+    key: 'gap_entry',
+    width: 90,
+    align: 'right',
+    render: (r) => (r.gap_entry || r.gap_exit ? `${r.gap_entry}/${r.gap_exit}` : '—'),
+  },
 ]
 
 const recentColumns: DataTableColumns<OutcomeDetail> = [
@@ -187,6 +194,17 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
     key: 'rollover_crossed',
     width: 70,
     render: (r) => (r.rollover_crossed ? '是' : '—'),
+  },
+  {
+    title: '缺口',
+    key: 'gap_crossed_entry',
+    width: 70,
+    render: (r) => {
+      const parts: string[] = []
+      if (r.gap_crossed_entry) parts.push('入')
+      if (r.gap_crossed_exit) parts.push('出')
+      return parts.length ? parts.join('/') : '—'
+    },
   },
   {
     title: '量能',
@@ -382,6 +400,12 @@ onBeforeUnmount(() => {
             <div class="stat-label">平均R</div>
             <div class="stat-value" :style="{ color: rColor(review.stats?.overall.avg_r) }">
               {{ fmtR(review.stats?.overall.avg_r) }}
+            </div>
+          </div>
+          <div class="stat-item">
+            <div class="stat-label">缺口成交</div>
+            <div class="stat-value">
+              {{ (review.stats?.overall.gap_entry ?? 0) + (review.stats?.overall.gap_exit ?? 0) }}
             </div>
           </div>
           <div class="stat-item">

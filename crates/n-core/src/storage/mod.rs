@@ -79,6 +79,9 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     ensure_column(db, "signal_outcomes", "entry_ts", "TEXT").await?;
     // 换月标记：信号在回放窗口内跨过连续合约换月时置 1，不计入盈亏统计
     ensure_column(db, "signal_outcomes", "rollover_crossed", "INTEGER").await?;
+    // 缺口成交标记：入场价/止损价被跳空穿越时按 current.open 成交
+    ensure_column(db, "signal_outcomes", "gap_crossed_entry", "INTEGER").await?;
+    ensure_column(db, "signal_outcomes", "gap_crossed_exit", "INTEGER").await?;
     // ATR 分位：触发 bar 的 ATR20 在近 60 根 15m bar 中的相对位置
     ensure_column(db, "signal_outcomes", "atr_percentile", "REAL").await?;
     info!("数据库表结构已就绪");
