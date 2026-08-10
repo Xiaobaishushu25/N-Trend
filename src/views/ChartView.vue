@@ -665,6 +665,20 @@ function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 
   return 'default'
 }
 
+const VOL_CONFIRM_RATIO = 1.3
+
+function volStatusText(s: PatternDto): string {
+  if (!s.vol_confirmed) return '量能待收盘'
+  if (s.vol_ratio == null) return '量能缺失'
+  return s.vol_ratio >= VOL_CONFIRM_RATIO ? '放量确认' : '未放量'
+}
+
+function volStatusClass(s: PatternDto): 'pending' | 'missing' | 'confirmed' | 'plain' {
+  if (!s.vol_confirmed) return 'pending'
+  if (s.vol_ratio == null) return 'missing'
+  return s.vol_ratio >= VOL_CONFIRM_RATIO ? 'confirmed' : 'plain'
+}
+
 /** 与入场的点差绝对值（单位：点），不区分多空方向 */
 function fmtDelta(delta: number) {
   return Math.abs(delta).toFixed(1)
@@ -999,6 +1013,12 @@ onBeforeUnmount(() => {
 
                 <div class="pc-state" :class="stateType(s.state)">
                   <span class="dot"></span>{{ s.state }}
+                </div>
+
+                <div v-if="s.trigger_ts" class="pc-vol" :class="volStatusClass(s)">
+                  <span>触发量能</span>
+                  <b v-if="s.vol_ratio != null">{{ s.vol_ratio.toFixed(2) }}×</b>
+                  <em>{{ volStatusText(s) }}</em>
                 </div>
 
                 <div v-if="patternHistory.get(historyKey(s))?.length" class="pc-history">
@@ -1626,6 +1646,39 @@ onBeforeUnmount(() => {
 .pc-state.error {
   color: #e03131;
   background: rgba(224, 49, 49, 0.1);
+}
+.pc-vol {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #64748b;
+}
+.pc-vol span {
+  color: #94a3b8;
+}
+.pc-vol b {
+  font-weight: 700;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.pc-vol em {
+  margin-left: auto;
+  font-style: normal;
+  font-weight: 600;
+}
+.pc-vol.confirmed em {
+  color: #e03131;
+}
+.pc-vol.plain em {
+  color: #64748b;
+}
+.pc-vol.pending em {
+  color: #b45309;
+}
+.pc-vol.missing em {
+  color: #94a3b8;
 }
 .pc-history {
   margin-top: 8px;

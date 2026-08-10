@@ -211,7 +211,7 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
 }
 
 /// 触发 bar 的量能比：成交量 / 前 20 根均量；均量缺失时返回 None。
-fn vol_ratio_at(bars: &[Bar], ec: usize) -> Option<f64> {
+pub(crate) fn vol_ratio_at(bars: &[Bar], ec: usize) -> Option<f64> {
     let vol = bars.get(ec)?.volume;
     if vol <= 0.0 {
         return None;

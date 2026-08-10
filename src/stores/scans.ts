@@ -63,7 +63,13 @@ export const useScansStore = defineStore('scans', {
       for (const r of rows) {
         try {
           const d = JSON.parse(r.detail) as PatternDto
-          out.push({ symbol: r.symbol, ...d })
+          const { vol_ratio, vol_confirmed, ...rest } = d
+          out.push({
+            symbol: r.symbol,
+            ...rest,
+            vol_ratio: vol_ratio ?? null,
+            vol_confirmed: vol_confirmed === true,
+          })
         } catch {
           // 单条记录解析失败不影响整体
         }

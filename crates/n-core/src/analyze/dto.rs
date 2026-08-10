@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::analyze::model::{Bar, Dir, NPattern, SignalCheck, Trend60};
+use crate::analyze::outcome::vol_ratio_at;
 use crate::analyze::report;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +40,10 @@ pub struct PatternDto {
     pub dims: [f64; 6],
     pub warning_ts: Option<String>,
     pub trigger_ts: Option<String>,
+    #[serde(default)]
+    pub vol_ratio: Option<f64>,
+    #[serde(default)]
+    pub vol_confirmed: bool,
     pub note: String,
     pub active: bool,
 }
@@ -46,6 +51,10 @@ pub struct PatternDto {
 impl PatternDto {
     pub fn from_parts(bars: &[Bar], number: usize, p: &NPattern, sc: &SignalCheck) -> Self {
         let ts = |i: usize| bars.get(i).map(|b| b.dt.to_string()).unwrap_or_default();
+        let (vol_ratio, vol_confirmed) = match sc.trigger {
+            Some(ec) => (vol_ratio_at(bars, ec), ec + 1 < bars.len()),
+            None => (None, false),
+        };
         Self {
             number,
             level: p.level.to_string(),
@@ -90,6 +99,8 @@ impl PatternDto {
             dims: sc.dims,
             warning_ts: sc.warning.map(ts),
             trigger_ts: sc.trigger.map(ts),
+            vol_ratio,
+            vol_confirmed,
             note: sc.note.clone(),
             active: report::is_active_signal(sc),
         }

@@ -318,12 +318,14 @@ function buildMarkers(): SeriesMarker<Time>[] {
       })
     }
     if (s.trigger_ts) {
+      const volSuffix =
+        s.vol_ratio != null && s.vol_confirmed ? ` 量${s.vol_ratio.toFixed(1)}×` : ''
       markers.push({
         time: toTs(s.trigger_ts),
         position: 'aboveBar',
         color: '#e53935',
         shape: 'arrowDown',
-        text: '触发',
+        text: `触发${volSuffix}`,
       })
     } else if (ex?.entryTs) {
       // 快照落库时仍是"即将触发"没有 trigger_ts：用回放找到的入场触达时间补画

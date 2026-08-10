@@ -76,6 +76,10 @@ export interface PatternDto {
   dims: number[]
   warning_ts: string | null
   trigger_ts: string | null
+  /** 触发bar量能：成交量 / 前20根15m均量 */
+  vol_ratio: number | null
+  /** 触发bar之后还有K线，量能已走完可确认 */
+  vol_confirmed: boolean
   note: string
   active: boolean
 }
@@ -125,6 +129,10 @@ export interface SignalOutcome {
   dims: number[]
   warning_ts: string | null
   trigger_ts: string | null
+  /** 触发bar量能：成交量 / 前20根15m均量 */
+  vol_ratio: number | null
+  /** 触发bar之后还有K线，量能已走完可确认 */
+  vol_confirmed: boolean
   note: string
   active: boolean
 }
