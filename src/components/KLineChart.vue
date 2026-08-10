@@ -55,13 +55,16 @@ interface VolumeLabelData {
   time: Time
   text: string
   color: string
+  volume: number
 }
 
 class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
+  private source: ISeriesApi<'Histogram'>
   private labels: VolumeLabelData[]
-  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
+  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
     this.chart = chart
+    this.source = source
     this.labels = labels
   }
   draw(target: CanvasRenderingTarget2D) {
@@ -83,11 +86,29 @@ class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
           Math.max(2, x - boxW / 2),
           Math.max(2, mediaSize.width - boxW - 2),
         )
-        const boxY = 5
+        const boxY = 4
         context.fillStyle = 'rgba(30, 41, 59, 0.86)'
         context.fillRect(boxX, boxY, boxW, boxH)
         context.fillStyle = label.color
         context.fillText(label.text, x, boxY + boxH / 2 + 1)
+
+        const barTopY = this.source.priceToCoordinate(label.volume)
+        if (barTopY == null || label.volume <= 0) continue
+        const labelBottomY = boxY + boxH
+        context.save()
+        context.setLineDash([4, 4])
+        context.strokeStyle = 'rgba(224, 49, 49, 0.8)'
+        context.lineWidth = 1.5
+        context.beginPath()
+        context.moveTo(x, labelBottomY)
+        context.lineTo(x, barTopY)
+        context.stroke()
+        context.setLineDash([])
+        context.fillStyle = '#e03131'
+        context.beginPath()
+        context.arc(x, barTopY, 3.5, 0, Math.PI * 2)
+        context.fill()
+        context.restore()
       }
     })
   }
@@ -95,8 +116,8 @@ class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
 
 class VolumeLabelPaneView implements IPrimitivePaneView {
   private paneRenderer: VolumeLabelPaneRenderer
-  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
-    this.paneRenderer = new VolumeLabelPaneRenderer(chart, labels)
+  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
+    this.paneRenderer = new VolumeLabelPaneRenderer(chart, source, labels)
   }
   renderer(): IPrimitivePaneRenderer | null {
     return this.paneRenderer
@@ -108,8 +129,8 @@ class VolumeLabelPaneView implements IPrimitivePaneView {
 
 class VolumeLabelPrimitive implements ISeriesPrimitive<Time> {
   private view: VolumeLabelPaneView
-  constructor(chart: IChartApi, labels: VolumeLabelData[]) {
-    this.view = new VolumeLabelPaneView(chart, labels)
+  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
+    this.view = new VolumeLabelPaneView(chart, source, labels)
   }
   paneViews(): readonly IPrimitivePaneView[] {
     return [this.view]
@@ -690,10 +711,12 @@ function buildVolumeLabels(): VolumeLabelData[] {
   const labels: VolumeLabelData[] = []
   for (const s of props.signals) {
     if (!s.trigger_ts || s.vol_ratio == null || !s.vol_confirmed) continue
+    const row = props.rows.find((r) => r.ts === s.trigger_ts)
     labels.push({
       time: toTs(s.trigger_ts),
       text: `量能${s.vol_ratio.toFixed(1)}×`,
       color: '#e03131',
+      volume: row?.volume ?? 0,
     })
   }
   return labels
@@ -708,7 +731,7 @@ function syncVolumeLabels() {
   }
   const labels = buildVolumeLabels()
   if (!labels.length) return
-  volumeLabelPrimitive = new VolumeLabelPrimitive(chart, labels)
+  volumeLabelPrimitive = new VolumeLabelPrimitive(chart, volumeSeries, labels)
   volumeSeries.attachPrimitive(volumeLabelPrimitive)
 }
 
@@ -882,9 +905,9 @@ onMounted(() => {
     { priceFormat: { type: 'volume' }, priceScaleId: 'vol' },
     1,
   )
-  // 0.08 就是 8%（小数形式），top 控制上边距、bottom 控制下边距
+  // top 控制上边距、bottom 控制下边距；成交量顶部多留空间给量能标签和指示线
   chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.08 } })
-  chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.08, bottom: 0.04 } })
+  chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.24, bottom: 0.04 } })
   applyPaneHeights()
 
   chart.subscribeCrosshairMove((param) => {
