@@ -3,9 +3,10 @@ use std::sync::Arc;
 use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
-    MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail, ScanResult,
+    KlineDto, MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail,
+    ScanResult,
 };
-use n_core::storage::entities::{groups, klines, scans, signals, symbols};
+use n_core::storage::entities::{groups, scans, signals, symbols};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
@@ -237,7 +238,7 @@ pub async fn get_klines(
     symbol: String,
     timeframe: String,
     limit: Option<usize>,
-) -> Result<Vec<klines::Model>, String> {
+) -> Result<Vec<KlineDto>, String> {
     state
         .services
         .get_klines(&symbol, &timeframe, limit)

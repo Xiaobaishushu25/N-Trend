@@ -239,6 +239,23 @@ pub struct MarketSnapshot {
     pub change_pct: Option<f64>,
 }
 
+/// Kline chart data: same fields as the klines table plus a rollover marker.
+#[derive(Debug, Clone, Serialize)]
+pub struct KlineDto {
+    pub symbol: String,
+    pub timeframe: String,
+    pub ts: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub hold: f64,
+    pub source: String,
+    /// true when this bar is the first bar after a continuous-contract rollover
+    pub rollover: bool,
+}
+
 /// 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EntryTriggerHit {
@@ -820,36 +837,30 @@ impl Services {
         symbol: &str,
         timeframe: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<klines::Model>> {
+    ) -> Result<Vec<KlineDto>> {
         let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
+        let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
         if tf == Timeframe::M5 {
-            return repo::klines(&self.db, symbol, "5m", limit, None).await;
+            let rows = repo::klines(&self.db, symbol, "5m", limit, None).await?;
+            return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
             let rows = repo::klines(&self.db, symbol, tf.as_str(), None, None).await?;
             if !rows.is_empty() {
-                return Ok(apply_limit(rows, limit));
+                let rows = apply_limit(rows, limit);
+                return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
         }
         let raw = repo::raw_klines(&self.db, symbol).await?;
         let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let derived = aggregate(&bars, tf);
-        let rows: Vec<klines::Model> = derived
-            .into_iter()
-            .map(|k| klines::Model {
-                symbol: symbol.to_string(),
-                timeframe: tf.as_str().to_string(),
-                ts: k.datetime,
-                open: k.open,
-                high: k.high,
-                low: k.low,
-                close: k.close,
-                volume: k.volume,
-                hold: k.hold,
-                source: "derived".to_string(),
-            })
+        let mut bars: Vec<Bar> = derived.iter().filter_map(fetch_to_bar).collect();
+        mark_rollover_bars(&mut bars, &rollovers, tf.as_str());
+        let rows: Vec<KlineDto> = bars
+            .iter()
+            .map(|b| bar_to_kline_dto(symbol, tf.as_str(), "derived", b))
             .collect();
-        Ok(apply_limit(rows, limit))
+        Ok(apply_limit_dto(rows, limit))
     }
 
     /// 全部品种的最新价与涨跌幅（供左侧品种列表展示）。
@@ -1183,6 +1194,57 @@ fn apply_limit(rows: Vec<klines::Model>, limit: Option<usize>) -> Vec<klines::Mo
     }
 }
 
+fn apply_limit_dto(rows: Vec<KlineDto>, limit: Option<usize>) -> Vec<KlineDto> {
+    match limit {
+        Some(limit) if rows.len() > limit => rows[rows.len() - limit..].to_vec(),
+        _ => rows,
+    }
+}
+
+fn bar_to_kline_dto(symbol: &str, timeframe: &str, source: &str, bar: &Bar) -> KlineDto {
+    KlineDto {
+        symbol: symbol.to_string(),
+        timeframe: timeframe.to_string(),
+        ts: format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:00",
+            bar.dt.year, bar.dt.month, bar.dt.day, bar.dt.hour, bar.dt.minute
+        ),
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.volume,
+        hold: bar.hold,
+        source: source.to_string(),
+        rollover: bar.rollover,
+    }
+}
+
+fn mark_rollover_models(
+    rows: Vec<klines::Model>,
+    rollovers: &[crate::storage::entities::rollovers::Model],
+    timeframe: &str,
+) -> Vec<KlineDto> {
+    let mut bars: Vec<Bar> = rows.iter().filter_map(model_to_bar).collect();
+    mark_rollover_bars(&mut bars, rollovers, timeframe);
+    rows.into_iter()
+        .zip(bars)
+        .map(|(m, b)| KlineDto {
+            symbol: m.symbol,
+            timeframe: m.timeframe,
+            ts: m.ts,
+            open: m.open,
+            high: m.high,
+            low: m.low,
+            close: m.close,
+            volume: m.volume,
+            hold: m.hold,
+            source: m.source,
+            rollover: b.rollover,
+        })
+        .collect()
+}
+
 fn ts_gap_minutes(later: &str, earlier: &str) -> Option<i64> {
     let fmt = "%Y-%m-%d %H:%M:%S";
     let a = chrono::NaiveDateTime::parse_from_str(later, fmt).ok()?;
@@ -1418,6 +1480,31 @@ mod tests {
     }
 
     #[test]
+    fn mark_rollover_models_marks_aggregated_first_bar() {
+        use crate::storage::entities::rollovers;
+        let rows = vec![
+            kline_model("2026-08-05 15:00:00"),
+            kline_model("2026-08-05 21:00:00"),
+            kline_model("2026-08-05 21:15:00"),
+        ];
+        let rollovers = vec![rollovers::Model {
+            symbol: "BU0".to_string(),
+            ts: "2026-08-05 21:05:00".to_string(),
+            from_contract: "BU2609".to_string(),
+            to_contract: "BU2610".to_string(),
+            confirmed: true,
+            created_at: "2026-08-05 21:10:00".to_string(),
+            updated_at: "2026-08-05 21:10:00".to_string(),
+        }];
+        let out = mark_rollover_models(rows, &rollovers, "15m");
+        assert!(!out[0].rollover);
+        assert!(!out[1].rollover);
+        assert!(out[2].rollover);
+        assert_eq!(out[2].ts, "2026-08-05 21:15:00");
+        assert_eq!(out[2].source, "derived");
+    }
+
+    #[test]
     fn contract_prefix_strips_continuous_digits() {
         assert_eq!(contract_prefix("BU0"), "BU");
         assert_eq!(contract_prefix("RB2610"), "RB");
@@ -1436,5 +1523,21 @@ fn dt_to_bar(dt: DT) -> Bar {
         volume: 0.0,
         hold: 0.0,
         rollover: false,
+    }
+}
+
+#[cfg(test)]
+fn kline_model(ts: &str) -> klines::Model {
+    klines::Model {
+        symbol: "BU0".to_string(),
+        timeframe: "15m".to_string(),
+        ts: ts.to_string(),
+        open: 0.0,
+        high: 0.0,
+        low: 0.0,
+        close: 0.0,
+        volume: 0.0,
+        hold: 0.0,
+        source: "derived".to_string(),
     }
 }

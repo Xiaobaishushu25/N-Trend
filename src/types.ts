@@ -40,6 +40,8 @@ export interface KlineRow {
   volume: number
   hold: number
   source: string
+  /** 连续合约换月后的第一根K线 */
+  rollover: boolean
 }
 
 export interface SwingDto {

@@ -249,6 +249,7 @@ function updateLiveBar(latest: number) {
       volume: seed?.volume ?? 0,
       hold: seed?.hold ?? 0,
       source: 'live',
+      rollover: false,
     })
     // 只保留最近一小段，等库内每 5 分钟刷新后自然由历史序列接管
     if (arr.length > 12) arr.splice(0, arr.length - 12)

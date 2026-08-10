@@ -107,6 +107,57 @@ class GapPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
+class RolloverPaneRenderer implements IPrimitivePaneRenderer {
+  private chart: IChartApi
+  private times: Time[]
+  constructor(chart: IChartApi, times: Time[]) {
+    this.chart = chart
+    this.times = times
+  }
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.times.length) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const timeScale = this.chart.timeScale()
+      context.strokeStyle = 'rgba(148, 163, 184, 0.9)'
+      context.lineWidth = 1
+      context.setLineDash([4, 4])
+      context.beginPath()
+      for (const t of this.times) {
+        const x = timeScale.timeToCoordinate(t)
+        if (x == null) continue
+        context.moveTo(x, 0)
+        context.lineTo(x, mediaSize.height)
+      }
+      context.stroke()
+      context.setLineDash([])
+    })
+  }
+}
+
+class RolloverPaneView implements IPrimitivePaneView {
+  private paneRenderer: RolloverPaneRenderer
+  constructor(chart: IChartApi, times: Time[]) {
+    this.paneRenderer = new RolloverPaneRenderer(chart, times)
+  }
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'bottom'
+  }
+}
+
+class RolloverPrimitive implements ISeriesPrimitive<Time> {
+  private view: RolloverPaneView
+  constructor(chart: IChartApi, times: Time[]) {
+    this.view = new RolloverPaneView(chart, times)
+  }
+  paneViews(): readonly IPrimitivePaneView[] {
+    return [this.view]
+  }
+}
+
 /** 同一品种/级别内的缩放/平移状态：切换品种或级别时沿用同样的横向视图，避免跳变 */
 let lastView: { from: number; to: number; totalAtCapture: number } | null = null
 /** 最近一次写入图表的数据量：captureView 用它标记视图取自多长的数据，
@@ -120,6 +171,7 @@ let resizeObserver: ResizeObserver | null = null
 let priceLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
+let rolloverPrimitive: RolloverPrimitive | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
 
@@ -548,6 +600,23 @@ function syncGaps() {
   candleSeries.attachPrimitive(gapPrimitive)
 }
 
+function computeRollovers(): Time[] {
+  return props.rows.filter((r) => !!r.rollover).map((r) => toTs(r.ts) as Time)
+}
+
+/** 重建换月竖线图层 */
+function syncRollovers() {
+  if (!chart || !candleSeries) return
+  if (rolloverPrimitive) {
+    candleSeries.detachPrimitive(rolloverPrimitive)
+    rolloverPrimitive = null
+  }
+  const times = computeRollovers()
+  if (!times.length) return
+  rolloverPrimitive = new RolloverPrimitive(chart, times)
+  candleSeries.attachPrimitive(rolloverPrimitive)
+}
+
 let prevSymbol: string | null = null
 let prevTimeframe: string | null = null
 
@@ -581,6 +650,7 @@ function renderData() {
   volumeSeries.setData(buildVolumes())
   lastDataCount = props.rows.length
   syncGaps()
+  syncRollovers()
   // updateDbg()
   if (isSwitch) {
     dropStaleView(props.rows.length)
@@ -797,6 +867,10 @@ onBeforeUnmount(() => {
   if (gapPrimitive && candleSeries) {
     candleSeries.detachPrimitive(gapPrimitive)
     gapPrimitive = null
+  }
+  if (rolloverPrimitive && candleSeries) {
+    candleSeries.detachPrimitive(rolloverPrimitive)
+    rolloverPrimitive = null
   }
   markersApi?.detach()
   markersApi = null
