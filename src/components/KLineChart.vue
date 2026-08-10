@@ -695,10 +695,11 @@ function buildEnergyLabels(): EnergyLabelData[] {
   const labels: EnergyLabelData[] = []
   for (const s of props.signals) {
     if (!s.trigger_ts || s.vol_ratio == null || !s.vol_confirmed) continue
-    const row = props.rows.find((r) => r.ts === s.trigger_ts)
+    const triggerTime = toTs(s.trigger_ts)
+    const row = props.rows.find((r) => toTs(r.ts) === triggerTime)
     if (!row) continue
     labels.push({
-      time: toTs(s.trigger_ts),
+      time: triggerTime,
       text: `量能${s.vol_ratio.toFixed(1)}×`,
       color: '#e03131',
       price: row.high,
