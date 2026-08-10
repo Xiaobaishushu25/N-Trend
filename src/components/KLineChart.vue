@@ -88,7 +88,7 @@ class EnergyLabelPaneRenderer implements IPrimitivePaneRenderer {
         )
         const barTopY = this.source.priceToCoordinate(label.price)
         if (barTopY == null) continue
-        const boxY = Math.max(4, barTopY - 40 - boxH)
+        const boxY = Math.max(4, barTopY - 100 - boxH)
         context.fillStyle = 'rgba(30, 41, 59, 0.86)'
         context.fillRect(boxX, boxY, boxW, boxH)
         context.fillStyle = label.color
@@ -708,7 +708,7 @@ function buildEnergyLabels(): EnergyLabelData[] {
   return labels
 }
 
-/** 触发量能画在触发K线上方约40px处，避免遮挡价格 */
+/** 触发量能画在触发K线上方约100px处，避免遮挡价格 */
 function syncEnergyLabels() {
   if (!chart || !candleSeries) return
   if (energyLabelPrimitive) {
