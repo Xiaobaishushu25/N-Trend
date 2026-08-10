@@ -12,6 +12,9 @@ export const REVIEW_DIMENSIONS = [
   { key: 'vol_confirm', label: '量能确认' },
   { key: 'oi', label: '持仓量' },
   { key: 'trend60', label: '60m趋势分' },
+  { key: 'symbol_hour', label: '品种×小时' },
+  { key: 'score_vol', label: '评分×量能' },
+  { key: 'hour_atr', label: '小时×波动' },
 ] as const
 
 export const REVIEW_STATS_SCOPES = [

@@ -645,6 +645,7 @@ pub async fn upsert_outcomes(
                         signal_outcomes::Column::VolRatio,
                         signal_outcomes::Column::OiIncrease,
                         signal_outcomes::Column::Trend60Score,
+                        signal_outcomes::Column::AtrPercentile,
                         signal_outcomes::Column::RolloverCrossed,
                         signal_outcomes::Column::UpdatedAt,
                     ])

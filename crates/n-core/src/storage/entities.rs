@@ -205,6 +205,8 @@ pub mod signal_outcomes {
         pub oi_increase: Option<bool>,
         /// 60m 连续趋势分 0~5（信号时刻截断计算）
         pub trend60_score: Option<f64>,
+        /// 触发 bar 的 ATR20 相对前 60 根 15m bar 的分位（0~1）
+        pub atr_percentile: Option<f64>,
         /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
         pub rollover_crossed: Option<bool>,
         pub updated_at: String,

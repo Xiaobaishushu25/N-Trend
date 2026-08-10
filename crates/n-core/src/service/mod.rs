@@ -214,6 +214,7 @@ fn stat_row_from(
         vol_ratio: o.and_then(|x| x.vol_ratio),
         oi_increase: o.and_then(|x| x.oi_increase),
         trend60_score: o.and_then(|x| x.trend60_score),
+        atr_percentile: o.and_then(|x| x.atr_percentile),
         rollover_crossed: o.is_some_and(|x| x.rollover_crossed.unwrap_or(false)),
     })
 }
@@ -1107,6 +1108,7 @@ impl Services {
                 vol_ratio: Set(ann.vol_ratio),
                 oi_increase: Set(ann.oi_increase),
                 trend60_score: Set(ann.trend60_score),
+                atr_percentile: Set(ann.atr_percentile),
                 rollover_crossed: Set(Some(ann.rollover_crossed)),
                 updated_at: Set(now.clone()),
                 ..Default::default()
@@ -1119,11 +1121,7 @@ impl Services {
 
     /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总；
     /// scope 控制统计口径（all/tradable/standard）。
-    pub async fn review_stats(
-        &self,
-        dimension: &str,
-        scope: &str,
-    ) -> Result<outcome::ReviewStats> {
+    pub async fn review_stats(&self, dimension: &str, scope: &str) -> Result<outcome::ReviewStats> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> =
@@ -1623,6 +1621,7 @@ fn outcome_model(outcome: &str, sim_version: i64, updated_at: &str) -> signal_ou
         vol_ratio: None,
         oi_increase: None,
         trend60_score: None,
+        atr_percentile: None,
         rollover_crossed: Some(false),
         updated_at: updated_at.to_string(),
     }

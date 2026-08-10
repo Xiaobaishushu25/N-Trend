@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 5;
+pub const SIM_VERSION: i64 = 6;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -40,6 +40,8 @@ pub const MIN_BARS_FOR_SETTLED: usize = 3;
 pub const VOL_AVG_WINDOW: usize = 20;
 /// 量能确认阈值：触发 bar 成交量 ≥ 前 20 根均量的 1.3 倍
 pub const VOL_CONFIRM_RATIO: f64 = 1.3;
+/// ATR 分位窗口：触发 bar 的 ATR20 与之前 60 根 15m bar 比较
+pub const ATR_PERCENTILE_WINDOW: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -151,6 +153,7 @@ pub struct SignalAnnotation {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    pub atr_percentile: Option<f64>,
     pub rollover_crossed: bool,
 }
 
@@ -197,6 +200,7 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         vol_ratio: None,
         oi_increase: None,
         trend60_score,
+        atr_percentile: None,
         rollover_crossed: false,
     }
 }
@@ -233,6 +237,26 @@ fn oi_increase_at(bars: &[Bar], ec: usize) -> Option<bool> {
         return None;
     }
     Some(cur > prev)
+}
+
+/// 触发 bar 的 ATR20 在当前品种近 60 根 15m bar 中的分位（0~1）。
+fn atr_percentile_at(atr20: &[Option<f64>], ec: usize) -> Option<f64> {
+    let cur = atr20.get(ec).copied().flatten()?;
+    let lo = ec.saturating_sub(ATR_PERCENTILE_WINDOW);
+    let mut lower = 0usize;
+    let mut total = 0usize;
+    for i in lo..ec {
+        if let Some(v) = atr20[i] {
+            total += 1;
+            if v <= cur {
+                lower += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(lower as f64 / total as f64)
 }
 
 /// 60m 连续趋势分 0~5：按信号时刻截断的 60m 序列计算。
@@ -312,6 +336,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     let Some(start) = start else {
         return Some(empty_annotation(Outcome::InsufficientData, trend60_score));
     };
+    let atr15 = indicators::atr(bars15, ATR_PERIOD);
     // 预警后 12 根内寻找入场触发（做多突破 entry、做空跌破 entry）
     let scan_end = (start + 1 + PENDING_BARS).min(bars15.len());
     let mut ec = None;
@@ -331,6 +356,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 vol_ratio: vol_ratio_at(bars15, j),
                 oi_increase: oi_increase_at(bars15, j),
                 trend60_score,
+                atr_percentile: atr_percentile_at(&atr15, j),
                 rollover_crossed: true,
             });
         }
@@ -353,6 +379,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     };
     let vol_ratio = vol_ratio_at(bars15, ec);
     let oi_increase = oi_increase_at(bars15, ec);
+    let atr_percentile = atr_percentile_at(&atr15, ec);
 
     // 第一止盈位 TP1 = 1R
     let base_tp = match dir {
@@ -398,6 +425,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 vol_ratio,
                 oi_increase,
                 trend60_score,
+                atr_percentile,
                 rollover_crossed: true,
             });
         }
@@ -522,6 +550,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         vol_ratio,
         oi_increase,
         trend60_score,
+        atr_percentile,
         rollover_crossed: false,
     })
 }
@@ -539,6 +568,9 @@ pub enum GroupBy {
     VolConfirm,
     OiIncrease,
     Trend60Band,
+    SymbolHour,
+    ScoreVol,
+    HourAtrBand,
 }
 
 impl GroupBy {
@@ -552,6 +584,9 @@ impl GroupBy {
             "vol_confirm" => GroupBy::VolConfirm,
             "oi" => GroupBy::OiIncrease,
             "trend60" => GroupBy::Trend60Band,
+            "symbol_hour" => GroupBy::SymbolHour,
+            "score_vol" => GroupBy::ScoreVol,
+            "hour_atr" => GroupBy::HourAtrBand,
             _ => GroupBy::ScoreBand,
         }
     }
@@ -619,6 +654,7 @@ pub struct StatRow {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    pub atr_percentile: Option<f64>,
     pub rollover_crossed: bool,
 }
 
@@ -752,6 +788,33 @@ fn hour_of(r: &StatRow) -> String {
         .unwrap_or_else(|| "未知".to_string())
 }
 
+fn score_band_label(score: f64) -> String {
+    if score < 2.5 {
+        "<2.5".to_string()
+    } else if score < 3.5 {
+        "2.5-3.5".to_string()
+    } else {
+        "3.5-5.0".to_string()
+    }
+}
+
+fn vol_label(r: &StatRow) -> String {
+    match r.vol_ratio {
+        Some(v) if v >= VOL_CONFIRM_RATIO => "放量确认".to_string(),
+        Some(_) => "未放量".to_string(),
+        None => "数据缺失".to_string(),
+    }
+}
+
+fn atr_band_label(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x < 0.25 => "低波动".to_string(),
+        Some(x) if x >= 0.75 => "高波动".to_string(),
+        Some(_) => "中波动".to_string(),
+        None => "数据缺失".to_string(),
+    }
+}
+
 fn bucket(group_by: GroupBy, r: &StatRow) -> String {
     match group_by {
         GroupBy::ScoreBand => {
@@ -796,6 +859,9 @@ fn bucket(group_by: GroupBy, r: &StatRow) -> String {
             Some(_) => "<2.5".to_string(),
             None => "数据缺失".to_string(),
         },
+        GroupBy::SymbolHour => format!("{} {}", r.symbol, hour_of(r)),
+        GroupBy::ScoreVol => format!("{} / {}", score_band_label(r.score), vol_label(r)),
+        GroupBy::HourAtrBand => format!("{} / {}", hour_of(r), atr_band_label(r.atr_percentile)),
     }
 }
 
@@ -852,6 +918,7 @@ fn group_rank(group_by: GroupBy, key: &str) -> (u8, String) {
             .and_then(|(h, _)| h.parse::<u8>().ok())
             .unwrap_or(24),
         GroupBy::Symbol => 0,
+        GroupBy::SymbolHour | GroupBy::ScoreVol | GroupBy::HourAtrBand => 0,
     };
     (rank, key.to_string())
 }
@@ -1196,6 +1263,21 @@ mod tests {
     }
 
     #[test]
+    fn atr_percentile_uses_previous_window() {
+        let mut atr20: Vec<Option<f64>> = (0..61).map(|i| Some(i as f64)).collect();
+        atr20.push(Some(10.0));
+        assert_eq!(
+            atr_percentile_at(&atr20, 61),
+            Some(10.0 / 60.0),
+            "前 60 根中 1~10 共 10 根不高于当前值 10"
+        );
+        assert_eq!(atr_percentile_at(&atr20, 0), None);
+
+        let sparse = vec![Some(3.0), None, Some(2.0)];
+        assert_eq!(atr_percentile_at(&sparse, 2), Some(0.0));
+    }
+
+    #[test]
     fn trend60_score_bounds_and_direction() {
         let mut up: Vec<Bar> = Vec::new();
         for i in 0..40 {
@@ -1270,6 +1352,7 @@ mod tests {
                 vol_ratio: Some(2.0),
                 oi_increase: Some(true),
                 trend60_score: Some(3.8),
+                atr_percentile: Some(0.6),
                 rollover_crossed: false,
             }
         };
@@ -1331,6 +1414,53 @@ mod tests {
     }
 
     #[test]
+    fn stats_composite_dimensions() {
+        let mk =
+            |id: i64, symbol: &str, ts: &str, score: f64, vol: f64, atr: Option<f64>| StatRow {
+                signal_id: id,
+                symbol: symbol.to_string(),
+                direction: "up".to_string(),
+                level: "fine".to_string(),
+                grade: "A级".to_string(),
+                score,
+                created_at: ts.to_string(),
+                warning_ts: Some(ts.to_string()),
+                s1_ts: Some("2026-08-03 08:45".to_string()),
+                s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+                outcome: Some(Outcome::Win),
+                r_multiple: Some(1.0),
+                bars_held: Some(3),
+                vol_ratio: Some(vol),
+                oi_increase: Some(true),
+                trend60_score: Some(3.0),
+                atr_percentile: atr,
+                rollover_crossed: false,
+            };
+        let rows = vec![
+            mk(1, "RB0", "2026-08-03 09:15", 3.8, 2.0, Some(0.8)),
+            mk(2, "RB0", "2026-08-03 10:30", 3.0, 1.0, Some(0.5)),
+            mk(3, "RB0", "2026-08-03 09:45", 2.2, 0.5, Some(0.2)),
+        ];
+
+        let symbol_hour = aggregate_stats(&rows, GroupBy::SymbolHour);
+        assert!(symbol_hour.groups.iter().any(|g| g.key == "RB0 09:00"));
+        assert!(symbol_hour.groups.iter().any(|g| g.key == "RB0 10:00"));
+
+        let score_vol = aggregate_stats(&rows, GroupBy::ScoreVol);
+        assert!(score_vol
+            .groups
+            .iter()
+            .any(|g| g.key == "3.5-5.0 / 放量确认"));
+        assert!(score_vol.groups.iter().any(|g| g.key == "2.5-3.5 / 未放量"));
+        assert!(score_vol.groups.iter().any(|g| g.key == "<2.5 / 未放量"));
+
+        let hour_atr = aggregate_stats(&rows, GroupBy::HourAtrBand);
+        assert!(hour_atr.groups.iter().any(|g| g.key == "09:00 / 高波动"));
+        assert!(hour_atr.groups.iter().any(|g| g.key == "10:00 / 中波动"));
+        assert!(hour_atr.groups.iter().any(|g| g.key == "09:00 / 低波动"));
+    }
+
+    #[test]
     fn stats_scope_filters_score_bands() {
         let mk = |id: i64, score: f64, outcome: Outcome, r: f64| StatRow {
             signal_id: id,
@@ -1349,6 +1479,7 @@ mod tests {
             vol_ratio: Some(1.0),
             oi_increase: Some(false),
             trend60_score: Some(2.0),
+            atr_percentile: Some(0.4),
             rollover_crossed: false,
         };
         let rows = vec![
