@@ -51,18 +51,18 @@ interface GapRect {
   bottom: number
 }
 
-interface VolumeLabelData {
+interface EnergyLabelData {
   time: Time
   text: string
   color: string
-  volume: number
+  price: number
 }
 
-class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
+class EnergyLabelPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
-  private source: ISeriesApi<'Histogram'>
-  private labels: VolumeLabelData[]
-  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
+  private source: ISeriesApi<'Candlestick'>
+  private labels: EnergyLabelData[]
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
     this.chart = chart
     this.source = source
     this.labels = labels
@@ -86,38 +86,22 @@ class VolumeLabelPaneRenderer implements IPrimitivePaneRenderer {
           Math.max(2, x - boxW / 2),
           Math.max(2, mediaSize.width - boxW - 2),
         )
-        const boxY = 4
+        const barTopY = this.source.priceToCoordinate(label.price)
+        if (barTopY == null) continue
+        const boxY = Math.max(4, barTopY - 40 - boxH)
         context.fillStyle = 'rgba(30, 41, 59, 0.86)'
         context.fillRect(boxX, boxY, boxW, boxH)
         context.fillStyle = label.color
-        context.fillText(label.text, x, boxY + boxH / 2 + 1)
-
-        const barTopY = this.source.priceToCoordinate(label.volume)
-        if (barTopY == null || label.volume <= 0) continue
-        const labelBottomY = boxY + boxH
-        context.save()
-        context.setLineDash([4, 4])
-        context.strokeStyle = 'rgba(224, 49, 49, 0.8)'
-        context.lineWidth = 1.5
-        context.beginPath()
-        context.moveTo(x, labelBottomY)
-        context.lineTo(x, barTopY)
-        context.stroke()
-        context.setLineDash([])
-        context.fillStyle = '#e03131'
-        context.beginPath()
-        context.arc(x, barTopY, 3.5, 0, Math.PI * 2)
-        context.fill()
-        context.restore()
+        context.fillText(label.text, boxX + boxW / 2, boxY + boxH / 2 + 1)
       }
     })
   }
 }
 
-class VolumeLabelPaneView implements IPrimitivePaneView {
-  private paneRenderer: VolumeLabelPaneRenderer
-  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
-    this.paneRenderer = new VolumeLabelPaneRenderer(chart, source, labels)
+class EnergyLabelPaneView implements IPrimitivePaneView {
+  private paneRenderer: EnergyLabelPaneRenderer
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
+    this.paneRenderer = new EnergyLabelPaneRenderer(chart, source, labels)
   }
   renderer(): IPrimitivePaneRenderer | null {
     return this.paneRenderer
@@ -127,10 +111,10 @@ class VolumeLabelPaneView implements IPrimitivePaneView {
   }
 }
 
-class VolumeLabelPrimitive implements ISeriesPrimitive<Time> {
-  private view: VolumeLabelPaneView
-  constructor(chart: IChartApi, source: ISeriesApi<'Histogram'>, labels: VolumeLabelData[]) {
-    this.view = new VolumeLabelPaneView(chart, source, labels)
+class EnergyLabelPrimitive implements ISeriesPrimitive<Time> {
+  private view: EnergyLabelPaneView
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
+    this.view = new EnergyLabelPaneView(chart, source, labels)
   }
   paneViews(): readonly IPrimitivePaneView[] {
     return [this.view]
@@ -261,7 +245,7 @@ let priceLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
-let volumeLabelPrimitive: VolumeLabelPrimitive | null = null
+let energyLabelPrimitive: EnergyLabelPrimitive | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
 
@@ -707,32 +691,33 @@ function syncRollovers() {
   candleSeries.attachPrimitive(rolloverPrimitive)
 }
 
-function buildVolumeLabels(): VolumeLabelData[] {
-  const labels: VolumeLabelData[] = []
+function buildEnergyLabels(): EnergyLabelData[] {
+  const labels: EnergyLabelData[] = []
   for (const s of props.signals) {
     if (!s.trigger_ts || s.vol_ratio == null || !s.vol_confirmed) continue
     const row = props.rows.find((r) => r.ts === s.trigger_ts)
+    if (!row) continue
     labels.push({
       time: toTs(s.trigger_ts),
       text: `量能${s.vol_ratio.toFixed(1)}×`,
       color: '#e03131',
-      volume: row?.volume ?? 0,
+      price: row.high,
     })
   }
   return labels
 }
 
-/** 触发量能文字画在成交量窗格顶部，避免和K线价格标记挤在一起 */
-function syncVolumeLabels() {
-  if (!chart || !volumeSeries) return
-  if (volumeLabelPrimitive) {
-    volumeSeries.detachPrimitive(volumeLabelPrimitive)
-    volumeLabelPrimitive = null
+/** 触发量能画在触发K线上方约40px处，避免遮挡价格 */
+function syncEnergyLabels() {
+  if (!chart || !candleSeries) return
+  if (energyLabelPrimitive) {
+    candleSeries.detachPrimitive(energyLabelPrimitive)
+    energyLabelPrimitive = null
   }
-  const labels = buildVolumeLabels()
+  const labels = buildEnergyLabels()
   if (!labels.length) return
-  volumeLabelPrimitive = new VolumeLabelPrimitive(chart, volumeSeries, labels)
-  volumeSeries.attachPrimitive(volumeLabelPrimitive)
+  energyLabelPrimitive = new EnergyLabelPrimitive(chart, candleSeries, labels)
+  candleSeries.attachPrimitive(energyLabelPrimitive)
 }
 
 let prevSymbol: string | null = null
@@ -787,7 +772,7 @@ function renderOverlays() {
   markersApi?.setMarkers(buildMarkers())
   syncPriceLines()
   syncPatternLines()
-  syncVolumeLabels()
+  syncEnergyLabels()
 }
 
 /** Ctrl+滚轮缩放：向上(deltaY<0)放大、向下(deltaY>0)缩小；时间轴与价格轴按光标位置同步缩放。
@@ -905,9 +890,9 @@ onMounted(() => {
     { priceFormat: { type: 'volume' }, priceScaleId: 'vol' },
     1,
   )
-  // top 控制上边距、bottom 控制下边距；成交量顶部多留空间给量能标签和指示线
+  // 0.08 就是 8%（小数形式），top 控制上边距、bottom 控制下边距
   chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.08 } })
-  chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.24, bottom: 0.04 } })
+  chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.08, bottom: 0.04 } })
   applyPaneHeights()
 
   chart.subscribeCrosshairMove((param) => {
@@ -991,9 +976,9 @@ onBeforeUnmount(() => {
     candleSeries.detachPrimitive(rolloverPrimitive)
     rolloverPrimitive = null
   }
-  if (volumeLabelPrimitive && volumeSeries) {
-    volumeSeries.detachPrimitive(volumeLabelPrimitive)
-    volumeLabelPrimitive = null
+  if (energyLabelPrimitive && candleSeries) {
+    candleSeries.detachPrimitive(energyLabelPrimitive)
+    energyLabelPrimitive = null
   }
   markersApi?.detach()
   markersApi = null
