@@ -176,6 +176,22 @@ fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
     })
 }
 
+/// 换月记录更新晚于结果回填时，已终局的信号也要重算（可能因新确认换月而改为 rollover）。
+fn needs_outcome_refresh(
+    outcome: Option<&signal_outcomes::Model>,
+    latest_rollover_updated: Option<&str>,
+) -> bool {
+    let Some(outcome) = outcome else {
+        return true;
+    };
+    if outcome.sim_version != outcome::SIM_VERSION
+        || !outcome::Outcome::parse(&outcome.outcome).is_some_and(|x| x.is_terminal())
+    {
+        return true;
+    }
+    latest_rollover_updated.is_some_and(|ts| ts > outcome.updated_at.as_str())
+}
+
 fn stat_row_from(
     s: &signals::Model,
     o: Option<&signal_outcomes::Model>,
@@ -1025,19 +1041,29 @@ impl Services {
     pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
-        // 只跳过"当前规则版本下已终结"的信号；旧版本结果或未终结信号一律重算
-        let current_version = outcome::SIM_VERSION;
-        let terminal: std::collections::HashSet<i64> = outs
-            .iter()
-            .filter(|o| {
-                o.sim_version == current_version
-                    && outcome::Outcome::parse(&o.outcome).is_some_and(|x| x.is_terminal())
-            })
-            .map(|o| o.signal_id)
-            .collect();
+        // 跳过已终结且之后没有换月记录更新的信号；旧版本、未终结或换月更新过的信号重算
+        let rollovers = repo::all_rollovers(&self.db).await?;
+        let mut latest_rollover_updated: HashMap<String, String> = HashMap::new();
+        for r in rollovers {
+            let symbol = r.symbol.clone();
+            match latest_rollover_updated.get_mut(&symbol) {
+                Some(cur) if *cur < r.updated_at => *cur = r.updated_at.clone(),
+                Some(_) => {}
+                None => {
+                    latest_rollover_updated.insert(symbol, r.updated_at);
+                }
+            }
+        }
+        let by_id: HashMap<i64, &signal_outcomes::Model> =
+            outs.iter().map(|o| (o.signal_id, o)).collect();
         let need: Vec<signals::Model> = sigs
             .into_iter()
-            .filter(|s| !terminal.contains(&s.id))
+            .filter(|s| {
+                needs_outcome_refresh(
+                    by_id.get(&s.id).copied(),
+                    latest_rollover_updated.get(&s.symbol).map(String::as_str),
+                )
+            })
             .collect();
         if need.is_empty() {
             return Ok(OutcomeRefresh { updated: 0 });
@@ -1510,6 +1536,38 @@ mod tests {
         assert_eq!(contract_prefix("RB2610"), "RB");
         assert_eq!(contract_prefix("0"), "0");
     }
+
+    #[test]
+    fn needs_refresh_when_rollover_updated_after_terminal_outcome() {
+        let o = outcome_model("win", outcome::SIM_VERSION, "2026-08-10 02:05:00");
+        assert!(needs_outcome_refresh(Some(&o), Some("2026-08-10 09:26:00")));
+        assert!(!needs_outcome_refresh(
+            Some(&o),
+            Some("2026-08-10 02:05:00")
+        ));
+        assert!(!needs_outcome_refresh(
+            Some(&o),
+            Some("2026-08-10 01:00:00")
+        ));
+        assert!(!needs_outcome_refresh(Some(&o), None));
+    }
+
+    #[test]
+    fn needs_refresh_for_missing_or_non_terminal_outcome() {
+        assert!(needs_outcome_refresh(None, None));
+
+        let rollover = outcome_model("rollover", outcome::SIM_VERSION, "2026-08-10 02:05:00");
+        assert!(needs_outcome_refresh(
+            Some(&rollover),
+            Some("2026-08-10 09:26:00")
+        ));
+
+        let old_version = outcome_model("win", outcome::SIM_VERSION - 1, "2026-08-10 02:05:00");
+        assert!(needs_outcome_refresh(Some(&old_version), None));
+
+        let open = outcome_model("open", outcome::SIM_VERSION, "2026-08-10 02:05:00");
+        assert!(needs_outcome_refresh(Some(&open), None));
+    }
 }
 
 #[cfg(test)]
@@ -1539,5 +1597,27 @@ fn kline_model(ts: &str) -> klines::Model {
         volume: 0.0,
         hold: 0.0,
         source: "derived".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn outcome_model(outcome: &str, sim_version: i64, updated_at: &str) -> signal_outcomes::Model {
+    signal_outcomes::Model {
+        signal_id: 1,
+        sim_version,
+        outcome: outcome.to_string(),
+        exit_reason: String::new(),
+        entry_ts: None,
+        exit_ts: None,
+        exit_price: None,
+        r_multiple: None,
+        mfe_r: None,
+        mae_r: None,
+        bars_held: None,
+        vol_ratio: None,
+        oi_increase: None,
+        trend60_score: None,
+        rollover_crossed: Some(false),
+        updated_at: updated_at.to_string(),
     }
 }

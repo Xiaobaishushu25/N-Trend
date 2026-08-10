@@ -79,6 +79,14 @@ pub async fn symbol_rollovers(
         .context("查询换月记录失败")?)
 }
 
+/// 全部换月记录：刷新结果时用来判断哪些品种有新确认的换月。
+pub async fn all_rollovers(db: &DatabaseConnection) -> Result<Vec<rollovers::Model>> {
+    Ok(rollovers::Entity::find()
+        .all(db)
+        .await
+        .context("查询全部换月记录失败")?)
+}
+
 /// 批量 upsert 换月记录：同一 symbol+ts 覆盖为最新确认结果。
 pub async fn upsert_rollovers(
     db: &DatabaseConnection,
@@ -828,6 +836,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].confirmed);
         assert_eq!(rows[0].from_contract, "BU2609");
+
+        let all = all_rollovers(&db).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].symbol, "BU0");
 
         delete_symbol_rollovers(&db, "BU0").await.unwrap();
         assert!(symbol_rollovers(&db, "BU0").await.unwrap().is_empty());

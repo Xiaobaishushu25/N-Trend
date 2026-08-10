@@ -16,8 +16,8 @@ use crate::fetch::kline::Kline;
 pub const SESSION_BREAK_MINUTES: i64 = 5;
 /// 断点跳空 / ATR 的最小倍数：太小会把普通消息跳空误判为换月。
 pub const GAP_ATR_MIN: f64 = 6.0;
-/// 断点前后持仓量相对变化的最小比例：换月时主力持仓通常发生明显迁移。
-pub const HOLD_CHANGE_MIN: f64 = 0.08;
+/// 断点前后持仓量相对变化的最小比例：仅作为候选条件，最终由月合约价格确认。
+pub const HOLD_CHANGE_MIN: f64 = 0.05;
 /// ATR 计算窗口（与策略分析一致）。
 pub const ATR_WINDOW: usize = 20;
 /// 确认时容忍的价格偏差比例。
@@ -264,6 +264,40 @@ mod tests {
         bars.push(bar("2026-08-05 15:00:00", 100.0, 100.0, 10000.0));
         bars.push(bar("2026-08-05 21:05:00", 80.0, 81.0, 10010.0));
         assert!(detect_candidates("BU0", &bars).is_empty());
+    }
+
+    #[test]
+    fn detects_rollover_with_moderate_hold_shift() {
+        // JD0 8/5 的实测形态：跳空约 19ATR，持仓迁移约 5.91%
+        let mut bars = session("2026-08-04", 100.0, 100.0, 100000.0);
+        bars.push(bar("2026-08-04 15:00:00", 100.0, 100.0, 100000.0));
+        bars.push(bar("2026-08-05 09:05:00", 80.0, 81.0, 105910.0));
+        let cands = detect_candidates("JD0", &bars);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].ts, "2026-08-05 09:05:00");
+    }
+
+    #[test]
+    fn moderate_hold_shift_news_gap_is_not_confirmed() {
+        // 持仓迁移到 5.91% 只让它成为候选；月合约价格对不上时不能确认为换月
+        let mut bars = session("2026-08-04", 100.0, 100.0, 100000.0);
+        bars.push(bar("2026-08-04 15:00:00", 100.0, 100.0, 100000.0));
+        bars.push(bar("2026-08-05 09:05:00", 80.0, 81.0, 105910.0));
+        let cands = detect_candidates("JD0", &bars);
+        assert_eq!(cands.len(), 1);
+
+        let mut month_bars = std::collections::HashMap::new();
+        month_bars.insert(
+            "JD2609".to_string(),
+            session("2026-08-04", 100.0, 100.0, 200000.0),
+        );
+        // 新合约开盘 99，和连续序列的 80 对不上，说明这是消息跳空而不是换月
+        month_bars.insert(
+            "JD2610".to_string(),
+            vec![bar("2026-08-05 09:05:00", 99.0, 99.0, 205910.0)],
+        );
+        let pair = confirm_candidate(&cands[0], &month_bars).unwrap();
+        assert!(pair.is_none());
     }
 
     #[test]
