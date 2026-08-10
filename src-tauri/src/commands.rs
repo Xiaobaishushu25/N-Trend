@@ -327,10 +327,12 @@ pub async fn refresh_outcomes_now(
 pub async fn get_review_stats(
     state: State<'_, Arc<AppState>>,
     dimension: String,
+    scope: Option<String>,
 ) -> Result<ReviewStats, String> {
+    let scope = scope.unwrap_or_default();
     state
         .services
-        .review_stats(&dimension)
+        .review_stats(&dimension, &scope)
         .await
         .map_err(|e| e.to_string())
 }

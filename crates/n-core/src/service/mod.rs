@@ -1117,8 +1117,13 @@ impl Services {
         Ok(OutcomeRefresh { updated })
     }
 
-    /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总。
-    pub async fn review_stats(&self, dimension: &str) -> Result<outcome::ReviewStats> {
+    /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总；
+    /// scope 控制统计口径（all/tradable/standard）。
+    pub async fn review_stats(
+        &self,
+        dimension: &str,
+        scope: &str,
+    ) -> Result<outcome::ReviewStats> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> =
@@ -1127,9 +1132,10 @@ impl Services {
             .iter()
             .filter_map(|s| stat_row_from(s, by_id.get(&s.id)))
             .collect();
-        Ok(outcome::aggregate_stats(
+        Ok(outcome::aggregate_stats_scoped(
             &rows,
             outcome::GroupBy::parse(dimension),
+            outcome::StatsScope::parse(scope),
         ))
     }
 

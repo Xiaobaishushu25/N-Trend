@@ -14,9 +14,18 @@ export const REVIEW_DIMENSIONS = [
   { key: 'trend60', label: '60m趋势分' },
 ] as const
 
+export const REVIEW_STATS_SCOPES = [
+  { key: 'all', label: '全部信号' },
+  { key: 'tradable', label: '仅可交易' },
+  { key: 'standard', label: '仅标准仓' },
+] as const
+
+export type StatsScopeKey = (typeof REVIEW_STATS_SCOPES)[number]['key']
+
 export const useReviewStore = defineStore('review', {
   state: () => ({
     dimension: 'score_band' as string,
+    statsScope: 'tradable' as StatsScopeKey,
     stats: null as ReviewStats | null,
     recent: [] as OutcomeDetail[],
     recentFilters: {
@@ -34,12 +43,13 @@ export const useReviewStore = defineStore('review', {
     recentLoading: false,
   }),
   actions: {
-    async load(dim?: string) {
+    async load(dim?: string, scope?: StatsScopeKey) {
       this.dimension = dim ?? this.dimension
+      this.statsScope = scope ?? this.statsScope
       this.loading = true
       try {
         const [stats] = await Promise.all([
-          api.getReviewStats(this.dimension),
+          api.getReviewStats(this.dimension, this.statsScope),
           this.loadRecent(),
         ])
         this.stats = stats

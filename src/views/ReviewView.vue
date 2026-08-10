@@ -15,7 +15,14 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import { onScanCompleted } from '../services/api'
-import { REVIEW_DIMENSIONS, fmtPct, fmtR, useReviewStore } from '../stores/review'
+import {
+  REVIEW_DIMENSIONS,
+  REVIEW_STATS_SCOPES,
+  fmtPct,
+  fmtR,
+  useReviewStore,
+  type StatsScopeKey,
+} from '../stores/review'
 import { notify } from '../utils/notify'
 import type { GroupStat, OutcomeDetail } from '../types'
 
@@ -232,11 +239,11 @@ const outcomeOptions = [
   { label: '换月', value: 'rollover' },
 ]
 
-async function load() {
+async function load(dim?: string, scope?: StatsScopeKey) {
   loading.value = true
   error.value = ''
   try {
-    await review.load()
+    await review.load(dim, scope)
   } catch (e) {
     error.value = String(e)
     notify.error(String(e))
@@ -328,6 +335,14 @@ onBeforeUnmount(() => {
       <n-space justify="space-between" align="center" style="width: 100%">
         <n-text strong style="font-size: 16px">复盘统计</n-text>
         <n-space align="center" :size="10">
+          <n-text depth="3" style="font-size: 12px">口径</n-text>
+          <n-select
+            v-model:value="review.statsScope"
+            :options="REVIEW_STATS_SCOPES.map((s) => ({ label: s.label, value: s.key }))"
+            size="small"
+            style="width: 110px"
+            @update:value="(v: string) => load(undefined, v as StatsScopeKey)"
+          />
           <n-select
             v-model:value="review.dimension"
             :options="REVIEW_DIMENSIONS.map((d) => ({ label: d.label, value: d.key }))"

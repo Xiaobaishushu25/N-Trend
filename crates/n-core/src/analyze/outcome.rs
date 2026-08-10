@@ -557,6 +557,49 @@ impl GroupBy {
     }
 }
 
+/// 复盘统计口径：仅影响统计聚合，不影响明细、K线图或交易规则。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsScope {
+    /// 全部信号（旧行为，不过滤评分）
+    All,
+    /// 可交易信号：评分 ≥ 2.5（小仓试错 + 标准仓）
+    Tradable,
+    /// 标准仓信号：评分 ≥ 3.5
+    Standard,
+}
+
+/// 可交易信号的最低评分（小仓试错 + 标准仓）
+pub const TRADABLE_MIN_SCORE: f64 = 2.5;
+/// 标准仓信号的最低评分
+pub const STANDARD_MIN_SCORE: f64 = 3.5;
+
+impl StatsScope {
+    pub fn parse(s: &str) -> StatsScope {
+        match s {
+            "tradable" => StatsScope::Tradable,
+            "standard" => StatsScope::Standard,
+            // 空值或未知值按旧的“全部信号”处理，兼容旧调用
+            _ => StatsScope::All,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatsScope::All => "all",
+            StatsScope::Tradable => "tradable",
+            StatsScope::Standard => "standard",
+        }
+    }
+
+    fn matches(self, score: f64) -> bool {
+        match self {
+            StatsScope::All => true,
+            StatsScope::Tradable => score >= TRADABLE_MIN_SCORE,
+            StatsScope::Standard => score >= STANDARD_MIN_SCORE,
+        }
+    }
+}
+
 /// 参与统计的信号行（信号快照 + 结局）。
 #[derive(Debug, Clone)]
 pub struct StatRow {
@@ -815,7 +858,20 @@ fn group_rank(group_by: GroupBy, key: &str) -> (u8, String) {
 
 /// 聚合复盘统计：先按结构键去重（取首条），再按维度分组。
 pub fn aggregate_stats(rows: &[StatRow], group_by: GroupBy) -> ReviewStats {
-    let dedup = dedup_first_seen(rows);
+    aggregate_stats_scoped(rows, group_by, StatsScope::All)
+}
+
+/// 按统计口径过滤后再聚合：all 不过滤，tradable 仅保留评分 ≥ 2.5，
+/// standard 仅保留评分 ≥ 3.5。
+pub fn aggregate_stats_scoped(
+    rows: &[StatRow],
+    group_by: GroupBy,
+    scope: StatsScope,
+) -> ReviewStats {
+    let dedup: Vec<&StatRow> = dedup_first_seen(rows)
+        .into_iter()
+        .filter(|r| scope.matches(r.score))
+        .collect();
     let overall = summarize("全部", &dedup);
 
     let mut buckets: BTreeMap<String, Vec<&StatRow>> = BTreeMap::new();
@@ -1272,5 +1328,58 @@ mod tests {
 
         let vol = aggregate_stats(&rows, GroupBy::VolConfirm);
         assert!(vol.groups.iter().any(|g| g.key == "放量确认"));
+    }
+
+    #[test]
+    fn stats_scope_filters_score_bands() {
+        let mk = |id: i64, score: f64, outcome: Outcome, r: f64| StatRow {
+            signal_id: id,
+            symbol: format!("RB{id}"),
+            direction: "up".to_string(),
+            level: "fine".to_string(),
+            grade: "A级".to_string(),
+            score,
+            created_at: "2026-08-03 09:15".to_string(),
+            warning_ts: Some("2026-08-03 09:15".to_string()),
+            s1_ts: Some("2026-08-03 08:45".to_string()),
+            s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            outcome: Some(outcome),
+            r_multiple: Some(r),
+            bars_held: Some(3),
+            vol_ratio: Some(1.0),
+            oi_increase: Some(false),
+            trend60_score: Some(2.0),
+            rollover_crossed: false,
+        };
+        let rows = vec![
+            mk(1, 1.5, Outcome::Loss, -1.0),
+            mk(2, 2.0, Outcome::Win, 1.0),
+            mk(3, 2.6, Outcome::Loss, -1.0),
+            mk(4, 3.0, Outcome::Win, 2.0),
+            mk(5, 3.6, Outcome::Loss, -1.0),
+            mk(6, 4.0, Outcome::Win, 1.5),
+        ];
+
+        let all = aggregate_stats_scoped(&rows, GroupBy::ScoreBand, StatsScope::All);
+        assert_eq!(all.overall.n, 6);
+        assert_eq!(all.overall.wins, 3);
+        assert_eq!(all.overall.losses, 3);
+
+        let tradable = aggregate_stats_scoped(&rows, GroupBy::ScoreBand, StatsScope::Tradable);
+        assert_eq!(tradable.overall.n, 4);
+        assert_eq!(tradable.overall.wins, 2);
+        assert_eq!(tradable.overall.win_rate, Some(0.5));
+
+        let standard = aggregate_stats_scoped(&rows, GroupBy::ScoreBand, StatsScope::Standard);
+        assert_eq!(standard.overall.n, 2);
+        assert_eq!(standard.overall.wins, 1);
+        assert_eq!(standard.overall.losses, 1);
+        assert_eq!(standard.overall.avg_r, Some(0.25)); // (-1.0 + 1.5) / 2
+
+        assert_eq!(StatsScope::parse("all"), StatsScope::All);
+        assert_eq!(StatsScope::parse("tradable"), StatsScope::Tradable);
+        assert_eq!(StatsScope::parse("standard"), StatsScope::Standard);
+        assert_eq!(StatsScope::parse(""), StatsScope::All);
+        assert_eq!(StatsScope::parse("unknown"), StatsScope::All);
     }
 }
