@@ -38,7 +38,7 @@ import { openReviewWindow } from '../utils/openReviewWindow'
 import { openSettingsWindow } from '../utils/openSettingsWindow'
 import { dismissAll, notify, notifyItems } from '../utils/notify'
 import TitleBar from './TitleBar.vue'
-import type { ContractSuggestion, SymbolRow } from '../types'
+import type { ContractSuggestion, OpenReviewChartPayload, SymbolRow } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -260,9 +260,10 @@ onMounted(async () => {
   try {
     if (getCurrentWindow().label === 'main') {
       unlisteners.push(
-        await listen<{ symbol: string; signalId: number }>('open-review-chart', (e) => {
-          const { symbol: sym, signalId } = e.payload
+        await listen<OpenReviewChartPayload>('open-review-chart', (e) => {
+          const { symbol: sym, signalId, filters } = e.payload
           if (sym) {
+            appStore.reviewJumpFilters = filters ?? null
             void router.push({
               name: 'chart',
               params: { symbol: sym },

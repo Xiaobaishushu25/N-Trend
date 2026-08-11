@@ -9,7 +9,7 @@ import { onDataUpdated, onScanCompleted, onEntryTrigger, api } from '../services
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import { isMainWindow, notify } from '../utils/notify'
-import type { AppInfo } from '../types'
+import type { AppInfo, RecentOutcomeFilters } from '../types'
 
 /** 通过 Tauri 官方通知插件发送系统级通知（自动申请权限；非 Tauri 环境忽略） */
 async function sendSystemNotification(title: string, body: string) {
@@ -35,6 +35,8 @@ export const useAppStore = defineStore('app', {
   state: () => ({
     info: { name: 'ntrend', version: '0.1.0' } as AppInfo,
     listeners: [] as (() => void)[],
+    /** 复盘窗口点击明细行时带入的筛选上下文；K线页复盘模式据此拉取信号列表 */
+    reviewJumpFilters: null as RecentOutcomeFilters | null,
   }),
   actions: {
     async init() {

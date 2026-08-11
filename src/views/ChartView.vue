@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import draggable from 'vuedraggable'
 import {
@@ -10,7 +10,7 @@ import {
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, List } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, List, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
@@ -19,6 +19,8 @@ import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
 import { useSettingsStore } from '../stores/settings'
+import { useAppStore } from '../stores/app'
+import { fmtR } from '../stores/review'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
@@ -26,6 +28,7 @@ import type {
   GroupRow,
   KlineRow,
   MarketSnapshot,
+  OutcomeDetail,
   PatternDto,
   ReviewExitOverlay,
   ReviewSignalDetail,
@@ -36,6 +39,7 @@ import type {
 
 const route = useRoute()
 const router = useRouter()
+const appStore = useAppStore()
 const symbolsStore = useSymbolsStore()
 const klinesStore = useKlinesStore()
 const scansStore = useScansStore()
@@ -73,6 +77,15 @@ const reviewSignalId = computed(() => {
   const q = route.query.review
   return q ? Number(q) : null
 })
+const reviewMode = computed(() => reviewSignalId.value != null)
+const reviewRows = ref<OutcomeDetail[]>([])
+const reviewLoading = ref(false)
+const reviewListKey = ref('')
+const reviewIndex = computed(() =>
+  reviewSignalId.value == null
+    ? -1
+    : reviewRows.value.findIndex((r) => r.signal_id === reviewSignalId.value),
+)
 const reviewExit = computed<ReviewExitOverlay | null>(() => {
   const o = reviewOverlay.value?.outcome
   if (!o) return null
@@ -85,19 +98,93 @@ const reviewExit = computed<ReviewExitOverlay | null>(() => {
   }
 })
 
+let reviewOverlaySeq = 0
 async function loadReviewOverlay() {
   const id = reviewSignalId.value
+  const seq = ++reviewOverlaySeq
   if (!id || !symbol.value) {
     reviewOverlay.value = null
     return
   }
   try {
     const detail = await api.getReviewSignal(id)
+    if (seq !== reviewOverlaySeq) return
     reviewOverlay.value = detail ?? null
     // 形态基于 15m，复盘视图固定到 15m
     if (detail) timeframe.value = '15m'
   } catch {
-    reviewOverlay.value = null
+    if (seq === reviewOverlaySeq) reviewOverlay.value = null
+  }
+}
+
+let reviewListSeq = 0
+/** 进入复盘模式后按复盘窗口的筛选条件拉取一次明细列表，切换信号时复用该列表 */
+async function loadReviewList(force = false) {
+  const id = reviewSignalId.value
+  if (id == null) return
+  const filters = appStore.reviewJumpFilters
+  const key = filters ? JSON.stringify(filters) : 'default'
+  if (!force && reviewListKey.value === key) return
+  const seq = ++reviewListSeq
+  reviewLoading.value = true
+  try {
+    let rows = await api.getRecentOutcomes(2000, filters ?? undefined)
+    // 目标信号不在筛选结果里时退化为全量明细，保证滚轮列表能覆盖当前信号
+    if (!rows.some((r) => r.signal_id === id)) {
+      rows = await api.getRecentOutcomes(2000)
+    }
+    if (seq !== reviewListSeq || reviewSignalId.value == null) return
+    reviewRows.value = rows
+    reviewListKey.value = key
+  } catch {
+    if (seq === reviewListSeq) {
+      reviewRows.value = []
+      reviewListKey.value = ''
+    }
+  } finally {
+    if (seq === reviewListSeq) reviewLoading.value = false
+  }
+}
+
+function selectReviewSignal(row: OutcomeDetail) {
+  if (!row) return
+  if (row.signal_id === reviewSignalId.value && row.symbol === symbol.value) return
+  void router.replace({
+    name: 'chart',
+    params: { symbol: row.symbol },
+    query: { review: String(row.signal_id) },
+  })
+}
+
+/** 复盘模式：在筛选列表内循环切换上/下一个信号 */
+function switchReviewSignal(dir: number) {
+  const rows = reviewRows.value
+  if (!rows.length) return
+  const cur = reviewIndex.value
+  const base = cur >= 0 ? cur : dir > 0 ? -1 : 0
+  const next = rows[(base + dir + rows.length) % rows.length]
+  selectReviewSignal(next)
+}
+
+/** 退出复盘模式：移除 review 参数，回到当前品种的普通图表 */
+function exitReviewMode() {
+  appStore.reviewJumpFilters = null
+  reviewRows.value = []
+  reviewListKey.value = ''
+  const query = { ...route.query }
+  delete query.review
+  if (symbol.value) {
+    void router.replace({
+      name: 'chart',
+      params: { symbol: symbol.value },
+      query,
+    })
+  }
+}
+
+function onReviewKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && reviewMode.value) {
+    exitReviewMode()
   }
 }
 
@@ -385,12 +472,17 @@ function onListMove(evt: {
 
 /** 行点击进入K线图；拖拽结束后紧接着的 click 不触发跳转 */
 function onSymbolRowClick(code: string) {
+  if (reviewMode.value) return
   if (symbolSuppressClick) return
   router.push({ name: 'chart', params: { symbol: code } })
 }
 
 /** 左侧品种行右键菜单：与表格行一致（分组操作 + 彻底删除） */
 async function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
+  if (reviewMode.value) {
+    e.preventDefault()
+    return
+  }
   // 先同步阻止浏览器默认菜单，再异步查分组归属，避免原生菜单闪现
   e.preventDefault()
   let memberGroups: GroupRow[] = []
@@ -605,6 +697,7 @@ function setRowFlash(code: string, dir: 'up' | 'down') {
 
 const visibleSignals = computed<PatternDto[]>(() => {
   if (reviewOverlay.value) return [reviewOverlay.value.pattern]
+  if (reviewMode.value) return []
   return signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
 })
 
@@ -637,7 +730,11 @@ function handleChartWheel(e: WheelEvent) {
   const dir = wheelAcc.value > 0 ? 1 : -1
   wheelAcc.value = 0
   lastSwitchAt = now
-  switchSymbol(dir)
+  if (reviewMode.value) {
+    switchReviewSignal(dir)
+  } else {
+    switchSymbol(dir)
+  }
 }
 
 function togglePattern(num: number) {
@@ -656,6 +753,69 @@ function dirText(d: string) {
 
 function levelText(l: string) {
   return l === 'fine' ? '精细' : l === 'large' ? '较大' : l
+}
+
+const reviewOutcomeLabel: Record<string, { text: string; cls: 'win' | 'loss' | 'plain' | 'warn' }> = {
+  win: { text: '盈利', cls: 'win' },
+  loss: { text: '亏损', cls: 'loss' },
+  no_trigger: { text: '未触发', cls: 'plain' },
+  open: { text: '持仓中', cls: 'warn' },
+  insufficient_data: { text: '数据不足', cls: 'plain' },
+  rollover: { text: '换月', cls: 'warn' },
+}
+
+const reviewExitLabel: Record<string, string> = {
+  stop: '止损',
+  target: '止盈',
+  no_follow: '无跟随退出',
+  time_exit: '时间退出',
+  rollover: '换月',
+  '': '—',
+}
+
+function reviewOutcome(row: OutcomeDetail) {
+  return reviewOutcomeLabel[row.outcome] ?? { text: row.outcome, cls: 'plain' as const }
+}
+
+function rvNum(v: number | null | undefined, digits = 2) {
+  return v == null ? '—' : v.toFixed(digits)
+}
+
+function rvMult(v: number | null | undefined) {
+  return v == null ? '—' : `${v.toFixed(2)}×`
+}
+
+function rvBool(v: boolean | null) {
+  return v == null ? '—' : v ? '是' : '否'
+}
+
+function rvRClass(v: number | null | undefined) {
+  return v == null ? 'is-neutral' : v >= 0 ? 'is-pos' : 'is-neg'
+}
+
+function rvGap(row: OutcomeDetail) {
+  const parts: string[] = []
+  if (row.gap_crossed_entry) parts.push('入')
+  if (row.gap_crossed_exit) parts.push('出')
+  return parts.length ? parts.join('/') : '—'
+}
+
+function rvTier(row: OutcomeDetail) {
+  if (row.target_tier === 'tp2') return 'TP2扩展'
+  if (row.target_tier === 'tp1') return 'TP1'
+  return '—'
+}
+
+function rvSpeed(row: OutcomeDetail) {
+  return row.a_move == null || row.b_move == null || row.a_move === 0
+    ? '—'
+    : (row.b_move / row.a_move).toFixed(2)
+}
+
+function rvBarRatio(row: OutcomeDetail) {
+  return row.a_bars == null || row.b_bars == null || row.a_bars === 0
+    ? '—'
+    : (row.b_bars / row.a_bars).toFixed(2)
 }
 
 function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 'error' {
@@ -711,6 +871,22 @@ watch([symbol, reviewSignalId], () => {
   void loadReviewOverlay()
 }, { immediate: true })
 
+// 复盘模式：首次进入或筛选上下文变化时拉取一次明细列表，后续切换信号直接复用
+watch(
+  [reviewSignalId, () => appStore.reviewJumpFilters],
+  () => {
+    if (reviewMode.value) void loadReviewList()
+  },
+  { immediate: true },
+)
+
+// 复盘模式：当前行变化时把高亮行滚进可视区
+watch([reviewIndex, reviewRows], async () => {
+  if (!reviewMode.value) return
+  await nextTick()
+  document.querySelector('.review-row.is-active')?.scrollIntoView({ block: 'nearest' })
+})
+
 watch([symbol, timeframe], async () => {
   hiddenApplied.value = ''
   applyDefaultHidden()
@@ -726,6 +902,7 @@ watch([symbol, timeframe], async () => {
 watch(() => groupsStore.revision, () => loadGroupSymbols())
 
 onMounted(async () => {
+  window.addEventListener('keydown', onReviewKeydown)
   unlisteners.push(
     await onScanCompleted((result) => {
       scansStore.ingest(result)
@@ -784,6 +961,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onReviewKeydown)
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
   for (const fn of unlisteners) fn()
@@ -805,6 +983,18 @@ onBeforeUnmount(() => {
             <n-icon :component="List" />
           </template>
           {{ showList ? '收起列表' : '品种列表' }}
+        </n-button>
+        <n-button
+          v-if="reviewMode"
+          secondary
+          size="small"
+          class="nav-btn review-exit-btn"
+          @click="exitReviewMode"
+        >
+          <template #icon>
+            <n-icon :component="X" />
+          </template>
+          退出复盘
         </n-button>
       </div>
 
@@ -833,7 +1023,9 @@ onBeforeUnmount(() => {
             :key="t"
             type="button"
             class="tf-btn"
-            :class="{ active: timeframe === t }"
+            :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
+            :disabled="reviewMode"
+            :title="reviewMode ? '复盘模式固定 15m' : t"
             @click="timeframe = t"
           >
             {{ t }}
@@ -846,7 +1038,12 @@ onBeforeUnmount(() => {
           style="padding: 0"
         >
           <template #trigger>
-            <button type="button" class="tf-more" title="周期显示设置">
+            <button
+              type="button"
+              class="tf-more"
+              :disabled="reviewMode"
+              title="周期显示设置"
+            >
               <n-icon :component="Adjustments" />
             </button>
           </template>
@@ -874,6 +1071,7 @@ onBeforeUnmount(() => {
           <VueDraggable
             v-model="groupSymbols"
             item-key="code"
+            :disabled="reviewMode"
             class="sl-list"
             :class="{ 'insert-at-end': listDragging && insertBeforeCode === null }"
             :animation="150"
@@ -990,7 +1188,139 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <div class="patterns-card">
+        <div v-if="reviewMode" class="patterns-card review-card">
+          <div class="patterns-title">复盘信号明细（{{ reviewRows.length }}）</div>
+          <n-scrollbar style="flex: 1">
+            <div v-if="reviewLoading" class="patterns-empty">正在加载信号明细...</div>
+            <div v-else-if="reviewRows.length" class="review-list">
+              <div
+                v-for="row in reviewRows"
+                :key="row.signal_id"
+                class="review-row"
+                :class="[
+                  row.direction === 'up' ? 'is-up' : 'is-down',
+                  { 'is-active': row.signal_id === reviewSignalId },
+                ]"
+                @click="selectReviewSignal(row)"
+              >
+                <div class="rv-head">
+                  <span class="rv-id">#{{ row.signal_id }}</span>
+                  <span class="rv-symbol">{{ row.symbol }}</span>
+                  <span class="rv-badge">
+                    {{ dirText(row.direction) }} {{ levelText(row.level) }}N
+                  </span>
+                  <span class="rv-grade">{{ row.grade }}</span>
+                  <span class="rv-score">
+                    <b>{{ row.score.toFixed(2) }}</b>
+                    <em>评分</em>
+                  </span>
+                </div>
+
+                <div class="rv-meta">
+                  <span class="rv-time" :title="row.created_at">{{ fmtRecentTime(row.created_at) }}</span>
+                  <span class="rv-outcome" :class="reviewOutcome(row).cls">
+                    {{ reviewOutcome(row).text }}
+                  </span>
+                  <span class="rv-exit">{{ reviewExitLabel[row.exit_reason] ?? row.exit_reason }}</span>
+                </div>
+
+                <div class="rv-grid">
+                  <div class="rv-item">
+                    <span>入场</span>
+                    <b>{{ row.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>止损</span>
+                    <b>{{ row.stop.toFixed(1) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>目标</span>
+                    <b>{{ row.target.toFixed(1) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>RR</span>
+                    <b>{{ row.rr.toFixed(2) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>出场价</span>
+                    <b>{{ row.exit_price == null ? '—' : row.exit_price.toFixed(1) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>R</span>
+                    <b :class="rvRClass(row.r_multiple)">{{ fmtR(row.r_multiple) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>MFE</span>
+                    <b :class="rvRClass(row.mfe_r)">{{ rvNum(row.mfe_r) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>MAE</span>
+                    <b :class="rvRClass(row.mae_r)">{{ rvNum(row.mae_r) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>K线</span>
+                    <b>{{ row.bars_held ?? '—' }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>净R</span>
+                    <b :class="rvRClass(row.net_r)">{{ fmtR(row.net_r) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>量能</span>
+                    <b>{{ rvMult(row.vol_ratio) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>增仓</span>
+                    <b>{{ rvBool(row.oi_increase) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>60m分</span>
+                    <b>{{ rvNum(row.trend60_score) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>止盈层级</span>
+                    <b>{{ rvTier(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>b/a量比</span>
+                    <b>{{ rvNum(row.b_vol_ratio) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>b/a速度</span>
+                    <b>{{ rvSpeed(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>根数比</span>
+                    <b>{{ rvBarRatio(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>触发延迟</span>
+                    <b>{{ row.trigger_lag_bars == null ? '—' : `${row.trigger_lag_bars}根` }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>追价深度</span>
+                    <b>{{ row.trigger_overshoot_r == null ? '—' : `${row.trigger_overshoot_r.toFixed(2)}R` }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>a段强度</span>
+                    <b>{{ row.a_move_atr == null ? '—' : `${row.a_move_atr.toFixed(1)}×ATR` }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>换月</span>
+                    <b>{{ rvBool(row.rollover_crossed) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>缺口</span>
+                    <b>{{ rvGap(row) }}</b>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div v-else class="patterns-empty">当前筛选下暂无信号</div>
+          </n-scrollbar>
+        </div>
+
+        <div v-else class="patterns-card">
           <div class="patterns-title">全部 N 形态（{{ signals.length }}）</div>
           <n-scrollbar style="flex: 1">
             <div v-if="signals.length" class="patterns-list">
@@ -1190,6 +1520,16 @@ onBeforeUnmount(() => {
   color: #1677ff;
   font-weight: 600;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+}
+.tf-btn:disabled,
+.tf-more:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.review-exit-btn {
+  color: #b45309;
+  border-color: rgba(180, 83, 9, 0.3);
+  background: rgba(249, 168, 37, 0.1);
 }
 .tf-more {
   display: inline-flex;
@@ -1529,6 +1869,176 @@ onBeforeUnmount(() => {
   font-weight: 600;
   color: #334155;
   margin-bottom: 8px;
+}
+.review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+.review-row {
+  position: relative;
+  border: 1px solid #eef0f3;
+  border-left-width: 4px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #fff;
+  cursor: pointer;
+  transition:
+    box-shadow 0.15s,
+    border-color 0.15s,
+    background 0.15s;
+}
+.review-row:hover {
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.1);
+}
+.review-row.is-up {
+  border-left-color: #e03131;
+}
+.review-row.is-down {
+  border-left-color: #0f9d58;
+}
+.review-row.is-active {
+  border-color: #bfdbfe;
+  background: #f5faff;
+  box-shadow: 0 2px 8px rgba(22, 119, 255, 0.14);
+}
+.rv-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 7px;
+}
+.rv-id {
+  font-size: 13px;
+  font-weight: 800;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.rv-symbol {
+  font-size: 12px;
+  font-weight: 700;
+  color: #475569;
+}
+.rv-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #64748b;
+}
+.review-row.is-up .rv-badge {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.08);
+}
+.review-row.is-down .rv-badge {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.08);
+}
+.rv-grade {
+  font-size: 11px;
+  font-weight: 600;
+  color: #7c5cff;
+  background: rgba(124, 92, 255, 0.08);
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.rv-score {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.1;
+}
+.rv-score b {
+  font-size: 14px;
+  font-weight: 800;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.rv-score em {
+  font-style: normal;
+  font-size: 9px;
+  color: #94a3b8;
+}
+.rv-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: #64748b;
+}
+.rv-time {
+  font-variant-numeric: tabular-nums;
+  color: #94a3b8;
+}
+.rv-outcome {
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.rv-outcome.win {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+}
+.rv-outcome.loss {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.1);
+}
+.rv-outcome.warn {
+  color: #b45309;
+  background: rgba(249, 168, 37, 0.16);
+}
+.rv-outcome.plain {
+  color: #64748b;
+  background: #f1f5f9;
+}
+.rv-exit {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #64748b;
+}
+.rv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 10px;
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed #eef0f3;
+}
+.rv-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.rv-item span {
+  flex: 0 0 auto;
+  color: #94a3b8;
+}
+.rv-item b {
+  min-width: 0;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  color: #1f2329;
+  font-variant-numeric: tabular-nums;
+}
+.rv-item b.is-pos {
+  color: #e03131;
+}
+.rv-item b.is-neg {
+  color: #0f9d58;
+}
+.rv-item b.is-neutral {
+  color: #94a3b8;
 }
 .patterns-list {
   display: flex;

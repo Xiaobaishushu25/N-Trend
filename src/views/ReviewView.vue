@@ -24,7 +24,7 @@ import {
   type StatsScopeKey,
 } from '../stores/review'
 import { notify } from '../utils/notify'
-import type { GroupStat, OutcomeDetail } from '../types'
+import type { GroupStat, OpenReviewChartPayload, OutcomeDetail } from '../types'
 
 const review = useReviewStore()
 const loading = ref(false)
@@ -468,7 +468,12 @@ async function resetFilters() {
 /** 点击明细行：通知主窗口打开对应K线图并重绘形态与进出场点位，同时聚焦主窗口 */
 async function openReviewChart(row: OutcomeDetail) {
   try {
-    await emit('open-review-chart', { symbol: row.symbol, signalId: row.signal_id })
+    const payload: OpenReviewChartPayload = {
+      symbol: row.symbol,
+      signalId: row.signal_id,
+      filters: { ...review.recentFilters },
+    }
+    await emit('open-review-chart', payload)
     const main = await WebviewWindow.getByLabel('main')
     if (main != null) {
       await main.show()

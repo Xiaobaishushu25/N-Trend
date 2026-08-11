@@ -406,6 +406,13 @@ export interface RecentOutcomeFilters {
   scoreMax?: number | null
 }
 
+/** 复盘明细跳转K线图时从复盘窗口带往主窗口的上下文 */
+export interface OpenReviewChartPayload {
+  symbol: string
+  signalId: number
+  filters?: RecentOutcomeFilters
+}
+
 export type NotifyKind = 'success' | 'info' | 'warning' | 'error'
 
 export interface NotificationSignal {
