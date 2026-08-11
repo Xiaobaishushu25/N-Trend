@@ -241,6 +241,10 @@ export interface UiConfig {
   flash_ms: number
   breathe_hold_ms: number
   min_bar_spacing: number
+  /** 点击进入K线图时默认展示的K线根数 */
+  chart_display_bars: number
+  /** K线图默认向左移动距离（根） */
+  chart_right_gap: number
   /** 启用的K线周期，K线页切换栏只显示勾选的周期 */
   timeframes: string[]
   /** 上次打开的分组表格（null=全部品种），应用启动后恢复 */

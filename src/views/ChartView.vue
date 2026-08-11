@@ -51,6 +51,8 @@ const symbol = computed(() => String(route.params.symbol || ''))
 const timeframe = ref<Timeframe>('15m')
 const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
 const settingsStore = useSettingsStore()
+/** 图表加载的历史K线根数：至少保留现有 1200 根窗口，展示根数调大时同步扩容 */
+const chartLoadLimit = computed(() => Math.max(1200, settingsStore.settings.ui.chart_display_bars))
 /** 按配置勾选过滤后显示的周期；全部未勾选时回退为全部 */
 const visibleTimeframes = computed<Timeframe[]>(() => {
   const enabled = settingsStore.settings.ui.timeframes
@@ -892,7 +894,7 @@ watch([symbol, timeframe], async () => {
   applyDefaultHidden()
   liveBars.value = []
   if (symbol.value) {
-    await klinesStore.load(symbol.value, timeframe.value, 1200)
+    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
     scansStore.loadRecentSignals(symbol.value)
     scansStore.refreshLatestSignals()
   }
@@ -916,7 +918,7 @@ onMounted(async () => {
       loadSnapshots()
       scansStore.refreshLatestSignals()
       // 定时入库后静默重载完整K线，让刚收盘的实时桶转正为历史K线
-      if (symbol.value) klinesStore.load(symbol.value, timeframe.value, 1200, true)
+      if (symbol.value) klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
     }),
   )
   // 实时现价：合并进快照表，缺失品种保留旧值，避免盘口跳动时整表闪空
@@ -954,7 +956,7 @@ onMounted(async () => {
     }
   }
   if (symbol.value) {
-    await klinesStore.load(symbol.value, timeframe.value, 1200)
+    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
     scansStore.loadRecentSignals(symbol.value)
     scansStore.refreshLatestSignals()
   }

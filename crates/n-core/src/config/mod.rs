@@ -283,6 +283,10 @@ pub struct UiConfig {
     pub breathe_hold_ms: u64,
     /// K线图最小间距（像素）
     pub min_bar_spacing: u64,
+    /// 点击进入K线图时默认展示的K线根数（从最新一根往前数）
+    pub chart_display_bars: u64,
+    /// K线图默认向左移动距离（根），即默认视图右侧留出的空白上限
+    pub chart_right_gap: u64,
     /// 启用的K线周期（空时按全部处理）
     pub timeframes: Vec<String>,
     /// 上次打开的分组表格（null=全部品种），应用启动后恢复
@@ -295,6 +299,8 @@ impl Default for UiConfig {
             flash_ms: 900,
             breathe_hold_ms: 5000,
             min_bar_spacing: 8,
+            chart_display_bars: 140,
+            chart_right_gap: 10,
             timeframes: DEFAULT_TIMEFRAMES.iter().map(|s| s.to_string()).collect(),
             last_group_id: None,
         }
@@ -424,6 +430,8 @@ mod tests {
         assert_eq!(back.ui.flash_ms, 900);
         assert_eq!(back.ui.breathe_hold_ms, 5000);
         assert_eq!(back.ui.min_bar_spacing, 8);
+        assert_eq!(back.ui.chart_display_bars, 140);
+        assert_eq!(back.ui.chart_right_gap, 10);
         assert_eq!(
             back.ui.timeframes,
             DEFAULT_TIMEFRAMES

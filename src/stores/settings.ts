@@ -44,6 +44,8 @@ const defaultConfig = (): Config => ({
     flash_ms: 900,
     breathe_hold_ms: 5000,
     min_bar_spacing: 8,
+    chart_display_bars: 140,
+    chart_right_gap: 10,
     timeframes: ['5m', '15m', '30m', '60m', '120m', '240m', '1d'],
     last_group_id: null,
   },

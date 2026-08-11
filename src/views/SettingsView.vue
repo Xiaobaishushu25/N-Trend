@@ -17,6 +17,7 @@ import {
 } from 'naive-ui'
 import {
   Bell,
+  ChartCandle,
   Database,
   DeviceFloppy,
   Help,
@@ -270,6 +271,80 @@ onMounted(async () => {
         </div>
       </n-tab-pane>
 
+      <n-tab-pane name="ui">
+        <template #tab>
+          <div class="custom-tab-label">
+            <span class="tab-icon"><n-icon :component="ChartCandle" /></span>
+            <span>界面</span>
+          </div>
+        </template>
+        <div class="tab-body">
+          <label class="section-title">界面</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                行情跳动闪烁时长（毫秒）
+                <Tip text="自选表格中价格变化时行背景闪烁的时长。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.flash_ms"
+                :min="100"
+                :max="3000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                顶栏呼吸灯保持时长（毫秒）
+                <Tip text="收到行情请求事件后，顶栏“运行中”呼吸灯保持亮起的时间。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.breathe_hold_ms"
+                :min="1000"
+                :max="30000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                K线最小间距（像素）
+                <Tip text="K线图横向拉宽时防止K线细成一条线的最小间距。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.min_bar_spacing"
+                :min="2"
+                :max="30"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                点击进入K线图时展示K线数量
+                <Tip text="点击品种进入K线图时，从最新一根往前展示的K线根数；调大后也会同步加载更多历史K线。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.chart_display_bars"
+                :min="20"
+                :max="2000"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                K线图默认向左移动距离（根）
+                <Tip text="进入图表时最新K线右侧预留的空白根数，相当于把图表向左拖动一段；设为 0 表示不预留。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.chart_right_gap"
+                :min="0"
+                :max="200"
+                style="width: 200px"
+              />
+            </div>
+          </div>
+        </div>
+      </n-tab-pane>
+
       <n-tab-pane name="notify">
         <template #tab>
           <div class="custom-tab-label">
@@ -314,46 +389,6 @@ onMounted(async () => {
                 <Tip text="入场价提醒同时发送系统级通知，需要操作系统通知权限。" />
               </div>
               <n-switch v-model:value="form.notify.system_entry_trigger" />
-            </div>
-          </div>
-
-          <label class="section-title">界面</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                行情跳动闪烁时长（毫秒）
-                <Tip text="自选表格中价格变化时行背景闪烁的时长。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.flash_ms"
-                :min="100"
-                :max="3000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                顶栏呼吸灯保持时长（毫秒）
-                <Tip text="收到行情请求事件后，顶栏“运行中”呼吸灯保持亮起的时间。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.breathe_hold_ms"
-                :min="1000"
-                :max="30000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                K线最小间距（像素）
-                <Tip text="K线图横向拉宽时防止K线细成一条线的最小间距。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.min_bar_spacing"
-                :min="2"
-                :max="30"
-                style="width: 200px"
-              />
             </div>
           </div>
 

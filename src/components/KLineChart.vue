@@ -301,19 +301,18 @@ let priceExtent = 1
 //   if (dbg.history.length > 8) dbg.history.splice(0, dbg.history.length - 8)
 // }
 
-/** 进入图表时默认展示的K线根数（从最新一根往前数）。根数越少单根K线越宽；
- *  想再宽就调小，想多看历史就调大。先写死便于手工调整，后续由配置传入 */
-const display_k_num = 140
-/** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，让最新K线不贴右边缘 */
-const display_right_gap = 10
+/** 进入图表时默认展示的K线根数（从最新一根往前数），由设置界面配置 */
+const displayKNum = computed(() => Math.max(1, settingsStore.settings.ui.chart_display_bars))
+/** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，由设置界面配置 */
+const displayRightGap = computed(() => Math.max(0, settingsStore.settings.ui.chart_right_gap))
 /** 右侧留白占可见K线根数的比例上限：数据量少的品种留白按此比例缩水，避免右侧出现大片空白 */
 const right_gap_ratio = 0.1
 
-/** 计算右侧留白根数：数据量足够时保持 display_right_gap 根；
- *  数据量少时按可见根数的 right_gap_ratio 缩到最小1根，保证不同品种留白占屏比例一致 */
+/** 计算右侧留白根数：数据量足够时保持 displayRightGap 根；
+ *  数据量少时按可见根数的 right_gap_ratio 缩到0，避免右侧出现大片空白 */
 function rightGapBars(visible: number): number {
-  if (visible <= 0) return display_right_gap
-  return Math.min(display_right_gap, Math.max(1, Math.round(visible * right_gap_ratio)))
+  if (visible <= 0) return displayRightGap.value
+  return Math.min(displayRightGap.value, Math.max(0, Math.round(visible * right_gap_ratio)))
 }
 /** N形态连线/标记颜色：与K线自身的红绿区分开并带透明度，减少对K线的遮挡 */
 const PATTERN_UP_COLOR = 'rgba(255, 135, 135, 0.9)' // 上涨：浅红
@@ -473,7 +472,7 @@ function applyDefaultView() {
   if (!candleSeries || candleSeries.data().length === 0) return
   const total = props.rows.length
   if (total === 0) return
-  const visible = Math.min(display_k_num, total)
+  const visible = Math.min(displayKNum.value, total)
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
@@ -546,7 +545,7 @@ function dropStaleView(total: number) {
   const capturedTotal = lastView.totalAtCapture
   if (
     capturedTotal > 0 &&
-    capturedTotal < display_k_num &&
+    capturedTotal < displayKNum.value &&
     span >= capturedTotal - 0.5 &&
     total > capturedTotal
   ) {
@@ -760,7 +759,7 @@ function renderData() {
     dropStaleView(props.rows.length)
     const span = lastView
       ? Math.min(lastView.to - lastView.from, props.rows.length)
-      : Math.min(display_k_num, props.rows.length)
+      : Math.min(displayKNum.value, props.rows.length)
     applySwitchView(span)
   } else {
     restoreView()
@@ -831,7 +830,7 @@ function handleWheel(e: WheelEvent) {
 
 onMounted(() => {
   if (!container.value) return
-  // 每次进入图表页先回到默认视图（最新 display_k_num 根）；页内切换品种/级别沿用缩放
+  // 每次进入图表页先回到默认视图（最新 displayKNum 根）；页内切换品种/级别沿用缩放
   // dbg.mountCount += 1
   // dbg.history.push(
   //   `== 挂载#${dbg.mountCount} 上次保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'} ` +
