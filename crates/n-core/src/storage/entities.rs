@@ -207,6 +207,16 @@ pub mod signal_outcomes {
         pub trend60_score: Option<f64>,
         /// 触发 bar 的 ATR20 相对前 60 根 15m bar 的分位（0~1）
         pub atr_percentile: Option<f64>,
+        /// 止盈层级：tp1 / tp2
+        pub target_tier: Option<String>,
+        /// b段均量 / a段均量（15m）
+        pub b_vol_ratio: Option<f64>,
+        /// a_move / 触发bar ATR20
+        pub a_move_atr: Option<f64>,
+        /// 预警K线到触发K线的根数差
+        pub trigger_lag_bars: Option<i64>,
+        /// 触发K线超出入场价的深度（按R归一化）
+        pub trigger_overshoot_r: Option<f64>,
         /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
         pub rollover_crossed: Option<bool>,
         /// 入场价被跳空穿越：按更保守的 current.open 成交

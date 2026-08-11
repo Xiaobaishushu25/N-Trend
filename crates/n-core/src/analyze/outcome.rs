@@ -1,6 +1,6 @@
 //! 信号结局回填与复盘统计。
 //!
-//! 简化出场规则（SIM_VERSION = 7）：
+//! 简化出场规则（SIM_VERSION = 8）：
 //! - 入场价 = 信号落库时的 entry（预警K线极值 ± tick），不重算、不回看；
 //! - 入场/止损被跳空穿越时按更保守的 current.open 成交，并标记 gap_crossed；
 //! - 在 15m 上逐根模拟：先到 stop → −1R；
@@ -15,7 +15,10 @@
 //! - 数据不足 → open / insufficient_data。
 //!
 //! 首批诊断特征只落库、不改评分：vol_ratio（触发量能）、oi_increase（增仓）、
-//! trend60_score（60m 连续趋势分），供复盘页按特征分组统计，为 v2 权重校准提供证据。
+//! trend60_score（60m 连续趋势分）、b_vol_ratio（b段相对a段量能）、
+//! a_move_atr（a段强度）、trigger_lag_bars（预警到触发延迟）、
+//! trigger_overshoot_r（触发K线追价深度）、target_tier（止盈层级），
+//! 供复盘页按特征分组统计，为 v2 权重校准提供证据。
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -26,7 +29,7 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 7;
+pub const SIM_VERSION: i64 = 8;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -39,8 +42,8 @@ pub const TIME_HORIZON_BARS: usize = 60;
 pub const MIN_BARS_FOR_SETTLED: usize = 3;
 /// 量能确认窗口：触发 bar 前 20 根 15m 均量
 pub const VOL_AVG_WINDOW: usize = 20;
-/// 量能确认阈值：触发 bar 成交量 ≥ 前 20 根均量的 1.3 倍
-pub const VOL_CONFIRM_RATIO: f64 = 1.3;
+/// 量能确认阈值：触发 bar 成交量 ≥ 前 20 根均量的 2.0 倍（复盘分桶显示 ≥2.0 才有明显区分度）
+pub const VOL_CONFIRM_RATIO: f64 = 2.0;
 /// ATR 分位窗口：触发 bar 的 ATR20 与之前 60 根 15m bar 比较
 pub const ATR_PERCENTILE_WINDOW: usize = 60;
 
@@ -133,8 +136,10 @@ pub struct SignalInput {
     pub risk: f64,
     pub created_at: String,
     pub warning_ts: Option<String>,
+    pub s0_ts: Option<String>,
     pub s1_ts: Option<String>,
     pub s2_ts: Option<String>,
+    pub a_move: Option<f64>,
 }
 
 /// 单条信号的结局 + 特征（对应 signal_outcomes 一行）。
@@ -155,6 +160,16 @@ pub struct SignalAnnotation {
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
     pub atr_percentile: Option<f64>,
+    /// 止盈时记录 tp1 / tp2，其他出场为空
+    pub target_tier: Option<String>,
+    /// b段均量 / a段均量（15m）
+    pub b_vol_ratio: Option<f64>,
+    /// a_move / 触发bar ATR20
+    pub a_move_atr: Option<f64>,
+    /// 预警K线到触发K线的根数差
+    pub trigger_lag_bars: Option<usize>,
+    /// 触发K线超出入场价的深度（按R归一化）
+    pub trigger_overshoot_r: Option<f64>,
     pub rollover_crossed: bool,
     pub gap_crossed_entry: bool,
     pub gap_crossed_exit: bool,
@@ -204,6 +219,11 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         oi_increase: None,
         trend60_score,
         atr_percentile: None,
+        target_tier: None,
+        b_vol_ratio: None,
+        a_move_atr: None,
+        trigger_lag_bars: None,
+        trigger_overshoot_r: None,
         rollover_crossed: false,
         gap_crossed_entry: false,
         gap_crossed_exit: false,
@@ -232,6 +252,47 @@ pub(crate) fn vol_ratio_at(bars: &[Bar], ec: usize) -> Option<f64> {
         return None;
     }
     Some(vol / (sum / count as f64))
+}
+
+/// 闭区间 `[start, end]` 内成交量 > 0 的 K 线均量；区间为空或全为 0 时返回 None。
+fn avg_volume_between(bars: &[Bar], start: usize, end: usize) -> Option<f64> {
+    if start > end || end >= bars.len() {
+        return None;
+    }
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for b in &bars[start..=end] {
+        if b.volume > 0.0 {
+            sum += b.volume;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(sum / count as f64)
+}
+
+/// b段均量 / a段均量：a段取 s0 后到 s1，b段取 s1 后到 s2。
+fn b_vol_ratio_at(
+    bars: &[Bar],
+    s0_ts: Option<&str>,
+    s1_ts: Option<&str>,
+    s2_ts: Option<&str>,
+) -> Option<f64> {
+    let (s0, s1, s2) = (s0_ts?, s1_ts?, s2_ts?);
+    let s0 = parse_minute(s0)?;
+    let s1 = parse_minute(s1)?;
+    let s2 = parse_minute(s2)?;
+    let i0 = bars.iter().position(|b| dt_minute(b) >= s0)?;
+    let i1 = bars.iter().position(|b| dt_minute(b) >= s1)?;
+    let i2 = bars.iter().position(|b| dt_minute(b) >= s2)?;
+    let a_avg = avg_volume_between(bars, i0, i1)?;
+    let b_avg = avg_volume_between(bars, i1, i2)?;
+    if a_avg <= 0.0 {
+        return None;
+    }
+    Some(b_avg / a_avg)
 }
 
 /// 触发 bar 持仓量较前一根增加；持仓量为 0（数据缺失）时返回 None。
@@ -362,6 +423,11 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 oi_increase: oi_increase_at(bars15, j),
                 trend60_score,
                 atr_percentile: atr_percentile_at(&atr15, j),
+                target_tier: None,
+                b_vol_ratio: None,
+                a_move_atr: None,
+                trigger_lag_bars: None,
+                trigger_overshoot_r: None,
                 rollover_crossed: true,
                 gap_crossed_entry: false,
                 gap_crossed_exit: false,
@@ -387,6 +453,25 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     let vol_ratio = vol_ratio_at(bars15, ec);
     let oi_increase = oi_increase_at(bars15, ec);
     let atr_percentile = atr_percentile_at(&atr15, ec);
+    let b_vol_ratio = b_vol_ratio_at(
+        bars15,
+        input.s0_ts.as_deref(),
+        input.s1_ts.as_deref(),
+        input.s2_ts.as_deref(),
+    );
+    let a_move_atr = input.a_move.and_then(|a| {
+        atr15
+            .get(ec)
+            .copied()
+            .flatten()
+            .filter(|atr| *atr > 0.0)
+            .map(|atr| a / atr)
+    });
+    let trigger_lag_bars = Some(ec.saturating_sub(start));
+    let trigger_overshoot_r = Some(match dir {
+        Dir::Up => (bars15[ec].high - input.entry) / risk,
+        Dir::Down => (input.entry - bars15[ec].low) / risk,
+    });
     let mut entry_fill = input.entry;
     let mut gap_crossed_entry = false;
     let mut gap_crossed_exit = false;
@@ -428,6 +513,7 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
     let mut mfe = 0.0_f64;
     let mut mae = 0.0_f64;
     let mut tp1_reached = false;
+    let mut target_tier: Option<&'static str> = None;
     let mut result: Option<(ExitReason, f64, usize, usize)> = None;
 
     for i in ec..bars15.len() {
@@ -448,6 +534,11 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                 oi_increase,
                 trend60_score,
                 atr_percentile,
+                target_tier: None,
+                b_vol_ratio,
+                a_move_atr,
+                trigger_lag_bars,
+                trigger_overshoot_r,
                 rollover_crossed: true,
                 gap_crossed_entry: false,
                 gap_crossed_exit: false,
@@ -503,15 +594,18 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
                     Dir::Down => bar.high >= base_tp,
                 };
                 if tp2_hit {
+                    target_tier = Some("tp2");
                     result = Some((ExitReason::Target, tp2_price, i, held));
                     break;
                 }
                 if fell_back {
+                    target_tier = Some("tp1");
                     result = Some((ExitReason::Target, base_tp, i, held));
                     break;
                 }
             }
         } else if reached_tp1 {
+            target_tier = Some("tp1");
             result = Some((ExitReason::Target, base_tp, i, held));
             break;
         }
@@ -572,6 +666,11 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         oi_increase,
         trend60_score,
         atr_percentile,
+        target_tier: target_tier.map(str::to_string),
+        b_vol_ratio,
+        a_move_atr,
+        trigger_lag_bars,
+        trigger_overshoot_r,
         rollover_crossed: false,
         gap_crossed_entry,
         gap_crossed_exit,
@@ -594,6 +693,22 @@ pub enum GroupBy {
     SymbolHour,
     ScoreVol,
     HourAtrBand,
+    ExitReason,
+    VolRatioBand,
+    BVolRatioBand,
+    RetracementBand,
+    BaSpeedBand,
+    AStrengthBand,
+    TriggerLagBand,
+    OvershootBand,
+    TpTier,
+    GapCombo,
+    DimTrend,
+    DimALeg,
+    DimBLeg,
+    DimTrigger,
+    DimRr,
+    DimMomentum,
 }
 
 impl GroupBy {
@@ -610,6 +725,22 @@ impl GroupBy {
             "symbol_hour" => GroupBy::SymbolHour,
             "score_vol" => GroupBy::ScoreVol,
             "hour_atr" => GroupBy::HourAtrBand,
+            "exit_reason" => GroupBy::ExitReason,
+            "vol_band" => GroupBy::VolRatioBand,
+            "b_vol" => GroupBy::BVolRatioBand,
+            "retracement" => GroupBy::RetracementBand,
+            "b_a_speed" => GroupBy::BaSpeedBand,
+            "a_strength" => GroupBy::AStrengthBand,
+            "trigger_lag" => GroupBy::TriggerLagBand,
+            "overshoot" => GroupBy::OvershootBand,
+            "tp_tier" => GroupBy::TpTier,
+            "gap_combo" => GroupBy::GapCombo,
+            "dim_trend" => GroupBy::DimTrend,
+            "dim_a" => GroupBy::DimALeg,
+            "dim_b" => GroupBy::DimBLeg,
+            "dim_trigger" => GroupBy::DimTrigger,
+            "dim_rr" => GroupBy::DimRr,
+            "dim_momentum" => GroupBy::DimMomentum,
             _ => GroupBy::ScoreBand,
         }
     }
@@ -673,11 +804,27 @@ pub struct StatRow {
     pub s2_ts: Option<String>,
     pub outcome: Option<Outcome>,
     pub r_multiple: Option<f64>,
+    pub mfe_r: Option<f64>,
+    pub mae_r: Option<f64>,
     pub bars_held: Option<usize>,
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
     pub atr_percentile: Option<f64>,
+    pub exit_reason: Option<ExitReason>,
+    pub target_tier: Option<String>,
+    pub extended_target: bool,
+    pub b_vol_ratio: Option<f64>,
+    pub a_move_atr: Option<f64>,
+    pub trigger_lag_bars: Option<usize>,
+    pub trigger_overshoot_r: Option<f64>,
+    pub a_move: Option<f64>,
+    pub b_move: Option<f64>,
+    pub a_bars: Option<usize>,
+    pub b_bars: Option<usize>,
+    pub retracement: Option<f64>,
+    pub dims: Option<[f64; 6]>,
+    pub net_r: Option<f64>,
     pub rollover_crossed: bool,
     pub gap_crossed_entry: bool,
     pub gap_crossed_exit: bool,
@@ -698,6 +845,22 @@ pub struct GroupStat {
     pub win_rate: Option<f64>,
     pub avg_r: Option<f64>,
     pub avg_bars: Option<f64>,
+    pub avg_win_r: Option<f64>,
+    pub avg_loss_r: Option<f64>,
+    pub payoff: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub r_ge1_rate: Option<f64>,
+    pub r_ge2_rate: Option<f64>,
+    pub mfe_ge1_rate: Option<f64>,
+    pub mae_le_neg1_rate: Option<f64>,
+    pub avg_r_mfe_ge1: Option<f64>,
+    pub avg_r_mae_le_neg1: Option<f64>,
+    pub avg_net_r: Option<f64>,
+    pub ext_target_n: usize,
+    pub tp1_exits: usize,
+    pub tp2_exits: usize,
+    pub tp2_conversion: Option<f64>,
+    pub tp2_of_ext_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -745,6 +908,27 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
     let mut r_count = 0usize;
     let mut bars_sum = 0.0_f64;
     let mut bars_count = 0usize;
+    let mut win_r_sum = 0.0_f64;
+    let mut win_r_count = 0usize;
+    let mut loss_r_sum = 0.0_f64;
+    let mut loss_r_count = 0usize;
+    let mut gross_win = 0.0_f64;
+    let mut gross_loss = 0.0_f64;
+    let mut r_ge1 = 0usize;
+    let mut r_ge2 = 0usize;
+    let mut mfe_count = 0usize;
+    let mut mfe_ge1 = 0usize;
+    let mut r_mfe_ge1_sum = 0.0_f64;
+    let mut r_mfe_ge1_count = 0usize;
+    let mut mae_count = 0usize;
+    let mut mae_le_neg1 = 0usize;
+    let mut r_mae_le_neg1_sum = 0.0_f64;
+    let mut r_mae_le_neg1_count = 0usize;
+    let mut net_r_sum = 0.0_f64;
+    let mut net_r_count = 0usize;
+    let mut ext_target_n = 0usize;
+    let mut tp1_exits = 0usize;
+    let mut tp2_exits = 0usize;
 
     for r in rows {
         if r.gap_crossed_entry {
@@ -753,6 +937,14 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
         if r.gap_crossed_exit {
             gap_exit += 1;
         }
+        if r.extended_target {
+            ext_target_n += 1;
+        }
+        match r.target_tier.as_deref() {
+            Some("tp2") => tp2_exits += 1,
+            Some("tp1") => tp1_exits += 1,
+            _ => {}
+        }
         match r.outcome {
             Some(Outcome::Win) => {
                 settled += 1;
@@ -760,10 +952,23 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
                 if let Some(x) = r.r_multiple {
                     r_sum += x;
                     r_count += 1;
+                    win_r_sum += x;
+                    win_r_count += 1;
+                    gross_win += x;
+                    if x >= 1.0 {
+                        r_ge1 += 1;
+                    }
+                    if x >= 2.0 {
+                        r_ge2 += 1;
+                    }
                 }
                 if let Some(b) = r.bars_held {
                     bars_sum += b as f64;
                     bars_count += 1;
+                }
+                if let Some(x) = r.net_r {
+                    net_r_sum += x;
+                    net_r_count += 1;
                 }
             }
             Some(Outcome::Loss) => {
@@ -772,10 +977,17 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
                 if let Some(x) = r.r_multiple {
                     r_sum += x;
                     r_count += 1;
+                    loss_r_sum += x;
+                    loss_r_count += 1;
+                    gross_loss += x;
                 }
                 if let Some(b) = r.bars_held {
                     bars_sum += b as f64;
                     bars_count += 1;
+                }
+                if let Some(x) = r.net_r {
+                    net_r_sum += x;
+                    net_r_count += 1;
                 }
             }
             Some(Outcome::NoTrigger) => no_trigger += 1,
@@ -783,8 +995,40 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
             Some(Outcome::Open) | Some(Outcome::InsufficientData) => pending += 1,
             None => {}
         }
+        if matches!(r.outcome, Some(Outcome::Win) | Some(Outcome::Loss)) {
+            if let Some(m) = r.mfe_r {
+                mfe_count += 1;
+                if m >= 1.0 {
+                    mfe_ge1 += 1;
+                    if let Some(x) = r.r_multiple {
+                        r_mfe_ge1_sum += x;
+                        r_mfe_ge1_count += 1;
+                    }
+                }
+            }
+            if let Some(m) = r.mae_r {
+                mae_count += 1;
+                if m <= -1.0 {
+                    mae_le_neg1 += 1;
+                    if let Some(x) = r.r_multiple {
+                        r_mae_le_neg1_sum += x;
+                        r_mae_le_neg1_count += 1;
+                    }
+                }
+            }
+        }
     }
 
+    let avg_win_r = if win_r_count > 0 {
+        Some(win_r_sum / win_r_count as f64)
+    } else {
+        None
+    };
+    let avg_loss_r = if loss_r_count > 0 {
+        Some(loss_r_sum / loss_r_count as f64)
+    } else {
+        None
+    };
     GroupStat {
         key: key.to_string(),
         n,
@@ -808,6 +1052,65 @@ fn summarize(key: &str, rows: &[&StatRow]) -> GroupStat {
         },
         avg_bars: if bars_count > 0 {
             Some(bars_sum / bars_count as f64)
+        } else {
+            None
+        },
+        avg_win_r,
+        avg_loss_r,
+        payoff: avg_win_r
+            .zip(avg_loss_r)
+            .filter(|(_, loss)| *loss < 0.0)
+            .map(|(win, loss)| win / -loss),
+        profit_factor: if gross_loss < 0.0 {
+            Some(gross_win / -gross_loss)
+        } else {
+            None
+        },
+        r_ge1_rate: if r_count > 0 {
+            Some(r_ge1 as f64 / r_count as f64)
+        } else {
+            None
+        },
+        r_ge2_rate: if r_count > 0 {
+            Some(r_ge2 as f64 / r_count as f64)
+        } else {
+            None
+        },
+        mfe_ge1_rate: if mfe_count > 0 {
+            Some(mfe_ge1 as f64 / mfe_count as f64)
+        } else {
+            None
+        },
+        mae_le_neg1_rate: if mae_count > 0 {
+            Some(mae_le_neg1 as f64 / mae_count as f64)
+        } else {
+            None
+        },
+        avg_r_mfe_ge1: if r_mfe_ge1_count > 0 {
+            Some(r_mfe_ge1_sum / r_mfe_ge1_count as f64)
+        } else {
+            None
+        },
+        avg_r_mae_le_neg1: if r_mae_le_neg1_count > 0 {
+            Some(r_mae_le_neg1_sum / r_mae_le_neg1_count as f64)
+        } else {
+            None
+        },
+        avg_net_r: if net_r_count > 0 {
+            Some(net_r_sum / net_r_count as f64)
+        } else {
+            None
+        },
+        ext_target_n,
+        tp1_exits,
+        tp2_exits,
+        tp2_conversion: if ext_target_n > 0 {
+            Some(tp2_exits as f64 / ext_target_n as f64)
+        } else {
+            None
+        },
+        tp2_of_ext_rate: if tp1_exits + tp2_exits > 0 {
+            Some(tp2_exits as f64 / (tp1_exits + tp2_exits) as f64)
         } else {
             None
         },
@@ -899,6 +1202,100 @@ fn bucket(group_by: GroupBy, r: &StatRow) -> String {
         GroupBy::SymbolHour => format!("{} {}", r.symbol, hour_of(r)),
         GroupBy::ScoreVol => format!("{} / {}", score_band_label(r.score), vol_label(r)),
         GroupBy::HourAtrBand => format!("{} / {}", hour_of(r), atr_band_label(r.atr_percentile)),
+        GroupBy::ExitReason => match r.exit_reason {
+            Some(ExitReason::Target) => "止盈".to_string(),
+            Some(ExitReason::Stop) => "止损".to_string(),
+            Some(ExitReason::NoFollow) => "无跟随".to_string(),
+            Some(ExitReason::TimeExit) => "时间退出".to_string(),
+            Some(ExitReason::Rollover) => "换月".to_string(),
+            _ => "其他".to_string(),
+        },
+        GroupBy::VolRatioBand => match r.vol_ratio {
+            Some(v) if v >= 2.0 => "≥2.0".to_string(),
+            Some(v) if v >= 1.3 => "1.3-2.0".to_string(),
+            Some(v) if v >= 1.0 => "1.0-1.3".to_string(),
+            Some(v) if v >= 0.8 => "0.8-1.0".to_string(),
+            Some(_) => "<0.8".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::BVolRatioBand => match r.b_vol_ratio {
+            Some(v) if v >= 1.3 => "≥1.3".to_string(),
+            Some(v) if v >= 1.0 => "1.0-1.3".to_string(),
+            Some(v) if v >= 0.8 => "0.8-1.0".to_string(),
+            Some(_) => "<0.8".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::RetracementBand => match r.retracement {
+            Some(v) if v >= 0.66 => ">66%".to_string(),
+            Some(v) if v >= 0.50 => "50-66%".to_string(),
+            Some(v) if v >= 0.33 => "33-50%".to_string(),
+            Some(v) if v >= 0.20 => "20-33%".to_string(),
+            Some(_) => "<20%".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::BaSpeedBand => {
+            let speed = match (r.a_move, r.b_move, r.a_bars, r.b_bars) {
+                (Some(a), Some(b), Some(ab), Some(bb)) if ab > 0 && bb > 0 && a > 0.0 => {
+                    Some((b / bb as f64) / (a / ab as f64))
+                }
+                _ => None,
+            };
+            match speed {
+                Some(v) if v >= 1.2 => "≥1.2".to_string(),
+                Some(v) if v >= 0.8 => "0.8-1.2".to_string(),
+                Some(v) if v >= 0.5 => "0.5-0.8".to_string(),
+                Some(_) => "<0.5".to_string(),
+                None => "数据缺失".to_string(),
+            }
+        }
+        GroupBy::AStrengthBand => match r.a_move_atr {
+            Some(v) if v >= 10.0 => "≥10".to_string(),
+            Some(v) if v >= 6.0 => "6-10".to_string(),
+            Some(v) if v >= 3.0 => "3-6".to_string(),
+            Some(_) => "<3".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::TriggerLagBand => match r.trigger_lag_bars {
+            Some(1) => "1".to_string(),
+            Some(2..=3) => "2-3".to_string(),
+            Some(4..=6) => "4-6".to_string(),
+            Some(7..=12) => "7-12".to_string(),
+            Some(_) => ">12".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::OvershootBand => match r.trigger_overshoot_r {
+            Some(v) if v >= 0.6 => "≥0.6".to_string(),
+            Some(v) if v >= 0.3 => "0.3-0.6".to_string(),
+            Some(v) if v >= 0.1 => "0.1-0.3".to_string(),
+            Some(_) => "<0.1".to_string(),
+            None => "数据缺失".to_string(),
+        },
+        GroupBy::TpTier => match r.target_tier.as_deref() {
+            Some("tp2") => "TP2扩展止盈".to_string(),
+            Some("tp1") => "TP1止盈".to_string(),
+            _ => "其他".to_string(),
+        },
+        GroupBy::GapCombo => match (r.gap_crossed_entry, r.gap_crossed_exit) {
+            (true, true) => "双跳空".to_string(),
+            (true, false) => "入场跳空".to_string(),
+            (false, true) => "出场跳空".to_string(),
+            (false, false) => "无跳空".to_string(),
+        },
+        GroupBy::DimTrend => dim_band(r.dims.map(|d| d[0])),
+        GroupBy::DimALeg => dim_band(r.dims.map(|d| d[1])),
+        GroupBy::DimBLeg => dim_band(r.dims.map(|d| d[2])),
+        GroupBy::DimTrigger => dim_band(r.dims.map(|d| d[3])),
+        GroupBy::DimRr => dim_band(r.dims.map(|d| d[4])),
+        GroupBy::DimMomentum => dim_band(r.dims.map(|d| d[5])),
+    }
+}
+
+fn dim_band(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x >= 3.5 => "≥3.5".to_string(),
+        Some(x) if x >= 2.0 => "2.0-3.5".to_string(),
+        Some(_) => "<2.0".to_string(),
+        None => "数据缺失".to_string(),
     }
 }
 
@@ -956,6 +1353,91 @@ fn group_rank(group_by: GroupBy, key: &str) -> (u8, String) {
             .unwrap_or(24),
         GroupBy::Symbol => 0,
         GroupBy::SymbolHour | GroupBy::ScoreVol | GroupBy::HourAtrBand => 0,
+        GroupBy::ExitReason => match key {
+            "止盈" => 0,
+            "止损" => 1,
+            "无跟随" => 2,
+            "时间退出" => 3,
+            "换月" => 4,
+            "其他" => 5,
+            _ => 9,
+        },
+        GroupBy::VolRatioBand => match key {
+            "≥2.0" => 0,
+            "1.3-2.0" => 1,
+            "1.0-1.3" => 2,
+            "0.8-1.0" => 3,
+            "<0.8" => 4,
+            _ => 9,
+        },
+        GroupBy::BVolRatioBand => match key {
+            "≥1.3" => 0,
+            "1.0-1.3" => 1,
+            "0.8-1.0" => 2,
+            "<0.8" => 3,
+            _ => 9,
+        },
+        GroupBy::RetracementBand => match key {
+            ">66%" => 0,
+            "50-66%" => 1,
+            "33-50%" => 2,
+            "20-33%" => 3,
+            "<20%" => 4,
+            _ => 9,
+        },
+        GroupBy::BaSpeedBand => match key {
+            "≥1.2" => 0,
+            "0.8-1.2" => 1,
+            "0.5-0.8" => 2,
+            "<0.5" => 3,
+            _ => 9,
+        },
+        GroupBy::AStrengthBand => match key {
+            "≥10" => 0,
+            "6-10" => 1,
+            "3-6" => 2,
+            "<3" => 3,
+            _ => 9,
+        },
+        GroupBy::TriggerLagBand => match key {
+            "1" => 0,
+            "2-3" => 1,
+            "4-6" => 2,
+            "7-12" => 3,
+            ">12" => 4,
+            _ => 9,
+        },
+        GroupBy::OvershootBand => match key {
+            "<0.1" => 0,
+            "0.1-0.3" => 1,
+            "0.3-0.6" => 2,
+            "≥0.6" => 3,
+            _ => 9,
+        },
+        GroupBy::TpTier => match key {
+            "TP2扩展止盈" => 0,
+            "TP1止盈" => 1,
+            "其他" => 2,
+            _ => 9,
+        },
+        GroupBy::GapCombo => match key {
+            "双跳空" => 0,
+            "入场跳空" => 1,
+            "出场跳空" => 2,
+            "无跳空" => 3,
+            _ => 9,
+        },
+        GroupBy::DimTrend
+        | GroupBy::DimALeg
+        | GroupBy::DimBLeg
+        | GroupBy::DimTrigger
+        | GroupBy::DimRr
+        | GroupBy::DimMomentum => match key {
+            "≥3.5" => 0,
+            "2.0-3.5" => 1,
+            "<2.0" => 2,
+            _ => 9,
+        },
     };
     (rank, key.to_string())
 }
@@ -1048,8 +1530,10 @@ mod tests {
             risk: 2.0,
             created_at: "2026-08-03 09:15".to_string(),
             warning_ts: Some("2026-08-03 09:15".to_string()),
+            s0_ts: Some("2026-08-03 09:15".to_string()),
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some("2026-08-03 09:15".to_string()),
+            a_move: Some(4.0),
         }
     }
 
@@ -1073,6 +1557,33 @@ mod tests {
                 volume: 100.0,
                 hold: 1000.0,
                 rollover: false,
+            })
+            .collect()
+    }
+
+    /// 从指定小时/分钟开始生成 15m K线序列，便于覆盖 ATR20 所需的较长窗口。
+    fn timed_bars_at(hour: i32, minute: i32, specs: &[(f64, f64, f64, f64)]) -> Vec<Bar> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, &(o, h, l, c))| {
+                let m = minute + i as i32 * 15;
+                Bar {
+                    dt: DT {
+                        year: 2026,
+                        month: 8,
+                        day: 3,
+                        hour: hour + m / 60,
+                        minute: m % 60,
+                    },
+                    open: o,
+                    high: h,
+                    low: l,
+                    close: c,
+                    volume: 100.0,
+                    hold: 1000.0,
+                    rollover: false,
+                }
             })
             .collect()
     }
@@ -1242,6 +1753,11 @@ mod tests {
         let ann = annotate(&input(), &bars, &[]).unwrap();
         assert_eq!(ann.outcome, Outcome::NoTrigger);
         assert_eq!(ann.entry_ts, None);
+        assert_eq!(ann.target_tier, None);
+        assert_eq!(ann.b_vol_ratio, None);
+        assert_eq!(ann.a_move_atr, None);
+        assert_eq!(ann.trigger_lag_bars, None);
+        assert_eq!(ann.trigger_overshoot_r, None);
     }
 
     #[test]
@@ -1268,6 +1784,11 @@ mod tests {
         assert!(ann.mae_r.is_none());
         assert!(ann.bars_held.is_none());
         assert!(ann.rollover_crossed);
+        assert_eq!(ann.target_tier, None);
+        assert_eq!(ann.b_vol_ratio, None);
+        assert_eq!(ann.a_move_atr, None);
+        assert_eq!(ann.trigger_lag_bars, None);
+        assert_eq!(ann.trigger_overshoot_r, None);
     }
 
     #[test]
@@ -1287,6 +1808,9 @@ mod tests {
         assert!(ann.mae_r.is_none());
         assert!(ann.bars_held.is_none());
         assert!(ann.rollover_crossed);
+        assert_eq!(ann.target_tier, None);
+        assert_eq!(ann.trigger_lag_bars, Some(1));
+        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
     }
 
     #[test]
@@ -1308,6 +1832,8 @@ mod tests {
         // 目标位 96 → 目标R=2.0 > 1，TP2 = 1.6R = 96.8，该 bar 最低 95 触及 TP2
         assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
         assert!((ann.exit_price.unwrap() - 96.8).abs() < 1e-9);
+        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
+        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
     }
 
     #[test]
@@ -1351,6 +1877,54 @@ mod tests {
         let ann = annotate(&input(), &bars, &[]).unwrap();
         assert_eq!(ann.vol_ratio, Some(5.0));
         assert_eq!(ann.oi_increase, Some(true));
+    }
+
+    #[test]
+    fn diagnostics_capture_tier_volume_lag_overshoot_and_a_strength() {
+        // 30 根 15m K线从 05:45 开始，触发 bar 位于 10:45（index=20），保证 ATR20 可用。
+        let mut bars = timed_bars_at(5, 45, &[(100.0, 100.5, 99.5, 100.0); 30]);
+        // a 段（05:45..=06:15）均量 100；b 段（06:15..=10:30）均量 50，缩量比为 0.5。
+        for i in 3..=19 {
+            bars[i].volume = 50.0;
+        }
+        bars[20] = Bar {
+            open: 100.0,
+            high: 102.0,
+            low: 100.0,
+            close: 101.0,
+            ..bars[20]
+        };
+        bars[21] = Bar {
+            open: 101.0,
+            high: 103.2,
+            low: 103.1,
+            close: 103.1,
+            ..bars[21]
+        };
+        bars[22] = Bar {
+            open: 103.1,
+            high: 104.5,
+            low: 103.2,
+            close: 104.4,
+            ..bars[22]
+        };
+
+        let mut inp = input();
+        inp.s0_ts = Some("2026-08-03 05:45".to_string());
+        inp.s1_ts = Some("2026-08-03 06:15".to_string());
+        inp.s2_ts = Some("2026-08-03 10:30".to_string());
+        inp.warning_ts = Some("2026-08-03 10:30".to_string());
+        inp.created_at = "2026-08-03 10:30".to_string();
+
+        let ann = annotate(&inp, &bars, &[]).unwrap();
+        assert_eq!(ann.outcome, Outcome::Win);
+        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
+        // a/b 段共享 s1 那根 K 线：a 均量 100，b 均量 (100 + 17×50)/18
+        assert!((ann.b_vol_ratio.unwrap() - 0.5277777777777778).abs() < 1e-9);
+        assert_eq!(ann.trigger_lag_bars, Some(1));
+        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
+        let atr20 = ann.a_move_atr.expect("a段强度应有值");
+        assert!(atr20 > 3.0 && atr20 < 5.0, "a_move_atr = {atr20}");
     }
 
     #[test]
@@ -1439,11 +2013,27 @@ mod tests {
                 s2_ts: Some(s2_ts.to_string()),
                 outcome,
                 r_multiple: r,
+                mfe_r: Some(2.0),
+                mae_r: Some(-1.0),
                 bars_held: Some(3),
                 vol_ratio: Some(2.0),
                 oi_increase: Some(true),
                 trend60_score: Some(3.8),
                 atr_percentile: Some(0.6),
+                exit_reason: None,
+                target_tier: None,
+                extended_target: false,
+                b_vol_ratio: None,
+                a_move_atr: None,
+                trigger_lag_bars: None,
+                trigger_overshoot_r: None,
+                a_move: None,
+                b_move: None,
+                a_bars: None,
+                b_bars: None,
+                retracement: None,
+                dims: None,
+                net_r: None,
                 rollover_crossed: false,
                 gap_crossed_entry: false,
                 gap_crossed_exit: false,
@@ -1522,11 +2112,27 @@ mod tests {
                 s2_ts: Some(format!("2026-08-03 09:{id:02}")),
                 outcome: Some(Outcome::Win),
                 r_multiple: Some(1.0),
+                mfe_r: Some(1.5),
+                mae_r: Some(-0.5),
                 bars_held: Some(3),
                 vol_ratio: Some(vol),
                 oi_increase: Some(true),
                 trend60_score: Some(3.0),
                 atr_percentile: atr,
+                exit_reason: None,
+                target_tier: None,
+                extended_target: false,
+                b_vol_ratio: None,
+                a_move_atr: None,
+                trigger_lag_bars: None,
+                trigger_overshoot_r: None,
+                a_move: None,
+                b_move: None,
+                a_bars: None,
+                b_bars: None,
+                retracement: None,
+                dims: None,
+                net_r: None,
                 rollover_crossed: false,
                 gap_crossed_entry: false,
                 gap_crossed_exit: false,
@@ -1570,11 +2176,27 @@ mod tests {
             s2_ts: Some(format!("2026-08-03 09:{id:02}")),
             outcome: Some(Outcome::Win),
             r_multiple: Some(1.0),
+            mfe_r: Some(1.5),
+            mae_r: Some(-0.5),
             bars_held: Some(3),
             vol_ratio: Some(1.0),
             oi_increase: Some(false),
             trend60_score: Some(3.0),
             atr_percentile: Some(0.4),
+            exit_reason: None,
+            target_tier: None,
+            extended_target: false,
+            b_vol_ratio: None,
+            a_move_atr: None,
+            trigger_lag_bars: None,
+            trigger_overshoot_r: None,
+            a_move: None,
+            b_move: None,
+            a_bars: None,
+            b_bars: None,
+            retracement: None,
+            dims: None,
+            net_r: None,
             rollover_crossed: false,
             gap_crossed_entry: gap_entry,
             gap_crossed_exit: gap_exit,
@@ -1583,6 +2205,283 @@ mod tests {
         let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
         assert_eq!(stats.overall.gap_entry, 2);
         assert_eq!(stats.overall.gap_exit, 2);
+    }
+
+    fn mk_stat(id: i64, outcome: Option<Outcome>, r: Option<f64>) -> StatRow {
+        StatRow {
+            signal_id: id,
+            symbol: format!("RB{id}"),
+            direction: "up".to_string(),
+            level: "fine".to_string(),
+            grade: "A级".to_string(),
+            score: 3.5,
+            created_at: "2026-08-03 09:15".to_string(),
+            warning_ts: Some("2026-08-03 09:15".to_string()),
+            s1_ts: Some("2026-08-03 08:45".to_string()),
+            s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            outcome,
+            r_multiple: r,
+            mfe_r: Some(1.5),
+            mae_r: Some(-0.5),
+            bars_held: Some(3),
+            vol_ratio: Some(1.0),
+            oi_increase: Some(true),
+            trend60_score: Some(3.0),
+            atr_percentile: Some(0.4),
+            exit_reason: Some(ExitReason::Target),
+            target_tier: None,
+            extended_target: false,
+            b_vol_ratio: None,
+            a_move_atr: None,
+            trigger_lag_bars: None,
+            trigger_overshoot_r: None,
+            a_move: None,
+            b_move: None,
+            a_bars: None,
+            b_bars: None,
+            retracement: None,
+            dims: None,
+            net_r: None,
+            rollover_crossed: false,
+            gap_crossed_entry: false,
+            gap_crossed_exit: false,
+        }
+    }
+
+    fn group_keys(stats: &ReviewStats) -> Vec<&str> {
+        stats.groups.iter().map(|g| g.key.as_str()).collect()
+    }
+
+    #[test]
+    fn stats_r_distribution_and_conditional_metrics() {
+        let mut rows = vec![
+            mk_stat(1, Some(Outcome::Win), Some(2.0)),
+            mk_stat(2, Some(Outcome::Win), Some(1.0)),
+            mk_stat(3, Some(Outcome::Loss), Some(-1.0)),
+            mk_stat(4, Some(Outcome::Loss), Some(-2.0)),
+        ];
+        rows[0].mfe_r = Some(2.5);
+        rows[0].mae_r = Some(-0.5);
+        rows[0].net_r = Some(1.9);
+        rows[1].mfe_r = Some(1.2);
+        rows[1].mae_r = Some(-0.2);
+        rows[1].net_r = Some(0.9);
+        rows[2].mfe_r = Some(0.8);
+        rows[2].mae_r = Some(-1.2);
+        rows[2].net_r = Some(-1.1);
+        rows[3].mfe_r = Some(0.5);
+        rows[3].mae_r = Some(-2.5);
+        rows[3].net_r = Some(-2.1);
+
+        let o = &aggregate_stats(&rows, GroupBy::ScoreBand).overall;
+        assert_eq!(o.avg_win_r, Some(1.5));
+        assert_eq!(o.avg_loss_r, Some(-1.5));
+        assert_eq!(o.payoff, Some(1.0));
+        assert_eq!(o.profit_factor, Some(1.0));
+        assert_eq!(o.r_ge1_rate, Some(0.5));
+        assert_eq!(o.r_ge2_rate, Some(0.25));
+        assert_eq!(o.mfe_ge1_rate, Some(0.5));
+        assert_eq!(o.avg_r_mfe_ge1, Some(1.5));
+        assert_eq!(o.mae_le_neg1_rate, Some(0.5));
+        assert_eq!(o.avg_r_mae_le_neg1, Some(-1.5));
+        assert!((o.avg_net_r.unwrap() + 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_zero_loss_denominators_stay_null() {
+        let rows = vec![
+            mk_stat(1, Some(Outcome::Win), Some(1.0)),
+            mk_stat(2, Some(Outcome::Win), Some(1.0)),
+        ];
+        let o = &aggregate_stats(&rows, GroupBy::ScoreBand).overall;
+        assert_eq!(o.avg_loss_r, None);
+        assert_eq!(o.payoff, None);
+        assert_eq!(o.profit_factor, None);
+        assert_eq!(o.mae_le_neg1_rate, Some(0.0));
+    }
+
+    #[test]
+    fn stats_target_hierarchy_conversion() {
+        let mut rows = vec![
+            mk_stat(1, Some(Outcome::Win), Some(1.6)),
+            mk_stat(2, Some(Outcome::Win), Some(1.0)),
+            mk_stat(3, Some(Outcome::Loss), Some(-1.0)),
+            mk_stat(4, Some(Outcome::Win), Some(1.0)),
+            mk_stat(5, Some(Outcome::Loss), Some(-1.0)),
+        ];
+        rows[0].extended_target = true;
+        rows[0].target_tier = Some("tp2".to_string());
+        rows[1].extended_target = true;
+        rows[1].target_tier = Some("tp1".to_string());
+        rows[2].extended_target = true;
+        rows[3].target_tier = Some("tp1".to_string());
+
+        let o = &aggregate_stats(&rows, GroupBy::ScoreBand).overall;
+        assert_eq!(o.ext_target_n, 3);
+        assert_eq!(o.tp1_exits, 2);
+        assert_eq!(o.tp2_exits, 1);
+        assert!((o.tp2_conversion.unwrap() - 1.0 / 3.0).abs() < 1e-9);
+        assert!((o.tp2_of_ext_rate.unwrap() - 1.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_new_dimension_bucket_order() {
+        let mut vol = (0..6)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in vol.iter_mut().zip([2.5, 1.5, 1.1, 0.9, 0.5, f64::NAN]) {
+            row.vol_ratio = if v.is_nan() { None } else { Some(v) };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&vol, GroupBy::VolRatioBand)),
+            vec!["≥2.0", "1.3-2.0", "1.0-1.3", "0.8-1.0", "<0.8", "数据缺失"]
+        );
+
+        let mut b_vol = (0..5)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in b_vol.iter_mut().zip([1.5, 1.1, 0.9, 0.5, f64::NAN]) {
+            row.b_vol_ratio = if v.is_nan() { None } else { Some(v) };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&b_vol, GroupBy::BVolRatioBand)),
+            vec!["≥1.3", "1.0-1.3", "0.8-1.0", "<0.8", "数据缺失"]
+        );
+
+        let mut retr = (0..6)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in retr.iter_mut().zip([0.7, 0.6, 0.4, 0.25, 0.1, f64::NAN]) {
+            row.retracement = if v.is_nan() { None } else { Some(v) };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&retr, GroupBy::RetracementBand)),
+            vec![">66%", "50-66%", "33-50%", "20-33%", "<20%", "数据缺失"]
+        );
+
+        let mut speed = (0..5)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in speed.iter_mut().zip([1.2, 1.0, 0.6, 0.3, f64::NAN]) {
+            row.a_move = Some(10.0);
+            row.a_bars = Some(5);
+            if v.is_nan() {
+                row.b_move = None;
+                row.b_bars = None;
+            } else {
+                row.b_move = Some(10.0 * v);
+                row.b_bars = Some(5);
+            }
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&speed, GroupBy::BaSpeedBand)),
+            vec!["≥1.2", "0.8-1.2", "0.5-0.8", "<0.5", "数据缺失"]
+        );
+
+        let mut strength = (0..5)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in strength.iter_mut().zip([12.0, 8.0, 4.0, 2.0, f64::NAN]) {
+            row.a_move_atr = if v.is_nan() { None } else { Some(v) };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&strength, GroupBy::AStrengthBand)),
+            vec!["≥10", "6-10", "3-6", "<3", "数据缺失"]
+        );
+
+        let mut lag = (0..5)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in lag.iter_mut().zip([1_i64, 3, 6, 10, i64::MIN]) {
+            row.trigger_lag_bars = if v == i64::MIN {
+                None
+            } else {
+                Some(v as usize)
+            };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&lag, GroupBy::TriggerLagBand)),
+            vec!["1", "2-3", "4-6", "7-12", "数据缺失"]
+        );
+
+        let mut overshoot = (0..5)
+            .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+            .collect::<Vec<_>>();
+        for (row, v) in overshoot.iter_mut().zip([0.8, 0.4, 0.2, 0.05, f64::NAN]) {
+            row.trigger_overshoot_r = if v.is_nan() { None } else { Some(v) };
+        }
+        assert_eq!(
+            group_keys(&aggregate_stats(&overshoot, GroupBy::OvershootBand)),
+            vec!["<0.1", "0.1-0.3", "0.3-0.6", "≥0.6", "数据缺失"]
+        );
+
+        let mut tier = vec![
+            mk_stat(1, Some(Outcome::Win), Some(1.0)),
+            mk_stat(2, Some(Outcome::Win), Some(1.0)),
+            mk_stat(3, Some(Outcome::Loss), Some(-1.0)),
+        ];
+        tier[0].target_tier = Some("tp2".to_string());
+        tier[1].target_tier = Some("tp1".to_string());
+        assert_eq!(
+            group_keys(&aggregate_stats(&tier, GroupBy::TpTier)),
+            vec!["TP2扩展止盈", "TP1止盈", "其他"]
+        );
+
+        let mut gap = vec![
+            mk_stat(1, Some(Outcome::Win), Some(1.0)),
+            mk_stat(2, Some(Outcome::Win), Some(1.0)),
+            mk_stat(3, Some(Outcome::Win), Some(1.0)),
+            mk_stat(4, Some(Outcome::Win), Some(1.0)),
+        ];
+        gap[0].gap_crossed_entry = true;
+        gap[0].gap_crossed_exit = true;
+        gap[1].gap_crossed_entry = true;
+        gap[2].gap_crossed_exit = true;
+        assert_eq!(
+            group_keys(&aggregate_stats(&gap, GroupBy::GapCombo)),
+            vec!["双跳空", "入场跳空", "出场跳空", "无跳空"]
+        );
+
+        let mut exit = vec![
+            mk_stat(1, Some(Outcome::Win), Some(1.0)),
+            mk_stat(2, Some(Outcome::Loss), Some(-1.0)),
+            mk_stat(3, Some(Outcome::Loss), Some(-0.5)),
+            mk_stat(4, Some(Outcome::Loss), Some(-0.2)),
+            mk_stat(5, Some(Outcome::Rollover), None),
+            mk_stat(6, Some(Outcome::Open), None),
+        ];
+        exit[0].exit_reason = Some(ExitReason::Target);
+        exit[1].exit_reason = Some(ExitReason::Stop);
+        exit[2].exit_reason = Some(ExitReason::NoFollow);
+        exit[3].exit_reason = Some(ExitReason::TimeExit);
+        exit[4].exit_reason = Some(ExitReason::Rollover);
+        exit[5].exit_reason = Some(ExitReason::None);
+        assert_eq!(
+            group_keys(&aggregate_stats(&exit, GroupBy::ExitReason)),
+            vec!["止盈", "止损", "无跟随", "时间退出", "换月", "其他"]
+        );
+
+        for (gb, idx) in [
+            (GroupBy::DimTrend, 0usize),
+            (GroupBy::DimALeg, 1),
+            (GroupBy::DimBLeg, 2),
+            (GroupBy::DimTrigger, 3),
+            (GroupBy::DimRr, 4),
+            (GroupBy::DimMomentum, 5),
+        ] {
+            let mut rows = (0..3)
+                .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
+                .collect::<Vec<_>>();
+            for (row, v) in rows.iter_mut().zip([3.6, 2.5, 1.0]) {
+                let mut dims = [0.0; 6];
+                dims[idx] = v;
+                row.dims = Some(dims);
+            }
+            assert_eq!(
+                group_keys(&aggregate_stats(&rows, gb)),
+                vec!["≥3.5", "2.0-3.5", "<2.0"]
+            );
+        }
     }
 
     #[test]
@@ -1600,11 +2499,27 @@ mod tests {
             s2_ts: Some(format!("2026-08-03 09:{id:02}")),
             outcome: Some(outcome),
             r_multiple: Some(r),
+            mfe_r: Some(1.5),
+            mae_r: Some(-1.0),
             bars_held: Some(3),
             vol_ratio: Some(1.0),
             oi_increase: Some(false),
             trend60_score: Some(2.0),
             atr_percentile: Some(0.4),
+            exit_reason: None,
+            target_tier: None,
+            extended_target: false,
+            b_vol_ratio: None,
+            a_move_atr: None,
+            trigger_lag_bars: None,
+            trigger_overshoot_r: None,
+            a_move: None,
+            b_move: None,
+            a_bars: None,
+            b_bars: None,
+            retracement: None,
+            dims: None,
+            net_r: None,
             rollover_crossed: false,
             gap_crossed_entry: false,
             gap_crossed_exit: false,

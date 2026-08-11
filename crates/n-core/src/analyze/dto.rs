@@ -44,6 +44,9 @@ pub struct PatternDto {
     pub vol_ratio: Option<f64>,
     #[serde(default)]
     pub vol_confirmed: bool,
+    /// 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值
+    #[serde(default)]
+    pub trigger_overshoot_r: Option<f64>,
     pub note: String,
     pub active: bool,
 }
@@ -51,9 +54,19 @@ pub struct PatternDto {
 impl PatternDto {
     pub fn from_parts(bars: &[Bar], number: usize, p: &NPattern, sc: &SignalCheck) -> Self {
         let ts = |i: usize| bars.get(i).map(|b| b.dt.to_string()).unwrap_or_default();
-        let (vol_ratio, vol_confirmed) = match sc.trigger {
-            Some(ec) => (vol_ratio_at(bars, ec), ec + 1 < bars.len()),
-            None => (None, false),
+        let (vol_ratio, vol_confirmed, trigger_overshoot_r) = match sc.trigger {
+            Some(ec) => {
+                let overshoot = if sc.risk > 0.0 {
+                    bars.get(ec).map(|b| match p.dir {
+                        Dir::Up => (b.high - sc.entry) / sc.risk,
+                        Dir::Down => (sc.entry - b.low) / sc.risk,
+                    })
+                } else {
+                    None
+                };
+                (vol_ratio_at(bars, ec), ec + 1 < bars.len(), overshoot)
+            }
+            None => (None, false, None),
         };
         Self {
             number,
@@ -101,6 +114,7 @@ impl PatternDto {
             trigger_ts: sc.trigger.map(ts),
             vol_ratio,
             vol_confirmed,
+            trigger_overshoot_r,
             note: sc.note.clone(),
             active: report::is_active_signal(sc),
         }
@@ -167,5 +181,121 @@ pub fn build_detail(
             .map(|(number, p, sc)| PatternDto::from_parts(bars15, *number, p, sc))
             .collect(),
         full_report: full_report.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyze::model::{Grade, Swing, DT};
+
+    fn bar(dt: DT, high: f64, low: f64) -> Bar {
+        Bar {
+            dt,
+            open: 100.0,
+            high,
+            low,
+            close: 100.0,
+            volume: 100.0,
+            hold: 0.0,
+            rollover: false,
+        }
+    }
+
+    fn pattern(dir: Dir) -> NPattern {
+        NPattern {
+            level: "fine",
+            dir,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 1,
+                price: 101.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 100.0,
+                is_high: false,
+            },
+            a_bars: 2,
+            b_bars: 2,
+            a_move: 1.0,
+            b_move: 1.0,
+            retracement: 0.5,
+            grade: Grade::A,
+            hard_failure: false,
+            a_too_long: false,
+            b_too_long: false,
+            b_fast: true,
+            a_strong_trend: 1,
+            b_strong_reverse: 0,
+            c_move: 0.0,
+            c_bars: 0,
+            c_extended: false,
+            c_hard_failure: false,
+        }
+    }
+
+    #[test]
+    fn pattern_dto_exposes_trigger_overshoot_and_confirmation() {
+        let bars = vec![
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 0,
+                },
+                100.0,
+                100.0,
+            ),
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 15,
+                },
+                101.0,
+                99.0,
+            ),
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 30,
+                },
+                100.0,
+                100.0,
+            ),
+        ];
+
+        let mut sc = SignalCheck::new();
+        sc.warning = Some(0);
+        sc.trigger = Some(1);
+        sc.entry = 100.0;
+        sc.risk = 2.0;
+        sc.stop = 99.0;
+        sc.decision_target = 102.0;
+        sc.space = 2.0;
+        sc.rr = 1.0;
+        sc.total = 3.5;
+        sc.state = "当前已触发";
+        sc.category = "fine";
+
+        let up = PatternDto::from_parts(&bars, 1, &pattern(Dir::Up), &sc);
+        assert_eq!(up.trigger_overshoot_r, Some(0.5));
+        assert!(up.vol_confirmed);
+
+        let down = PatternDto::from_parts(&bars, 1, &pattern(Dir::Down), &sc);
+        assert_eq!(down.trigger_overshoot_r, Some(0.5));
     }
 }

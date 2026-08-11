@@ -80,6 +80,8 @@ export interface PatternDto {
   vol_ratio: number | null
   /** 触发bar之后还有K线，量能已走完可确认 */
   vol_confirmed: boolean
+  /** 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值 */
+  trigger_overshoot_r?: number | null
   note: string
   active: boolean
 }
@@ -133,6 +135,8 @@ export interface SignalOutcome {
   vol_ratio: number | null
   /** 触发bar之后还有K线，量能已走完可确认 */
   vol_confirmed: boolean
+  /** 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值 */
+  trigger_overshoot_r?: number | null
   note: string
   active: boolean
 }
@@ -302,6 +306,22 @@ export interface GroupStat {
   win_rate: number | null
   avg_r: number | null
   avg_bars: number | null
+  avg_win_r: number | null
+  avg_loss_r: number | null
+  payoff: number | null
+  profit_factor: number | null
+  r_ge1_rate: number | null
+  r_ge2_rate: number | null
+  mfe_ge1_rate: number | null
+  mae_le_neg1_rate: number | null
+  avg_r_mfe_ge1: number | null
+  avg_r_mae_le_neg1: number | null
+  avg_net_r: number | null
+  ext_target_n: number
+  tp1_exits: number
+  tp2_exits: number
+  tp2_conversion: number | null
+  tp2_of_ext_rate: number | null
 }
 
 export interface ReviewStats {
@@ -336,6 +356,16 @@ export interface OutcomeDetail {
   vol_ratio: number | null
   oi_increase: boolean | null
   trend60_score: number | null
+  target_tier: string | null
+  b_vol_ratio: number | null
+  a_move: number | null
+  b_move: number | null
+  a_bars: number | null
+  b_bars: number | null
+  a_move_atr: number | null
+  trigger_lag_bars: number | null
+  trigger_overshoot_r: number | null
+  net_r: number | null
   /** 模拟窗口内跨过连续合约换月 */
   rollover_crossed: boolean
   /** 入场价被跳空穿越，按当前 bar open 成交 */
@@ -373,9 +403,6 @@ export interface RecentOutcomeFilters {
   scoreMin?: number | null
   scoreMax?: number | null
 }
-
-export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
-export type Timeframe = (typeof TIMEFRAMES)[number]
 
 export type NotifyKind = 'success' | 'info' | 'warning' | 'error'
 
@@ -417,4 +444,7 @@ export interface NotificationHistoryItem {
   signal?: NotificationSignal | null
   entry_trigger?: NotificationEntryTrigger | null
 }
+
+export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
+export type Timeframe = (typeof TIMEFRAMES)[number]
 

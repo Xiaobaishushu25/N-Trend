@@ -84,6 +84,12 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     ensure_column(db, "signal_outcomes", "gap_crossed_exit", "INTEGER").await?;
     // ATR 分位：触发 bar 的 ATR20 在近 60 根 15m bar 中的相对位置
     ensure_column(db, "signal_outcomes", "atr_percentile", "REAL").await?;
+    // 复盘诊断字段：止盈层级、b段缩量、a段强度、预警延迟、追价深度
+    ensure_column(db, "signal_outcomes", "target_tier", "TEXT").await?;
+    ensure_column(db, "signal_outcomes", "b_vol_ratio", "REAL").await?;
+    ensure_column(db, "signal_outcomes", "a_move_atr", "REAL").await?;
+    ensure_column(db, "signal_outcomes", "trigger_lag_bars", "INTEGER").await?;
+    ensure_column(db, "signal_outcomes", "trigger_overshoot_r", "REAL").await?;
     info!("数据库表结构已就绪");
     Ok(())
 }
@@ -120,4 +126,36 @@ async fn ensure_column(
         .context("回填 symbols.sort_index 失败")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migrate_is_idempotent_and_has_diagnostic_columns() {
+        let db = SeaDatabase::connect("sqlite::memory:").await.unwrap();
+        migrate(&db).await.unwrap();
+        migrate(&db).await.unwrap();
+
+        let backend = DbBackend::Sqlite;
+        for column in [
+            "target_tier",
+            "b_vol_ratio",
+            "a_move_atr",
+            "trigger_lag_bars",
+            "trigger_overshoot_r",
+        ] {
+            let found = db
+                .query_one(Statement::from_string(
+                    backend,
+                    format!(
+                        "SELECT 1 AS x FROM pragma_table_info('signal_outcomes') WHERE name = '{column}'"
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert!(found.is_some(), "signal_outcomes.{column} 应已迁移");
+        }
+    }
 }

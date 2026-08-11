@@ -665,7 +665,7 @@ function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 
   return 'default'
 }
 
-const VOL_CONFIRM_RATIO = 1.3
+const VOL_CONFIRM_RATIO = 2.0
 
 function volStatusText(s: PatternDto): string {
   if (!s.vol_confirmed) return '量能待收盘'
@@ -677,6 +677,18 @@ function volStatusClass(s: PatternDto): 'pending' | 'missing' | 'confirmed' | 'p
   if (!s.vol_confirmed) return 'pending'
   if (s.vol_ratio == null) return 'missing'
   return s.vol_ratio >= VOL_CONFIRM_RATIO ? 'confirmed' : 'plain'
+}
+
+function overshootStatusText(s: PatternDto): string {
+  if (!s.vol_confirmed) return '待收盘'
+  if (s.trigger_overshoot_r == null) return '数据缺失'
+  return '已确认'
+}
+
+function overshootStatusClass(s: PatternDto): 'pending' | 'missing' | 'done' {
+  if (!s.vol_confirmed) return 'pending'
+  if (s.trigger_overshoot_r == null) return 'missing'
+  return 'done'
 }
 
 /** 与入场的点差绝对值（单位：点），不区分多空方向 */
@@ -1019,6 +1031,12 @@ onBeforeUnmount(() => {
                   <span>触发量能</span>
                   <b v-if="s.vol_ratio != null">{{ s.vol_ratio.toFixed(2) }}×</b>
                   <em>{{ volStatusText(s) }}</em>
+                </div>
+
+                <div v-if="s.trigger_ts" class="pc-vol pc-overshoot" :class="overshootStatusClass(s)">
+                  <span>追价深度</span>
+                  <b v-if="s.trigger_overshoot_r != null">{{ s.trigger_overshoot_r.toFixed(2) }}R</b>
+                  <em>{{ overshootStatusText(s) }}</em>
                 </div>
 
                 <div v-if="patternHistory.get(historyKey(s))?.length" class="pc-history">
@@ -1679,6 +1697,12 @@ onBeforeUnmount(() => {
 }
 .pc-vol.missing em {
   color: #94a3b8;
+}
+.pc-overshoot {
+  margin-top: 4px;
+}
+.pc-vol.done em {
+  color: #1677ff;
 }
 .pc-history {
   margin-top: 8px;

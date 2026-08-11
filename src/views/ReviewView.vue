@@ -115,6 +115,103 @@ const groupColumns: DataTableColumns<GroupStat> = [
     align: 'right',
     render: (r) => (r.avg_bars == null ? '—' : r.avg_bars.toFixed(1)),
   },
+  {
+    title: '均盈R',
+    key: 'avg_win_r',
+    width: 90,
+    align: 'right',
+    render: (r) => (r.avg_win_r == null ? '—' : fmtR(r.avg_win_r)),
+  },
+  {
+    title: '均亏R',
+    key: 'avg_loss_r',
+    width: 90,
+    align: 'right',
+    render: (r) => (r.avg_loss_r == null ? '—' : fmtR(r.avg_loss_r)),
+  },
+  {
+    title: '盈亏比',
+    key: 'payoff',
+    width: 80,
+    align: 'right',
+    render: (r) => (r.payoff == null ? '—' : r.payoff.toFixed(2)),
+  },
+  {
+    title: '盈利因子',
+    key: 'profit_factor',
+    width: 90,
+    align: 'right',
+    render: (r) => (r.profit_factor == null ? '—' : r.profit_factor.toFixed(2)),
+  },
+  {
+    title: 'R≥1',
+    key: 'r_ge1_rate',
+    width: 80,
+    align: 'right',
+    render: (r) => fmtPct(r.r_ge1_rate),
+  },
+  {
+    title: 'R≥2',
+    key: 'r_ge2_rate',
+    width: 80,
+    align: 'right',
+    render: (r) => fmtPct(r.r_ge2_rate),
+  },
+  {
+    title: 'MFE≥1',
+    key: 'mfe_ge1_rate',
+    width: 90,
+    align: 'right',
+    render: (r) => fmtPct(r.mfe_ge1_rate),
+  },
+  {
+    title: 'MAE≤-1',
+    key: 'mae_le_neg1_rate',
+    width: 90,
+    align: 'right',
+    render: (r) => fmtPct(r.mae_le_neg1_rate),
+  },
+  {
+    title: '均R(MFE≥1)',
+    key: 'avg_r_mfe_ge1',
+    width: 110,
+    align: 'right',
+    render: (r) => (r.avg_r_mfe_ge1 == null ? '—' : fmtR(r.avg_r_mfe_ge1)),
+  },
+  {
+    title: '均R(MAE≤-1)',
+    key: 'avg_r_mae_le_neg1',
+    width: 115,
+    align: 'right',
+    render: (r) => (r.avg_r_mae_le_neg1 == null ? '—' : fmtR(r.avg_r_mae_le_neg1)),
+  },
+  {
+    title: '净R',
+    key: 'avg_net_r',
+    width: 90,
+    align: 'right',
+    render: (r) => {
+      if (r.avg_net_r == null) return '—'
+      return h('span', { style: `color:${rColor(r.avg_net_r)};font-weight:600` }, fmtR(r.avg_net_r))
+    },
+  },
+  { title: '扩展目标', key: 'ext_target_n', width: 90, align: 'right' },
+  { title: 'TP1', key: 'tp1_exits', width: 70, align: 'right' },
+  { title: 'TP2', key: 'tp2_exits', width: 70, align: 'right' },
+  {
+    title: 'TP2转化',
+    key: 'tp2_conversion',
+    width: 90,
+    align: 'right',
+    render: (r) => fmtPct(r.tp2_conversion),
+  },
+  {
+    title: 'TP2/扩展止盈',
+    key: 'tp2_of_ext_rate',
+    width: 110,
+    align: 'right',
+    render: (r) => fmtPct(r.tp2_of_ext_rate),
+  },
   { title: '在途', key: 'pending', width: 70, align: 'right' },
   { title: '未触发', key: 'no_trigger', width: 80, align: 'right' },
   { title: '换月', key: 'rollover', width: 70, align: 'right' },
@@ -225,6 +322,69 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
     width: 80,
     align: 'right',
     render: (r) => (r.trend60_score == null ? '—' : r.trend60_score.toFixed(2)),
+  },
+  {
+    title: '止盈层级',
+    key: 'target_tier',
+    width: 90,
+    render: (r) => (r.target_tier === 'tp2' ? 'TP2扩展' : r.target_tier === 'tp1' ? 'TP1' : '—'),
+  },
+  {
+    title: 'b/a量比',
+    key: 'b_vol_ratio',
+    width: 90,
+    align: 'right',
+    render: (r) => (r.b_vol_ratio == null ? '—' : r.b_vol_ratio.toFixed(2)),
+  },
+  {
+    title: 'b/a速度',
+    key: 'speed_ratio',
+    width: 90,
+    align: 'right',
+    render: (r) =>
+      r.a_move == null || r.b_move == null || r.a_move === 0
+        ? '—'
+        : (r.b_move / r.a_move).toFixed(2),
+  },
+  {
+    title: '根数比',
+    key: 'bar_ratio',
+    width: 80,
+    align: 'right',
+    render: (r) =>
+      r.a_bars == null || r.b_bars == null || r.a_bars === 0
+        ? '—'
+        : (r.b_bars / r.a_bars).toFixed(2),
+  },
+  {
+    title: '触发延迟',
+    key: 'trigger_lag_bars',
+    width: 90,
+    render: (r) => (r.trigger_lag_bars == null ? '—' : `${r.trigger_lag_bars}根`),
+  },
+  {
+    title: '追价深度',
+    key: 'trigger_overshoot_r',
+    width: 100,
+    align: 'right',
+    render: (r) => (r.trigger_overshoot_r == null ? '—' : `${r.trigger_overshoot_r.toFixed(2)}R`),
+  },
+  {
+    title: 'a段强度',
+    key: 'a_move_atr',
+    width: 100,
+    align: 'right',
+    render: (r) => (r.a_move_atr == null ? '—' : `${r.a_move_atr.toFixed(1)}×ATR`),
+  },
+  {
+    title: '净R',
+    key: 'net_r',
+    width: 90,
+    align: 'right',
+    render: (r) => {
+      if (r.net_r == null) return '—'
+      return h('span', { style: `color:${rColor(r.net_r)};font-weight:600` }, fmtR(r.net_r))
+    },
   },
 ]
 
@@ -365,7 +525,7 @@ onBeforeUnmount(() => {
             v-model:value="review.dimension"
             :options="REVIEW_DIMENSIONS.map((d) => ({ label: d.label, value: d.key }))"
             size="small"
-            style="width: 150px"
+            style="width: 170px"
             @update:value="() => load()"
           />
           <n-button size="small" type="primary" :loading="review.refreshing" @click="refresh">
@@ -375,7 +535,7 @@ onBeforeUnmount(() => {
       </n-space>
       <n-text v-if="error" type="error" style="display: block; margin-top: 8px">{{ error }}</n-text>
       <n-text depth="3" style="display: block; font-size: 12px; margin-top: 8px">
-        止盈口径：第一目标 1R；目标位R&gt;1 时第二目标=0.8×目标R（不低于1R），触及第二目标或从1R回落则止盈；目标位R≤1 时达到 1R 才止盈。同一结构跨扫描只保留首条；未触发不计胜率；同根K线双触按止损；不含手续费/滑点。
+        止盈口径：第一目标 1R；目标位R&gt;1 时第二目标=0.8×目标R（不低于1R），触及第二目标或从1R回落则止盈；目标位R≤1 时达到 1R 才止盈。同一结构跨扫描只保留首条；未触发不计胜率；同根K线双触按止损；不含手续费/滑点，另有净R估算（固定 2.5 tick/往返）。
       </n-text>
     </n-card>
 
@@ -435,6 +595,7 @@ onBeforeUnmount(() => {
           :bordered="false"
           :loading="loading"
           max-height="240"
+          :scroll-x="2100"
         />
         <n-empty
           v-if="!loading && !review.stats?.groups.length"
@@ -512,7 +673,7 @@ onBeforeUnmount(() => {
           :row-props="rowProps"
           size="small"
           :bordered="false"
-          :scroll-x="1500"
+          :scroll-x="2900"
           flex-height
           :loading="loading || review.recentLoading"
         />

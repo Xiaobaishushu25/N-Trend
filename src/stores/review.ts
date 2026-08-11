@@ -15,6 +15,22 @@ export const REVIEW_DIMENSIONS = [
   { key: 'symbol_hour', label: '品种×小时' },
   { key: 'score_vol', label: '评分×量能' },
   { key: 'hour_atr', label: '小时×波动' },
+  { key: 'exit_reason', label: '出场原因' },
+  { key: 'vol_band', label: '放量分桶' },
+  { key: 'b_vol', label: 'b段缩量' },
+  { key: 'retracement', label: '回撤率' },
+  { key: 'b_a_speed', label: 'b/a速度比' },
+  { key: 'a_strength', label: 'a段强度' },
+  { key: 'trigger_lag', label: '预警延迟' },
+  { key: 'overshoot', label: '追价深度' },
+  { key: 'tp_tier', label: '止盈层级' },
+  { key: 'gap_combo', label: '跳空成交' },
+  { key: 'dim_trend', label: '评分·趋势' },
+  { key: 'dim_a', label: '评分·A腿' },
+  { key: 'dim_b', label: '评分·B腿' },
+  { key: 'dim_trigger', label: '评分·触发' },
+  { key: 'dim_rr', label: '评分·盈亏比' },
+  { key: 'dim_momentum', label: '评分·动量' },
 ] as const
 
 export const REVIEW_STATS_SCOPES = [
@@ -87,7 +103,7 @@ export const useReviewStore = defineStore('review', {
       }
       await this.loadRecent()
     },
-    /** 先回填未终结信号的结局，再重新拉取统计 */
+    /** 先回填未终结信号的结果，再重新拉取统计 */
     async refresh() {
       this.refreshing = true
       try {

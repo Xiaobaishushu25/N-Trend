@@ -73,6 +73,23 @@ pub struct OutcomeDetail {
     pub vol_ratio: Option<f64>,
     pub oi_increase: Option<bool>,
     pub trend60_score: Option<f64>,
+    /// 止盈层级：tp1 / tp2
+    pub target_tier: Option<String>,
+    /// b段均量 / a段均量（15m）
+    pub b_vol_ratio: Option<f64>,
+    /// 结构快照：a/b 段幅度与根数（明细表展示 b/a 速度比与根数比）
+    pub a_move: Option<f64>,
+    pub b_move: Option<f64>,
+    pub a_bars: Option<usize>,
+    pub b_bars: Option<usize>,
+    /// a_move / 触发bar ATR20
+    pub a_move_atr: Option<f64>,
+    /// 预警K线到触发K线的根数差
+    pub trigger_lag_bars: Option<i64>,
+    /// 触发K线超出入场价的深度（按R归一化）
+    pub trigger_overshoot_r: Option<f64>,
+    /// 净R估算：R - 2.5 × tick / risk（固定往返成本）
+    pub net_r: Option<f64>,
     /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
     pub rollover_crossed: bool,
     /// 入场价被跳空穿越
@@ -163,8 +180,12 @@ fn parse_detail_ts(detail: &str) -> (Option<String>, Option<String>, Option<Stri
     (get(&["warning_ts"]), get(&["s1", "ts"]), get(&["s2", "ts"]))
 }
 
+fn parse_detail(detail: &str) -> Option<crate::analyze::dto::PatternDto> {
+    serde_json::from_str(detail).ok()
+}
+
 fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
-    let (warning_ts, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+    let p = parse_detail(&s.detail);
     Some(outcome::SignalInput {
         symbol: s.symbol.clone(),
         direction: s.direction.clone(),
@@ -174,9 +195,11 @@ fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
         target: s.target,
         risk: (s.entry - s.stop).abs(),
         created_at: s.created_at.clone(),
-        warning_ts,
-        s1_ts,
-        s2_ts,
+        warning_ts: p.as_ref().and_then(|p| p.warning_ts.clone()),
+        s0_ts: p.as_ref().map(|p| p.s0.ts.clone()),
+        s1_ts: p.as_ref().map(|p| p.s1.ts.clone()),
+        s2_ts: p.as_ref().map(|p| p.s2.ts.clone()),
+        a_move: p.as_ref().map(|p| p.a_move),
     })
 }
 
@@ -199,8 +222,10 @@ fn needs_outcome_refresh(
 fn stat_row_from(
     s: &signals::Model,
     o: Option<&signal_outcomes::Model>,
+    tick: Option<f64>,
 ) -> Option<outcome::StatRow> {
-    let (warning_ts, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+    let p = parse_detail(&s.detail);
+    let risk = (s.entry - s.stop).abs();
     Some(outcome::StatRow {
         signal_id: s.id,
         symbol: s.symbol.clone(),
@@ -209,23 +234,49 @@ fn stat_row_from(
         grade: s.grade.clone(),
         score: s.score,
         created_at: s.created_at.clone(),
-        warning_ts,
-        s1_ts,
-        s2_ts,
+        warning_ts: p.as_ref().and_then(|p| p.warning_ts.clone()),
+        s1_ts: p.as_ref().map(|p| p.s1.ts.clone()),
+        s2_ts: p.as_ref().map(|p| p.s2.ts.clone()),
         outcome: o.and_then(|x| outcome::Outcome::parse(&x.outcome)),
         r_multiple: o.and_then(|x| x.r_multiple),
+        mfe_r: o.and_then(|x| x.mfe_r),
+        mae_r: o.and_then(|x| x.mae_r),
         bars_held: o.and_then(|x| x.bars_held.map(|b| b as usize)),
         vol_ratio: o.and_then(|x| x.vol_ratio),
         oi_increase: o.and_then(|x| x.oi_increase),
         trend60_score: o.and_then(|x| x.trend60_score),
         atr_percentile: o.and_then(|x| x.atr_percentile),
+        exit_reason: o.map(|x| outcome::ExitReason::parse(&x.exit_reason)),
+        target_tier: o.and_then(|x| x.target_tier.clone()),
+        extended_target: s.rr > 1.0,
+        b_vol_ratio: o.and_then(|x| x.b_vol_ratio),
+        a_move_atr: o.and_then(|x| x.a_move_atr),
+        trigger_lag_bars: o.and_then(|x| x.trigger_lag_bars.map(|b| b as usize)),
+        trigger_overshoot_r: o.and_then(|x| x.trigger_overshoot_r),
+        a_move: p.as_ref().map(|p| p.a_move),
+        b_move: p.as_ref().map(|p| p.b_move),
+        a_bars: p.as_ref().map(|p| p.a_bars),
+        b_bars: p.as_ref().map(|p| p.b_bars),
+        retracement: p.as_ref().map(|p| p.retracement),
+        dims: p.as_ref().map(|p| p.dims),
+        net_r: o
+            .and_then(|x| x.r_multiple)
+            .zip(tick)
+            .filter(|_| risk > 0.0)
+            .map(|(r, t)| r - 2.5 * t / risk),
         rollover_crossed: o.is_some_and(|x| x.rollover_crossed.unwrap_or(false)),
         gap_crossed_entry: o.is_some_and(|x| x.gap_crossed_entry.unwrap_or(false)),
         gap_crossed_exit: o.is_some_and(|x| x.gap_crossed_exit.unwrap_or(false)),
     })
 }
 
-fn outcome_detail_from(s: &signals::Model, o: &signal_outcomes::Model) -> OutcomeDetail {
+fn outcome_detail_from(
+    s: &signals::Model,
+    o: &signal_outcomes::Model,
+    tick: Option<f64>,
+) -> OutcomeDetail {
+    let risk = (s.entry - s.stop).abs();
+    let p = parse_detail(&s.detail);
     OutcomeDetail {
         signal_id: s.id,
         symbol: s.symbol.clone(),
@@ -250,6 +301,20 @@ fn outcome_detail_from(s: &signals::Model, o: &signal_outcomes::Model) -> Outcom
         vol_ratio: o.vol_ratio,
         oi_increase: o.oi_increase,
         trend60_score: o.trend60_score,
+        target_tier: o.target_tier.clone(),
+        b_vol_ratio: o.b_vol_ratio,
+        a_move: p.as_ref().map(|p| p.a_move),
+        b_move: p.as_ref().map(|p| p.b_move),
+        a_bars: p.as_ref().map(|p| p.a_bars),
+        b_bars: p.as_ref().map(|p| p.b_bars),
+        a_move_atr: o.a_move_atr,
+        trigger_lag_bars: o.trigger_lag_bars,
+        trigger_overshoot_r: o.trigger_overshoot_r,
+        net_r: o
+            .r_multiple
+            .zip(tick)
+            .filter(|_| risk > 0.0)
+            .map(|(r, t)| r - 2.5 * t / risk),
         rollover_crossed: o.rollover_crossed.unwrap_or(false),
         gap_crossed_entry: o.gap_crossed_entry.unwrap_or(false),
         gap_crossed_exit: o.gap_crossed_exit.unwrap_or(false),
@@ -1117,6 +1182,11 @@ impl Services {
                 oi_increase: Set(ann.oi_increase),
                 trend60_score: Set(ann.trend60_score),
                 atr_percentile: Set(ann.atr_percentile),
+                target_tier: Set(ann.target_tier),
+                b_vol_ratio: Set(ann.b_vol_ratio),
+                a_move_atr: Set(ann.a_move_atr),
+                trigger_lag_bars: Set(ann.trigger_lag_bars.map(|b| b as i64)),
+                trigger_overshoot_r: Set(ann.trigger_overshoot_r),
                 rollover_crossed: Set(Some(ann.rollover_crossed)),
                 gap_crossed_entry: Set(Some(ann.gap_crossed_entry)),
                 gap_crossed_exit: Set(Some(ann.gap_crossed_exit)),
@@ -1136,9 +1206,21 @@ impl Services {
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> =
             outs.into_iter().map(|o| (o.signal_id, o)).collect();
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let tick_by_symbol: HashMap<String, f64> = symbols
+            .iter()
+            .map(|sym| {
+                (
+                    sym.code.clone(),
+                    crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety),
+                )
+            })
+            .collect();
         let rows: Vec<outcome::StatRow> = sigs
             .iter()
-            .filter_map(|s| stat_row_from(s, by_id.get(&s.id)))
+            .filter_map(|s| {
+                stat_row_from(s, by_id.get(&s.id), tick_by_symbol.get(&s.symbol).copied())
+            })
             .collect();
         Ok(outcome::aggregate_stats_scoped(
             &rows,
@@ -1157,6 +1239,16 @@ impl Services {
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> =
             outs.into_iter().map(|o| (o.signal_id, o)).collect();
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let tick_by_symbol: HashMap<String, f64> = symbols
+            .iter()
+            .map(|sym| {
+                (
+                    sym.code.clone(),
+                    crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety),
+                )
+            })
+            .collect();
         // 与统计口径一致：同一结构（品种+方向+级别+s1/s2 时间）只保留首次识别的快照
         let mut seen: HashSet<String> = HashSet::new();
         let mut rows: Vec<OutcomeDetail> = Vec::new();
@@ -1178,7 +1270,11 @@ impl Services {
             if !matches_outcome_filter(s, o, filter) {
                 continue;
             }
-            rows.push(outcome_detail_from(s, o));
+            rows.push(outcome_detail_from(
+                s,
+                o,
+                tick_by_symbol.get(&s.symbol).copied(),
+            ));
         }
         rows.sort_by(|a, b| b.signal_id.cmp(&a.signal_id));
         rows.truncate(limit);
@@ -1194,8 +1290,13 @@ impl Services {
         else {
             return Ok(None);
         };
+        let symbols = repo::list_symbols(&self.db, false).await?;
+        let tick = symbols.iter().find_map(|sym| {
+            (sym.code == row.symbol)
+                .then(|| crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety))
+        });
         let outcome = match repo::outcome_by_signal(&self.db, signal_id).await? {
-            Some(o) => Some(outcome_detail_from(&row, &o)),
+            Some(o) => Some(outcome_detail_from(&row, &o, tick)),
             None => None,
         };
         Ok(Some(ReviewSignalDetail { pattern, outcome }))
@@ -1582,6 +1683,13 @@ mod tests {
         let open = outcome_model("open", outcome::SIM_VERSION, "2026-08-10 02:05:00");
         assert!(needs_outcome_refresh(Some(&open), None));
     }
+
+    #[test]
+    fn sim_version_8_recomputes_legacy_outcomes() {
+        assert_eq!(outcome::SIM_VERSION, 8);
+        let legacy = outcome_model("win", 7, "2026-08-10 02:05:00");
+        assert!(needs_outcome_refresh(Some(&legacy), None));
+    }
 }
 
 #[cfg(test)]
@@ -1632,6 +1740,11 @@ fn outcome_model(outcome: &str, sim_version: i64, updated_at: &str) -> signal_ou
         oi_increase: None,
         trend60_score: None,
         atr_percentile: None,
+        target_tier: None,
+        b_vol_ratio: None,
+        a_move_atr: None,
+        trigger_lag_bars: None,
+        trigger_overshoot_r: None,
         rollover_crossed: Some(false),
         gap_crossed_entry: Some(false),
         gap_crossed_exit: Some(false),
