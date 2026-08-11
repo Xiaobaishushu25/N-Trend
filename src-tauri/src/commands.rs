@@ -10,7 +10,7 @@ use n_core::storage::entities::{groups, scans, signals, symbols};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
-use crate::state::AppState;
+use crate::state::{AppState, NewNotificationHistoryItem, NotificationHistoryItem};
 use crate::AppInfo;
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +26,25 @@ pub async fn app_info() -> AppInfo {
         name: "ntrend".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
+}
+
+#[tauri::command]
+pub async fn record_notification(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    item: NewNotificationHistoryItem,
+) -> Result<Vec<NotificationHistoryItem>, String> {
+    state.record_notification(item);
+    let history = state.notification_history();
+    let _ = app.emit("notification-history-updated", &history);
+    Ok(history)
+}
+
+#[tauri::command]
+pub async fn get_notification_history(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<NotificationHistoryItem>, String> {
+    Ok(state.notification_history())
 }
 
 #[tauri::command]

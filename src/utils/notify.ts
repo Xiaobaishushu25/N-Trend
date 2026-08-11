@@ -4,6 +4,7 @@
 import { createApp, reactive } from 'vue'
 import AppNotificationHost from '../components/AppNotificationHost.vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
+import { api } from '../services/api'
 
 export type NotifyType = 'success' | 'info' | 'warning' | 'error'
 
@@ -108,6 +109,19 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
   }
   notifyItems.push(item)
   schedule(item)
+  if (isMainWindow()) {
+    void api.recordNotification({
+      kind: type,
+      title: item.title ?? null,
+      content: item.content,
+      signal: item.signal
+        ? { ...item.signal, time: item.signal.time ?? null }
+        : null,
+      entry_trigger: item.entryTrigger ?? null,
+    }).catch(() => {
+      // 浏览器预览或后端未包含新命令时，历史功能静默降级
+    })
+  }
   return item.id
 }
 
@@ -118,6 +132,13 @@ export function dismiss(id: number) {
   timers.delete(id)
   const idx = notifyItems.findIndex((i) => i.id === id)
   if (idx >= 0) notifyItems.splice(idx, 1)
+}
+
+/** 一键清空当前所有应用内通知 */
+export function dismissAll() {
+  for (const timer of timers.values()) clearTimeout(timer)
+  timers.clear()
+  notifyItems.splice(0, notifyItems.length)
 }
 
 /** 悬停暂停：记住剩余时长并取消定时器 */

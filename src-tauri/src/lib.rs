@@ -125,6 +125,8 @@ pub fn run() {
                     refresh_anchor: last_refresh,
                     scan_anchor: last_scan,
                 }),
+                notification_history: std::sync::Mutex::new(Vec::new()),
+                next_notification_id: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
             // 后台补齐品种名称：不阻塞启动，完成后通知前端刷新；成功后打标记避免每次启动重复联网
@@ -219,6 +221,8 @@ pub fn run() {
             commands::scheduler_status,
             commands::set_scheduler_running,
             commands::app_info,
+            commands::record_notification,
+            commands::get_notification_history,
         ])
         .run(tauri::generate_context!())
         .expect("运行 N趋势 失败");

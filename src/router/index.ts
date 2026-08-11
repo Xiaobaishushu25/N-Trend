@@ -1,6 +1,7 @@
 ﻿import { createRouter, createWebHashHistory } from 'vue-router'
 import DashboardView from '../views/DashboardView.vue'
 import ChartView from '../views/ChartView.vue'
+import NotificationsView from '../views/NotificationsView.vue'
 import ReviewView from '../views/ReviewView.vue'
 import SettingsView from '../views/SettingsView.vue'
 
@@ -24,6 +25,12 @@ export default createRouter({
       path: '/review',
       name: 'review',
       component: ReviewView,
+      meta: { bare: true },
+    },
+    {
+      path: '/notifications',
+      name: 'notifications',
+      component: NotificationsView,
       meta: { bare: true },
     },
   ],

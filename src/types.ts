@@ -377,3 +377,44 @@ export interface RecentOutcomeFilters {
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
 
+export type NotifyKind = 'success' | 'info' | 'warning' | 'error'
+
+export interface NotificationSignal {
+  code: string
+  name: string
+  direction: string
+  level: string
+  grade: string
+  score: number
+  entry: number
+  stop: number
+  target: number
+  time?: string | null
+}
+
+export interface NotificationEntryTrigger {
+  symbol: string
+  name: string
+  direction: string
+  entry: number
+  latest: number
+}
+
+export interface NewNotificationHistoryItem {
+  kind: NotifyKind
+  title?: string | null
+  content: string
+  signal?: NotificationSignal | null
+  entry_trigger?: NotificationEntryTrigger | null
+}
+
+export interface NotificationHistoryItem {
+  id: number
+  created_at: string
+  kind: NotifyKind
+  title?: string | null
+  content: string
+  signal?: NotificationSignal | null
+  entry_trigger?: NotificationEntryTrigger | null
+}
+

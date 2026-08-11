@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
   NAutoComplete,
+  NBadge,
   NButton,
   NDropdown,
   NIcon,
@@ -15,6 +16,8 @@ import {
   type DropdownOption,
 } from 'naive-ui'
 import {
+  BellX,
+  Clock,
   DotsVertical,
   History,
   Plus,
@@ -30,9 +33,10 @@ import { useActionsStore } from '../stores/actions'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
+import { openNotificationsWindow } from '../utils/openNotificationsWindow'
 import { openReviewWindow } from '../utils/openReviewWindow'
 import { openSettingsWindow } from '../utils/openSettingsWindow'
-import { notify } from '../utils/notify'
+import { dismissAll, notify, notifyItems } from '../utils/notify'
 import TitleBar from './TitleBar.vue'
 import type { ContractSuggestion, SymbolRow } from '../types'
 
@@ -44,10 +48,19 @@ const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
 
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
-const isStandaloneWindow = computed(() => route.name === 'settings' || route.name === 'review')
-const windowTitle = computed(() =>
-  route.name === 'settings' ? '设置' : route.name === 'review' ? '复盘统计' : '',
+const isStandaloneWindow = computed(
+  () => route.name === 'settings' || route.name === 'review' || route.name === 'notifications',
 )
+const windowTitle = computed(() =>
+  route.name === 'settings'
+    ? '设置'
+    : route.name === 'review'
+      ? '复盘统计'
+      : route.name === 'notifications'
+        ? '历史通知'
+        : '',
+)
+const activeNotifyCount = computed(() => notifyItems.length)
 
 /** bare 路由（K线图/设置）：内容区不额外加内边距，由页面自行布局 */
 const bare = computed(() => Boolean(route.meta.bare))
@@ -396,6 +409,18 @@ onBeforeUnmount(() => {
           quaternary
           circle
           size="small"
+          title="历史通知"
+          class="notifications-button"
+          @click="openNotificationsWindow"
+        >
+          <template #icon>
+            <n-icon :component="Clock" size="18" />
+          </template>
+        </n-button>
+        <n-button
+          quaternary
+          circle
+          size="small"
           title="设置"
           class="settings-button"
           @click="openSettingsWindow"
@@ -404,6 +429,26 @@ onBeforeUnmount(() => {
             <n-icon :component="SettingsIcon" size="18" />
           </template>
         </n-button>
+        <n-badge
+          v-if="activeNotifyCount > 0"
+          :value="activeNotifyCount"
+          :max="99"
+          :offset="[-8, 2]"
+          class="clear-notifications-badge"
+        >
+          <n-button
+            quaternary
+            circle
+            size="small"
+            :title="`清空全部通知（${activeNotifyCount}）`"
+            class="clear-notifications-button"
+            @click="dismissAll"
+          >
+            <template #icon>
+              <n-icon :component="BellX" size="18" />
+            </template>
+          </n-button>
+        </n-badge>
       </template>
     </TitleBar>
 
@@ -535,5 +580,14 @@ onBeforeUnmount(() => {
   height: 14px;
   background: #e5e9ef;
   flex: none;
+}
+.clear-notifications-badge :deep(.n-badge-sup) {
+  min-width: 16px;
+  height: 14px;
+  line-height: 14px;
+  padding: 0 4px;
+  border-radius: 7px;
+  box-sizing: border-box;
+  font-size: 10px;
 }
 </style>

@@ -10,6 +10,8 @@ import type {
   GroupRow,
   KlineRow,
   MarketSnapshot,
+  NewNotificationHistoryItem,
+  NotificationHistoryItem,
   OutcomeDetail,
   OutcomeRefresh,
   RecentOutcomeFilters,
@@ -25,6 +27,10 @@ import type {
 
 export const api = {
   appInfo: () => invoke<AppInfo>('app_info'),
+  recordNotification: (item: NewNotificationHistoryItem) =>
+    invoke<NotificationHistoryItem[]>('record_notification', { item }),
+  getNotificationHistory: () =>
+    invoke<NotificationHistoryItem[]>('get_notification_history'),
 
   getSymbols: () => invoke<SymbolRow[]>('get_symbols'),
   listGroups: () => invoke<GroupRow[]>('list_groups'),
@@ -110,6 +116,14 @@ export function onScanCompleted(cb: (result: ScanResult) => void) {
 
 export function onEntryTrigger(cb: (hits: EntryTriggerHit[]) => void) {
   return listen<EntryTriggerHit[]>('entry-trigger', (e) => cb(e.payload))
+}
+
+export function onNotificationHistoryUpdated(
+  cb: (items: NotificationHistoryItem[]) => void,
+) {
+  return listen<NotificationHistoryItem[]>('notification-history-updated', (e) =>
+    cb(e.payload),
+  )
 }
 
 
