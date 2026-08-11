@@ -446,7 +446,7 @@ impl Services {
         let mut notified = self.entry_notified.write().await;
         let mut hits = Vec::new();
         for row in rows {
-            if !is_active_signal_state(&row.state) {
+            if !is_pending_entry_signal(&row) {
                 continue;
             }
             let Some(latest) = by_code.get(row.symbol.as_str()).copied() else {
@@ -1398,6 +1398,18 @@ fn is_active_signal_state(state: &str) -> bool {
     matches!(state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
 }
 
+/// 入场价提醒只针对尚未触发的形态；detail 已带 trigger_ts 说明之前已经命中过，
+/// 即使最新价仍满足方向条件也不再通知，避免旧信号在重启/后续轮询里再次弹出。
+fn is_pending_entry_signal(row: &signals::Model) -> bool {
+    if !is_active_signal_state(&row.state) {
+        return false;
+    }
+    match parse_detail(&row.detail) {
+        Some(p) => p.trigger_ts.is_none(),
+        None => row.state == "即将触发",
+    }
+}
+
 pub fn model_to_fetch(m: &klines::Model) -> Kline {
     Kline {
         datetime: m.ts.clone(),
@@ -1564,6 +1576,60 @@ fn parse_dt(s: &str) -> Option<DT> {
 mod tests {
     use super::*;
 
+    fn pending_signal_model(state: &str, detail: &str) -> signals::Model {
+        signals::Model {
+            id: 1,
+            scan_id: 1,
+            symbol: "MA0".to_string(),
+            level: "L1".to_string(),
+            direction: "up".to_string(),
+            grade: "A".to_string(),
+            state: state.to_string(),
+            category: "N".to_string(),
+            entry: 2577.0,
+            stop: 2564.0,
+            target: 2584.0,
+            rr: 0.54,
+            score: 80.0,
+            note: String::new(),
+            detail: detail.to_string(),
+            created_at: "2026-08-11 09:15:00".to_string(),
+        }
+    }
+
+    fn pending_pattern_detail(with_trigger: bool) -> String {
+        let mut detail = serde_json::json!({
+            "number": 1,
+            "level": "L1",
+            "direction": "up",
+            "grade": "A",
+            "s0": {"index": 0, "price": 2550.0, "is_high": false, "ts": "2026-08-11 09:15:00"},
+            "s1": {"index": 1, "price": 2590.0, "is_high": true, "ts": "2026-08-11 09:30:00"},
+            "s2": {"index": 2, "price": 2570.0, "is_high": false, "ts": "2026-08-11 09:45:00"},
+            "a_bars": 1,
+            "b_bars": 1,
+            "a_move": 40.0,
+            "b_move": 20.0,
+            "retracement": 0.5,
+            "state": "即将触发",
+            "category": "N",
+            "entry": 2577.0,
+            "stop": 2564.0,
+            "target": 2584.0,
+            "risk": 13.0,
+            "space": 7.0,
+            "rr": 0.54,
+            "score": 80.0,
+            "dims": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "note": "",
+            "active": true
+        });
+        if with_trigger {
+            detail["trigger_ts"] = serde_json::json!("2026-08-11 14:00:00");
+        }
+        detail.to_string()
+    }
+
     #[test]
     fn parse_dt_handles_common_formats() {
         let dt = parse_dt("2026-08-03 09:15:00").unwrap();
@@ -1581,6 +1647,24 @@ mod tests {
             ts_gap_minutes("2026-08-03 10:00:00", "2026-08-03 08:00:00"),
             Some(120)
         );
+    }
+
+    #[test]
+    fn pending_entry_signal_allows_untriggered_pattern() {
+        let row = pending_signal_model("即将触发", &pending_pattern_detail(false));
+        assert!(is_pending_entry_signal(&row));
+    }
+
+    #[test]
+    fn pending_entry_signal_skips_already_triggered_pattern() {
+        let row = pending_signal_model("已触发，接近时效边界", &pending_pattern_detail(true));
+        assert!(!is_pending_entry_signal(&row));
+    }
+
+    #[test]
+    fn pending_entry_signal_skips_inactive_state() {
+        let row = pending_signal_model("已失效", &pending_pattern_detail(false));
+        assert!(!is_pending_entry_signal(&row));
     }
 
     #[test]
