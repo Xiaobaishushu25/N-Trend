@@ -1769,9 +1769,9 @@ mod tests {
     }
 
     #[test]
-    fn sim_version_8_recomputes_legacy_outcomes() {
-        assert_eq!(outcome::SIM_VERSION, 8);
-        let legacy = outcome_model("win", 7, "2026-08-10 02:05:00");
+    fn sim_version_9_recomputes_legacy_outcomes() {
+        assert_eq!(outcome::SIM_VERSION, 9);
+        let legacy = outcome_model("win", 8, "2026-08-10 02:05:00");
         assert!(needs_outcome_refresh(Some(&legacy), None));
     }
 }

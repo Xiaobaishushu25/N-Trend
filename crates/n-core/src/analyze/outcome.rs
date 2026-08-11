@@ -1,13 +1,12 @@
 //! 信号结局回填与复盘统计。
 //!
-//! 简化出场规则（SIM_VERSION = 8）：
+//! 简化出场规则（SIM_VERSION = 9）：
 //! - 入场价 = 信号落库时的 entry（预警K线极值 ± tick），不重算、不回看；
 //! - 入场/止损被跳空穿越时按更保守的 current.open 成交，并标记 gap_crossed；
 //! - 在 15m 上逐根模拟：先到 stop → −1R；
 //! - 第一止盈位 TP1 = 1R（entry ± 1R）；
-//! - 若落库目标位（前高/前低）对应 R 倍数 > 1：第二止盈位 TP2 = max(0.8 × 目标R, 1)R，
-//!   触及 TP1 后：触及 TP2 → 按 TP2 止盈；从 TP1 回落到 1R → 按 1R 止盈；
-//! - 若目标位对应 R 倍数 ≤ 1：持有至达到 1R 才止盈（目标位不作为止盈）；
+//! - 触及 TP1 后采用推动止盈：每达到 0.8×2R、0.8×3R、0.8×4R…… 就把该阈值作为新的止盈位，
+//!   随后回落触到该止盈位即平仓；未到更高阈值前回落 1R 则按 1R 止盈；
 //! - 同一根 bar 双触按止损优先（保守）；
 //! - 入场后第 5 根 bar（含入场bar共 6 根）若 MFE < 0.5R → 按该 bar 收盘平仓；
 //! - 60 根 bar 内未决 → 按第 60 根收盘平仓（时间退出）；
@@ -29,13 +28,17 @@ use serde::Serialize;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
 
-pub const SIM_VERSION: i64 = 8;
+pub const SIM_VERSION: i64 = 9;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
 pub const NO_FOLLOW_BAR: usize = 5;
 /// 无跟随检查阈值：最大浮盈不足 0.5R 即退出
 pub const NO_FOLLOW_MFE_R: f64 = 0.5;
+/// 推动止盈起点：触及 1R 后才开始锁定
+pub const TRAIL_START_R: f64 = 1.0;
+/// 推动止盈步长：后续每达到 0.8×2R、0.8×3R、0.8×4R…… 上移一级
+pub const TRAIL_STEP_R: f64 = 0.8;
 /// 时间退出上限：入场后 60 根 15m bar 未决按收盘平仓
 pub const TIME_HORIZON_BARS: usize = 60;
 /// 入场后至少几根 bar 才允许判定为 open（更少视为数据不足）
@@ -200,6 +203,15 @@ fn signal_dir(direction: &str) -> Dir {
         Dir::Down
     } else {
         Dir::Up
+    }
+}
+
+/// 推动止盈第 n 级对应的 R 倍数：第 1 级 = 1R，之后为 0.8×nR。
+fn trail_r_for(grade: usize) -> f64 {
+    if grade == 1 {
+        TRAIL_START_R
+    } else {
+        TRAIL_STEP_R * grade as f64
     }
 }
 
@@ -488,31 +500,15 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         }
     }
 
-    // 第一止盈位 TP1 = 1R
+    // 第一止盈位 TP1 = 1R；此后按 0.8×2R、0.8×3R…… 逐级推动止盈位
     let base_tp = match dir {
         Dir::Up => input.entry + risk,
         Dir::Down => input.entry - risk,
     };
-    // 落库目标位（前高/前低）对应的 R 倍数；目标位无效时按 ≤1 处理（只止盈 1R）
-    let target_rr = match dir {
-        Dir::Up => (input.target - input.entry) / risk,
-        Dir::Down => (input.entry - input.target) / risk,
-    };
-    let extend = target_rr > 1.0;
-    // 第二止盈位 TP2 相对 entry 的距离（R 倍数），不低于 1R
-    let tp2_r = if extend {
-        (0.8 * target_rr).max(1.0)
-    } else {
-        0.0
-    };
-    let tp2_price = match dir {
-        Dir::Up => input.entry + tp2_r * risk,
-        Dir::Down => input.entry - tp2_r * risk,
-    };
 
     let mut mfe = 0.0_f64;
     let mut mae = 0.0_f64;
-    let mut tp1_reached = false;
+    let mut trail_grade: Option<usize> = None;
     let mut target_tier: Option<&'static str> = None;
     let mut result: Option<(ExitReason, f64, usize, usize)> = None;
 
@@ -580,34 +576,43 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
             Dir::Up => bar.high >= base_tp,
             Dir::Down => bar.low <= base_tp,
         };
-        if extend {
-            if reached_tp1 {
-                tp1_reached = true;
-            }
-            if tp1_reached {
-                let tp2_hit = match dir {
-                    Dir::Up => bar.high >= tp2_price,
-                    Dir::Down => bar.low <= tp2_price,
-                };
-                let fell_back = match dir {
-                    Dir::Up => bar.low <= base_tp,
-                    Dir::Down => bar.high >= base_tp,
-                };
-                if tp2_hit {
-                    target_tier = Some("tp2");
-                    result = Some((ExitReason::Target, tp2_price, i, held));
-                    break;
-                }
-                if fell_back {
-                    target_tier = Some("tp1");
-                    result = Some((ExitReason::Target, base_tp, i, held));
-                    break;
-                }
-            }
-        } else if reached_tp1 {
+        if trail_grade.is_none() && reached_tp1 {
+            trail_grade = Some(1);
             target_tier = Some("tp1");
-            result = Some((ExitReason::Target, base_tp, i, held));
-            break;
+        }
+        if let Some(mut grade) = trail_grade {
+            // 单根 bar 可一次跨过多个档位：一直推进到该 bar 触及的最高档
+            loop {
+                let next_grade = grade + 1;
+                let next_r = trail_r_for(next_grade);
+                let next_price = match dir {
+                    Dir::Up => input.entry + next_r * risk,
+                    Dir::Down => input.entry - next_r * risk,
+                };
+                let next_hit = match dir {
+                    Dir::Up => bar.high >= next_price,
+                    Dir::Down => bar.low <= next_price,
+                };
+                if !next_hit {
+                    break;
+                }
+                grade = next_grade;
+                target_tier = Some("tp2");
+            }
+            trail_grade = Some(grade);
+            let trail_r = trail_r_for(grade);
+            let trail_price = match dir {
+                Dir::Up => input.entry + trail_r * risk,
+                Dir::Down => input.entry - trail_r * risk,
+            };
+            let fell_back = match dir {
+                Dir::Up => bar.low <= trail_price,
+                Dir::Down => bar.high >= trail_price,
+            };
+            if fell_back {
+                result = Some((ExitReason::Target, trail_price, i, held));
+                break;
+            }
         }
         if i == ec + NO_FOLLOW_BAR && mfe < NO_FOLLOW_MFE_R {
             result = Some((ExitReason::NoFollow, bar.close, i, held));
@@ -1625,12 +1630,12 @@ mod tests {
 
     #[test]
     fn long_extends_to_second_target() {
-        // 目标位 105 → 目标R=2.0 > 1，TP2 = max(0.8×2, 1) = 1.6R = 104.2
+        // 触及 1R 后推动止盈：0.8×2R = 1.6R = 104.2，回落触到该位止盈
         let bars = timed_bars(&[
             (100.0, 100.0, 100.0, 100.0), // warning bar
             (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 103.2, 103.1, 103.1), // 触及 TP1(103) 未回落
-            (103.1, 104.5, 103.2, 104.4), // 触及 TP2(104.2) 止盈
+            (101.0, 103.2, 103.1, 103.1), // 触及 1R(103) 未回落
+            (103.1, 104.5, 103.2, 104.4), // 触及 1.6R(104.2) 并回落，按该位止盈
         ]);
         let ann = annotate(&input(), &bars, &[]).unwrap();
         assert_eq!(ann.outcome, Outcome::Win);
@@ -1638,6 +1643,57 @@ mod tests {
         assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
         assert!((ann.exit_price.unwrap() - 104.2).abs() < 1e-9);
         assert_eq!(ann.bars_held, Some(3));
+    }
+
+    #[test]
+    fn trailing_profit_locks_1r_then_moves_to_1_6r() {
+        let bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0), // warning bar
+            (100.0, 102.0, 100.0, 101.0), // entry-cross
+            (101.0, 103.5, 103.1, 103.2), // 触及 1R(103) 未回落
+            (103.2, 104.5, 104.3, 104.4), // 触及 1.6R(104.2) 未回落
+            (104.4, 104.5, 103.8, 103.9), // 回落到 1.6R 止盈
+        ]);
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert_eq!(ann.exit_reason, ExitReason::Target);
+        assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
+        assert!((ann.exit_price.unwrap() - 104.2).abs() < 1e-9);
+        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
+        assert_eq!(ann.bars_held, Some(4));
+    }
+
+    #[test]
+    fn trailing_profit_advances_to_2_4r() {
+        let bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0),  // warning bar
+            (100.0, 102.0, 100.0, 101.0),  // entry-cross
+            (101.0, 103.5, 103.2, 103.3),  // 触及 1R(103)
+            (103.3, 104.5, 104.3, 104.4),  // 触及 1.6R(104.2)
+            (104.4, 106.0, 105.9, 105.95), // 触及 2.4R(105.8) 未回落
+            (105.9, 106.1, 105.6, 105.7),  // 回落到 2.4R 止盈
+        ]);
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert_eq!(ann.exit_reason, ExitReason::Target);
+        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
+        assert!((ann.exit_price.unwrap() - 105.8).abs() < 1e-9);
+        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
+        assert_eq!(ann.bars_held, Some(5));
+    }
+
+    #[test]
+    fn trailing_profit_skips_levels_on_one_bar() {
+        // 单根 bar 从下方跳空直触 1R/1.6R/2.4R 并回落到 2.4R(105.8)：应直接锁到 2.4R
+        let bars = timed_bars(&[
+            (100.0, 100.0, 100.0, 100.0), // warning bar
+            (100.0, 102.0, 100.0, 101.0), // entry-cross
+            (105.5, 106.0, 105.5, 105.8), // 触及 1.6R/2.4R，回落到 2.4R 止盈
+        ]);
+        let ann = annotate(&input(), &bars, &[]).unwrap();
+        assert_eq!(ann.exit_reason, ExitReason::Target);
+        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
+        assert!((ann.exit_price.unwrap() - 105.8).abs() < 1e-9);
+        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
+        assert_eq!(ann.bars_held, Some(2));
     }
 
     #[test]
@@ -1824,14 +1880,14 @@ mod tests {
         let bars = timed_bars(&[
             (101.0, 101.0, 101.0, 101.0),
             (101.0, 101.0, 99.0, 100.0), // entry-cross (low <= 100)
-            (99.0, 99.5, 95.0, 96.0),    // target hit
+            (99.0, 99.5, 95.0, 96.0),    // 触及 2.4R=95.2 并回落，按该位止盈
         ]);
         let ann = annotate(&inp, &bars, &[]).unwrap();
         assert_eq!(ann.outcome, Outcome::Win);
         assert_eq!(ann.exit_reason, ExitReason::Target);
-        // 目标位 96 → 目标R=2.0 > 1，TP2 = 1.6R = 96.8，该 bar 最低 95 触及 TP2
-        assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 96.8).abs() < 1e-9);
+        // 触及 1R 后推动止盈：单根触到 0.8×3R = 2.4R = 95.2，回落到该位止盈
+        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
+        assert!((ann.exit_price.unwrap() - 95.2).abs() < 1e-9);
         assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
         assert_eq!(ann.trigger_overshoot_r, Some(0.5));
     }
@@ -1847,14 +1903,14 @@ mod tests {
         let bars = timed_bars(&[
             (101.0, 101.0, 101.0, 101.0), // warning
             (98.0, 98.5, 98.1, 98.2),     // 跳空跌破 entry，但未触及 TP1
-            (98.2, 99.0, 96.5, 97.0),     // 触及 TP2=97.2
+            (98.2, 99.0, 96.5, 97.0),     // 触及推动止盈 1.6R=96.8
         ]);
         let ann = annotate(&inp, &bars, &[]).unwrap();
         assert!(ann.gap_crossed_entry);
         assert!(!ann.gap_crossed_exit);
         assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.exit_price.unwrap() - 97.2).abs() < 1e-9);
-        assert!((ann.r_multiple.unwrap() - 0.4).abs() < 1e-9);
+        assert!((ann.exit_price.unwrap() - 96.8).abs() < 1e-9);
+        assert!((ann.r_multiple.unwrap() - 0.6).abs() < 1e-9);
     }
 
     #[test]
