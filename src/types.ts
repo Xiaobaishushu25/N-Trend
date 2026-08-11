@@ -225,6 +225,8 @@ export interface QuoteConfig {
 export interface NotifyConfig {
   /** 局内新形态通知：扫描发现新的即将触发形态时弹卡片通知 */
   in_app_new_pattern: boolean
+  /** 新形态通知的最低形态评分：低于该阈值的即将触发形态不提醒 */
+  new_pattern_min_score: number
   /** 局内触发价通知：实时行情触及形态入场价时弹右下角通知（持久，需手动关闭） */
   in_app_entry_trigger: boolean
   /** 系统级触发价通知：入场价提醒同时发送系统通知 */

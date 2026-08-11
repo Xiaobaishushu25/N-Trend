@@ -180,6 +180,8 @@ impl Config {
 pub struct NotifyConfig {
     /// 局内新形态通知：扫描发现新的即将触发形态时弹卡片通知
     pub in_app_new_pattern: bool,
+    /// 新形态通知的最低形态评分：低于该阈值的即将触发形态不提醒
+    pub new_pattern_min_score: f64,
     /// 局内触发价通知：实时行情触及形态入场价时弹右下角通知（持久，需手动关闭）
     pub in_app_entry_trigger: bool,
     /// 系统级触发价通知：入场价提醒同时发送系统通知
@@ -190,6 +192,7 @@ impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
             in_app_new_pattern: true,
+            new_pattern_min_score: 0.0,
             in_app_entry_trigger: true,
             system_entry_trigger: false,
         }
@@ -414,6 +417,7 @@ mod tests {
         assert_eq!(back.quote.request_interval_ms, 200);
         assert_eq!(back.quote.minutely_budget, 120);
         assert_eq!(back.notify.in_app_new_pattern, true);
+        assert_eq!(back.notify.new_pattern_min_score, 0.0);
         assert_eq!(back.notify.in_app_entry_trigger, true);
         assert_eq!(back.notify.system_entry_trigger, false);
         assert_eq!(back.log.level, "info");
@@ -437,6 +441,7 @@ mod tests {
         assert_eq!(config.fetch.request_interval_ms, 400);
         assert_eq!(config.quote.poll_interval_ms, 3000);
         assert_eq!(config.log.level, "info");
+        assert_eq!(config.notify.new_pattern_min_score, 0.0);
     }
 
     #[test]
@@ -446,6 +451,15 @@ mod tests {
         assert_eq!(config.scheduler.refresh_interval_secs, 600);
         assert_eq!(config.scheduler.scan_interval_secs, 900);
         assert_eq!(config.app_config.auto_start_scheduler, true);
+    }
+
+    #[test]
+    fn notify_threshold_roundtrips_through_json() {
+        let mut config = Config::default();
+        config.notify.new_pattern_min_score = 3.5;
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.notify.new_pattern_min_score, 3.5);
     }
 
     #[tokio::test]

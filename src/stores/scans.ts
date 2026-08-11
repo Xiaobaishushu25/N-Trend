@@ -87,12 +87,13 @@ export const useScansStore = defineStore('scans', {
       this.loadHistory(20)
       const pendings = newPendingSignals(prev?.signals ?? null, result.signals)
       if (!pendings.length) return
-      // 局内新形态通知开关
-      if (!useSettingsStore().settings.notify.in_app_new_pattern) return
+      // 局内新形态通知开关与评分阈值
+      const notifySettings = useSettingsStore().settings.notify
+      if (!notifySettings.in_app_new_pattern) return
       const symbolsStore = useSymbolsStore()
       for (const s of pendings) {
         const sym = symbolsStore.symbols.find((x) => x.code === s.symbol)
-        notify.signal({
+        const signal = {
           code: s.symbol,
           name: sym && sym.name !== s.symbol ? sym.name : '',
           direction: s.direction,
@@ -102,7 +103,12 @@ export const useScansStore = defineStore('scans', {
           entry: s.entry,
           stop: s.stop,
           target: s.target,
-        })
+        }
+        if (s.score >= notifySettings.new_pattern_min_score) {
+          notify.signal(signal)
+        } else {
+          notify.recordSignal(signal)
+        }
       }
     },
     ingest(result: ScanResult) {

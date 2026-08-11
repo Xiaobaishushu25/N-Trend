@@ -21,6 +21,8 @@ export interface NotifyOptions {
   signal?: NotifyItem['signal']
   /** 可选：结构化入场价提醒内容 */
   entryTrigger?: NotifyItem['entryTrigger']
+  /** 仅写入历史通知，不弹出应用内卡片 */
+  recordOnly?: boolean
 }
 
 export interface NotifyItem {
@@ -93,7 +95,8 @@ function schedule(item: NotifyItem) {
 }
 
 function push(type: NotifyType, content: string, options?: NotifyOptions): number {
-  ensureHost()
+  const recordOnly = options?.recordOnly ?? false
+  if (!recordOnly) ensureHost()
   const duration = options?.duration ?? (type === 'error' ? 0 : 4000)
   const item: NotifyItem = {
     id: ++seed,
@@ -107,8 +110,10 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     signal: options?.signal,
     entryTrigger: options?.entryTrigger,
   }
-  notifyItems.push(item)
-  schedule(item)
+  if (!recordOnly) {
+    notifyItems.push(item)
+    schedule(item)
+  }
   if (isMainWindow()) {
     void api.recordNotification({
       kind: type,
@@ -123,6 +128,16 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     })
   }
   return item.id
+}
+
+function withSignalTime(data: NonNullable<NotifyItem['signal']>) {
+  return {
+    ...data,
+    time: data.time ?? new Date().toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
+  }
 }
 
 /** 手动关闭某条通知 */
@@ -170,16 +185,10 @@ export const notify = {
   error: (content: string, options?: NotifyOptions) => push('error', content, options),
   /** 持久化的信号卡片通知（不自动关闭，可手动关闭） */
   signal: (data: NonNullable<NotifyItem['signal']>) =>
-    push('info', '', {
-      duration: 0,
-      signal: {
-        ...data,
-        time: data.time ?? new Date().toLocaleTimeString('zh-CN', {
-          hour: '2-digit',
-          minute: '2-digit',
-        }),
-      },
-    }),
+    push('info', '', { duration: 0, signal: withSignalTime(data) }),
+  /** 仅写入历史通知，不弹出应用内卡片 */
+  recordSignal: (data: NonNullable<NotifyItem['signal']>) =>
+    push('info', '', { duration: 0, recordOnly: true, signal: withSignalTime(data) }),
   /** 持久化的入场价提醒（不自动关闭，可手动关闭） */
   entryTrigger: (data: NonNullable<NotifyItem['entryTrigger']>) =>
     push('info', '', { duration: 0, entryTrigger: data }),

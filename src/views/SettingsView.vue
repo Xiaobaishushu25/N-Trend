@@ -289,6 +289,20 @@ onMounted(async () => {
             </div>
             <div class="setting-card-row">
               <div class="row-label">
+                新形态通知评分阈值
+                <Tip text="仅当即将触发形态评分达到该阈值时才弹出新形态通知；设为 0 表示全部提醒。" />
+              </div>
+              <n-input-number
+                v-model:value="form.notify.new_pattern_min_score"
+                :min="0"
+                :max="5"
+                :step="0.1"
+                :precision="1"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
                 局内触发价通知
                 <Tip text="实时行情轮询发现最新价已触及形态入场价时弹出通知（做空为跌破入场价，做多为突破入场价）；通知不自动消失，需手动关闭。" />
               </div>

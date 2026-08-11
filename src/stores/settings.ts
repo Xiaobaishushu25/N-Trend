@@ -33,6 +33,7 @@ const defaultConfig = (): Config => ({
   },
   notify: {
     in_app_new_pattern: true,
+    new_pattern_min_score: 0,
     in_app_entry_trigger: true,
     system_entry_trigger: false,
   },
