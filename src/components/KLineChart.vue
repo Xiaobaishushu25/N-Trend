@@ -41,6 +41,7 @@ const props = defineProps<{
 
 const container = ref<HTMLDivElement | null>(null)
 const legend = ref<HTMLDivElement | null>(null)
+const timeLeft = ref<HTMLDivElement | null>(null)
 const settingsStore = useSettingsStore()
 const minBarSpacing = computed(() => settingsStore.settings.ui.min_bar_spacing)
 
@@ -51,18 +52,20 @@ interface GapRect {
   bottom: number
 }
 
-interface EnergyLabelData {
+interface EventLabelData {
   time: Time
   text: string
   color: string
-  price: number
+  price: number | null
+  priority: number
+  side: 'above' | 'below'
 }
 
-class EnergyLabelPaneRenderer implements IPrimitivePaneRenderer {
+class EventLabelPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
   private source: ISeriesApi<'Candlestick'>
-  private labels: EnergyLabelData[]
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
+  private labels: EventLabelData[]
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EventLabelData[]) {
     this.chart = chart
     this.source = source
     this.labels = labels
@@ -72,36 +75,90 @@ class EnergyLabelPaneRenderer implements IPrimitivePaneRenderer {
     target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
       const { context, mediaSize } = scope
       const timeScale = this.chart.timeScale()
-      context.font = '600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+      const boxH = 18
+      const rowGap = 4
+      const priceAxisWidth = this.chart.priceScale('right').width() || 64
+      const rightEdge = Math.max(2, mediaSize.width - priceAxisWidth - 4)
+      context.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
       context.textBaseline = 'middle'
       context.textAlign = 'center'
-      for (const label of this.labels) {
+
+      const drawn: {
+        label: EventLabelData
+        x: number
+        anchorY: number
+        boxX: number
+        boxY: number
+        boxW: number
+        boxH: number
+      }[] = []
+      let aboveRows = 0
+      let belowRows = 0
+
+      const sorted = [...this.labels].sort((a, b) => a.priority - b.priority)
+      for (const label of sorted) {
         const x = timeScale.timeToCoordinate(label.time)
         if (x == null) continue
+        const anchorY = label.price == null ? null : this.source.priceToCoordinate(label.price)
+        if (anchorY == null) continue
+
         const textWidth = context.measureText(label.text).width
-        const padX = 6
-        const boxW = textWidth + padX * 2
-        const boxH = 22
-        const boxX = Math.min(
-          Math.max(2, x - boxW / 2),
-          Math.max(2, mediaSize.width - boxW - 2),
-        )
-        const barTopY = this.source.priceToCoordinate(label.price)
-        if (barTopY == null) continue
-        const boxY = Math.max(4, barTopY - 100 - boxH)
-        context.fillStyle = 'rgba(30, 41, 59, 0.86)'
-        context.fillRect(boxX, boxY, boxW, boxH)
-        context.fillStyle = label.color
-        context.fillText(label.text, boxX + boxW / 2, boxY + boxH / 2 + 1)
+        const boxW = Math.min(Math.max(0, rightEdge - 2), textWidth + 12)
+        if (boxW <= 0) continue
+        const boxX = Math.min(Math.max(2, x - boxW / 2), Math.max(2, rightEdge - boxW))
+        const boxY =
+          label.side === 'below'
+            ? mediaSize.height - 4 - boxH - belowRows * (boxH + rowGap)
+            : 4 + aboveRows * (boxH + rowGap)
+        if (label.side === 'below') belowRows += 1
+        else aboveRows += 1
+
+        drawn.push({
+          label,
+          x,
+          anchorY,
+          boxX,
+          boxY,
+          boxW,
+          boxH,
+        })
+      }
+
+      for (const d of drawn) {
+        context.strokeStyle = d.label.color
+        context.globalAlpha = 0.55
+        context.lineWidth = 1
+        context.beginPath()
+        const lineFromY = d.boxY + d.boxH <= d.anchorY ? d.boxY + d.boxH : d.boxY
+        context.moveTo(d.x, lineFromY)
+        context.lineTo(d.x, d.anchorY)
+        context.stroke()
+        context.globalAlpha = 1
+
+        context.fillStyle = d.label.color
+        context.beginPath()
+        context.arc(d.x, d.anchorY, 3, 0, Math.PI * 2)
+        context.fill()
+
+        context.fillStyle = 'rgba(255, 255, 255, 0.86)'
+        context.strokeStyle = 'rgba(100, 116, 139, 0.55)'
+        context.lineWidth = 1
+        context.shadowColor = 'rgba(15, 23, 42, 0.22)'
+        context.shadowBlur = 5
+        context.fillRect(d.boxX, d.boxY, d.boxW, d.boxH)
+        context.shadowBlur = 0
+        context.strokeRect(d.boxX + 0.5, d.boxY + 0.5, d.boxW - 1, d.boxH - 1)
+        context.fillStyle = d.label.color
+        context.fillText(d.label.text, d.boxX + d.boxW / 2, d.boxY + d.boxH / 2 + 1)
       }
     })
   }
 }
 
-class EnergyLabelPaneView implements IPrimitivePaneView {
-  private paneRenderer: EnergyLabelPaneRenderer
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
-    this.paneRenderer = new EnergyLabelPaneRenderer(chart, source, labels)
+class EventLabelPaneView implements IPrimitivePaneView {
+  private paneRenderer: EventLabelPaneRenderer
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EventLabelData[]) {
+    this.paneRenderer = new EventLabelPaneRenderer(chart, source, labels)
   }
   renderer(): IPrimitivePaneRenderer | null {
     return this.paneRenderer
@@ -111,10 +168,10 @@ class EnergyLabelPaneView implements IPrimitivePaneView {
   }
 }
 
-class EnergyLabelPrimitive implements ISeriesPrimitive<Time> {
-  private view: EnergyLabelPaneView
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EnergyLabelData[]) {
-    this.view = new EnergyLabelPaneView(chart, source, labels)
+class EventLabelPrimitive implements ISeriesPrimitive<Time> {
+  private view: EventLabelPaneView
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, labels: EventLabelData[]) {
+    this.view = new EventLabelPaneView(chart, source, labels)
   }
   paneViews(): readonly IPrimitivePaneView[] {
     return [this.view]
@@ -241,11 +298,12 @@ let chart: IChartApi | null = null
 let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let resizeObserver: ResizeObserver | null = null
+let countdownTimer: ReturnType<typeof setInterval> | null = null
 let priceLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
-let energyLabelPrimitive: EnergyLabelPrimitive | null = null
+let eventLabelPrimitive: EventLabelPrimitive | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
 let priceExtent = 1
 
@@ -334,6 +392,105 @@ function formatTime(t: Time): string {
   return `${bd.year}-${String(bd.month).padStart(2, '0')}-${String(bd.day).padStart(2, '0')}`
 }
 
+/** 周期字符串转毫秒：5m/15m/60m/1d 等 */
+function timeframeMs(tf: string): number {
+  if (tf === '1d') return 24 * 60 * 60 * 1000
+  const m = /^(\d+)m$/.exec(tf)
+  if (m) return Number(m[1]) * 60 * 1000
+  const h = /^(\d+)h$/.exec(tf)
+  if (h) return Number(h[1]) * 60 * 60 * 1000
+  return 0
+}
+
+/** 分钟周期的当前K线结束时间：按自然日分钟网格取整，与后端桶末语义一致 */
+function currentBucketEnd(date: Date, periodMs: number): Date | null {
+  const minutes = periodMs / 60000
+  if (!Number.isInteger(minutes) || minutes <= 0 || minutes >= 24 * 60) return null
+  const elapsed = date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
+  const endMin = Math.max(1, Math.ceil(elapsed / minutes)) * minutes
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, endMin, 0, 0)
+}
+
+/** 与后端一致：仅在国内期货日盘/夜盘窗口显示倒计时 */
+function isTradingTime(date: Date): boolean {
+  const weekday = (date.getDay() + 6) % 7 // 0=周一
+  const t = date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
+  const friNight = weekday === 4 && t >= 21 * 60
+  const earlySat = weekday === 5 && t < 2 * 60 + 31
+  if (friNight || earlySat) return true
+  if (weekday >= 5) return false
+  return (
+    (t >= 9 * 60 && t < 10 * 60 + 16) ||
+    (t >= 10 * 60 + 30 && t < 11 * 60 + 31) ||
+    (t >= 13 * 60 + 30 && t < 15 * 60 + 1) ||
+    (t >= 21 * 60 && t < 23 * 60 + 31)
+  )
+}
+
+/** 十字光标下的K线信息：时间 + 开高低收 */
+function formatLegend(d: CandlestickData, time: Time): string {
+  const up = d.close >= d.open
+  const color = up ? '#e03131' : '#0f9d58'
+  const item = (label: string, value: number) =>
+    `<span class="lg-item"><span class="lg-label">${label}</span><span class="lg-value" style="color:${color}">${value}</span></span>`
+  return `<span class="lg-time">${formatTime(time)}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}`
+}
+
+/** 当前K线收盘倒计时：显示在时间轴上方、最新K线正下方 */
+function updateCountdown() {
+  const el = timeLeft.value
+  if (!el) return
+  if (!chart || !container.value || !props.rows.length) {
+    el.style.display = 'none'
+    return
+  }
+  const last = props.rows[props.rows.length - 1]
+  const period = timeframeMs(last.timeframe || props.timeframe)
+  if (period <= 0) {
+    el.style.display = 'none'
+    return
+  }
+  const now = new Date()
+  const endDate = currentBucketEnd(now, period)
+  // 时间戳为桶末（K线收盘时间），按当前自然分钟桶计算剩余时间；
+  // 没有实时报价时也能显示，但仅限交易时段，避免休市时出现无效倒计时
+  if (!endDate || !isTradingTime(now)) {
+    el.style.display = 'none'
+    return
+  }
+  const remaining = endDate.getTime() - now.getTime()
+  if (remaining <= 0 || remaining > period) {
+    el.style.display = 'none'
+    return
+  }
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const totalSec = Math.ceil(remaining / 1000)
+  const hh = Math.floor(totalSec / 3600)
+  const mm = Math.floor((totalSec % 3600) / 60)
+  const ss = totalSec % 60
+  el.textContent = hh > 0 ? `剩余 ${pad(hh)}:${pad(mm)}:${pad(ss)}` : `剩余 ${pad(mm)}:${pad(ss)}`
+  const pad2 = (n: number) => String(n).padStart(2, '0')
+  const endLabel = `${endDate.getFullYear()}-${pad2(endDate.getMonth() + 1)}-${pad2(endDate.getDate())} ${pad2(endDate.getHours())}:${pad2(endDate.getMinutes())}:00`
+  let x: number | null = chart.timeScale().timeToCoordinate(toTs(endLabel))
+  if (x == null) {
+    const lastX = chart.timeScale().timeToCoordinate(toTs(last.ts))
+    if (lastX == null) {
+      el.style.display = 'none'
+      return
+    }
+    const barSpacing = chart.timeScale().options().barSpacing || 8
+    x = lastX + barSpacing
+  }
+  if (x == null) {
+    el.style.display = 'none'
+    return
+  }
+  const width = container.value.clientWidth
+  el.style.left = `${Math.min(Math.max(56, x), Math.max(56, width - 56))}px`
+  el.style.bottom = `${chart.timeScale().height() + 6}px`
+  el.style.display = 'block'
+}
+
 function buildCandles(): CandlestickData[] {
   return props.rows.map((r) => ({
     time: toTs(r.ts) as Time,
@@ -362,21 +519,20 @@ function buildMarkers(): SeriesMarker<Time>[] {
       position: 'belowBar',
       color,
       shape: 'arrowUp',
-      text: 'S0',
     })
     markers.push({
       time: toTs(s.s1.ts),
       position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
       color,
       shape: 'circle',
-      text: 'S1',
+      size: 0.5,
     })
     markers.push({
       time: toTs(s.s2.ts),
       position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
       color,
       shape: 'square',
-      text: 'S2',
+      size: 0.5,
     })
     if (s.warning_ts) {
       markers.push({
@@ -384,7 +540,7 @@ function buildMarkers(): SeriesMarker<Time>[] {
         position: 'aboveBar',
         color: '#f9a825',
         shape: 'circle',
-        text: '预警',
+        size: 0.5,
       })
     }
     if (s.trigger_ts) {
@@ -393,7 +549,6 @@ function buildMarkers(): SeriesMarker<Time>[] {
         position: 'aboveBar',
         color: '#e53935',
         shape: 'arrowDown',
-        text: '触发',
       })
     } else if (ex?.entryTs) {
       // 快照落库时仍是"即将触发"没有 trigger_ts：用回放找到的入场触达时间补画
@@ -402,18 +557,15 @@ function buildMarkers(): SeriesMarker<Time>[] {
         position: 'aboveBar',
         color: '#fb8c00',
         shape: 'arrowDown',
-        text: '回放触发',
       })
     }
   }
   if (ex?.ts) {
-    const rText = ex.r == null ? '' : ` ${ex.r >= 0 ? '+' : ''}${ex.r.toFixed(2)}R`
     markers.push({
       time: toTs(ex.ts),
       position: 'aboveBar',
       color: '#7c3aed',
       shape: 'circle',
-      text: `出场${rText}`,
     })
   }
   return markers
@@ -690,34 +842,120 @@ function syncRollovers() {
   candleSeries.attachPrimitive(rolloverPrimitive)
 }
 
-function buildEnergyLabels(): EnergyLabelData[] {
-  const labels: EnergyLabelData[] = []
+function rowAt(ts: string): KlineRow | undefined {
+  const target = toTs(ts)
+  return props.rows.find((r) => toTs(r.ts) === target)
+}
+
+/** 事件文字统一走带避让的标签层，避免S0/S1/S2与预警/触发/出场互相压住 */
+function buildEventLabels(): EventLabelData[] {
+  const labels: EventLabelData[] = []
+  const ex = props.reviewExit
   for (const s of props.signals) {
-    if (!s.trigger_ts || s.vol_ratio == null || !s.vol_confirmed) continue
-    const triggerTime = toTs(s.trigger_ts)
-    const row = props.rows.find((r) => toTs(r.ts) === triggerTime)
-    if (!row) continue
+    const color = s.direction === 'up' ? '#d64545' : '#0e9f6e'
+    const swingSide = (isHigh: boolean): 'above' | 'below' => (isHigh ? 'above' : 'below')
     labels.push({
-      time: triggerTime,
-      text: `量能${s.vol_ratio.toFixed(1)}×`,
-      color: '#e03131',
-      price: row.high,
+      time: toTs(s.s0.ts),
+      text: 'S0',
+      color,
+      price: s.s0.price,
+      priority: 0,
+      side: swingSide(s.s0.is_high),
+    })
+    labels.push({
+      time: toTs(s.s1.ts),
+      text: 'S1',
+      color,
+      price: s.s1.price,
+      priority: 0,
+      side: swingSide(s.s1.is_high),
+    })
+    labels.push({
+      time: toTs(s.s2.ts),
+      text: 'S2',
+      color,
+      price: s.s2.price,
+      priority: 0,
+      side: swingSide(s.s2.is_high),
+    })
+
+    if (s.warning_ts) {
+      const row = rowAt(s.warning_ts)
+      if (row) {
+        labels.push({
+          time: toTs(s.warning_ts),
+          text: '预警',
+          color: '#b45309',
+          price: s.direction === 'up' ? row.low : row.high,
+          priority: 1,
+          side: s.direction === 'up' ? 'below' : 'above',
+        })
+      }
+    }
+
+    const triggerTs = s.trigger_ts ?? (ex?.entryTs ? ex.entryTs : null)
+    if (triggerTs) {
+      const row = rowAt(triggerTs)
+      const replay = !s.trigger_ts && !!ex?.entryTs
+      if (row) {
+        labels.push({
+          time: toTs(triggerTs),
+          text: replay ? '回放触发' : '触发',
+          color: replay ? '#b45309' : '#c0392b',
+          price: s.direction === 'up' ? row.high : row.low,
+          priority: 2,
+          side: s.direction === 'up' ? 'above' : 'below',
+        })
+      }
+    }
+
+    if (s.trigger_ts && s.vol_ratio != null && s.vol_confirmed) {
+      const row = rowAt(s.trigger_ts)
+      if (row) {
+        labels.push({
+          time: toTs(s.trigger_ts),
+          text: `量能${s.vol_ratio.toFixed(1)}×`,
+          color: '#0f766e',
+          price: row.high,
+          priority: 3,
+          side: 'above',
+        })
+      }
+    }
+  }
+
+  if (ex?.ts && ex.price != null && ex.price > 0) {
+    const rText = ex.r == null ? '' : ` ${ex.r >= 0 ? '+' : ''}${ex.r.toFixed(2)}R`
+    labels.push({
+      time: toTs(ex.ts),
+      text: `出场${rText}`,
+      color: '#6d28d9',
+      price: ex.price,
+      priority: 4,
+      side: 'above',
     })
   }
   return labels
 }
 
-/** 触发量能画在触发K线上方约100px处，避免遮挡价格 */
-function syncEnergyLabels() {
+function syncEventLabels() {
   if (!chart || !candleSeries) return
-  if (energyLabelPrimitive) {
-    candleSeries.detachPrimitive(energyLabelPrimitive)
-    energyLabelPrimitive = null
+  if (eventLabelPrimitive) {
+    candleSeries.detachPrimitive(eventLabelPrimitive)
+    eventLabelPrimitive = null
   }
-  const labels = buildEnergyLabels()
+  const labels = buildEventLabels()
   if (!labels.length) return
-  energyLabelPrimitive = new EnergyLabelPrimitive(chart, candleSeries, labels)
-  candleSeries.attachPrimitive(energyLabelPrimitive)
+  const aboveCount = labels.filter((l) => l.side === 'above').length
+  const belowCount = labels.filter((l) => l.side === 'below').length
+  chart.priceScale('right').applyOptions({
+    scaleMargins: {
+      top: Math.min(0.22, Math.max(0.15, 0.12 + aboveCount * 0.02)),
+      bottom: Math.min(0.22, Math.max(0.15, 0.12 + belowCount * 0.02)),
+    },
+  })
+  eventLabelPrimitive = new EventLabelPrimitive(chart, candleSeries, labels)
+  candleSeries.attachPrimitive(eventLabelPrimitive)
 }
 
 let prevSymbol: string | null = null
@@ -772,7 +1010,7 @@ function renderOverlays() {
   markersApi?.setMarkers(buildMarkers())
   syncPriceLines()
   syncPatternLines()
-  syncEnergyLabels()
+  syncEventLabels()
 }
 
 /** Ctrl+滚轮缩放：向上(deltaY<0)放大、向下(deltaY>0)缩小；时间轴与价格轴按光标位置同步缩放。
@@ -890,16 +1128,19 @@ onMounted(() => {
     { priceFormat: { type: 'volume' }, priceScaleId: 'vol' },
     1,
   )
-  // 0.08 就是 8%（小数形式），top 控制上边距、bottom 控制下边距
-  chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.08 } })
+  // 0.15 就是 15%（小数形式），top 控制上边距、bottom 控制下边距；留白给事件文字标签使用
+  chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.15, bottom: 0.15 } })
   chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.08, bottom: 0.04 } })
   applyPaneHeights()
 
   chart.subscribeCrosshairMove((param) => {
     if (!legend.value || !param.time || !candleSeries) return
     const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
-    if (!d) return
-    legend.value.innerHTML = `${formatTime(param.time as Time)}　开 ${d.open}　高 ${d.high}　低 ${d.low}　收 ${d.close}`
+    if (!d) {
+      legend.value.innerHTML = 'N趋势 K线'
+      return
+    }
+    legend.value.innerHTML = formatLegend(d, param.time as Time)
   })
 
   container.value.addEventListener('wheel', handleWheel, { passive: false })
@@ -937,6 +1178,8 @@ onMounted(() => {
       // })
     }
   })
+  updateCountdown()
+  countdownTimer = setInterval(updateCountdown, 1000)
 })
 
 watch(
@@ -976,9 +1219,13 @@ onBeforeUnmount(() => {
     candleSeries.detachPrimitive(rolloverPrimitive)
     rolloverPrimitive = null
   }
-  if (energyLabelPrimitive && candleSeries) {
-    candleSeries.detachPrimitive(energyLabelPrimitive)
-    energyLabelPrimitive = null
+  if (eventLabelPrimitive && candleSeries) {
+    candleSeries.detachPrimitive(eventLabelPrimitive)
+    eventLabelPrimitive = null
+  }
+  if (countdownTimer) {
+    clearInterval(countdownTimer)
+    countdownTimer = null
   }
   markersApi?.detach()
   markersApi = null
@@ -995,6 +1242,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="kline-wrap">
     <div ref="legend" class="legend">N趋势 K线</div>
+    <div ref="timeLeft" class="time-left"></div>
     <div ref="container" class="kline-canvas"></div>
     <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
     <!-- <div v-if="dbg.visible" class="debug-info">
@@ -1034,12 +1282,57 @@ onBeforeUnmount(() => {
   top: 8px;
   left: 12px;
   z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
-  color: #475569;
-  background: rgba(255, 255, 255, 0.85);
-  padding: 2px 8px;
-  border-radius: 4px;
+  color: #334155;
+  background: rgba(255, 255, 255, 0.88);
+  border: 1px solid rgba(100, 116, 139, 0.28);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.1);
+  padding: 5px 10px;
+  border-radius: 6px;
   pointer-events: none;
+  white-space: nowrap;
+}
+.legend :deep(.lg-time) {
+  color: #475569;
+  font-variant-numeric: tabular-nums;
+}
+.legend :deep(.lg-sep) {
+  width: 1px;
+  height: 14px;
+  background: rgba(148, 163, 184, 0.5);
+}
+.legend :deep(.lg-item) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.legend :deep(.lg-label) {
+  color: #94a3b8;
+  font-size: 11px;
+}
+.legend :deep(.lg-value) {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.time-left {
+  position: absolute;
+  z-index: 5;
+  display: none;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-weight: 600;
+  color: #334155;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(100, 116, 139, 0.3);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.12);
+  padding: 2px 8px;
+  border-radius: 5px;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .help-hint {
   position: absolute;

@@ -34,6 +34,12 @@ const WEAK_CONFIRM_MOMENTUM_PENALTY: f64 = 1.0;
 const WEAK_CONFIRM_TOTAL_MAX: f64 = 3.49;
 // 影线预警的收盘位置上限：做空上影线须收盘于振幅下1/3内，做多下影线须收盘于上1/3内
 const WICK_CLOSE_POS_MAX: f64 = 0.35;
+// 长影线预警的“反向影线”占比门槛：做空看下影，做多看上影。
+// 反向影线过短视为光脚长影线，不扣；偏长会削弱反转推力，触发维度相应扣分。
+const WICK_REVERSE_SHADOW_MEDIUM_RATIO: f64 = 0.10;
+const WICK_REVERSE_SHADOW_HEAVY_RATIO: f64 = 0.20;
+const WICK_REVERSE_SHADOW_MEDIUM_PENALTY: f64 = 0.30;
+const WICK_REVERSE_SHADOW_HEAVY_PENALTY: f64 = 0.50;
 
 fn clamp(v: f64) -> f64 {
     v.clamp(0.0, 5.0)
@@ -136,6 +142,7 @@ fn score_trigger(
     trigger: Option<usize>,
     p: &NPattern,
     local_block_count: u8,
+    wick_penalty: f64,
 ) -> f64 {
     match (warning, trigger) {
         (None, _) => 0.0,
@@ -158,6 +165,7 @@ fn score_trigger(
             }
             s -= ENTRY_BLOCK_TRIGGER_PENALTY * local_block_count as f64;
             s -= trigger_opposition_penalty(bars, atr20, p.dir, p.s2.index, t);
+            s -= wick_penalty;
             clamp(s)
         }
     }
@@ -294,10 +302,41 @@ fn trigger_opposition_penalty(
     (ratio - 1.0).clamp(0.0, 3.0) * (TRIGGER_OPPOSITION_PENALTY_MAX / 3.0)
 }
 
+/// 长影线预警的反向影线质量扣分：做空看下影，做多看上影。
+fn long_wick_reverse_shadow_penalty(bars: &[Bar], dir: Dir, w: usize) -> f64 {
+    let Some(bar) = bars.get(w) else {
+        return 0.0;
+    };
+    let range = bar.high - bar.low;
+    if range <= 0.0 {
+        return 0.0;
+    }
+    let reverse_shadow = match dir {
+        Dir::Down => bar.open.min(bar.close) - bar.low,
+        Dir::Up => bar.high - bar.open.max(bar.close),
+    };
+    let ratio = reverse_shadow / range;
+    if ratio <= WICK_REVERSE_SHADOW_MEDIUM_RATIO {
+        0.0
+    } else if ratio <= WICK_REVERSE_SHADOW_HEAVY_RATIO {
+        WICK_REVERSE_SHADOW_MEDIUM_PENALTY
+    } else {
+        WICK_REVERSE_SHADOW_HEAVY_PENALTY
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum WarnKind {
     Single,
     Cumulative,
+}
+
+/// 单根反转形态的具体类型：区分长影线预警，用于反向影线质量扣分。
+#[derive(Clone, Copy, PartialEq)]
+enum SingleReversalKind {
+    Engulf,
+    Strong,
+    Wick,
 }
 
 fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
@@ -323,13 +362,13 @@ fn single_reversal_pattern(
     dir: Dir,
     w: usize,
     run_start: usize,
-) -> bool {
+) -> Option<SingleReversalKind> {
     let Some(bar) = bars.get(w) else {
-        return false;
+        return None;
     };
     let range = bar.high - bar.low;
     if range <= 0.0 {
-        return false;
+        return None;
     }
 
     // 阴包阳/阳包阴：仅对反转段的第一根反向K线检查，目标实体是它前面的b向K线。
@@ -356,7 +395,7 @@ fn single_reversal_pattern(
             }
         };
     if engulf {
-        return true;
+        return Some(SingleReversalKind::Engulf);
     }
 
     let strong = match dir {
@@ -364,7 +403,7 @@ fn single_reversal_pattern(
         Dir::Down => trend_k.get(w).is_some_and(|x| x.1),
     };
     if strong {
-        return true;
+        return Some(SingleReversalKind::Strong);
     }
 
     let body = (bar.close - bar.open).abs();
@@ -380,10 +419,11 @@ fn single_reversal_pattern(
         Dir::Up => (bar.high - bar.close) / range <= WICK_CLOSE_POS_MAX,
         Dir::Down => (bar.close - bar.low) / range <= WICK_CLOSE_POS_MAX,
     };
-    wick > body
+    (wick > body
         && wick >= OPPOSING_WICK_ATR_MIN * atr
         && wick >= OPPOSING_WICK_RANGE_MIN * range
-        && close_ok
+        && close_ok)
+        .then_some(SingleReversalKind::Wick)
 }
 
 /// 多K累积覆盖：连续反向收盘至少2根，且最后一根收盘越过强b向K线的开盘价（吞没其实体）
@@ -477,11 +517,20 @@ fn compute_scores(
     local_block_count: u8,
     entry_block_count: u8,
     weak_confirm: bool,
+    wick_penalty: f64,
 ) -> ([f64; 6], f64) {
     let dim_trend = score_60m(trend, p.dir);
     let dim_a = score_a(bars, atr20, p);
     let dim_b = score_b(p);
-    let mut dim_trigger = score_trigger(bars, atr20, warning, trigger, p, local_block_count);
+    let mut dim_trigger = score_trigger(
+        bars,
+        atr20,
+        warning,
+        trigger,
+        p,
+        local_block_count,
+        wick_penalty,
+    );
     let mut dim_momentum = score_momentum(p, trend, atr20, entry_block_count);
     if weak_confirm {
         dim_trigger = (dim_trigger - WEAK_CONFIRM_TRIGGER_PENALTY).max(0.0);
@@ -542,12 +591,15 @@ pub fn evaluate_signal_with_tick(
     let trend_k = indicators::trend_flags(bars, atr20);
     let mut warning = None;
     let mut warn_kind = WarnKind::Single;
+    let mut warning_is_wick = false;
     let mut gate_active = false;
     let mut gate_anchor_strong = false;
     // s2 本身构成合格反转形态（长影线/吞没/强反向趋势K）时，s2 就是预警K线。
     // 长影线不要求反向收盘：做空时上影线够长即使收阳也算预警，做多方向对称。
-    if single_reversal_pattern(bars, atr20, &trend_k, p.dir, p.s2.index, p.s2.index) {
+    let s2_single = single_reversal_pattern(bars, atr20, &trend_k, p.dir, p.s2.index, p.s2.index);
+    if let Some(kind) = s2_single {
         warning = Some(p.s2.index);
+        warning_is_wick = kind == SingleReversalKind::Wick;
     }
     let mut i = p.s2.index + 1;
     while warning.is_none() && i < end {
@@ -572,19 +624,22 @@ pub fn evaluate_signal_with_tick(
             // A级允许首根反向收盘直接作为预警，但仍要求收盘在反向一半内，
             // 排除小实体+长反向影线的K线；其余情况（强b向趋势K顶、B/C级）
             // 都要求单根反转形态自证。
+            let single_now = single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
             let single_ok =
                 (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
-                    || single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
+                    || single_now.is_some();
             // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
             let cumul_ok = (anchor_strong || strict_confirm)
                 && cumulative_coverage(bars, run_start, j, anchor_open, p.dir);
             if single_ok || cumul_ok {
                 warning = Some(j);
-                warn_kind = if cumul_ok && !single_ok {
+                let is_cumulative = cumul_ok && !single_ok;
+                warn_kind = if is_cumulative {
                     WarnKind::Cumulative
                 } else {
                     WarnKind::Single
                 };
+                warning_is_wick = !is_cumulative && single_now == Some(SingleReversalKind::Wick);
                 found = true;
                 break;
             }
@@ -611,6 +666,11 @@ pub fn evaluate_signal_with_tick(
             "b端后尚未出现与原方向一致的反转预警".to_string()
         };
         return sc;
+    };
+    let wick_penalty = if warning_is_wick {
+        long_wick_reverse_shadow_penalty(bars, p.dir, w)
+    } else {
+        0.0
     };
     let weak_confirm = warn_kind == WarnKind::Cumulative;
     sc.warning = Some(w);
@@ -697,6 +757,7 @@ pub fn evaluate_signal_with_tick(
             0,
             0,
             weak_confirm,
+            wick_penalty,
         );
         sc.dims = dims;
         sc.total = total;
@@ -802,6 +863,7 @@ pub fn evaluate_signal_with_tick(
         local_block_count,
         entry_block_count,
         weak_confirm,
+        wick_penalty,
     );
     sc.dims = dims;
 
@@ -840,6 +902,13 @@ pub fn evaluate_signal_with_tick(
             Dir::Down => "追空",
         };
         sc.note = format!("{}；触发受阻，不宜急于{}", sc.note, verb);
+    }
+    if wick_penalty > 0.0 {
+        let shadow_note = match p.dir {
+            Dir::Up => "做多预警K线为长下影，上影偏长",
+            Dir::Down => "做空预警K线为长上影，下影偏长",
+        };
+        sc.note = format!("{}；{}，触发分已相应扣减", sc.note, shadow_note);
     }
     if stale_by_price {
         sc.note = format!(
@@ -983,8 +1052,8 @@ mod tests {
             bar(0.6, 1.0, 0.5, 0.7),
         ];
 
-        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0);
-        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2);
+        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0, 0.0);
+        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2, 0.0);
         assert!((blocked_trigger - clean_trigger + 1.4).abs() < 1e-9);
 
         let clean_momentum = score_momentum(&p, &trend, &atr, 0);
@@ -1244,6 +1313,7 @@ mod tests {
         assert_eq!(sc.warning, Some(3));
         assert_eq!(sc.trigger, Some(4));
         assert!(!sc.note.contains("累积确认"));
+        assert!(!sc.note.contains("触发分已相应扣减"));
     }
 
     #[test]
@@ -1305,7 +1375,90 @@ mod tests {
         assert_eq!(sc.trigger, Some(3));
         assert_eq!(sc.entry, 4018.0);
         assert_eq!(sc.state, "当前已触发");
+        assert!((sc.dims[3] - 3.9).abs() < 1e-9);
+        assert!(sc.note.contains("下影偏长"));
         assert!(!sc.note.contains("累积确认"));
+    }
+
+    #[test]
+    fn long_wick_reverse_shadow_penalty_follows_ratio_thresholds() {
+        // 做空：长上影的反向影线是下影；≤10%不扣，10%-20%扣0.3，>20%扣0.5
+        let short_clean = vec![bar(100.0, 109.0, 99.0, 99.0)];
+        let short_boundary_low = vec![bar(100.0, 108.0, 98.0, 99.0)];
+        let short_medium = vec![bar(100.0, 107.5, 97.5, 99.0)];
+        let short_boundary_high = vec![bar(100.0, 107.0, 97.0, 99.0)];
+        let short_heavy = vec![bar(100.0, 106.9, 96.9, 99.0)];
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&short_clean, Dir::Down, 0),
+            0.0
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&short_boundary_low, Dir::Down, 0),
+            0.0
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&short_medium, Dir::Down, 0),
+            0.3
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&short_boundary_high, Dir::Down, 0),
+            0.3
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&short_heavy, Dir::Down, 0),
+            0.5
+        );
+
+        // 做多：长下影的反向影线是上影，扣分口径对称
+        let long_clean = vec![bar(100.0, 101.0, 91.0, 101.0)];
+        let long_medium = vec![bar(100.0, 102.5, 92.5, 101.0)];
+        let long_heavy = vec![bar(100.0, 103.1, 93.1, 101.0)];
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&long_clean, Dir::Up, 0),
+            0.0
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&long_medium, Dir::Up, 0),
+            0.3
+        );
+        assert_eq!(
+            long_wick_reverse_shadow_penalty(&long_heavy, Dir::Up, 0),
+            0.5
+        );
+    }
+
+    #[test]
+    fn long_wick_warning_with_reverse_shadow_lowers_trigger_score() {
+        // 做空：s2长上影本身就是预警，下影占振幅20%，触发分3.5降为3.2
+        let atr = atrs(5, 15.4);
+        let p = NPattern {
+            dir: Dir::Down,
+            s1: Swing {
+                index: 1,
+                price: 3996.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 2,
+                price: 4029.0,
+                is_high: true,
+            },
+            grade: Grade::C,
+            ..pattern()
+        };
+        let bars = vec![
+            bar(4066.0, 4066.0, 4055.0, 4060.0), // s0 高点
+            bar(4050.0, 4055.0, 3996.0, 4000.0), // s1 低点
+            bar(4023.0, 4029.0, 4019.0, 4021.0), // s2 长上影，下影占振幅20%
+            bar(4021.0, 4022.0, 4020.0, 4021.5), // 延迟K线，未跌破s2低点
+            bar(4019.0, 4020.0, 3998.0, 4002.0), // 触发：跌破s2低点
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.trigger, Some(4));
+        assert!((sc.dims[3] - 3.2).abs() < 1e-9);
+        assert!(sc.note.contains("下影偏长"));
     }
 
     #[test]

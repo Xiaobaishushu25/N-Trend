@@ -1094,7 +1094,7 @@ impl Services {
                 }
             })
             .collect();
-        repo::insert_signals(&self.db, rows).await?;
+        repo::upsert_signals(&self.db, rows).await?;
 
         // 扫描后顺手刷新信号结局：新增信号第一次回填，在途信号按最新K线更新
         if let Err(e) = self.refresh_outcomes().await {

@@ -568,17 +568,70 @@ pub async fn insert_scan(
     Ok(res.last_insert_id)
 }
 
-pub async fn insert_signals(
+/// 结构身份键：品种 + 方向 + 级别 + S1/S2 时间戳。
+/// 与复盘统计的去重口径保持一致，跨扫描的重复快照不会重复落库。
+fn signal_structure_key(
+    symbol: &str,
+    level: &str,
+    direction: &str,
+    detail: &str,
+) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(detail).ok()?;
+    let s1 = v.get("s1")?.get("ts")?.as_str()?;
+    let s2 = v.get("s2")?.get("ts")?.as_str()?;
+    Some(format!("{symbol}|{direction}|{level}|{s1}|{s2}"))
+}
+
+/// 写入信号：同一结构只保留一条记录，后续扫描更新这条记录的状态与扫描信息。
+pub async fn upsert_signals(
     db: &DatabaseConnection,
     rows: Vec<signals::ActiveModel>,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
-    signals::Entity::insert_many(rows)
-        .exec(db)
+
+    let existing = signals::Entity::find()
+        .all(db)
         .await
-        .context("写入信号失败")?;
+        .context("查询信号失败")?;
+    let mut by_key: std::collections::HashMap<String, signals::Model> =
+        std::collections::HashMap::new();
+    for s in existing {
+        if let Some(key) = signal_structure_key(&s.symbol, &s.level, &s.direction, &s.detail) {
+            by_key.entry(key).or_insert(s);
+        }
+    }
+
+    let mut inserts = Vec::new();
+    for row in rows {
+        let symbol = row.symbol.clone().take().unwrap_or_default();
+        let level = row.level.clone().take().unwrap_or_default();
+        let direction = row.direction.clone().take().unwrap_or_default();
+        let detail = row.detail.clone().take().unwrap_or_default();
+        let Some(key) = signal_structure_key(&symbol, &level, &direction, &detail) else {
+            inserts.push(row);
+            continue;
+        };
+        if let Some(existing) = by_key.get(&key) {
+            let mut updated = row;
+            updated.id = Set(existing.id);
+            updated.created_at = Set(existing.created_at.clone());
+            signals::Entity::update(updated)
+                .exec(db)
+                .await
+                .context("更新信号失败")?;
+        } else {
+            inserts.push(row);
+        }
+    }
+
+    if !inserts.is_empty() {
+        signals::Entity::insert_many(inserts)
+            .exec(db)
+            .await
+            .context("写入信号失败")?;
+    }
     Ok(())
 }
 
@@ -802,6 +855,82 @@ mod tests {
         let limited = klines(&db, "RB0", "5m", Some(1), None).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].ts, "2026-08-03 09:05:00");
+    }
+
+    #[tokio::test]
+    async fn upsert_signals_keeps_one_row_per_structure() {
+        let db = test_db().await;
+        let row = |scan_id: i64, state: &str, s2: &str, created_at: &str, score: f64| {
+            let detail = format!(
+                r#"{{"s1":{{"ts":"2026-08-03 09:00"}},"s2":{{"ts":"{s2}"}}}}"#
+            );
+            signals::ActiveModel {
+                id: sea_orm::NotSet,
+                scan_id: Set(scan_id),
+                symbol: Set("RB0".to_string()),
+                level: Set("fine".to_string()),
+                direction: Set("down".to_string()),
+                grade: Set("A级".to_string()),
+                state: Set(state.to_string()),
+                category: Set("默认观察，不主动开仓".to_string()),
+                entry: Set(3000.0),
+                stop: Set(3050.0),
+                target: Set(2900.0),
+                rr: Set(2.0),
+                score: Set(score),
+                note: Set(String::new()),
+                detail: Set(detail),
+                created_at: Set(created_at.to_string()),
+            }
+        };
+
+        upsert_signals(
+            &db,
+            vec![row(
+                1,
+                "即将触发",
+                "2026-08-03 10:00",
+                "2026-08-03 10:05",
+                3.1,
+            )],
+        )
+        .await
+        .unwrap();
+        upsert_signals(
+            &db,
+            vec![row(
+                2,
+                "当前已触发",
+                "2026-08-03 10:00",
+                "2026-08-03 11:00",
+                3.6,
+            )],
+        )
+        .await
+        .unwrap();
+
+        let rows = all_signals(&db).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].scan_id, 2);
+        assert_eq!(rows[0].state, "当前已触发");
+        assert!((rows[0].score - 3.6).abs() < 1e-9);
+        assert_eq!(rows[0].created_at, "2026-08-03 10:05");
+
+        upsert_signals(
+            &db,
+            vec![row(
+                3,
+                "即将触发",
+                "2026-08-03 11:00",
+                "2026-08-03 12:00",
+                2.9,
+            )],
+        )
+        .await
+        .unwrap();
+        let rows = all_signals(&db).await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
