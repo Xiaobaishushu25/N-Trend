@@ -361,14 +361,12 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                 res.scanned,
                 res.active_count
             );
-            if res.active_count > 0 {
-                let cfg = state.services.config().await;
-                if cfg.email.enabled && cfg.email.sendable() {
-                    let (subject, body) = n_core::notify::email::scan_email_payload(&res.summary);
-                    if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email)
-                    {
-                        tracing::error!("邮件发送失败: {e}");
-                    }
+            let cfg = state.services.config().await;
+            let min_score = cfg.notify.new_pattern_min_score;
+            if res.has_notifiable_signal(min_score) && cfg.email.enabled && cfg.email.sendable() {
+                let (subject, body) = n_core::notify::email::scan_email_payload(&res.summary);
+                if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                    tracing::error!("邮件发送失败: {e}");
                 }
             }
         }

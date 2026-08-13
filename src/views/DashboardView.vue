@@ -642,6 +642,16 @@ function stateCls(state: string): string {
   return 'muted'
 }
 
+/** 评分分档：3.5 起每 0.2 分一档，2.5-2.7 及以下保持最小样式 */
+function scoreTier(score: number | null | undefined) {
+  if (score == null || score < 2.7) return 'score-0'
+  if (score >= 3.5) return 'score-5'
+  if (score >= 3.3) return 'score-4'
+  if (score >= 3.1) return 'score-3'
+  if (score >= 2.9) return 'score-2'
+  return 'score-1'
+}
+
 const columns: DataTableColumns<WatchRow> = [
   {
     title: '代码',
@@ -733,7 +743,10 @@ const columns: DataTableColumns<WatchRow> = [
       return sig
         ? h(
             'span',
-            { class: `state-pill is-${stateCls(sig.state)}`, title: sig.state },
+            {
+              class: `state-pill is-${stateCls(sig.state)} is-${scoreTier(sig.score)}`,
+              title: sig.state,
+            },
             [h('span', { class: 'state-dot' }), stateLabel(sig.state)],
           )
         : h('span', { class: 'cell-empty' }, '—')
@@ -1302,19 +1315,27 @@ onBeforeUnmount(() => {
   background: rgba(124, 92, 255, 0.1);
 }
 .watch-table .state-pill {
+  --tb-font: 13px;
+  --tb-font-weight: 600;
+  --tb-gap: 5px;
+  --tb-pad-y: 4px;
+  --tb-pad-x: 10px;
+  --tb-dot: 6px;
+  --tb-opacity: 1;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  font-size: 13px;
-  font-weight: 600;
+  gap: var(--tb-gap);
+  font-size: var(--tb-font);
+  font-weight: var(--tb-font-weight);
   line-height: 1;
-  padding: 4px 10px;
+  padding: var(--tb-pad-y) var(--tb-pad-x);
   border-radius: 999px;
   white-space: nowrap;
+  opacity: var(--tb-opacity);
 }
 .watch-table .state-dot {
-  width: 6px;
-  height: 6px;
+  width: var(--tb-dot);
+  height: var(--tb-dot);
   border-radius: 50%;
   background: currentColor;
   flex: none;
@@ -1342,6 +1363,60 @@ onBeforeUnmount(() => {
 .watch-table .state-pill.is-muted {
   color: #64748b;
   background: rgba(148, 163, 184, 0.1);
+}
+.watch-table .state-pill.is-score-0 {
+  --tb-font: 6.5px;
+  --tb-font-weight: 500;
+  --tb-gap: 2.5px;
+  --tb-pad-y: 2px;
+  --tb-pad-x: 5px;
+  --tb-dot: 3px;
+  --tb-opacity: 0.5;
+}
+.watch-table .state-pill.is-score-1 {
+  --tb-font: 7.8px;
+  --tb-font-weight: 550;
+  --tb-gap: 3px;
+  --tb-pad-y: 2.4px;
+  --tb-pad-x: 6px;
+  --tb-dot: 3.6px;
+  --tb-opacity: 0.6;
+}
+.watch-table .state-pill.is-score-2 {
+  --tb-font: 9.1px;
+  --tb-font-weight: 600;
+  --tb-gap: 3.5px;
+  --tb-pad-y: 2.8px;
+  --tb-pad-x: 7px;
+  --tb-dot: 4.2px;
+  --tb-opacity: 0.7;
+}
+.watch-table .state-pill.is-score-3 {
+  --tb-font: 10.4px;
+  --tb-font-weight: 650;
+  --tb-gap: 4px;
+  --tb-pad-y: 3.2px;
+  --tb-pad-x: 8px;
+  --tb-dot: 4.8px;
+  --tb-opacity: 0.8;
+}
+.watch-table .state-pill.is-score-4 {
+  --tb-font: 11.7px;
+  --tb-font-weight: 700;
+  --tb-gap: 4.5px;
+  --tb-pad-y: 3.6px;
+  --tb-pad-x: 9px;
+  --tb-dot: 5.4px;
+  --tb-opacity: 0.9;
+}
+.watch-table .state-pill.is-score-5 {
+  --tb-font: 13px;
+  --tb-font-weight: 600;
+  --tb-gap: 5px;
+  --tb-pad-y: 4px;
+  --tb-pad-x: 10px;
+  --tb-dot: 6px;
+  --tb-opacity: 1;
 }
 
 /* 行情跳动时的行闪烁：上涨红、下跌绿，透明背景淡入淡出 */

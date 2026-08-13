@@ -377,7 +377,7 @@ onMounted(async () => {
             <div class="setting-card-row">
               <div class="row-label">
                 新形态通知评分阈值
-                <Tip text="仅当即将触发形态评分达到该阈值时才弹出新形态通知；设为 0 表示全部提醒。" />
+                <Tip text="仅当即将触发形态评分达到该阈值时才弹出新形态通知；若本次扫描没有任何达标形态，也不发送扫描邮件。设为 0 表示全部提醒。" />
               </div>
               <n-input-number
                 v-model:value="form.notify.new_pattern_min_score"

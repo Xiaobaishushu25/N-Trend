@@ -181,7 +181,7 @@ impl Config {
 pub struct NotifyConfig {
     /// 局内新形态通知：扫描发现新的即将触发形态时弹卡片通知
     pub in_app_new_pattern: bool,
-    /// 新形态通知的最低形态评分：低于该阈值的即将触发形态不提醒
+    /// 新形态通知的最低形态评分：低于该阈值的即将触发形态不弹卡片，且没有达标形态时也不发送扫描邮件
     pub new_pattern_min_score: f64,
     /// 局内触发价通知：实时行情触及形态入场价时弹右下角通知（持久，需手动关闭）
     pub in_app_entry_trigger: bool,

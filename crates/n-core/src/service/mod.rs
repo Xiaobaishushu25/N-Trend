@@ -40,6 +40,13 @@ pub struct ScanResult {
     pub failed: Vec<SymbolFailure>,
 }
 
+impl ScanResult {
+    /// 是否存在评分达到通知阈值的活跃信号，应用内卡片与邮件共用同一门槛。
+    pub fn has_notifiable_signal(&self, min_score: f64) -> bool {
+        self.signals.iter().any(|s| s.signal.score >= min_score)
+    }
+}
+
 /// 结局回填结果（复盘页刷新按钮返回值）。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OutcomeRefresh {
@@ -1707,6 +1714,34 @@ mod tests {
             detail["trigger_ts"] = serde_json::json!("2026-08-11 14:00:00");
         }
         detail.to_string()
+    }
+
+    fn signal_outcome(score: f64) -> SignalOutcome {
+        let mut detail =
+            serde_json::from_str::<serde_json::Value>(&pending_pattern_detail(false)).unwrap();
+        detail["score"] = serde_json::json!(score);
+        SignalOutcome {
+            symbol: "MA0".to_string(),
+            signal: serde_json::from_value(detail).unwrap(),
+        }
+    }
+
+    fn scan_result(scores: &[f64]) -> ScanResult {
+        ScanResult {
+            scan_id: 0,
+            scanned: 0,
+            active_count: scores.len() as i64,
+            summary: String::new(),
+            signals: scores.iter().map(|&s| signal_outcome(s)).collect(),
+            failed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scan_result_email_gate_respects_min_score() {
+        assert!(!scan_result(&[2.0, 2.4]).has_notifiable_signal(2.5));
+        assert!(scan_result(&[2.0, 2.5]).has_notifiable_signal(2.5));
+        assert!(scan_result(&[3.0]).has_notifiable_signal(2.5));
     }
 
     #[test]

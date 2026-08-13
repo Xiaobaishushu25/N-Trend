@@ -619,22 +619,19 @@ function fmtSigned(v: number | null) {
   return `${v >= 0 ? '+' : ''}${v.toFixed(1)}`
 }
 
-/** 每个品种取优先级最高的信号：即将触发 > 当前已触发 > 接近时效 > 过时；同级按触发/预警时间新的优先 */
+/** 每个品种取优先级最高的信号：与表格页同源同规则 */
 const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
   const out: Record<string, SignalOutcome | null> = {}
-  const latest = scansStore.latest
-  if (!latest) return out
+  const latest = scansStore.latestSignals
+  if (!latest.length) return out
   const rankOf = (s: SignalOutcome): number => {
     if (s.state === '即将触发') return 0
     if (s.state === '当前已触发') return 1
     if (s.state === '已触发，接近时效边界') return 2
-    return 3
+    if (s.state === '已过时，仅复盘') return 3
+    return 4
   }
-  const tsOf = (s: SignalOutcome): number => {
-    const raw = s.trigger_ts || s.warning_ts
-    return raw ? new Date(raw.replace(' ', 'T') + 'Z').getTime() : 0
-  }
-  for (const s of latest.signals) {
+  for (const s of latest) {
     const prev = out[s.symbol]
     if (!prev) {
       out[s.symbol] = s
@@ -645,9 +642,9 @@ const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
     if (a < b) {
       out[s.symbol] = s
     } else if (a === b) {
-      const ta = tsOf(s)
-      const tb = tsOf(prev)
-      if (ta > tb || (ta === tb && s.score > prev.score)) out[s.symbol] = s
+      if (s.score > prev.score || (s.score === prev.score && s.number < prev.number)) {
+        out[s.symbol] = s
+      }
     }
   }
   return out
@@ -677,12 +674,14 @@ function sigType(state: string) {
   return 'expired'
 }
 
-/** 评分分档：≥3.5 高分，2.5-3.5 中分，<2.5 低分 */
+/** 评分分档：3.5 起每 0.2 分一档，2.5-2.7 及以下保持最小样式 */
 function scoreTier(score: number | null | undefined) {
-  if (score == null) return 'score-low'
-  if (score >= 3.5) return 'score-high'
-  if (score >= 2.5) return 'score-mid'
-  return 'score-low'
+  if (score == null || score < 2.7) return 'score-0'
+  if (score >= 3.5) return 'score-5'
+  if (score >= 3.3) return 'score-4'
+  if (score >= 3.1) return 'score-3'
+  if (score >= 2.9) return 'score-2'
+  return 'score-1'
 }
 
 /** 悬停提示：形态编号、方向、级别、状态与触发/预警时间 */
@@ -1181,7 +1180,7 @@ onBeforeUnmount(() => {
                   class="sl-sig"
                   :class="[
                     'is-' + sigType(signalBySymbol[element.code]?.state ?? ''),
-                    scoreTier(signalBySymbol[element.code]?.score),
+                    'is-' + scoreTier(signalBySymbol[element.code]?.score),
                   ]"
                   :title="sigTitle(signalBySymbol[element.code]!)"
                 >
@@ -1810,21 +1809,29 @@ onBeforeUnmount(() => {
   background: rgba(249, 168, 37, 0.08);
 }
 .sl-sig {
+  --sl-font: 12px;
+  --sl-font-weight: 600;
+  --sl-gap: 4px;
+  --sl-pad-y: 3px;
+  --sl-pad-x: 8px;
+  --sl-dot: 6px;
+  --sl-opacity: 1;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  font-weight: 600;
+  gap: var(--sl-gap);
+  font-size: var(--sl-font);
+  font-weight: var(--sl-font-weight);
   line-height: 1;
-  padding: 3px 8px;
+  padding: var(--sl-pad-y) var(--sl-pad-x);
   border-radius: 999px;
   white-space: nowrap;
+  opacity: var(--sl-opacity);
 }
 .sl-sig::before {
   content: '';
-  width: 6px;
-  height: 6px;
+  width: var(--sl-dot);
+  height: var(--sl-dot);
   border-radius: 50%;
   background: currentColor;
 }
@@ -1844,86 +1851,59 @@ onBeforeUnmount(() => {
   color: #64748b;
   background: rgba(148, 163, 184, 0.14);
 }
-.sl-sig.is-score-high {
-  font-size: 15px;
-  font-weight: 900;
-  padding: 4px 12px;
+.sl-sig.is-score-0 {
+  --sl-font: 6.5px;
+  --sl-font-weight: 500;
+  --sl-gap: 2.5px;
+  --sl-pad-y: 2px;
+  --sl-pad-x: 5px;
+  --sl-dot: 3px;
+  --sl-opacity: 0.5;
 }
-.sl-sig.is-score-mid {
-  font-size: 12.5px;
-  font-weight: 700;
-  padding: 3px 9px;
-  box-shadow: inset 0 0 0 1px currentColor;
+.sl-sig.is-score-1 {
+  --sl-font: 7.8px;
+  --sl-font-weight: 550;
+  --sl-gap: 3px;
+  --sl-pad-y: 2.4px;
+  --sl-pad-x: 6px;
+  --sl-dot: 3.6px;
+  --sl-opacity: 0.6;
 }
-.sl-sig.is-score-low {
-  font-size: 10px;
-  font-weight: 500;
-  padding: 2px 6px;
-  opacity: 0.9;
+.sl-sig.is-score-2 {
+  --sl-font: 9.1px;
+  --sl-font-weight: 600;
+  --sl-gap: 3.5px;
+  --sl-pad-y: 2.8px;
+  --sl-pad-x: 7px;
+  --sl-dot: 4.2px;
+  --sl-opacity: 0.7;
 }
-.sl-sig.is-score-high::before {
-  width: 8px;
-  height: 8px;
+.sl-sig.is-score-3 {
+  --sl-font: 10.4px;
+  --sl-font-weight: 650;
+  --sl-gap: 4px;
+  --sl-pad-y: 3.2px;
+  --sl-pad-x: 8px;
+  --sl-dot: 4.8px;
+  --sl-opacity: 0.8;
 }
-.sl-sig.is-score-mid::before {
-  width: 6px;
-  height: 6px;
+.sl-sig.is-score-4 {
+  --sl-font: 11.7px;
+  --sl-font-weight: 700;
+  --sl-gap: 4.5px;
+  --sl-pad-y: 3.6px;
+  --sl-pad-x: 9px;
+  --sl-dot: 5.4px;
+  --sl-opacity: 0.9;
 }
-.sl-sig.is-score-low::before {
-  width: 4px;
-  height: 4px;
-}
-.sl-sig.is-score-high.is-pending {
-  color: #fff;
-  background: #1677ff;
-}
-.sl-sig.is-score-high.is-triggered {
-  color: #fff;
-  background: #0f9d58;
-}
-.sl-sig.is-score-high.is-stale {
-  color: #fff;
-  background: #d97706;
-}
-.sl-sig.is-score-high.is-expired {
-  color: #fff;
-  background: #64748b;
-}
-.sl-sig.is-score-mid.is-pending {
-  color: #1677ff;
-  background: rgba(22, 119, 255, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(22, 119, 255, 0.55);
-}
-.sl-sig.is-score-mid.is-triggered {
-  color: #0f9d58;
-  background: rgba(15, 157, 88, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(15, 157, 88, 0.55);
-}
-.sl-sig.is-score-mid.is-stale {
-  color: #b45309;
-  background: rgba(217, 119, 6, 0.18);
-  box-shadow: inset 0 0 0 1px rgba(217, 119, 6, 0.55);
-}
-.sl-sig.is-score-mid.is-expired {
-  color: #64748b;
-  background: rgba(148, 163, 184, 0.16);
-  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.45);
-}
-.sl-sig.is-score-low.is-pending {
-  color: #7ba5d8;
-  background: rgba(22, 119, 255, 0.06);
-}
-.sl-sig.is-score-low.is-triggered {
-  color: #74a894;
-  background: rgba(15, 157, 88, 0.06);
-}
-.sl-sig.is-score-low.is-stale {
-  color: #ab8a62;
-  background: rgba(217, 119, 6, 0.07);
-}
-.sl-sig.is-score-low.is-expired {
-  color: #a5b0bd;
-  background: rgba(148, 163, 184, 0.07);
+.sl-sig.is-score-5 {
+  --sl-font: 13px;
+  --sl-font-weight: 600;
+  --sl-gap: 5px;
+  --sl-pad-y: 4px;
+  --sl-pad-x: 10px;
+  --sl-dot: 6px;
+  --sl-opacity: 1;
 }
 .chart-col {
   flex: 1 1 auto;
