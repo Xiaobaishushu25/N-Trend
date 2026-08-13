@@ -35,7 +35,8 @@ const symbolInput = ref('')
 const scoreBand = ref<string | null>(null)
 
 const dirLabel = (d: string) => (d === 'up' ? '做多' : d === 'down' ? '做空' : d)
-const levelLabel = (l: string) => (l === 'fine' ? '精细' : l === 'large' ? '较大' : l)
+const levelLabel = (l: string) =>
+  l === 'fine' ? '精细' : l === 'large' ? '较大' : l === 'box' ? '箱体' : l
 
 const outcomeLabel: Record<string, { text: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
   win: { text: '盈利', type: 'error' },
@@ -229,6 +230,12 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   { title: '品种', key: 'symbol', width: 80 },
   { title: '方向', key: 'direction', width: 70, render: (r) => dirLabel(r.direction) },
   { title: '级别', key: 'level', width: 70, render: (r) => levelLabel(r.level) },
+  {
+    title: '版本',
+    key: 'logic_version',
+    width: 70,
+    render: (r) => r.logic_version || '1',
+  },
   { title: '等级', key: 'grade', width: 90 },
   {
     title: '评分',
@@ -395,6 +402,11 @@ const directionOptions = [
 const levelOptions = [
   { label: '精细', value: 'fine' },
   { label: '较大', value: 'large' },
+  { label: '箱体', value: 'box' },
+]
+const versionOptions = [
+  { label: '1.x', value: '1' },
+  { label: '2.0', value: '2' },
 ]
 const gradeOptions = [
   { label: 'A级', value: 'A级' },
@@ -632,6 +644,15 @@ onBeforeUnmount(() => {
             style="width: 100px"
             :options="directionOptions"
             @update:value="() => review.loadRecent()"
+          />
+          <n-select
+            v-model:value="review.recentFilters.version"
+            size="small"
+            clearable
+            placeholder="版本"
+            style="width: 90px"
+            :options="versionOptions"
+            @update:value="() => review.load()"
           />
           <n-select
             v-model:value="review.recentFilters.level"

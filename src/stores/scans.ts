@@ -7,7 +7,12 @@ import type { PatternDto, ScanResult, ScanRow, SignalOutcome, SignalRow } from '
 
 /** 形态身份键：同一品种内用 方向+级别+s1/s2 索引 识别“同一个形态” */
 function signalKey(s: SignalOutcome): string {
-  return `${s.symbol}|${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
+  const version = s.logic_version || '1'
+  if (s.level === 'box') {
+    const b = s.box
+    return `${s.symbol}|${version}|box|${s.direction}|${b?.upper ?? ''}|${b?.lower ?? ''}|${s.warning_ts ?? ''}`
+  }
+  return `${s.symbol}|${version}|${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
 }
 
 /** 对比上一次扫描，找出“新出现”的即将触发信号：本次是即将触发，且上次不是 */

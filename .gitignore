@@ -6,3 +6,6 @@ logs
 .DS_Store
 .idea
 email.toml
+__pycache__/
+_*.py
+_report_out.txt

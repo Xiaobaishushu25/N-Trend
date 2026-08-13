@@ -43,7 +43,11 @@ function directionLabel(direction: string): string {
 }
 
 function levelLabel(level: string): string {
-  return level === 'fine' ? '精细' : level === 'large' ? '较大' : level
+  return level === 'fine' ? '精细' : level === 'large' ? '较大' : level === 'box' ? '箱体' : level
+}
+
+function levelLabelWithSuffix(level: string): string {
+  return `${levelLabel(level)}${level === 'box' ? '' : 'N'}`
 }
 
 onMounted(async () => {
@@ -146,7 +150,7 @@ onBeforeUnmount(() => {
               {{ directionLabel(item.signal.direction) }}
             </span>
             <span class="signal-level">
-              {{ levelLabel(item.signal.level) }}N · {{ item.signal.grade }}
+              {{ levelLabelWithSuffix(item.signal.level) }} · {{ item.signal.grade }}
             </span>
             <span class="signal-score">评分 {{ item.signal.score.toFixed(2) }}</span>
             <span v-if="item.signal.time" class="signal-time">{{ item.signal.time }}</span>

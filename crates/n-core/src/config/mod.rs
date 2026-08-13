@@ -127,6 +127,7 @@ impl Config {
         let d = Config::default();
         Config {
             app_config: AppConfig {
+                logic_version: d.app_config.logic_version.clone(),
                 auto_start_scheduler: get_bool(
                     map,
                     "auto_start_scheduler",
@@ -204,12 +205,16 @@ impl Default for NotifyConfig {
 pub struct AppConfig {
     /// 应用启动时自动运行定时任务
     pub auto_start_scheduler: bool,
+    /// 交易信号分析版本：1 = 保留原逻辑（默认），2 = 严格N字 + 箱体
+    #[serde(default = "default_logic_version")]
+    pub logic_version: String,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             auto_start_scheduler: true,
+            logic_version: default_logic_version(),
         }
     }
 }
@@ -402,6 +407,10 @@ fn get_u16(map: &HashMap<String, String>, key: &str, default: u16) -> u16 {
     map.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn default_logic_version() -> String {
+    "1".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +421,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.app_config.auto_start_scheduler, true);
+        assert_eq!(back.app_config.logic_version, "1");
         assert_eq!(back.scheduler.refresh_interval_secs, 300);
         assert_eq!(back.scheduler.scan_interval_secs, 900);
         assert_eq!(back.scheduler.trading_only, true);
@@ -446,6 +456,7 @@ mod tests {
     fn empty_json_uses_defaults() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert_eq!(config.app_config.auto_start_scheduler, true);
+        assert_eq!(config.app_config.logic_version, "1");
         assert_eq!(config.fetch.request_interval_ms, 400);
         assert_eq!(config.quote.poll_interval_ms, 3000);
         assert_eq!(config.log.level, "info");
@@ -514,6 +525,7 @@ mod tests {
         assert_eq!(config.fetch.backfill_count, 500);
         assert_eq!(config.fetch.incremental_count, 5);
         assert_eq!(config.app_config.auto_start_scheduler, false);
+        assert_eq!(config.app_config.logic_version, "1");
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.email.enabled, false);
         assert_eq!(config.email.to, "a@b.com");

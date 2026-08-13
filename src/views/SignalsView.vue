@@ -54,7 +54,8 @@ const signalColumns: DataTableColumns<SignalRow> = [
     title: '级别',
     key: 'level',
     width: 80,
-    render: (r) => (r.level === 'fine' ? '精细' : '较大'),
+    render: (r) =>
+      r.level === 'fine' ? '精细' : r.level === 'large' ? '较大' : r.level === 'box' ? '箱体' : r.level,
   },
   { title: '状态', key: 'state', width: 130 },
   { title: '入场', key: 'entry', width: 90, render: (r) => r.entry.toFixed(1) },

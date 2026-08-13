@@ -5,6 +5,7 @@ import type { Config, SchedulerStatus } from '../types'
 const defaultConfig = (): Config => ({
   app_config: {
     auto_start_scheduler: true,
+    logic_version: '1',
   },
   scheduler: {
     refresh_interval_secs: 300,

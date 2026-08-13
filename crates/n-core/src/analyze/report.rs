@@ -14,6 +14,7 @@ pub fn level_label(level: &str) -> &'static str {
     match level {
         "fine" => "精细",
         "large" => "较大",
+        "box" => "箱体",
         _ => "自定义",
     }
 }
@@ -38,6 +39,18 @@ pub fn num_label(n: usize) -> String {
 }
 
 fn write_pattern_body(out: &mut dyn Write, bars: &[Bar], p: &NPattern) -> io::Result<()> {
+    if p.level == "box" {
+        let upper = p.s0.price.max(p.s1.price);
+        let lower = p.s0.price.min(p.s1.price);
+        writeln!(
+            out,
+            "箱体: 上轨 {:.1} | 下轨 {:.1} | 高度 {:.1}点",
+            upper, lower, p.a_move
+        )?;
+        writeln!(out, "触碰: 上轨 {}次 | 下轨 {}次", p.b_bars, p.a_bars)?;
+        writeln!(out, "预警K线: {}", bars[p.s2.index].dt)?;
+        return Ok(());
+    }
     writeln!(
         out,
         "a段: {} {:.1} -> {} {:.1} | {}根K | {:.1}点",
@@ -142,13 +155,17 @@ fn write_signal_body(
 }
 
 fn write_pattern(out: &mut dyn Write, bars: &[Bar], p: &NPattern, number: usize) -> io::Result<()> {
-    writeln!(
-        out,
-        "--- {} {} {} N ---",
-        num_label(number),
-        level_label(p.level),
-        p.dir.label()
-    )?;
+    if p.level == "box" {
+        writeln!(out, "--- {} 箱体 {} ---", num_label(number), p.dir.label())?;
+    } else {
+        writeln!(
+            out,
+            "--- {} {} {} N ---",
+            num_label(number),
+            level_label(p.level),
+            p.dir.label()
+        )?;
+    }
     write_pattern_body(out, bars, p)
 }
 
@@ -169,25 +186,41 @@ pub fn write_signal_summary(
     p: &NPattern,
     sc: &SignalCheck,
 ) -> io::Result<()> {
-    writeln!(
-        out,
-        "--- {} {} 形态：{} {} N | 信号状态: {} ---",
-        symbol,
-        num_label(number),
-        level_label(p.level),
-        p.dir.label(),
-        sc.state
-    )?;
+    if p.level == "box" {
+        writeln!(
+            out,
+            "--- {} 箱体形态：{} {} | 信号状态: {} ---",
+            symbol,
+            num_label(number),
+            p.dir.label(),
+            sc.state
+        )?;
+    } else {
+        writeln!(
+            out,
+            "--- {} {} 形态：{} {} N | 信号状态: {} ---",
+            symbol,
+            num_label(number),
+            level_label(p.level),
+            p.dir.label(),
+            sc.state
+        )?;
+    }
     write_pattern_body(out, bars, p)?;
     writeln!(out)?;
     write_signal_body(out, bars, sc, false, true)
 }
 
 pub fn is_active_signal(sc: &SignalCheck) -> bool {
+    is_active_signal_with_min(sc, 0.0)
+}
+
+/// 活跃信号判定：达到最低总分且状态仍在关注窗口内。
+pub fn is_active_signal_with_min(sc: &SignalCheck, min_total: f64) -> bool {
     if sc.total <= 0.0 {
         return false;
     }
-    matches!(sc.state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
+    sc.total >= min_total && matches!(sc.state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -287,14 +320,24 @@ pub fn write_full_report(
 
     writeln!(out)?;
     for (number, p, sc) in signals {
-        writeln!(
-            out,
-            "--- {} 形态：{} {} N | 信号状态: {} ---",
-            num_label(*number),
-            level_label(p.level),
-            p.dir.label(),
-            sc.state
-        )?;
+        if p.level == "box" {
+            writeln!(
+                out,
+                "--- {} 箱体形态：{} | 信号状态: {} ---",
+                num_label(*number),
+                p.dir.label(),
+                sc.state
+            )?;
+        } else {
+            writeln!(
+                out,
+                "--- {} 形态：{} {} N | 信号状态: {} ---",
+                num_label(*number),
+                level_label(p.level),
+                p.dir.label(),
+                sc.state
+            )?;
+        }
         write_signal(out, bars15, sc)?;
     }
 

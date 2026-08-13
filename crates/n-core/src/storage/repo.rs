@@ -568,8 +568,9 @@ pub async fn insert_scan(
     Ok(res.last_insert_id)
 }
 
-/// 结构身份键：品种 + 方向 + 级别 + S1/S2 时间戳。
-/// 与复盘统计的去重口径保持一致，跨扫描的重复快照不会重复落库。
+/// 结构身份键：品种 + 版本 + 方向 + 级别 + 结构时间戳（箱体用上下轨 + 预警K）。
+/// 与复盘统计的去重口径保持一致，跨扫描的重复快照不会重复落库；
+/// 版本纳入 key 后，2.0 扫描不会覆盖 1.x 历史记录。
 fn signal_structure_key(
     symbol: &str,
     level: &str,
@@ -577,9 +578,26 @@ fn signal_structure_key(
     detail: &str,
 ) -> Option<String> {
     let v = serde_json::from_str::<serde_json::Value>(detail).ok()?;
-    let s1 = v.get("s1")?.get("ts")?.as_str()?;
+    let version = v
+        .get("logic_version")
+        .and_then(|x| x.as_str())
+        .unwrap_or("1");
     let s2 = v.get("s2")?.get("ts")?.as_str()?;
-    Some(format!("{symbol}|{direction}|{level}|{s1}|{s2}"))
+    if level == "box" {
+        let (upper, lower) = if let Some(b) = v.get("box") {
+            (b.get("upper")?.as_f64()?, b.get("lower")?.as_f64()?)
+        } else {
+            let s0 = v.get("s0")?.get("price")?.as_f64()?;
+            let s1 = v.get("s1")?.get("price")?.as_f64()?;
+            (s0.max(s1), s0.min(s1))
+        };
+        Some(format!(
+            "{symbol}|{version}|{direction}|box|{upper}|{lower}|{s2}"
+        ))
+    } else {
+        let s1 = v.get("s1")?.get("ts")?.as_str()?;
+        Some(format!("{symbol}|{version}|{direction}|{level}|{s1}|{s2}"))
+    }
 }
 
 /// 写入信号：同一结构只保留一条记录，后续扫描更新这条记录的状态与扫描信息。
@@ -861,9 +879,7 @@ mod tests {
     async fn upsert_signals_keeps_one_row_per_structure() {
         let db = test_db().await;
         let row = |scan_id: i64, state: &str, s2: &str, created_at: &str, score: f64| {
-            let detail = format!(
-                r#"{{"s1":{{"ts":"2026-08-03 09:00"}},"s2":{{"ts":"{s2}"}}}}"#
-            );
+            let detail = format!(r#"{{"s1":{{"ts":"2026-08-03 09:00"}},"s2":{{"ts":"{s2}"}}}}"#);
             signals::ActiveModel {
                 id: sea_orm::NotSet,
                 scan_id: Set(scan_id),

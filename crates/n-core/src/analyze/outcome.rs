@@ -139,6 +139,8 @@ pub struct SignalInput {
     pub risk: f64,
     pub created_at: String,
     pub warning_ts: Option<String>,
+    /// 已落盘信号明确记录触发K线时，直接用该根K线做入场模拟。
+    pub trigger_ts: Option<String>,
     pub s0_ts: Option<String>,
     pub s1_ts: Option<String>,
     pub s2_ts: Option<String>,
@@ -237,6 +239,37 @@ fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnot
         trigger_lag_bars: None,
         trigger_overshoot_r: None,
         rollover_crossed: false,
+        gap_crossed_entry: false,
+        gap_crossed_exit: false,
+    }
+}
+
+fn rollover_annotation(
+    trend60_score: Option<f64>,
+    entry_ts: Option<String>,
+    exit_ts: Option<String>,
+) -> SignalAnnotation {
+    SignalAnnotation {
+        sim_version: SIM_VERSION,
+        outcome: Outcome::Rollover,
+        exit_reason: ExitReason::Rollover,
+        entry_ts,
+        exit_ts,
+        exit_price: None,
+        r_multiple: None,
+        mfe_r: None,
+        mae_r: None,
+        bars_held: None,
+        vol_ratio: None,
+        oi_increase: None,
+        trend60_score,
+        atr_percentile: None,
+        target_tier: None,
+        b_vol_ratio: None,
+        a_move_atr: None,
+        trigger_lag_bars: None,
+        trigger_overshoot_r: None,
+        rollover_crossed: true,
         gap_crossed_entry: false,
         gap_crossed_exit: false,
     }
@@ -415,43 +448,63 @@ pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<S
         return Some(empty_annotation(Outcome::InsufficientData, trend60_score));
     };
     let atr15 = indicators::atr(bars15, ATR_PERIOD);
-    // 预警后 12 根内寻找入场触发（做多突破 entry、做空跌破 entry）
-    let scan_end = (start + 1 + PENDING_BARS).min(bars15.len());
     let mut ec = None;
-    for j in start + 1..scan_end {
-        if bars15[j].rollover {
-            return Some(SignalAnnotation {
-                sim_version: SIM_VERSION,
-                outcome: Outcome::Rollover,
-                exit_reason: ExitReason::Rollover,
-                entry_ts: None,
-                exit_ts: Some(bars15[j].dt.to_string()),
-                exit_price: None,
-                r_multiple: None,
-                mfe_r: None,
-                mae_r: None,
-                bars_held: None,
-                vol_ratio: vol_ratio_at(bars15, j),
-                oi_increase: oi_increase_at(bars15, j),
-                trend60_score,
-                atr_percentile: atr_percentile_at(&atr15, j),
-                target_tier: None,
-                b_vol_ratio: None,
-                a_move_atr: None,
-                trigger_lag_bars: None,
-                trigger_overshoot_r: None,
-                rollover_crossed: true,
-                gap_crossed_entry: false,
-                gap_crossed_exit: false,
-            });
+    if let Some(trigger_ts) = input.trigger_ts.as_deref() {
+        if let Some(t_minute) = parse_minute(trigger_ts) {
+            if let Some(j) = (start + 1..bars15.len()).find(|&j| dt_minute(&bars15[j]) >= t_minute)
+            {
+                if dt_minute(&bars15[j]) == t_minute {
+                    ec = Some(j);
+                }
+            }
         }
-        let hit = match dir {
-            Dir::Up => bars15[j].high >= input.entry,
-            Dir::Down => bars15[j].low <= input.entry,
-        };
-        if hit {
-            ec = Some(j);
-            break;
+    }
+    if let Some(ec_known) = ec {
+        if let Some(rb) = (start + 1..=ec_known).find(|&j| bars15[j].rollover) {
+            return Some(rollover_annotation(
+                trend60_score,
+                None,
+                Some(bars15[rb].dt.to_string()),
+            ));
+        }
+    } else {
+        // 预警后 12 根内寻找入场触发（做多突破 entry、做空跌破 entry）
+        let scan_end = (start + 1 + PENDING_BARS).min(bars15.len());
+        for j in start + 1..scan_end {
+            if bars15[j].rollover {
+                return Some(SignalAnnotation {
+                    sim_version: SIM_VERSION,
+                    outcome: Outcome::Rollover,
+                    exit_reason: ExitReason::Rollover,
+                    entry_ts: None,
+                    exit_ts: Some(bars15[j].dt.to_string()),
+                    exit_price: None,
+                    r_multiple: None,
+                    mfe_r: None,
+                    mae_r: None,
+                    bars_held: None,
+                    vol_ratio: vol_ratio_at(bars15, j),
+                    oi_increase: oi_increase_at(bars15, j),
+                    trend60_score,
+                    atr_percentile: atr_percentile_at(&atr15, j),
+                    target_tier: None,
+                    b_vol_ratio: None,
+                    a_move_atr: None,
+                    trigger_lag_bars: None,
+                    trigger_overshoot_r: None,
+                    rollover_crossed: true,
+                    gap_crossed_entry: false,
+                    gap_crossed_exit: false,
+                });
+            }
+            let hit = match dir {
+                Dir::Up => bars15[j].high >= input.entry,
+                Dir::Down => bars15[j].low <= input.entry,
+            };
+            if hit {
+                ec = Some(j);
+                break;
+            }
         }
     }
 
@@ -799,6 +852,8 @@ impl StatsScope {
 pub struct StatRow {
     pub signal_id: i64,
     pub symbol: String,
+    /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1。
+    pub logic_version: String,
     pub direction: String,
     pub level: String,
     pub grade: String,
@@ -881,10 +936,16 @@ fn dedup_first_seen(rows: &[StatRow]) -> Vec<&StatRow> {
     for r in rows {
         let key = match (&r.s1_ts, &r.s2_ts) {
             (Some(s1), Some(s2)) => {
-                format!("{}|{}|{}|{}|{}", r.symbol, r.direction, r.level, s1, s2)
+                format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    r.symbol, r.logic_version, r.direction, r.level, s1, s2
+                )
             }
             // 旧数据缺少结构时间戳时退回信号自身，不做合并
-            _ => format!("{}|{}|{}|id{}", r.symbol, r.direction, r.level, r.signal_id),
+            _ => format!(
+                "{}|{}|{}|{}|id{}",
+                r.symbol, r.logic_version, r.direction, r.level, r.signal_id
+            ),
         };
         seen.entry(key)
             .and_modify(|cur| {
@@ -1539,6 +1600,7 @@ mod tests {
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some("2026-08-03 09:15".to_string()),
             a_move: Some(4.0),
+            trigger_ts: None,
         }
     }
 
@@ -2059,6 +2121,7 @@ mod tests {
             StatRow {
                 signal_id: id,
                 symbol: symbol.to_string(),
+                logic_version: "1".to_string(),
                 direction: "up".to_string(),
                 level: "fine".to_string(),
                 grade: "A级".to_string(),
@@ -2153,11 +2216,59 @@ mod tests {
     }
 
     #[test]
+    fn stats_dedup_isolates_logic_versions() {
+        let mk = |id: i64, version: &str| StatRow {
+            signal_id: id,
+            symbol: "RB0".to_string(),
+            logic_version: version.to_string(),
+            direction: "up".to_string(),
+            level: "fine".to_string(),
+            grade: "A级".to_string(),
+            score: 3.8,
+            created_at: "2026-08-03 09:15".to_string(),
+            warning_ts: Some("2026-08-03 09:15".to_string()),
+            s1_ts: Some("2026-08-03 08:45".to_string()),
+            s2_ts: Some("2026-08-03 09:15".to_string()),
+            outcome: Some(Outcome::Win),
+            r_multiple: Some(1.0),
+            mfe_r: Some(1.5),
+            mae_r: Some(-0.5),
+            bars_held: Some(3),
+            vol_ratio: Some(1.0),
+            oi_increase: Some(true),
+            trend60_score: Some(3.0),
+            atr_percentile: Some(0.4),
+            exit_reason: Some(ExitReason::Target),
+            target_tier: None,
+            extended_target: false,
+            b_vol_ratio: None,
+            a_move_atr: None,
+            trigger_lag_bars: None,
+            trigger_overshoot_r: None,
+            a_move: None,
+            b_move: None,
+            a_bars: None,
+            b_bars: None,
+            retracement: None,
+            dims: None,
+            net_r: None,
+            rollover_crossed: false,
+            gap_crossed_entry: false,
+            gap_crossed_exit: false,
+        };
+        // 同结构同版本只留首条；1.0 与 2.0 同名结构互不覆盖。
+        let rows = vec![mk(1, "1"), mk(2, "1"), mk(3, "2"), mk(4, "2")];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.n, 2);
+    }
+
+    #[test]
     fn stats_composite_dimensions() {
         let mk =
             |id: i64, symbol: &str, ts: &str, score: f64, vol: f64, atr: Option<f64>| StatRow {
                 signal_id: id,
                 symbol: symbol.to_string(),
+                logic_version: "1".to_string(),
                 direction: "up".to_string(),
                 level: "fine".to_string(),
                 grade: "A级".to_string(),
@@ -2222,6 +2333,7 @@ mod tests {
         let mk = |id: i64, gap_entry: bool, gap_exit: bool| StatRow {
             signal_id: id,
             symbol: format!("RB{id}"),
+            logic_version: "1".to_string(),
             direction: "up".to_string(),
             level: "fine".to_string(),
             grade: "A级".to_string(),
@@ -2267,6 +2379,7 @@ mod tests {
         StatRow {
             signal_id: id,
             symbol: format!("RB{id}"),
+            logic_version: "1".to_string(),
             direction: "up".to_string(),
             level: "fine".to_string(),
             grade: "A级".to_string(),
@@ -2545,6 +2658,7 @@ mod tests {
         let mk = |id: i64, score: f64, outcome: Outcome, r: f64| StatRow {
             signal_id: id,
             symbol: format!("RB{id}"),
+            logic_version: "1".to_string(),
             direction: "up".to_string(),
             level: "fine".to_string(),
             grade: "A级".to_string(),

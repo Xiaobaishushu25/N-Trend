@@ -611,7 +611,11 @@ function dirLabel(s: SignalOutcome) {
 }
 
 function levelLabel(s: SignalOutcome) {
-  return s.level === 'fine' ? '精细' : s.level === 'large' ? '较大' : s.level
+  return s.level === 'fine' ? '精细' : s.level === 'large' ? '较大' : s.level === 'box' ? '箱体' : s.level
+}
+
+function patternLabel(s: SignalOutcome) {
+  return `${dirLabel(s)} ${levelLabel(s)}${s.level === 'box' ? '' : 'N'}`
 }
 
 /** 状态胶囊的短标签（与 K 线图左侧品种列表一致） */
@@ -705,8 +709,7 @@ const columns: DataTableColumns<WatchRow> = [
     render: (r) => {
       const s = r.signal
       if (!s) return h('span', { class: 'cell-empty' }, '—')
-      const dir = dirLabel(s)
-      const tip = `${dir} ${levelLabel(s)}N · ${s.grade} · 评分 ${s.score.toFixed(2)}`
+      const tip = `${patternLabel(s)} · ${s.grade} · 评分 ${s.score.toFixed(2)}`
       return h(
         'div',
         { class: 'pattern-pills', title: tip },
@@ -714,7 +717,7 @@ const columns: DataTableColumns<WatchRow> = [
           h(
             'span',
             { class: `pill pill-dir ${s.direction === 'up' ? 'is-up' : 'is-down'}` },
-            `${dir} ${levelLabel(s)}N`,
+            patternLabel(s),
           ),
           h('span', { class: 'pill pill-grade' }, s.grade),
         ],

@@ -51,6 +51,11 @@ pub struct OutcomeRefresh {
 pub struct OutcomeDetail {
     pub signal_id: i64,
     pub symbol: String,
+    /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1
+    pub logic_version: String,
+    /// 2026-08-14：预警K线类型，strong / engulf / wick / fast / cumulative / none；
+    /// 旧记录无此字段。质量分已计入 `score`，不再单独下发显示加成。
+    pub warning_kind: String,
     pub direction: String,
     pub level: String,
     pub grade: String,
@@ -120,6 +125,8 @@ pub struct OutcomeFilter {
     pub score_max: Option<f64>,
     /// win / loss / no_trigger / open / insufficient_data
     pub outcome: Option<String>,
+    /// 1 / 2，缺省不过滤
+    pub version: Option<String>,
 }
 
 fn matches_outcome_filter(
@@ -162,6 +169,19 @@ fn matches_outcome_filter(
             return false;
         }
     }
+    if let Some(v) = f.version.as_deref().filter(|x| !x.is_empty()) {
+        let detail_version = serde_json::from_str::<serde_json::Value>(&s.detail)
+            .ok()
+            .and_then(|x| {
+                x.get("logic_version")
+                    .and_then(|y| y.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "1".to_string());
+        if detail_version != v {
+            return false;
+        }
+    }
     true
 }
 
@@ -196,6 +216,7 @@ fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
         risk: (s.entry - s.stop).abs(),
         created_at: s.created_at.clone(),
         warning_ts: p.as_ref().and_then(|p| p.warning_ts.clone()),
+        trigger_ts: p.as_ref().and_then(|p| p.trigger_ts.clone()),
         s0_ts: p.as_ref().map(|p| p.s0.ts.clone()),
         s1_ts: p.as_ref().map(|p| p.s1.ts.clone()),
         s2_ts: p.as_ref().map(|p| p.s2.ts.clone()),
@@ -229,6 +250,10 @@ fn stat_row_from(
     Some(outcome::StatRow {
         signal_id: s.id,
         symbol: s.symbol.clone(),
+        logic_version: p
+            .as_ref()
+            .map(|x| x.logic_version.clone())
+            .unwrap_or_else(|| "1".to_string()),
         direction: s.direction.clone(),
         level: s.level.clone(),
         grade: s.grade.clone(),
@@ -280,6 +305,14 @@ fn outcome_detail_from(
     OutcomeDetail {
         signal_id: s.id,
         symbol: s.symbol.clone(),
+        logic_version: p
+            .as_ref()
+            .map(|x| x.logic_version.clone())
+            .unwrap_or_else(|| "1".to_string()),
+        warning_kind: p
+            .as_ref()
+            .map(|x| x.warning_kind.clone())
+            .unwrap_or_default(),
         direction: s.direction.clone(),
         level: s.level.clone(),
         grade: s.grade.clone(),
@@ -1025,6 +1058,7 @@ impl Services {
     /// 全品种扫描：15m 结构 + 60m 趋势 → 信号持久化。
     pub async fn run_scan(&self) -> Result<ScanResult> {
         let started = crate::analyze::time::now_display();
+        let logic_version = self.config().await.app_config.logic_version;
         let symbols = repo::list_symbols(&self.db, true).await?;
         let mut active: Vec<SignalOutcome> = Vec::new();
         let mut failed: Vec<SymbolFailure> = Vec::new();
@@ -1041,7 +1075,13 @@ impl Services {
                 continue;
             }
             let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
-            match crate::analyze::analyze_bars(&sym.code, &bars15, &bars60, tick) {
+            match crate::analyze::analyze_bars_for_version(
+                &sym.code,
+                &bars15,
+                &bars60,
+                tick,
+                &logic_version,
+            ) {
                 Ok(outcome) => {
                     scanned += 1;
                     active.extend(crate::analyze::collect_active(&outcome));
@@ -1201,7 +1241,12 @@ impl Services {
 
     /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总；
     /// scope 控制统计口径（all/tradable/standard）。
-    pub async fn review_stats(&self, dimension: &str, scope: &str) -> Result<outcome::ReviewStats> {
+    pub async fn review_stats(
+        &self,
+        dimension: &str,
+        scope: &str,
+        version: Option<&str>,
+    ) -> Result<outcome::ReviewStats> {
         let sigs = repo::all_signals(&self.db).await?;
         let outs = repo::all_outcomes(&self.db).await?;
         let by_id: HashMap<i64, signal_outcomes::Model> =
@@ -1219,6 +1264,19 @@ impl Services {
         let rows: Vec<outcome::StatRow> = sigs
             .iter()
             .filter_map(|s| {
+                if let Some(v) = version {
+                    let detail_version = serde_json::from_str::<serde_json::Value>(&s.detail)
+                        .ok()
+                        .and_then(|x| {
+                            x.get("logic_version")
+                                .and_then(|y| y.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "1".to_string());
+                    if detail_version != v {
+                        return None;
+                    }
+                }
                 stat_row_from(s, by_id.get(&s.id), tick_by_symbol.get(&s.symbol).copied())
             })
             .collect();
@@ -1256,13 +1314,34 @@ impl Services {
             let Some(o) = by_id.get(&s.id) else {
                 continue;
             };
-            let (_, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
-            let key = match (&s1_ts, &s2_ts) {
-                (Some(a), Some(b)) => {
-                    format!("{}|{}|{}|{}|{}", s.symbol, s.direction, s.level, a, b)
+            let p = parse_detail(&s.detail);
+            let version = p
+                .as_ref()
+                .map(|x| x.logic_version.clone())
+                .unwrap_or_else(|| "1".to_string());
+            let key = if s.level == "box" {
+                if let Some(b) = p.as_ref().and_then(|x| x.r#box.as_ref()) {
+                    let w = p
+                        .as_ref()
+                        .and_then(|x| x.warning_ts.clone())
+                        .unwrap_or_default();
+                    format!("{}|{}|box|{}|{}|{}", s.symbol, version, b.upper, b.lower, w)
+                } else {
+                    format!("{}|{}|box|id{}", s.symbol, version, s.id)
                 }
-                // 旧数据缺少结构时间戳时退回信号自身，不做合并
-                _ => format!("{}|{}|{}|id{}", s.symbol, s.direction, s.level, s.id),
+            } else {
+                let (_, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
+                match (&s1_ts, &s2_ts) {
+                    (Some(a), Some(b)) => format!(
+                        "{}|{}|{}|{}|{}|{}",
+                        s.symbol, version, s.direction, s.level, a, b
+                    ),
+                    // 旧数据缺少结构时间戳时退回信号自身，不做合并
+                    _ => format!(
+                        "{}|{}|{}|{}|id{}",
+                        s.symbol, version, s.direction, s.level, s.id
+                    ),
+                }
             };
             if !seen.insert(key) {
                 continue;

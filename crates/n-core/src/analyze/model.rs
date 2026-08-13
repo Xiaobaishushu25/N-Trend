@@ -158,8 +158,10 @@ impl Trend60 {
     }
 }
 
+#[derive(Clone)]
 pub struct SignalCheck {
     pub warning: Option<usize>,
+    pub warning_kind: &'static str,
     pub trigger: Option<usize>,
     pub trigger_age: usize,
     pub state: &'static str,
@@ -181,6 +183,7 @@ impl SignalCheck {
     pub fn new() -> Self {
         Self {
             warning: None,
+            warning_kind: "",
             trigger: None,
             trigger_age: 0,
             state: "",
@@ -196,6 +199,45 @@ impl SignalCheck {
             total: 0.0,
             category: "",
             note: String::new(),
+        }
+    }
+
+    /// 2026-08-14：预警K线质量改为真实综合评分项。
+    /// 强趋势K/吞没/长影线统一计入 0.3 分，快速路径/累计覆盖/无预警不计分，
+    /// 让三类强预警在最终评分上比其余预警明显高出约 0.3 分。
+    pub const WARNING_QUALITY_POINTS: f64 = 0.3;
+
+    pub fn warning_quality_points(&self) -> f64 {
+        Self::warning_quality_points_for(self.warning_kind)
+    }
+
+    pub fn warning_quality_points_for(kind: &str) -> f64 {
+        if matches!(kind, "strong" | "engulf" | "wick") {
+            Self::WARNING_QUALITY_POINTS
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warning_quality_points_are_real_scoring_bonus() {
+        let mut sc = SignalCheck::new();
+        for (kind, points) in [
+            ("strong", 0.3),
+            ("engulf", 0.3),
+            ("wick", 0.3),
+            ("fast", 0.0),
+            ("cumulative", 0.0),
+            ("none", 0.0),
+            ("", 0.0),
+        ] {
+            sc.warning_kind = kind;
+            assert_eq!(sc.warning_quality_points(), points, "kind={kind}");
         }
     }
 }

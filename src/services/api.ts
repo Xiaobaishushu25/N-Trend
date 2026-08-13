@@ -73,12 +73,13 @@ export const api = {
   getLatestSignals: (limit?: number) => invoke<SignalRow[]>('get_latest_signals', { limit }),
 
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
-  getReviewStats: (dimension: string, scope: string) =>
-    invoke<ReviewStats>('get_review_stats', { dimension, scope }),
+  getReviewStats: (dimension: string, scope: string, version?: string | null) =>
+    invoke<ReviewStats>('get_review_stats', { dimension, scope, version: version || null }),
   getRecentOutcomes: (limit?: number, filters?: RecentOutcomeFilters) =>
     invoke<OutcomeDetail[]>('get_recent_outcomes', {
       limit,
       symbol: filters?.symbol || null,
+      version: filters?.version || null,
       direction: filters?.direction || null,
       level: filters?.level || null,
       grade: filters?.grade || null,

@@ -17,7 +17,7 @@ pub const SESSION_BREAK_MINUTES: i64 = 5;
 /// 断点跳空 / ATR 的最小倍数：太小会把普通消息跳空误判为换月。
 pub const GAP_ATR_MIN: f64 = 6.0;
 /// 断点前后持仓量相对变化的最小比例：仅作为候选条件，最终由月合约价格确认。
-pub const HOLD_CHANGE_MIN: f64 = 0.05;
+pub const HOLD_CHANGE_MIN: f64 = 0.03;
 /// ATR 计算窗口（与策略分析一致）。
 pub const ATR_WINDOW: usize = 20;
 /// 确认时容忍的价格偏差比例。
@@ -320,6 +320,28 @@ mod tests {
 
         let pair = confirm_candidate(&cands[0], &month_bars).unwrap();
         assert_eq!(pair, Some(("BU2609".to_string(), "BU2610".to_string())));
+    }
+
+    #[test]
+    fn c0_low_hold_shift_confirms_via_month_price() {
+        let mut bars = session("2026-08-12", 100.0, 100.0, 100000.0);
+        bars.push(bar("2026-08-12 15:00:00", 100.0, 100.0, 100000.0));
+        bars.push(bar("2026-08-12 21:05:00", 80.0, 81.0, 104090.0));
+        let cands = detect_candidates("C0", &bars);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].ts, "2026-08-12 21:05:00");
+
+        let mut month_bars = std::collections::HashMap::new();
+        let mut old = session("2026-08-12", 100.0, 100.0, 200000.0);
+        old.push(bar("2026-08-12 15:00:00", 100.0, 100.0, 200000.0));
+        month_bars.insert("C2609".to_string(), old);
+        month_bars.insert(
+            "C2611".to_string(),
+            vec![bar("2026-08-12 21:05:00", 80.0, 81.0, 220000.0)],
+        );
+
+        let pair = confirm_candidate(&cands[0], &month_bars).unwrap();
+        assert_eq!(pair, Some(("C2609".to_string(), "C2611".to_string())));
     }
 
     #[test]

@@ -51,9 +51,23 @@ export interface SwingDto {
   ts: string
 }
 
+/** 箱体信号元数据：上下轨价格、触碰次数与箱体首末时间 */
+export interface BoxDto {
+  upper: number
+  lower: number
+  upper_touches: number
+  lower_touches: number
+  first_ts: string
+  last_ts: string
+}
+
 export interface PatternDto {
   number: number
   level: string
+  /** 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认视为 1 */
+  logic_version: string
+  /** 2026-08-14：预警K线类型；质量分已计入 score */
+  warning_kind?: string
   direction: string
   grade: string
   s0: SwingDto
@@ -82,6 +96,8 @@ export interface PatternDto {
   vol_confirmed: boolean
   /** 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值 */
   trigger_overshoot_r?: number | null
+  /** 箱体信号元数据（仅 level="box" 时存在） */
+  box?: BoxDto | null
   note: string
   active: boolean
 }
@@ -109,6 +125,9 @@ export interface SignalOutcome {
   symbol: string
   number: number
   level: string
+  logic_version: string
+  /** 2026-08-14：预警K线类型；质量分已计入 score */
+  warning_kind?: string
   direction: string
   grade: string
   s0: SwingDto
@@ -137,6 +156,8 @@ export interface SignalOutcome {
   vol_confirmed: boolean
   /** 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值 */
   trigger_overshoot_r?: number | null
+  /** 箱体信号元数据（仅 level="box" 时存在） */
+  box?: BoxDto | null
   note: string
   active: boolean
 }
@@ -201,6 +222,8 @@ export interface EmailSettings {
 
 export interface AppConfig {
   auto_start_scheduler: boolean
+  /** 信号分析版本：1 = 原逻辑，2 = 严格N字 + 箱体 */
+  logic_version: string
 }
 
 export interface SchedulerConfig {
@@ -340,6 +363,10 @@ export interface ReviewStats {
 export interface OutcomeDetail {
   signal_id: number
   symbol: string
+  /** 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1 */
+  logic_version: string
+  /** 2026-08-14：预警K线类型；质量分已计入 score */
+  warning_kind?: string
   direction: string
   level: string
   grade: string
@@ -402,6 +429,7 @@ export interface ReviewExitOverlay {
 /** 最近信号明细筛选条件（全部可选，空值不过滤） */
 export interface RecentOutcomeFilters {
   symbol?: string | null
+  version?: string | null
   direction?: string | null
   level?: string | null
   grade?: string | null

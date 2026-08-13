@@ -34,6 +34,8 @@ const props = defineProps<{
   timeframe: string
   rows: KlineRow[]
   signals: PatternDto[]
+  /** 是否在当前可视区间标注最高价/最低价 */
+  showExtremes?: boolean
   loading?: boolean
   /** 复盘跳转模式：额外绘制出场价位与出场标记 */
   reviewExit?: ReviewExitOverlay | null
@@ -300,6 +302,7 @@ let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let resizeObserver: ResizeObserver | null = null
 let countdownTimer: ReturnType<typeof setInterval> | null = null
 let priceLines: IPriceLine[] = []
+let extremeLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
@@ -375,7 +378,11 @@ function rightGapBars(visible: number): number {
 /** N形态连线/标记颜色：与K线自身的红绿区分开并带透明度，减少对K线的遮挡 */
 const PATTERN_UP_COLOR = 'rgba(255, 135, 135, 0.9)' // 上涨：浅红
 const PATTERN_DOWN_COLOR = 'rgba(32, 201, 151, 0.9)' // 下跌：青绿
+const BOX_COLOR = '#ff6d00' // 箱体：亮橘色，与N形态红绿区分开
 const ZOOM_SENSITIVITY = 0.0015
+/** 价格轴上下留白：K线最高/最低点与图表边框之间的空隙比例 */
+const PRICE_SCALE_TOP = 0.06
+const PRICE_SCALE_BOTTOM = 0.06
 
 const toTs = (s: string): UTCTimestamp =>
   Math.floor(new Date(s.replace(' ', 'T') + 'Z').getTime() / 1000) as UTCTimestamp
@@ -430,7 +437,7 @@ function isTradingTime(date: Date): boolean {
 /** 十字光标下的K线信息：时间 + 开高低收 */
 function formatLegend(d: CandlestickData, time: Time): string {
   const up = d.close >= d.open
-  const color = up ? '#e03131' : '#0f9d58'
+  const color = up ? '#e03131' : '#43BC7C'
   const item = (label: string, value: number) =>
     `<span class="lg-item"><span class="lg-label">${label}</span><span class="lg-value" style="color:${color}">${value}</span></span>`
   return `<span class="lg-time">${formatTime(time)}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}`
@@ -509,11 +516,79 @@ function buildVolumes(): HistogramData[] {
   }))
 }
 
+/** 当前可视区间内的最高价/最低价所在K线 */
+function visibleExtremes(): { high: KlineRow | null; low: KlineRow | null } {
+  if (!chart || !props.rows.length) return { high: null, low: null }
+  const logical = chart.timeScale().getVisibleLogicalRange()
+  const from = Math.max(0, Math.floor(logical?.from ?? 0))
+  const to = Math.min(props.rows.length - 1, Math.ceil(logical?.to ?? props.rows.length - 1))
+  if (to < from) return { high: null, low: null }
+  let high = props.rows[from]
+  let low = props.rows[from]
+  for (let i = from + 1; i <= to; i++) {
+    const r = props.rows[i]
+    if (r.high > high.high) high = r
+    if (r.low < low.low) low = r
+  }
+  return { high, low }
+}
+
 function buildMarkers(): SeriesMarker<Time>[] {
   const markers: SeriesMarker<Time>[] = []
   const ex = props.reviewExit
+  if (props.showExtremes) {
+    const { high, low } = visibleExtremes()
+    if (high) {
+      markers.push({
+        time: toTs(high.ts),
+        position: 'aboveBar',
+        color: '#e03131',
+        shape: 'arrowDown',
+        text: '最高',
+      })
+    }
+    if (low) {
+      markers.push({
+        time: toTs(low.ts),
+        position: 'belowBar',
+        color: '#0f9d58',
+        shape: 'arrowUp',
+        text: '最低',
+      })
+    }
+  }
   for (const s of props.signals) {
     const color = s.direction === 'up' ? PATTERN_UP_COLOR : PATTERN_DOWN_COLOR
+    if (s.level === 'box') {
+      if (s.warning_ts) {
+        markers.push({
+          time: toTs(s.warning_ts),
+          position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
+          color: BOX_COLOR,
+          shape: 'circle',
+          size: 0.5,
+          text: 'BOX',
+        })
+      }
+      if (s.trigger_ts) {
+        markers.push({
+          time: toTs(s.trigger_ts),
+          position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
+          color: '#e53935',
+          shape: 'arrowDown',
+          text: '触发',
+        })
+      } else if (ex?.entryTs) {
+        markers.push({
+          time: toTs(ex.entryTs),
+          position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
+          color: '#fb8c00',
+          shape: 'arrowDown',
+          text: '回放触发',
+        })
+      }
+      continue
+    }
     markers.push({
       time: toTs(s.s0.ts),
       position: 'belowBar',
@@ -597,12 +672,66 @@ function syncPriceLines() {
   )
 }
 
-/** 画出每个N形态的 S0→S1→S2 连线 */
+/** 在当前可视区间画出最高价/最低价虚线 */
+function syncExtremes() {
+  if (!candleSeries) return
+  for (const line of extremeLines) candleSeries.removePriceLine(line)
+  extremeLines = []
+  if (!props.showExtremes) return
+  const { high, low } = visibleExtremes()
+  const lines: { price: number; color: string; title: string }[] = []
+  if (high) lines.push({ price: high.high, color: '#e03131', title: '最高' })
+  if (low) lines.push({ price: low.low, color: '#0f9d58', title: '最低' })
+  extremeLines = lines.map((l) =>
+    candleSeries!.createPriceLine({
+      price: l.price,
+      color: l.color,
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
+      title: l.title,
+    }),
+  )
+}
+
+/** 可视区间变化时重算最高/最低点 */
+function onVisibleRangeChange() {
+  if (!props.showExtremes) return
+  syncExtremes()
+  markersApi?.setMarkers(buildMarkers())
+}
+
+/** 画出每个N形态的 S0→S1→S2 连线；箱体只画上下轨横线 */
 function syncPatternLines() {
   if (!chart) return
   for (const line of patternLines) chart.removeSeries(line)
   patternLines = []
+  const seenBoxRails = new Set<string>()
   for (const sig of props.signals) {
+    if (sig.level === 'box') {
+      if (!sig.box) continue
+      const addRail = (price: number) => {
+        const key = `${price}|${sig.box!.first_ts}|${sig.box!.last_ts}`
+        if (seenBoxRails.has(key)) return
+        seenBoxRails.add(key)
+        const line = chart!.addSeries(LineSeries, {
+          color: BOX_COLOR,
+          lineWidth: 1,
+          lineStyle: LineStyle.Solid,
+          lastValueVisible: false,
+          priceLineVisible: false,
+          crosshairMarkerVisible: false,
+        })
+        line.setData([
+          { time: toTs(sig.box!.first_ts) as Time, value: price },
+          { time: toTs(sig.box!.last_ts) as Time, value: price },
+        ])
+        patternLines.push(line)
+      }
+      addRail(sig.box.upper)
+      addRail(sig.box.lower)
+      continue
+    }
     const pts = [sig.s0, sig.s1, sig.s2]
     if (pts.some((p) => !p.ts || p.price <= 0)) continue
     const line = chart.addSeries(LineSeries, {
@@ -851,41 +980,65 @@ function rowAt(ts: string): KlineRow | undefined {
 function buildEventLabels(): EventLabelData[] {
   const labels: EventLabelData[] = []
   const ex = props.reviewExit
+  const seenBoxLabels = new Set<string>()
   for (const s of props.signals) {
     const color = s.direction === 'up' ? '#d64545' : '#0e9f6e'
     const swingSide = (isHigh: boolean): 'above' | 'below' => (isHigh ? 'above' : 'below')
-    labels.push({
-      time: toTs(s.s0.ts),
-      text: 'S0',
-      color,
-      price: s.s0.price,
-      priority: 0,
-      side: swingSide(s.s0.is_high),
-    })
-    labels.push({
-      time: toTs(s.s1.ts),
-      text: 'S1',
-      color,
-      price: s.s1.price,
-      priority: 0,
-      side: swingSide(s.s1.is_high),
-    })
-    labels.push({
-      time: toTs(s.s2.ts),
-      text: 'S2',
-      color,
-      price: s.s2.price,
-      priority: 0,
-      side: swingSide(s.s2.is_high),
-    })
+    if (s.level === 'box' && s.box) {
+      const boxKey = `${s.box.upper}|${s.box.lower}|${s.box.first_ts}|${s.box.last_ts}`
+      if (!seenBoxLabels.has(boxKey)) {
+        seenBoxLabels.add(boxKey)
+        labels.push({
+          time: toTs(s.box.first_ts),
+          text: '下轨',
+          color: BOX_COLOR,
+          price: s.box.lower,
+          priority: 0,
+          side: 'below',
+        })
+        labels.push({
+          time: toTs(s.box.last_ts),
+          text: '上轨',
+          color: BOX_COLOR,
+          price: s.box.upper,
+          priority: 0,
+          side: 'above',
+        })
+      }
+    } else if (s.level !== 'box') {
+      labels.push({
+        time: toTs(s.s0.ts),
+        text: 'S0',
+        color,
+        price: s.s0.price,
+        priority: 0,
+        side: swingSide(s.s0.is_high),
+      })
+      labels.push({
+        time: toTs(s.s1.ts),
+        text: 'S1',
+        color,
+        price: s.s1.price,
+        priority: 0,
+        side: swingSide(s.s1.is_high),
+      })
+      labels.push({
+        time: toTs(s.s2.ts),
+        text: 'S2',
+        color,
+        price: s.s2.price,
+        priority: 0,
+        side: swingSide(s.s2.is_high),
+      })
+    }
 
     if (s.warning_ts) {
       const row = rowAt(s.warning_ts)
       if (row) {
         labels.push({
           time: toTs(s.warning_ts),
-          text: '预警',
-          color: '#b45309',
+          text: s.level === 'box' ? '箱体预警' : '预警',
+          color: s.level === 'box' ? BOX_COLOR : '#b45309',
           price: s.direction === 'up' ? row.low : row.high,
           priority: 1,
           side: s.direction === 'up' ? 'below' : 'above',
@@ -950,8 +1103,8 @@ function syncEventLabels() {
   const belowCount = labels.filter((l) => l.side === 'below').length
   chart.priceScale('right').applyOptions({
     scaleMargins: {
-      top: Math.min(0.22, Math.max(0.15, 0.12 + aboveCount * 0.02)),
-      bottom: Math.min(0.22, Math.max(0.15, 0.12 + belowCount * 0.02)),
+      top: Math.min(0.2, Math.max(PRICE_SCALE_TOP, 0.04 + aboveCount * 0.02)),
+      bottom: Math.min(0.2, Math.max(PRICE_SCALE_BOTTOM, 0.04 + belowCount * 0.02)),
     },
   })
   eventLabelPrimitive = new EventLabelPrimitive(chart, candleSeries, labels)
@@ -1009,6 +1162,7 @@ function renderOverlays() {
   if (!chart || !candleSeries) return
   markersApi?.setMarkers(buildMarkers())
   syncPriceLines()
+  syncExtremes()
   syncPatternLines()
   syncEventLabels()
 }
@@ -1114,12 +1268,12 @@ onMounted(() => {
   candleSeries = chart.addSeries(CandlestickSeries, {
     // 红涨空心：实体透明只留红色描边；绿跌实心
     upColor: 'rgba(224, 49, 49, 0)',
-    downColor: '#0f9d58',
+    downColor: '#43BC7C',
     borderVisible: true,
     borderUpColor: '#e03131',
-    borderDownColor: '#0f9d58',
+    borderDownColor: '#43BC7C',
     wickUpColor: '#e03131',
-    wickDownColor: '#0f9d58',
+    wickDownColor: '#43BC7C',
   })
   markersApi = createSeriesMarkers(candleSeries, [])
   // 成交量柱状图放在独立窗格（pane 1），与K线物理分离，放大不会互相压到
@@ -1128,10 +1282,13 @@ onMounted(() => {
     { priceFormat: { type: 'volume' }, priceScaleId: 'vol' },
     1,
   )
-  // 0.15 就是 15%（小数形式），top 控制上边距、bottom 控制下边距；留白给事件文字标签使用
-  chart.priceScale('right').applyOptions({ scaleMargins: { top: 0.15, bottom: 0.15 } })
+  // 默认 6% 上下留白；事件文字标签较多时会由 syncEventLabels 动态放宽
+  chart.priceScale('right').applyOptions({
+    scaleMargins: { top: PRICE_SCALE_TOP, bottom: PRICE_SCALE_BOTTOM },
+  })
   chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.08, bottom: 0.04 } })
   applyPaneHeights()
+  chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleRangeChange)
 
   chart.subscribeCrosshairMove((param) => {
     if (!legend.value || !param.time || !candleSeries) return
@@ -1205,6 +1362,13 @@ watch(
     if (chart) renderOverlays()
   },
 )
+watch(
+  () => props.showExtremes,
+  () => {
+    syncExtremes()
+    markersApi?.setMarkers(buildMarkers())
+  },
+)
 
 onBeforeUnmount(() => {
   // dbg.unmountCount += 1
@@ -1223,12 +1387,15 @@ onBeforeUnmount(() => {
     candleSeries.detachPrimitive(eventLabelPrimitive)
     eventLabelPrimitive = null
   }
+  chart?.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
   if (countdownTimer) {
     clearInterval(countdownTimer)
     countdownTimer = null
   }
   markersApi?.detach()
   markersApi = null
+  for (const line of extremeLines) candleSeries?.removePriceLine(line)
+  extremeLines = []
   for (const line of patternLines) chart?.removeSeries(line)
   patternLines = []
   chart?.remove()

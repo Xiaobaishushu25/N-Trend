@@ -5,6 +5,8 @@ import {
   NIcon,
   NInput,
   NInputNumber,
+  NRadioButton,
+  NRadioGroup,
   NSelect,
   NSpace,
   NSwitch,
@@ -248,6 +250,16 @@ onMounted(async () => {
                 <Tip text="应用启动后自动开始定时刷新与扫描，无需手动点击启动。" />
               </div>
               <n-switch v-model:value="form.app_config.auto_start_scheduler" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                交易信号逻辑
+                <Tip text="默认使用 1.x 原版逻辑；2.0 使用严格N字 + 箱体识别，且信号评分≥3.5才入库和通知。切换后扫描按所选版本运行，两版历史记录互不覆盖。" />
+              </div>
+              <n-radio-group v-model:value="form.app_config.logic_version">
+                <n-radio-button value="1">1.x 原版</n-radio-button>
+                <n-radio-button value="2">2.0 严格</n-radio-button>
+              </n-radio-group>
             </div>
           </div>
 

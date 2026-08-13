@@ -50,6 +50,7 @@ export const useReviewStore = defineStore('review', {
     recentFilters: {
       symbol: '',
       // 下拉筛选用 null 作为"未选择"，naive-ui 才会显示 placeholder
+      version: null,
       direction: null,
       level: null,
       grade: null,
@@ -68,7 +69,11 @@ export const useReviewStore = defineStore('review', {
       this.loading = true
       try {
         const [stats] = await Promise.all([
-          api.getReviewStats(this.dimension, this.statsScope),
+          api.getReviewStats(
+            this.dimension,
+            this.statsScope,
+            this.recentFilters.version,
+          ),
           this.loadRecent(),
         ])
         this.stats = stats
@@ -94,6 +99,7 @@ export const useReviewStore = defineStore('review', {
     async resetRecentFilters() {
       this.recentFilters = {
         symbol: '',
+        version: null,
         direction: null,
         level: null,
         grade: null,
@@ -101,7 +107,7 @@ export const useReviewStore = defineStore('review', {
         scoreMin: null,
         scoreMax: null,
       }
-      await this.loadRecent()
+      await this.load()
     },
     /** 先回填未终结信号的结果，再重新拉取统计 */
     async refresh() {

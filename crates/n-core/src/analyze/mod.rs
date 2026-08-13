@@ -1,3 +1,4 @@
+pub mod box_range;
 pub mod dto;
 pub mod indicators;
 pub mod io;
@@ -10,7 +11,7 @@ pub mod time;
 
 use anyhow::{Context, Result};
 
-use crate::analyze::dto::{AnalysisDetail, SignalOutcome};
+use crate::analyze::dto::{AnalysisDetail, BoxDto, SignalOutcome};
 use crate::analyze::model::{Bar, Dir, NPattern, SignalCheck, ATR_PERIOD};
 
 type SignalTuple<'a> = (usize, &'a NPattern, SignalCheck);
@@ -155,6 +156,166 @@ pub fn analyze_bars(
         summary,
         detail,
     })
+}
+
+/// 2.0 分析：严格 N 字（A段强动能 + 三选一预警）与箱体触轨信号。
+pub fn analyze_bars_v2(
+    symbol: &str,
+    bars15: &[Bar],
+    bars60: &[Bar],
+    tick: f64,
+) -> Result<AnalysisOutcome> {
+    const V2_N_MIN_TOTAL: f64 = 3.5;
+    const V2_BOX_MIN_TOTAL: f64 = 3.0;
+    const V2_MIN_A_STRICT_LEG: usize = 1;
+    const V2_MIN_A_RELAXED_LEG: usize = 2;
+    const V2_MIN_A_SPEED_ATR: f64 = 0.15;
+    let atr15 = indicators::atr(bars15, ATR_PERIOD);
+    let trend_k = indicators::trend_flags(bars15, &atr15);
+    let trend_k_relaxed = indicators::trend_flags_relaxed(bars15, &atr15);
+    let trend60 = indicators::analyze_60m(bars60);
+
+    let up_count = trend_k.iter().filter(|x| x.0).count();
+    let down_count = trend_k.iter().filter(|x| x.1).count();
+    let swings_fine = indicators::find_swings(bars15, &atr15, 2, 8);
+    let swings_large = indicators::find_swings(bars15, &atr15, 5, 10);
+    let fine = pattern::analyze_level(
+        "fine",
+        bars15,
+        &swings_fine,
+        &trend_k,
+        pattern::FINE_MAX_A_BARS,
+        pattern::FINE_MAX_B_BARS,
+    );
+    let large = pattern::analyze_level(
+        "large",
+        bars15,
+        &swings_large,
+        &trend_k,
+        pattern::LARGE_MAX_A_BARS,
+        pattern::LARGE_MAX_B_BARS,
+    );
+
+    // 2.0 严格 A 段门槛：a段内至少 2 根严格同向趋势K，且幅度 >= 3×ATR。
+    let keep_valid_v2 = |p: &NPattern| {
+        let atr_s1 = atr15.get(p.s1.index).and_then(|x| *x).unwrap_or(1.0);
+        let strict_count = pattern::a_leg_strong_count(p, &trend_k);
+        let relaxed_count = pattern::a_leg_strong_count(p, &trend_k_relaxed);
+        let avg_speed = p.a_move / p.a_bars as f64;
+        !pattern::is_small_n(p, &atr15)
+            && strict_count >= V2_MIN_A_STRICT_LEG
+            && relaxed_count >= V2_MIN_A_RELAXED_LEG
+            && avg_speed >= V2_MIN_A_SPEED_ATR * atr_s1
+            && p.a_move >= 3.0 * atr_s1
+            && !pattern_window_has_rollover(bars15, p)
+    };
+    let fine: Vec<NPattern> = fine.into_iter().filter(|p| keep_valid_v2(p)).collect();
+    let large: Vec<NPattern> = large.into_iter().filter(|p| keep_valid_v2(p)).collect();
+
+    let mut n_candidates: Vec<SignalTuple> = Vec::new();
+    for p in [
+        pattern::latest_pattern(&large, Dir::Down),
+        pattern::latest_pattern(&fine, Dir::Down),
+        pattern::latest_pattern(&fine, Dir::Up),
+        pattern::latest_pattern(&large, Dir::Up),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        n_candidates.push((
+            0,
+            p,
+            scoring::evaluate_signal_v2_strict_with_tick(bars15, &atr15, p, &trend60, tick),
+        ));
+    }
+    let mut signals = dedup_signals(n_candidates);
+    let mut box_meta: Vec<Option<BoxDto>> = vec![None; signals.len()];
+
+    let box_signals = box_range::detect_boxes(bars15, &atr15, &trend_k, &trend60, tick);
+    for bs in &box_signals {
+        box_meta.push(Some(bs.meta.clone()));
+        signals.push((signals.len() + 1, &bs.pattern, bs.check.clone()));
+    }
+
+    let mut full = Vec::new();
+    report::write_full_report(
+        &mut full,
+        symbol,
+        bars15,
+        bars60,
+        &trend60,
+        &atr15,
+        up_count,
+        down_count,
+        &swings_fine,
+        &swings_large,
+        &signals,
+    )?;
+    let full = String::from_utf8(full).context("完整报告不是合法UTF-8")?;
+
+    let mut blocks = Vec::new();
+    for (number, p, sc) in &signals {
+        let min_total = if p.level == "box" {
+            V2_BOX_MIN_TOTAL
+        } else {
+            V2_N_MIN_TOTAL
+        };
+        if report::is_active_signal_with_min(sc, min_total) {
+            let mut text = Vec::new();
+            report::write_signal_summary(&mut text, symbol, bars15, *number, p, sc)?;
+            let text = String::from_utf8(text).context("信号摘要不是合法UTF-8")?;
+            blocks.push(SummaryBlock {
+                priority: signal_priority(sc),
+                score: sc.total,
+                text,
+            });
+        }
+    }
+    blocks.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then(b.score.total_cmp(&a.score))
+    });
+
+    let summary = if blocks.is_empty() {
+        None
+    } else {
+        Some(render_single_summary(
+            symbol, bars15, bars60, &trend60, &blocks,
+        ))
+    };
+
+    let detail = dto::build_detail_for_version(
+        symbol,
+        bars15,
+        &trend60,
+        &signals,
+        &full,
+        "2",
+        V2_N_MIN_TOTAL,
+        V2_BOX_MIN_TOTAL,
+        &box_meta,
+    );
+    Ok(AnalysisOutcome {
+        full_report: full,
+        summary,
+        detail,
+    })
+}
+
+/// 按配置路由分析版本：1 = 原逻辑，2 = 严格N字 + 箱体（默认）。
+pub fn analyze_bars_for_version(
+    symbol: &str,
+    bars15: &[Bar],
+    bars60: &[Bar],
+    tick: f64,
+    version: &str,
+) -> Result<AnalysisOutcome> {
+    if version == "1" {
+        analyze_bars(symbol, bars15, bars60, tick)
+    } else {
+        analyze_bars_v2(symbol, bars15, bars60, tick)
+    }
 }
 
 /// 形态结构窗口（s0 到 s2 后 6 根）内是否跨过换月 bar。

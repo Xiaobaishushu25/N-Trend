@@ -15,9 +15,26 @@ pub struct SwingDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BoxDto {
+    pub upper: f64,
+    pub lower: f64,
+    pub upper_touches: usize,
+    pub lower_touches: usize,
+    pub first_ts: String,
+    pub last_ts: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PatternDto {
     pub number: usize,
     pub level: String,
+    /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认视为 1
+    #[serde(default = "legacy_logic_version")]
+    pub logic_version: String,
+    /// 2026-08-14：预警K线类型，strong / engulf / wick / fast / cumulative / none；
+    /// 旧记录无此字段。质量分已计入 `score`，不再单独下发显示加成。
+    #[serde(default)]
+    pub warning_kind: String,
     pub direction: String,
     pub grade: String,
     pub s0: SwingDto,
@@ -47,12 +64,28 @@ pub struct PatternDto {
     /// 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值
     #[serde(default)]
     pub trigger_overshoot_r: Option<f64>,
+    /// 箱体信号元数据（仅 level="box" 时存在）
+    #[serde(default)]
+    #[serde(rename = "box")]
+    pub r#box: Option<BoxDto>,
     pub note: String,
     pub active: bool,
 }
 
 impl PatternDto {
     pub fn from_parts(bars: &[Bar], number: usize, p: &NPattern, sc: &SignalCheck) -> Self {
+        Self::from_parts_for_version(bars, number, p, sc, "1", 0.0, None)
+    }
+
+    pub fn from_parts_for_version(
+        bars: &[Bar],
+        number: usize,
+        p: &NPattern,
+        sc: &SignalCheck,
+        logic_version: &str,
+        min_total: f64,
+        box_meta: Option<BoxDto>,
+    ) -> Self {
         let ts = |i: usize| bars.get(i).map(|b| b.dt.to_string()).unwrap_or_default();
         let (vol_ratio, vol_confirmed, trigger_overshoot_r) = match sc.trigger {
             Some(ec) => {
@@ -71,6 +104,8 @@ impl PatternDto {
         Self {
             number,
             level: p.level.to_string(),
+            logic_version: logic_version.to_string(),
+            warning_kind: sc.warning_kind.to_string(),
             direction: match p.dir {
                 Dir::Up => "up",
                 Dir::Down => "down",
@@ -115,10 +150,15 @@ impl PatternDto {
             vol_ratio,
             vol_confirmed,
             trigger_overshoot_r,
+            r#box: box_meta,
             note: sc.note.clone(),
-            active: report::is_active_signal(sc),
+            active: report::is_active_signal_with_min(sc, min_total),
         }
     }
+}
+
+fn legacy_logic_version() -> String {
+    "1".to_string()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -179,6 +219,46 @@ pub fn build_detail(
         signals: signals
             .iter()
             .map(|(number, p, sc)| PatternDto::from_parts(bars15, *number, p, sc))
+            .collect(),
+        full_report: full_report.to_string(),
+    }
+}
+
+/// 带版本与箱体元数据构建分析详情（2.0 路径专用，1.x 保持原入口不变）。
+pub fn build_detail_for_version(
+    symbol: &str,
+    bars15: &[Bar],
+    trend60: &Trend60,
+    signals: &[(usize, &NPattern, SignalCheck)],
+    full_report: &str,
+    logic_version: &str,
+    min_n_total: f64,
+    min_box_total: f64,
+    box_meta: &[Option<BoxDto>],
+) -> AnalysisDetail {
+    debug_assert_eq!(signals.len(), box_meta.len());
+    AnalysisDetail {
+        symbol: symbol.to_string(),
+        trend60: TrendDto::from_trend(trend60),
+        signals: signals
+            .iter()
+            .zip(box_meta.iter())
+            .map(|((number, p, sc), meta)| {
+                let min_total = if p.level == "box" {
+                    min_box_total
+                } else {
+                    min_n_total
+                };
+                PatternDto::from_parts_for_version(
+                    bars15,
+                    *number,
+                    p,
+                    sc,
+                    logic_version,
+                    min_total,
+                    meta.clone(),
+                )
+            })
             .collect(),
         full_report: full_report.to_string(),
     }
@@ -290,12 +370,78 @@ mod tests {
         sc.total = 3.5;
         sc.state = "当前已触发";
         sc.category = "fine";
+        sc.warning_kind = "engulf";
 
         let up = PatternDto::from_parts(&bars, 1, &pattern(Dir::Up), &sc);
         assert_eq!(up.trigger_overshoot_r, Some(0.5));
         assert!(up.vol_confirmed);
+        assert_eq!(up.warning_kind, "engulf");
+        assert_eq!(up.score, 3.5);
 
         let down = PatternDto::from_parts(&bars, 1, &pattern(Dir::Down), &sc);
         assert_eq!(down.trigger_overshoot_r, Some(0.5));
+    }
+
+    #[test]
+    fn warning_kind_fields_are_optional_for_legacy_records() {
+        let bars = vec![
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 0,
+                },
+                100.0,
+                100.0,
+            ),
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 15,
+                },
+                101.0,
+                99.0,
+            ),
+            bar(
+                DT {
+                    year: 2026,
+                    month: 8,
+                    day: 3,
+                    hour: 9,
+                    minute: 30,
+                },
+                100.0,
+                100.0,
+            ),
+        ];
+        let mut sc = SignalCheck::new();
+        sc.warning = Some(0);
+        sc.trigger = Some(1);
+        sc.entry = 100.0;
+        sc.risk = 2.0;
+        sc.stop = 99.0;
+        sc.decision_target = 102.0;
+        sc.space = 2.0;
+        sc.rr = 1.0;
+        sc.total = 3.5;
+        sc.state = "当前已触发";
+        sc.category = "fine";
+        sc.warning_kind = "wick";
+
+        let dto = PatternDto::from_parts(&bars, 1, &pattern(Dir::Up), &sc);
+        let mut json = serde_json::to_value(&dto).unwrap();
+        json.as_object_mut().unwrap().remove("warning_kind");
+        // 旧落盘记录可能还带 warning_bonus，serde 对未知字段忽略，不应影响解析。
+        json.as_object_mut()
+            .unwrap()
+            .insert("warning_bonus".to_string(), serde_json::json!(0.4));
+        let back: PatternDto = serde_json::from_value(json).unwrap();
+        assert_eq!(back.warning_kind, "");
+        assert_eq!(back.score, dto.score);
     }
 }

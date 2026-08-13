@@ -339,6 +339,16 @@ enum SingleReversalKind {
     Wick,
 }
 
+impl SingleReversalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SingleReversalKind::Engulf => "engulf",
+            SingleReversalKind::Strong => "strong",
+            SingleReversalKind::Wick => "wick",
+        }
+    }
+}
+
 fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
     match dir {
         Dir::Up => bar.close > bar.open,
@@ -512,6 +522,7 @@ fn compute_scores(
     p: &NPattern,
     trend: &Trend60,
     rr: f64,
+    warning_kind: &str,
     warning: Option<usize>,
     trigger: Option<usize>,
     local_block_count: u8,
@@ -538,12 +549,16 @@ fn compute_scores(
     }
     let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
 
+    // 2026-08-14：预警K线质量分直接计入综合评分。
+    // 强趋势K/吞没/长影线 +0.3，快速路径/累计覆盖/无预警 +0，
+    // 不新增 dims 维度，避免改变旧记录的 dims 结构与去重/统计口径。
     let mut total = 0.10 * dim_trend
         + 0.40 * dim_a
         + 0.20 * dim_b
         + 0.15 * dim_trigger
         + 0.05 * dim_rr
-        + 0.10 * dim_momentum;
+        + 0.10 * dim_momentum
+        + SignalCheck::warning_quality_points_for(warning_kind);
     if weak_confirm {
         total = total.min(WEAK_CONFIRM_TOTAL_MAX);
     }
@@ -572,6 +587,29 @@ pub fn evaluate_signal_with_tick(
     trend: &Trend60,
     tick: f64,
 ) -> SignalCheck {
+    evaluate_signal_inner(bars, atr20, p, trend, tick, false)
+}
+
+/// 2.0 严格版：预警K线只接受强趋势K/吞没/长影线三选一，
+/// 关闭 A 级快速路径与 B/C 级多K累积覆盖通道。
+pub fn evaluate_signal_v2_strict_with_tick(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    trend: &Trend60,
+    tick: f64,
+) -> SignalCheck {
+    evaluate_signal_inner(bars, atr20, p, trend, tick, true)
+}
+
+fn evaluate_signal_inner(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    trend: &Trend60,
+    tick: f64,
+    v2_strict: bool,
+) -> SignalCheck {
     let mut sc = SignalCheck::new();
 
     let end = bars.len().min(p.s2.index + 6);
@@ -585,11 +623,16 @@ pub fn evaluate_signal_with_tick(
     // 方案B：B/C级结构按系统文档§6.3要求更严格的反转确认——预警必须是
     // 吞没/强反向趋势K/长影线/多K累积覆盖之一；A级保留快速预警路径，
     // 避免浅回调结构因等待确认而错过入场。
-    let strict_confirm = matches!(p.grade, Grade::B | Grade::C);
+    let strict_confirm = if v2_strict {
+        true
+    } else {
+        matches!(p.grade, Grade::B | Grade::C)
+    };
     // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不足以
     // 确认b段结束，必须出现吞没/长影线/强反向趋势K/多K累积覆盖。
     let trend_k = indicators::trend_flags(bars, atr20);
     let mut warning = None;
+    let mut warning_kind = "";
     let mut warn_kind = WarnKind::Single;
     let mut warning_is_wick = false;
     let mut gate_active = false;
@@ -600,6 +643,7 @@ pub fn evaluate_signal_with_tick(
     if let Some(kind) = s2_single {
         warning = Some(p.s2.index);
         warning_is_wick = kind == SingleReversalKind::Wick;
+        warning_kind = kind.as_str();
     }
     let mut i = p.s2.index + 1;
     while warning.is_none() && i < end {
@@ -625,15 +669,26 @@ pub fn evaluate_signal_with_tick(
             // 排除小实体+长反向影线的K线；其余情况（强b向趋势K顶、B/C级）
             // 都要求单根反转形态自证。
             let single_now = single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
-            let single_ok =
+            let single_ok = if v2_strict {
+                single_now.is_some()
+            } else {
                 (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
-                    || single_now.is_some();
+                    || single_now.is_some()
+            };
             // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
-            let cumul_ok = (anchor_strong || strict_confirm)
+            let cumul_ok = !v2_strict
+                && (anchor_strong || strict_confirm)
                 && cumulative_coverage(bars, run_start, j, anchor_open, p.dir);
             if single_ok || cumul_ok {
                 warning = Some(j);
                 let is_cumulative = cumul_ok && !single_ok;
+                warning_kind = if is_cumulative {
+                    "cumulative"
+                } else if let Some(kind) = single_now {
+                    kind.as_str()
+                } else {
+                    "fast"
+                };
                 warn_kind = if is_cumulative {
                     WarnKind::Cumulative
                 } else {
@@ -652,10 +707,13 @@ pub fn evaluate_signal_with_tick(
     }
 
     let Some(w) = warning else {
+        sc.warning_kind = "none";
         sc.category = "无预警K线";
         sc.state = "等待预警";
         sc.note = if gate_active {
-            if gate_anchor_strong {
+            if v2_strict {
+                "2.0要求预警K线必须为强趋势K/吞没/长影线形态，等待更强反转确认".to_string()
+            } else if gate_anchor_strong {
                 "b段末为强反向实体（强趋势K或大实体），当前反向K线未形成吞没/强反转/累积覆盖形态，等待更强反转确认"
                     .to_string()
             } else {
@@ -672,8 +730,9 @@ pub fn evaluate_signal_with_tick(
     } else {
         0.0
     };
-    let weak_confirm = warn_kind == WarnKind::Cumulative;
+    let weak_confirm = !v2_strict && warn_kind == WarnKind::Cumulative;
     sc.warning = Some(w);
+    sc.warning_kind = warning_kind;
 
     let mut trigger = None;
     for j in w + 1..bars.len() {
@@ -752,6 +811,7 @@ pub fn evaluate_signal_with_tick(
             p,
             trend,
             sc.rr,
+            sc.warning_kind,
             Some(w),
             None,
             0,
@@ -858,6 +918,7 @@ pub fn evaluate_signal_with_tick(
         p,
         trend,
         sc.rr,
+        sc.warning_kind,
         Some(w),
         Some(t),
         local_block_count,
@@ -1276,6 +1337,7 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.warning_kind, "cumulative");
         assert_eq!(sc.trigger, Some(5));
         assert_eq!(sc.state, "当前已触发");
         assert!(sc.total <= 3.49);
@@ -1311,6 +1373,7 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(3));
+        assert_eq!(sc.warning_kind, "engulf");
         assert_eq!(sc.trigger, Some(4));
         assert!(!sc.note.contains("累积确认"));
         assert!(!sc.note.contains("触发分已相应扣减"));
@@ -1372,6 +1435,7 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(2));
+        assert_eq!(sc.warning_kind, "wick");
         assert_eq!(sc.trigger, Some(3));
         assert_eq!(sc.entry, 4018.0);
         assert_eq!(sc.state, "当前已触发");
@@ -1618,6 +1682,7 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.warning_kind, "strong");
         assert_eq!(sc.trigger, Some(5));
         assert_eq!(sc.entry, 14799.0);
         assert!(!sc.note.contains("累积确认"));
@@ -1754,7 +1819,86 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, None);
+        assert_eq!(sc.warning_kind, "none");
         assert_eq!(sc.state, "等待预警");
+    }
+
+    #[test]
+    fn a_grade_fast_path_marks_warning_kind_as_fast() {
+        // A级普通b端：小阳线收盘位置合格但不算吞没/强趋势K/长影线时，
+        // 走快速路径出预警，warning_kind 记为 fast，且不给强预警加成。
+        let atr = atrs(6, 40.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 5910.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 5856.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
+            bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
+            bar(5880.0, 5890.0, 5856.0, 5866.0), // s2 普通阴线（非强锚）
+            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径可过
+            bar(5874.0, 5890.0, 5872.0, 5884.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(3));
+        assert_eq!(sc.warning_kind, "fast");
+        assert_eq!(sc.warning_quality_points(), 0.0);
+        assert_eq!(sc.trigger, Some(4));
+    }
+
+    #[test]
+    fn strong_warning_kinds_beat_other_paths_by_three_tenths() {
+        let atr = atrs(4, 10.0);
+        let p = pattern();
+        let trend = trend60();
+        let bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.6, 1.0, 0.5, 0.7),
+            bar(0.7, 1.1, 0.6, 0.9),
+        ];
+        let fast = compute_scores(
+            &bars,
+            &atr,
+            &p,
+            &trend,
+            2.0,
+            "fast",
+            Some(2),
+            Some(3),
+            0,
+            0,
+            false,
+            0.0,
+        );
+        for kind in ["strong", "engulf", "wick"] {
+            let strong = compute_scores(
+                &bars,
+                &atr,
+                &p,
+                &trend,
+                2.0,
+                kind,
+                Some(2),
+                Some(3),
+                0,
+                0,
+                false,
+                0.0,
+            );
+            assert!((strong.1 - fast.1 - 0.3).abs() < 1e-9, "kind={kind}");
+        }
     }
 
     #[test]

@@ -75,6 +75,8 @@ const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code ===
 
 /** 复盘跳转模式：从 /chart/:symbol?review=<signalId> 进入时重绘该信号形态与进出场点位 */
 const reviewOverlay = ref<ReviewSignalDetail | null>(null)
+/** 复盘模式下被点击隐藏绘制的信号ID */
+const reviewHidden = ref<Set<number>>(new Set())
 const reviewSignalId = computed(() => {
   const q = route.query.review
   return q ? Number(q) : null
@@ -90,7 +92,7 @@ const reviewIndex = computed(() =>
 )
 const reviewExit = computed<ReviewExitOverlay | null>(() => {
   const o = reviewOverlay.value?.outcome
-  if (!o) return null
+  if (!o || reviewHidden.value.has(reviewSignalId.value ?? -1)) return null
   return {
     price: o.exit_price,
     ts: o.exit_ts,
@@ -150,12 +152,33 @@ async function loadReviewList(force = false) {
 
 function selectReviewSignal(row: OutcomeDetail) {
   if (!row) return
+  reviewHidden.value.delete(row.signal_id)
   if (row.signal_id === reviewSignalId.value && row.symbol === symbol.value) return
   void router.replace({
     name: 'chart',
     params: { symbol: row.symbol },
     query: { review: String(row.signal_id) },
   })
+}
+
+/** 复盘卡片：点击当前信号切换隐藏/显示，点击其他信号则先切过去并显示 */
+function toggleReviewSignal(row: OutcomeDetail) {
+  if (!row) return
+  if (row.signal_id === reviewSignalId.value && row.symbol === symbol.value) {
+    const next = new Set(reviewHidden.value)
+    if (next.has(row.signal_id)) {
+      next.delete(row.signal_id)
+    } else {
+      next.add(row.signal_id)
+    }
+    reviewHidden.value = next
+    return
+  }
+  selectReviewSignal(row)
+}
+
+function isReviewHidden(id: number) {
+  return reviewHidden.value.has(id)
 }
 
 /** 复盘模式：在筛选列表内循环切换上/下一个信号 */
@@ -255,11 +278,14 @@ const patternHistory = computed(() => {
 /** 被点击隐藏的形态编号（用于控制K线图上的展示） */
 const hiddenNumbers = ref<Set<number>>(new Set())
 
-/** 记录“仅显示首个形态”的默认隐藏是否已应用到当前 品种+周期 */
+/** 是否在K线图上标记当前视图的最高价/最低价 */
+const showExtremes = ref(true)
+
+/** 记录“默认全部隐藏”是否已应用到当前 品种+周期 */
 const hiddenApplied = ref('')
 
 /**
- * 默认只显示第一个形态：其余全部在K线图上隐藏，避免画线/标点堆叠看不清。
+ * 默认不展示任何形态：全部在K线图上隐藏，避免画线/标点堆叠看不清。
  * 用户手动点开/隐藏后不再自动重置；切换品种或周期时重新按默认应用。
  */
 function applyDefaultHidden() {
@@ -268,7 +294,7 @@ function applyDefaultHidden() {
   const nums = signals.value.map((s) => s.number)
   if (!nums.length) return
   hiddenApplied.value = key
-  hiddenNumbers.value = new Set(nums.slice(1))
+  hiddenNumbers.value = new Set(nums)
 }
 
 /** 左侧品种列表开关与行情快照 */
@@ -651,12 +677,19 @@ function sigType(state: string) {
   return 'expired'
 }
 
+/** 评分分档：≥3.5 高分，2.5-3.5 中分，<2.5 低分 */
+function scoreTier(score: number | null | undefined) {
+  if (score == null) return 'score-low'
+  if (score >= 3.5) return 'score-high'
+  if (score >= 2.5) return 'score-mid'
+  return 'score-low'
+}
+
 /** 悬停提示：形态编号、方向、级别、状态与触发/预警时间 */
 function sigTitle(s: SignalOutcome) {
   const dir = s.direction === 'up' ? '做多' : s.direction === 'down' ? '做空' : s.direction
-  const level = s.level === 'fine' ? '精细' : s.level === 'large' ? '较大' : s.level
   const t = s.trigger_ts || s.warning_ts || ''
-  return `#${s.number} ${dir} ${level}N ${s.state}${t ? ` ${t}` : ''} 评分 ${s.score.toFixed(2)}`
+  return `#${s.number} ${dir} ${levelSuffix(s.level)} ${s.state}${t ? ` ${t}` : ''} 评分 ${s.score.toFixed(2)}`
 }
 
 function trendColor(v: number | null) {
@@ -698,7 +731,9 @@ function setRowFlash(code: string, dir: 'up' | 'down') {
 }
 
 const visibleSignals = computed<PatternDto[]>(() => {
-  if (reviewOverlay.value) return [reviewOverlay.value.pattern]
+  if (reviewOverlay.value) {
+    return reviewHidden.value.has(reviewSignalId.value ?? -1) ? [] : [reviewOverlay.value.pattern]
+  }
   if (reviewMode.value) return []
   return signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
 })
@@ -754,7 +789,29 @@ function dirText(d: string) {
 }
 
 function levelText(l: string) {
-  return l === 'fine' ? '精细' : l === 'large' ? '较大' : l
+  return l === 'fine' ? '精细' : l === 'large' ? '较大' : l === 'box' ? '箱体' : l
+}
+
+function levelSuffix(l: string) {
+  return `${levelText(l)}${l === 'box' ? '' : 'N'}`
+}
+
+// 2026-08-14：预警质量分已计入 score，这里只显示类型标签，不再叠加显示加分。
+function warningKindText(kind?: string) {
+  switch (kind) {
+    case 'strong':
+      return '强趋势K'
+    case 'engulf':
+      return '吞没'
+    case 'wick':
+      return '长影线'
+    case 'fast':
+      return '快速路径'
+    case 'cumulative':
+      return '累计覆盖'
+    default:
+      return '—'
+  }
 }
 
 const reviewOutcomeLabel: Record<string, { text: string; cls: 'win' | 'loss' | 'plain' | 'warn' }> = {
@@ -870,6 +927,7 @@ watch(signals, applyDefaultHidden, { immediate: true })
 
 // 复盘模式：query.review 变化（或切换品种）时重新加载复盘点位
 watch([symbol, reviewSignalId], () => {
+  reviewHidden.value = new Set()
   void loadReviewOverlay()
 }, { immediate: true })
 
@@ -1033,6 +1091,15 @@ onBeforeUnmount(() => {
             {{ t }}
           </button>
         </div>
+        <button
+          type="button"
+          class="tf-btn hl-btn"
+          :class="{ active: showExtremes }"
+          :title="showExtremes ? '隐藏最高/最低点标记' : '标记当前视图最高/最低点'"
+          @click="showExtremes = !showExtremes"
+        >
+          高低
+        </button>
         <n-popover
           placement="bottom-end"
           trigger="click"
@@ -1112,7 +1179,10 @@ onBeforeUnmount(() => {
                 <span
                   v-if="signalBySymbol[element.code]"
                   class="sl-sig"
-                  :class="'is-' + sigType(signalBySymbol[element.code]?.state ?? '')"
+                  :class="[
+                    'is-' + sigType(signalBySymbol[element.code]?.state ?? ''),
+                    scoreTier(signalBySymbol[element.code]?.score),
+                  ]"
                   :title="sigTitle(signalBySymbol[element.code]!)"
                 >
                   {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
@@ -1144,6 +1214,7 @@ onBeforeUnmount(() => {
           :timeframe="timeframe"
           :rows="displayRows"
           :signals="visibleSignals"
+          :show-extremes="showExtremes"
           :review-exit="reviewExit"
           :loading="klinesStore.loading"
         />
@@ -1201,20 +1272,42 @@ onBeforeUnmount(() => {
                 class="review-row"
                 :class="[
                   row.direction === 'up' ? 'is-up' : 'is-down',
-                  { 'is-active': row.signal_id === reviewSignalId },
+                  {
+                    'is-active': row.signal_id === reviewSignalId,
+                    'is-hidden': isReviewHidden(row.signal_id),
+                  },
                 ]"
-                @click="selectReviewSignal(row)"
+                :title="
+                  row.signal_id === reviewSignalId
+                    ? isReviewHidden(row.signal_id)
+                      ? '点击显示该信号绘制'
+                      : '点击隐藏该信号绘制'
+                    : '点击查看该信号'
+                "
+                @click="toggleReviewSignal(row)"
               >
                 <div class="rv-head">
                   <span class="rv-id">#{{ row.signal_id }}</span>
                   <span class="rv-symbol">{{ row.symbol }}</span>
                   <span class="rv-badge">
-                    {{ dirText(row.direction) }} {{ levelText(row.level) }}N
+                    {{ dirText(row.direction) }} {{ levelSuffix(row.level) }}
                   </span>
                   <span class="rv-grade">{{ row.grade }}</span>
+                  <span class="rv-warning">{{ warningKindText(row.warning_kind) }}</span>
                   <span class="rv-score">
                     <b>{{ row.score.toFixed(2) }}</b>
                     <em>评分</em>
+                  </span>
+                  <span
+                    v-if="row.signal_id === reviewSignalId"
+                    class="rv-eye"
+                    :title="isReviewHidden(row.signal_id) ? '点击显示该信号绘制' : '点击隐藏该信号绘制'"
+                  >
+                    <n-icon
+                      :component="isReviewHidden(row.signal_id) ? EyeOff : Eye"
+                      :size="14"
+                      :color="isReviewHidden(row.signal_id) ? '#94a3b8' : '#f97316'"
+                    />
                   </span>
                 </div>
 
@@ -1323,7 +1416,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else class="patterns-card">
-          <div class="patterns-title">全部 N 形态（{{ signals.length }}）</div>
+          <div class="patterns-title">全部信号（{{ signals.length }}）</div>
           <n-scrollbar style="flex: 1">
             <div v-if="signals.length" class="patterns-list">
               <div
@@ -1340,8 +1433,9 @@ onBeforeUnmount(() => {
                 <div class="pc-head">
                   <div class="pc-badges">
                     <span class="pc-num">#{{ s.number }}</span>
-                    <span class="pc-dir">{{ dirText(s.direction) }} {{ levelText(s.level) }}N</span>
+                    <span class="pc-dir">{{ dirText(s.direction) }} {{ levelSuffix(s.level) }}</span>
                     <span class="pc-grade">{{ s.grade }}</span>
+                    <span class="pc-warning">{{ warningKindText(s.warning_kind) }}</span>
                   </div>
                   <n-icon
                   :component="isHidden(s.number) ? EyeOff : Eye"
@@ -1408,7 +1502,7 @@ onBeforeUnmount(() => {
                 <div class="pc-note">{{ s.note }}</div>
               </div>
             </div>
-            <div v-else class="patterns-empty">当前品种暂无识别出的N形态</div>
+            <div v-else class="patterns-empty">当前品种暂无识别出的信号</div>
           </n-scrollbar>
         </div>
       </div>
@@ -1522,6 +1616,9 @@ onBeforeUnmount(() => {
   color: #1677ff;
   font-weight: 600;
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.1);
+}
+.hl-btn {
+  background: #f1f5f9;
 }
 .tf-btn:disabled,
 .tf-more:disabled {
@@ -1747,6 +1844,87 @@ onBeforeUnmount(() => {
   color: #64748b;
   background: rgba(148, 163, 184, 0.14);
 }
+.sl-sig.is-score-high {
+  font-size: 15px;
+  font-weight: 900;
+  padding: 4px 12px;
+}
+.sl-sig.is-score-mid {
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 3px 9px;
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+.sl-sig.is-score-low {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  opacity: 0.9;
+}
+.sl-sig.is-score-high::before {
+  width: 8px;
+  height: 8px;
+}
+.sl-sig.is-score-mid::before {
+  width: 6px;
+  height: 6px;
+}
+.sl-sig.is-score-low::before {
+  width: 4px;
+  height: 4px;
+}
+.sl-sig.is-score-high.is-pending {
+  color: #fff;
+  background: #1677ff;
+}
+.sl-sig.is-score-high.is-triggered {
+  color: #fff;
+  background: #0f9d58;
+}
+.sl-sig.is-score-high.is-stale {
+  color: #fff;
+  background: #d97706;
+}
+.sl-sig.is-score-high.is-expired {
+  color: #fff;
+  background: #64748b;
+}
+.sl-sig.is-score-mid.is-pending {
+  color: #1677ff;
+  background: rgba(22, 119, 255, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(22, 119, 255, 0.55);
+}
+.sl-sig.is-score-mid.is-triggered {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(15, 157, 88, 0.55);
+}
+.sl-sig.is-score-mid.is-stale {
+  color: #b45309;
+  background: rgba(217, 119, 6, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(217, 119, 6, 0.55);
+}
+.sl-sig.is-score-mid.is-expired {
+  color: #64748b;
+  background: rgba(148, 163, 184, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.45);
+}
+.sl-sig.is-score-low.is-pending {
+  color: #7ba5d8;
+  background: rgba(22, 119, 255, 0.06);
+}
+.sl-sig.is-score-low.is-triggered {
+  color: #74a894;
+  background: rgba(15, 157, 88, 0.06);
+}
+.sl-sig.is-score-low.is-stale {
+  color: #ab8a62;
+  background: rgba(217, 119, 6, 0.07);
+}
+.sl-sig.is-score-low.is-expired {
+  color: #a5b0bd;
+  background: rgba(148, 163, 184, 0.07);
+}
 .chart-col {
   flex: 1 1 auto;
   min-width: 0;
@@ -1905,6 +2083,14 @@ onBeforeUnmount(() => {
   background: #f5faff;
   box-shadow: 0 2px 8px rgba(22, 119, 255, 0.14);
 }
+.review-row.is-hidden {
+  opacity: 0.45;
+}
+.rv-eye {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+}
 .rv-head {
   display: flex;
   align-items: center;
@@ -1943,6 +2129,14 @@ onBeforeUnmount(() => {
   font-weight: 600;
   color: #7c5cff;
   background: rgba(124, 92, 255, 0.08);
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.rv-warning {
+  font-size: 10px;
+  font-weight: 700;
+  color: #c2410c;
+  background: rgba(249, 115, 22, 0.12);
   padding: 2px 7px;
   border-radius: 999px;
 }
@@ -2121,6 +2315,14 @@ onBeforeUnmount(() => {
   font-weight: 600;
   color: #7c5cff;
   background: rgba(124, 92, 255, 0.08);
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.pc-warning {
+  font-size: 10px;
+  font-weight: 700;
+  color: #c2410c;
+  background: rgba(249, 115, 22, 0.12);
   padding: 2px 7px;
   border-radius: 999px;
 }

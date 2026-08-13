@@ -347,11 +347,12 @@ pub async fn get_review_stats(
     state: State<'_, Arc<AppState>>,
     dimension: String,
     scope: Option<String>,
+    version: Option<String>,
 ) -> Result<ReviewStats, String> {
     let scope = scope.unwrap_or_default();
     state
         .services
-        .review_stats(&dimension, &scope)
+        .review_stats(&dimension, &scope, version.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -368,6 +369,7 @@ pub async fn get_recent_outcomes(
     score_min: Option<f64>,
     score_max: Option<f64>,
     outcome: Option<String>,
+    version: Option<String>,
 ) -> Result<Vec<OutcomeDetail>, String> {
     let filter = n_core::service::OutcomeFilter {
         symbol,
@@ -377,6 +379,7 @@ pub async fn get_recent_outcomes(
         score_min,
         score_max,
         outcome,
+        version,
     };
     state
         .services
