@@ -6,46 +6,80 @@ const STOP_FOLLOW_MAX_AGE: usize = 6;
 const STOP_FOLLOW_DISTANCE_RISK: f64 = 1.0;
 // 未触发信号的预警K线最大存活根数，超过视为过时
 const PENDING_MAX_AGE: usize = 12;
-const OPPOSING_WICK_ATR_MIN: f64 = 0.25;
-const OPPOSING_WICK_RANGE_MIN: f64 = 0.50;
+// 触发K线受阻的影线门槛：只用于“触发受阻”扣分，不等同于预警K线长影线门槛。
+const ENTRY_BLOCK_WICK_ATR_MIN: f64 = 0.25;
+const ENTRY_BLOCK_WICK_RANGE_MIN: f64 = 0.50;
 const OPPOSING_PREV_RANGE_ATR_MIN: f64 = 0.80;
 const OPPOSING_PREV_BODY_ATR_MIN: f64 = 0.50;
 const ENTRY_BLOCK_TRIGGER_PENALTY: f64 = 0.70;
 const ENTRY_BLOCK_MOMENTUM_PENALTY: f64 = 0.35;
 const TRIGGER_OPPOSITION_PENALTY_MAX: f64 = 2.00;
 // ===== a段质量分标定参数 =====
-// 幅度满档：a_move 达到 10 倍 ATR 即得满分。
+// 幅度满档：a_move 达到 8 倍 ATR 即得满分。
 // 幅度不足的短腿自然低分，不另设“最少根数”之类的硬门槛，避免针对个案。
-const A_LEG_AMPLITUDE_ATR_FULL: f64 = 10.0;
+const A_LEG_AMPLITUDE_ATR_FULL: f64 = 8.0;
+// 推动分权重：幅度、强K密度、推进速度三项相乘，全部满档时推动分 3.6。
+const A_LEG_CORE_SCORE_WEIGHT: f64 = 3.6;
+// 推进速度（每根K线平均推进的 ATR 数）满档：0.50 倍 ATR/根。
+// 从 0.15 倍（与 v2 最低速度门槛一致）线性升至满档，慢腿按比例压推动分。
+const A_LEG_SPEED_ATR_MIN: f64 = 0.15;
+const A_LEG_SPEED_ATR_FULL: f64 = 0.50;
+// 超大A段扣分：a_move 超过 8 倍 ATR 后每多 1 ATR 扣 0.1，封顶 0.3。
+// 再往上就是小时级 N 形的尺度，15m 信号不再给更多幅度分，只做轻压。
+const A_LEG_AMPLITUDE_OVERSIZE_ATR_MIN: f64 = 8.0;
+const A_LEG_AMPLITUDE_OVERSIZE_PER_ATR: f64 = 0.1;
+const A_LEG_AMPLITUDE_OVERSIZE_MAX: f64 = 0.3;
+// A段跳空扣分：向上、向下跳空都统计，单根缺口达到 1 倍 ATR 才开始扣；
+// 扣分 = min(0.4 × 缺口合计 / A段幅度, 0.25)，小跳空不计。
+// 跨合约换月的 rollover bar 不构成真实跳空，不参与统计。
+const A_LEG_GAP_MIN_ATR: f64 = 1.0;
+const A_LEG_GAP_PENALTY_RATIO: f64 = 0.4;
+const A_LEG_GAP_PENALTY_MAX: f64 = 0.25;
 // 强趋势K密度基准：长腿按 35% 密度折算；短腿保底 2 根。
 // 这样“长而干净”（大量光头阳线/光脚阴线）的腿仍能得高分，
 // 只有强K密度低的震荡/重叠腿被压低。
 const A_LEG_STRONG_DENSITY_BASE: f64 = 0.35;
 const A_LEG_STRONG_MIN_COUNT: f64 = 2.0;
 // 长度扣分：a 段过长消耗动能，分两档轻扣；只扣“动能”，不与质量混为一谈。
+// 常量保持正数，公式统一用减号，避免“负数再加”造成视觉歧义。
 const A_LEG_LONG_PENALTY_MIN_BARS: usize = 24;
-const A_LEG_LONG_PENALTY_LEVEL1: f64 = -0.4;
+const A_LEG_LONG_PENALTY_LEVEL1: f64 = 0.4;
 const A_LEG_LONG_PENALTY_MAX_BARS: usize = 32;
-const A_LEG_LONG_PENALTY_LEVEL2: f64 = -0.8;
+const A_LEG_LONG_PENALTY_LEVEL2: f64 = 0.8;
 // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不能确认b段结束
 const WEAK_CONFIRM_TRIGGER_PENALTY: f64 = 1.0;
 const WEAK_CONFIRM_MOMENTUM_PENALTY: f64 = 1.0;
 // 弱确认信号总分上限：只允许小仓试错，不进入标准仓区间
 const WEAK_CONFIRM_TOTAL_MAX: f64 = 3.49;
-// 影线预警的收盘位置上限：做空上影线须收盘于振幅下1/3内，做多下影线须收盘于上1/3内
-const WICK_CLOSE_POS_MAX: f64 = 0.35;
-// 长影线预警的“反向影线”占比门槛：做空看下影，做多看上影。
-// 反向影线过短视为光脚长影线，不扣；偏长会削弱反转推力，触发维度相应扣分。
-const WICK_REVERSE_SHADOW_MEDIUM_RATIO: f64 = 0.10;
-const WICK_REVERSE_SHADOW_HEAVY_RATIO: f64 = 0.20;
-const WICK_REVERSE_SHADOW_MEDIUM_PENALTY: f64 = 0.30;
-const WICK_REVERSE_SHADOW_HEAVY_PENALTY: f64 = 0.50;
+// 预警K线长影线硬门槛（2026-08-15），七条同时满足才识别：
+// 实体 > 0；主影线 ≥ 3 倍实体；主影线 ≥ 60% 振幅且 ≥ 0.5 倍 ATR20；
+// 收盘位于反向一端 25% 振幅内；反向影线 ≤ 10% 振幅；
+// 主影线 ≥ 50% 前一根 b 向K线振幅。
+const WICK_BODY_RATIO_MIN: f64 = 3.0;
+const WICK_ATR_MIN: f64 = 0.50;
+const WICK_RANGE_MIN: f64 = 0.60;
+const WICK_CLOSE_POS_MAX: f64 = 0.25;
+const WICK_REVERSE_SHADOW_MAX_RATIO: f64 = 0.10;
+const WICK_PREV_BAR_RANGE_MIN: f64 = 0.50;
+// 强反转（强趋势K/干净吞没合并）硬门槛：反向影线必须严格小于 50% 振幅。
+// 等于或超过 50% 说明收盘只回到振幅中点或更差，吞没质量不足，不再识别为 strong。
+const STRONG_REVERSE_SHADOW_MAX_RATIO: f64 = 0.5;
+/// 长影线收盘方向微调：做多长下影收阴、做空长上影收阳时，预警K线质量略扣 0.1 分。
+/// 只影响评分，不改变七条识别门槛。
+const WICK_DIRECTION_PENALTY: f64 = 0.1;
+// 预警K线透支空间扣分：反转K线实体已经覆盖大部分到 S1 的剩余空间时，
+// 突破入场后的空间不足、止损与目标盈亏比差，预警质量应下降而不是继续按标准强预警计。
+// 从实体覆盖剩余空间 50% 起线性扣分，覆盖 150% 时扣满 1.0 分。
+// 只降质量分，不取消识别，避免把“大K预警”整体丢弃。
+const WARNING_SPACE_OVERRUN_START: f64 = 0.5;
+const WARNING_SPACE_OVERRUN_FULL: f64 = 1.5;
+const WARNING_SPACE_OVERRUN_PENALTY_MAX: f64 = 1.0;
 
 fn clamp(v: f64) -> f64 {
     v.clamp(0.0, 5.0)
 }
 
-fn atr_at(atr20: &[Option<f64>], index: usize) -> f64 {
+pub(crate) fn atr_at(atr20: &[Option<f64>], index: usize) -> f64 {
     atr20.get(index).and_then(|x| *x).unwrap_or(1.0)
 }
 
@@ -70,17 +104,25 @@ fn score_60m(trend: &Trend60, dir: Dir) -> f64 {
 /// a段质量分：衡量“推动腿”的幅度与K线质量，采用乘法短板结构。
 ///
 /// 公式：
-///   dim_a = 0.5 + 4.5 × min(1, a_move/(10·ATR)) × min(1, 强趋势K/密度基准) + 长度扣分
+///   dim_a = 0.5 + 3.6 × min(1, a_move/(8·ATR)) × min(1, 强趋势K/密度基准)
+///                  × clamp((推进速度/ATR - 0.15)/(0.50 - 0.15), 0, 1)
+///           - 超大A段扣分 - 跳空扣分 - 长度扣分
 ///
 /// 设计要点（避免“各项中等、凑满高分”的加法漏洞）：
-/// 1. 幅度与强K质量相乘，任何一项弱都会按比例压低总分；
-/// 2. 强趋势K按密度折算：长腿按 35% 基准放宽，短腿保底 2 根——
+/// 1. 幅度、强K密度、推进速度三项相乘，任何一项弱都会按比例压低总分；
+/// 2. 推进速度 = (a_move/a_bars)/ATR，最能体现动能；低于 0.15 不给推动分，
+///    0.50 倍 ATR/根及以上按满动能计；
+/// 3. 强趋势K按密度折算：长腿按 35% 基准放宽，短腿保底 2 根——
 ///    长而干净的腿（大量光头阳线/光脚阴线）仍得高分，震荡/重叠腿被压低；
-/// 3. 长度单独作为“动能消耗”轻扣，不与质量混为一谈。
-fn score_a(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
+/// 4. 长度单独作为“动能消耗”轻扣，不与质量混为一谈；
+/// 5. 8 倍 ATR 幅度满档，但幅度权重不抬高；超过 8 倍后再轻扣；
+/// 6. A段内部大跳空按占比单独扣分（单根 ≥ 1 倍 ATR 才计），
+///    向上、向下都统计，不影响质量和幅度权重。
+pub(crate) fn score_a(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
     let atr = atr_at(atr20, p.s1.index);
     let strong = a_leg_relaxed_strong(bars, atr20, p);
-    a_leg_score_formula(p.a_move, p.a_bars, strong, atr)
+    let gap_penalty = a_leg_gap_penalty(bars, p, atr);
+    a_leg_score_formula(p.a_move, p.a_bars, strong, atr, gap_penalty)
 }
 
 /// a段内“形态方向强趋势K”的数量（宽松口径，与识别阶段的 a_leg_strong_count 一致）。
@@ -100,16 +142,60 @@ fn a_leg_relaxed_strong(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> us
     count
 }
 
+/// A段内部大跳空的合计占比扣分：向上、向下跳空都统计，
+/// 单根缺口低于 1 倍 ATR 视为可接受的正常波动，不参与扣分。
+fn a_leg_gap_penalty(bars: &[Bar], p: &NPattern, atr: f64) -> f64 {
+    if atr <= 0.0 || p.a_move <= 0.0 {
+        return 0.0;
+    }
+    let mut gap_sum = 0.0;
+    for i in p.s0.index + 1..=p.s1.index {
+        let Some(prev) = bars.get(i.saturating_sub(1)) else {
+            continue;
+        };
+        let Some(cur) = bars.get(i) else {
+            continue;
+        };
+        if prev.rollover || cur.rollover {
+            continue;
+        }
+        let gap_up = (cur.low - prev.high).max(0.0);
+        let gap_down = (prev.low - cur.high).max(0.0);
+        let gap = gap_up.max(gap_down);
+        if gap >= A_LEG_GAP_MIN_ATR * atr {
+            gap_sum += gap;
+        }
+    }
+    let ratio = (gap_sum / p.a_move).min(1.0);
+    (ratio * A_LEG_GAP_PENALTY_RATIO).min(A_LEG_GAP_PENALTY_MAX)
+}
+
 /// a段质量分的纯公式（抽出便于单测与标定）。
-fn a_leg_score_formula(a_move: f64, a_bars: usize, strong: usize, atr: f64) -> f64 {
+fn a_leg_score_formula(
+    a_move: f64,
+    a_bars: usize,
+    strong: usize,
+    atr: f64,
+    gap_penalty: f64,
+) -> f64 {
     if atr <= 0.0 {
         return 0.0;
     }
-    // 幅度分：a_move 达到 10 倍 ATR 视为满档（1.0）。
+    // 幅度分：a_move 达到 8 倍 ATR 视为满档（1.0）。
     let amplitude = (a_move / (A_LEG_AMPLITUDE_ATR_FULL * atr)).min(1.0);
     // 强趋势K密度分：短腿保底 2 根，长腿按 35% 密度折算。
     let density_floor = (A_LEG_STRONG_DENSITY_BASE * a_bars as f64).max(A_LEG_STRONG_MIN_COUNT);
     let quality = (strong as f64 / density_floor).min(1.0);
+    // 推进速度：每根K线平均推进的 ATR 数，最能体现动能。
+    // 低于 0.15 不给推动分，0.50 及以上按满动能计。
+    let speed_atr = a_move / a_bars.max(1) as f64 / atr;
+    let speed_factor = ((speed_atr - A_LEG_SPEED_ATR_MIN)
+        / (A_LEG_SPEED_ATR_FULL - A_LEG_SPEED_ATR_MIN))
+        .clamp(0.0, 1.0);
+    // 超大A段扣分：独立轻扣，不再随质量缩放。
+    let oversize_excess = (a_move / atr - A_LEG_AMPLITUDE_OVERSIZE_ATR_MIN).max(0.0);
+    let oversize_penalty =
+        (oversize_excess * A_LEG_AMPLITUDE_OVERSIZE_PER_ATR).min(A_LEG_AMPLITUDE_OVERSIZE_MAX);
     // 长度扣分：a 段过长消耗动能，分两档轻扣。
     let length_penalty = if a_bars > A_LEG_LONG_PENALTY_MAX_BARS {
         A_LEG_LONG_PENALTY_LEVEL2
@@ -118,16 +204,26 @@ fn a_leg_score_formula(a_move: f64, a_bars: usize, strong: usize, atr: f64) -> f
     } else {
         0.0
     };
-    clamp(0.5 + 4.5 * amplitude * quality + length_penalty)
+    clamp(
+        0.5 + A_LEG_CORE_SCORE_WEIGHT * amplitude * quality * speed_factor
+            - oversize_penalty
+            - length_penalty
+            - gap_penalty,
+    )
 }
 
-fn score_b(p: &NPattern) -> f64 {
+pub(crate) fn score_b(p: &NPattern) -> f64 {
     let mut s = p.grade.score_base();
     if p.b_fast && p.grade != Grade::C {
         s -= 0.5;
     }
     if p.b_too_long {
         s -= 0.5;
+    }
+    // b段反向K线整体收敛：回调动能在衰减，对反转结构是加分项。
+    // 但长b本身已扣过动能消耗分，不能再用“后半段变小”补回来。
+    if p.b_weakening && !p.b_too_long {
+        s += 0.3;
     }
     // 反向强K扣分：健康回撤里第一根反向强K是正常的，不惩罚；
     // 从第 2 根起每根扣 0.3（至多按 2 根计），避免把正常回撤误判为弱结构。
@@ -142,7 +238,6 @@ fn score_trigger(
     trigger: Option<usize>,
     p: &NPattern,
     local_block_count: u8,
-    wick_penalty: f64,
 ) -> f64 {
     match (warning, trigger) {
         (None, _) => 0.0,
@@ -165,7 +260,6 @@ fn score_trigger(
             }
             s -= ENTRY_BLOCK_TRIGGER_PENALTY * local_block_count as f64;
             s -= trigger_opposition_penalty(bars, atr20, p.dir, p.s2.index, t);
-            s -= wick_penalty;
             clamp(s)
         }
     }
@@ -206,7 +300,7 @@ fn score_momentum(
     clamp(s)
 }
 
-fn strong_opposite_body_at(
+pub(crate) fn strong_opposite_body_at(
     bars: &[Bar],
     atr20: &[Option<f64>],
     dir: Dir,
@@ -271,8 +365,8 @@ fn entry_block_flags(
             Dir::Down => lower,
         };
         wick > body
-            && wick >= OPPOSING_WICK_ATR_MIN * atr
-            && wick >= OPPOSING_WICK_RANGE_MIN * range
+            && wick >= ENTRY_BLOCK_WICK_ATR_MIN * atr
+            && wick >= ENTRY_BLOCK_WICK_RANGE_MIN * range
     });
 
     let prev_block =
@@ -302,54 +396,29 @@ fn trigger_opposition_penalty(
     (ratio - 1.0).clamp(0.0, 3.0) * (TRIGGER_OPPOSITION_PENALTY_MAX / 3.0)
 }
 
-/// 长影线预警的反向影线质量扣分：做空看下影，做多看上影。
-fn long_wick_reverse_shadow_penalty(bars: &[Bar], dir: Dir, w: usize) -> f64 {
-    let Some(bar) = bars.get(w) else {
-        return 0.0;
-    };
-    let range = bar.high - bar.low;
-    if range <= 0.0 {
-        return 0.0;
-    }
-    let reverse_shadow = match dir {
-        Dir::Down => bar.open.min(bar.close) - bar.low,
-        Dir::Up => bar.high - bar.open.max(bar.close),
-    };
-    let ratio = reverse_shadow / range;
-    if ratio <= WICK_REVERSE_SHADOW_MEDIUM_RATIO {
-        0.0
-    } else if ratio <= WICK_REVERSE_SHADOW_HEAVY_RATIO {
-        WICK_REVERSE_SHADOW_MEDIUM_PENALTY
-    } else {
-        WICK_REVERSE_SHADOW_HEAVY_PENALTY
-    }
-}
-
 #[derive(Clone, Copy, PartialEq)]
-enum WarnKind {
+pub(crate) enum WarnKind {
     Single,
     Cumulative,
 }
 
-/// 单根反转形态的具体类型：区分长影线预警，用于反向影线质量扣分。
-#[derive(Clone, Copy, PartialEq)]
-enum SingleReversalKind {
-    Engulf,
+/// 单根反转形态的具体类型：强反转包含强趋势K与干净吞没，长影线预警必须通过七条硬门槛。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SingleReversalKind {
     Strong,
     Wick,
 }
 
 impl SingleReversalKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
-            SingleReversalKind::Engulf => "engulf",
             SingleReversalKind::Strong => "strong",
             SingleReversalKind::Wick => "wick",
         }
     }
 }
 
-fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
+pub(crate) fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
     match dir {
         Dir::Up => bar.close > bar.open,
         Dir::Down => bar.close < bar.open,
@@ -357,15 +426,88 @@ fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
 }
 
 /// b段方向上的严格趋势K线（做多对应强阴线，做空对应强阳线）
-fn strong_b_dir_trend_candle(trend_k: &[(bool, bool)], i: usize, dir: Dir) -> bool {
+pub(crate) fn strong_b_dir_trend_candle(trend_k: &[(bool, bool)], i: usize, dir: Dir) -> bool {
     trend_k.get(i).is_some_and(|&(up, down)| match dir {
         Dir::Up => down,
         Dir::Down => up,
     })
 }
 
-/// 单根K线构成的反转形态：吞没反转段前的b向实体 / 强反向趋势K / 反向长影线
-fn single_reversal_pattern(
+/// 预警K线长影线硬门槛（2026-08-15）：做多看下影、做空看上影。
+/// 七条同时满足才算长影线预警，任何一条不满足都不产生 wick 信号。
+/// `prev` 是预警K线前面的 b 向K线；缺失或振幅不足都算不通过。
+pub(crate) fn is_wick_warning_bar(bar: &Bar, atr: f64, dir: Dir, prev: Option<&Bar>) -> bool {
+    let range = bar.high - bar.low;
+    if range <= 0.0 || atr <= 0.0 {
+        return false;
+    }
+    let body = (bar.close - bar.open).abs();
+    if body <= 0.0 {
+        return false;
+    }
+    let upper = bar.high - bar.open.max(bar.close);
+    let lower = bar.open.min(bar.close) - bar.low;
+    let wick = match dir {
+        Dir::Up => lower,
+        Dir::Down => upper,
+    };
+    let reverse_shadow = match dir {
+        Dir::Up => upper,
+        Dir::Down => lower,
+    };
+    let close_ok = match dir {
+        Dir::Up => (bar.high - bar.close) / range <= WICK_CLOSE_POS_MAX,
+        Dir::Down => (bar.close - bar.low) / range <= WICK_CLOSE_POS_MAX,
+    };
+    wick >= WICK_BODY_RATIO_MIN * body
+        && wick >= WICK_RANGE_MIN * range
+        && wick >= WICK_ATR_MIN * atr
+        && close_ok
+        && reverse_shadow <= WICK_REVERSE_SHADOW_MAX_RATIO * range
+        && prev
+            .map(|p| wick >= WICK_PREV_BAR_RANGE_MIN * (p.high - p.low))
+            .unwrap_or(false)
+}
+
+/// 长影线收盘方向契合度：做多长下影收阴、做空长上影收阳时轻微扣分。
+/// 识别阶段仍允许这类K线成为 wick 预警，只是质量分略低。
+pub(crate) fn wick_direction_penalty(bar: &Bar, dir: Dir) -> f64 {
+    match dir {
+        Dir::Up if bar.close < bar.open => WICK_DIRECTION_PENALTY,
+        Dir::Down if bar.close > bar.open => WICK_DIRECTION_PENALTY,
+        _ => 0.0,
+    }
+}
+
+/// 预警K线透支空间扣分：做多按预警K线实体覆盖 `S1 - 高点` 的剩余空间比例，
+/// 做空按实体覆盖 `低点 - S1` 的剩余空间比例，方向对称。
+pub(crate) fn warning_space_overrun_penalty(bars: &[Bar], p: &NPattern, w: usize) -> f64 {
+    let Some(bar) = bars.get(w) else {
+        return 0.0;
+    };
+    let body = (bar.close - bar.open).abs();
+    if body <= 0.0 {
+        return 0.0;
+    }
+    let space = match p.dir {
+        Dir::Up => p.s1.price - bar.high,
+        Dir::Down => bar.low - p.s1.price,
+    };
+    if space <= 0.0 {
+        return 0.0;
+    }
+    let ratio = body / space;
+    if ratio <= WARNING_SPACE_OVERRUN_START {
+        return 0.0;
+    }
+    let t = ((ratio - WARNING_SPACE_OVERRUN_START)
+        / (WARNING_SPACE_OVERRUN_FULL - WARNING_SPACE_OVERRUN_START))
+        .clamp(0.0, 1.0);
+    WARNING_SPACE_OVERRUN_PENALTY_MAX * t
+}
+
+/// 单根K线构成的反转形态：干净吞没/强反向趋势K 合并为强反转，反向长影线单独识别
+pub(crate) fn single_reversal_pattern(
     bars: &[Bar],
     atr20: &[Option<f64>],
     trend_k: &[(bool, bool)],
@@ -384,6 +526,7 @@ fn single_reversal_pattern(
     // 阴包阳/阳包阴：仅对反转段的第一根反向K线检查，目标实体是它前面的b向K线。
     // 要求前面是b向实体（做空为阳线、做多为阴线），新K线为反向收盘并包住前一根实体，
     // 且至少一侧严格超过前实体——避免"实体完全相同的镜像小K线"被误判为吞没。
+    // 2026-08-16：吞没与强趋势K合并为 strong，反向影线必须严格小于 50% 振幅。
     let engulf = w == run_start
         && w > 0
         && match dir {
@@ -404,8 +547,12 @@ fn single_reversal_pattern(
                     && (bar.open > prev.close || bar.close < prev.open)
             }
         };
-    if engulf {
-        return Some(SingleReversalKind::Engulf);
+    let reverse_shadow = match dir {
+        Dir::Up => bar.high - bar.open.max(bar.close),
+        Dir::Down => bar.open.min(bar.close) - bar.low,
+    };
+    if engulf && reverse_shadow < STRONG_REVERSE_SHADOW_MAX_RATIO * range {
+        return Some(SingleReversalKind::Strong);
     }
 
     let strong = match dir {
@@ -416,28 +563,13 @@ fn single_reversal_pattern(
         return Some(SingleReversalKind::Strong);
     }
 
-    let body = (bar.close - bar.open).abs();
     let atr = atr_at(atr20, w);
-    let upper = bar.high - bar.open.max(bar.close);
-    let lower = bar.open.min(bar.close) - bar.low;
-    let wick = match dir {
-        Dir::Up => lower,
-        Dir::Down => upper,
-    };
-    // 影线预警还要求收盘位置在反向一端：避免把十字星/中位收盘的小K线误判为长影线
-    let close_ok = match dir {
-        Dir::Up => (bar.high - bar.close) / range <= WICK_CLOSE_POS_MAX,
-        Dir::Down => (bar.close - bar.low) / range <= WICK_CLOSE_POS_MAX,
-    };
-    (wick > body
-        && wick >= OPPOSING_WICK_ATR_MIN * atr
-        && wick >= OPPOSING_WICK_RANGE_MIN * range
-        && close_ok)
+    is_wick_warning_bar(bar, atr, dir, bars.get(w.saturating_sub(1)))
         .then_some(SingleReversalKind::Wick)
 }
 
 /// 多K累积覆盖：连续反向收盘至少2根，且最后一根收盘越过强b向K线的开盘价（吞没其实体）
-fn cumulative_coverage(
+pub(crate) fn cumulative_coverage(
     bars: &[Bar],
     run_start: usize,
     j: usize,
@@ -457,7 +589,7 @@ fn cumulative_coverage(
 /// A级快速路径的最低质量门槛：反向收盘必须落在K线振幅的反向一半内。
 /// 排除"小实体+长反向影线"（十字星、射击之星变体）这类收盘被反向力量
 /// 压制的K线直接当预警，避免任意一根小阳线/小阴线都被放行。
-fn fast_path_close_ok(bars: &[Bar], dir: Dir, i: usize) -> bool {
+pub(crate) fn fast_path_close_ok(bars: &[Bar], dir: Dir, i: usize) -> bool {
     let Some(bar) = bars.get(i) else {
         return false;
     };
@@ -506,6 +638,9 @@ fn build_note(p: &NPattern, rr: f64) -> String {
     if p.b_fast {
         parts.push("b段偏快".to_string());
     }
+    if p.b_weakening {
+        parts.push("b段动能衰减".to_string());
+    }
     if p.c_extended {
         parts.push("c段已透支".to_string());
     }
@@ -528,20 +663,11 @@ fn compute_scores(
     local_block_count: u8,
     entry_block_count: u8,
     weak_confirm: bool,
-    wick_penalty: f64,
 ) -> ([f64; 6], f64) {
     let dim_trend = score_60m(trend, p.dir);
     let dim_a = score_a(bars, atr20, p);
     let dim_b = score_b(p);
-    let mut dim_trigger = score_trigger(
-        bars,
-        atr20,
-        warning,
-        trigger,
-        p,
-        local_block_count,
-        wick_penalty,
-    );
+    let mut dim_trigger = score_trigger(bars, atr20, warning, trigger, p, local_block_count);
     let mut dim_momentum = score_momentum(p, trend, atr20, entry_block_count);
     if weak_confirm {
         dim_trigger = (dim_trigger - WEAK_CONFIRM_TRIGGER_PENALTY).max(0.0);
@@ -549,8 +675,8 @@ fn compute_scores(
     }
     let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
 
-    // 2026-08-14：预警K线质量分直接计入综合评分。
-    // 强趋势K/吞没/长影线 +0.3，快速路径/累计覆盖/无预警 +0，
+    // 2026-08-16：预警K线质量分直接计入综合评分。
+    // 强反转（强趋势K/干净吞没）/长影线 +0.3，快速路径/累计覆盖/无预警 +0，
     // 不新增 dims 维度，避免改变旧记录的 dims 结构与去重/统计口径。
     let mut total = 0.10 * dim_trend
         + 0.40 * dim_a
@@ -559,6 +685,14 @@ fn compute_scores(
         + 0.05 * dim_rr
         + 0.10 * dim_momentum
         + SignalCheck::warning_quality_points_for(warning_kind);
+    if warning_kind == "wick" {
+        if let Some(w) = warning {
+            total -= wick_direction_penalty(&bars[w], p.dir);
+        }
+    }
+    if let Some(w) = warning {
+        total -= warning_space_overrun_penalty(bars, p, w);
+    }
     if weak_confirm {
         total = total.min(WEAK_CONFIRM_TOTAL_MAX);
     }
@@ -590,7 +724,7 @@ pub fn evaluate_signal_with_tick(
     evaluate_signal_inner(bars, atr20, p, trend, tick, false)
 }
 
-/// 2.0 严格版：预警K线只接受强趋势K/吞没/长影线三选一，
+/// 2.0 严格版：预警K线只接受强反转/长影线两类单K自证形态，
 /// 关闭 A 级快速路径与 B/C 级多K累积覆盖通道。
 pub fn evaluate_signal_v2_strict_with_tick(
     bars: &[Bar],
@@ -621,7 +755,7 @@ fn evaluate_signal_inner(
     }
 
     // 方案B：B/C级结构按系统文档§6.3要求更严格的反转确认——预警必须是
-    // 吞没/强反向趋势K/长影线/多K累积覆盖之一；A级保留快速预警路径，
+    // 强反转/长影线/多K累积覆盖之一；A级保留快速预警路径，
     // 避免浅回调结构因等待确认而错过入场。
     let strict_confirm = if v2_strict {
         true
@@ -629,20 +763,18 @@ fn evaluate_signal_inner(
         matches!(p.grade, Grade::B | Grade::C)
     };
     // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不足以
-    // 确认b段结束，必须出现吞没/长影线/强反向趋势K/多K累积覆盖。
+    // 确认b段结束，必须出现强反转/长影线/多K累积覆盖。
     let trend_k = indicators::trend_flags(bars, atr20);
     let mut warning = None;
     let mut warning_kind = "";
     let mut warn_kind = WarnKind::Single;
-    let mut warning_is_wick = false;
     let mut gate_active = false;
     let mut gate_anchor_strong = false;
-    // s2 本身构成合格反转形态（长影线/吞没/强反向趋势K）时，s2 就是预警K线。
+    // s2 本身构成合格反转形态（长影线/强反转）时，s2 就是预警K线。
     // 长影线不要求反向收盘：做空时上影线够长即使收阳也算预警，做多方向对称。
     let s2_single = single_reversal_pattern(bars, atr20, &trend_k, p.dir, p.s2.index, p.s2.index);
     if let Some(kind) = s2_single {
         warning = Some(p.s2.index);
-        warning_is_wick = kind == SingleReversalKind::Wick;
         warning_kind = kind.as_str();
     }
     let mut i = p.s2.index + 1;
@@ -672,7 +804,10 @@ fn evaluate_signal_inner(
             let single_ok = if v2_strict {
                 single_now.is_some()
             } else {
-                (!anchor_strong && !strict_confirm && fast_path_close_ok(bars, p.dir, j))
+                (!anchor_strong
+                    && !strict_confirm
+                    && !p.b_too_long
+                    && fast_path_close_ok(bars, p.dir, j))
                     || single_now.is_some()
             };
             // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
@@ -694,7 +829,6 @@ fn evaluate_signal_inner(
                 } else {
                     WarnKind::Single
                 };
-                warning_is_wick = !is_cumulative && single_now == Some(SingleReversalKind::Wick);
                 found = true;
                 break;
             }
@@ -712,23 +846,17 @@ fn evaluate_signal_inner(
         sc.state = "等待预警";
         sc.note = if gate_active {
             if v2_strict {
-                "2.0要求预警K线必须为强趋势K/吞没/长影线形态，等待更强反转确认".to_string()
+                "2.0要求预警K线必须为强反转/长影线形态，等待更强反转确认".to_string()
             } else if gate_anchor_strong {
-                "b段末为强反向实体（强趋势K或大实体），当前反向K线未形成吞没/强反转/累积覆盖形态，等待更强反转确认"
+                "b段末为强反向实体（强趋势K或大实体），当前反向K线未形成强反转/累积覆盖形态，等待更强反转确认"
                     .to_string()
             } else {
-                "B/C级结构要求反转预警具备吞没/强反向K/长影线/累积覆盖形态，等待更强反转确认"
-                    .to_string()
+                "B/C级结构要求反转预警具备强反转/长影线/累积覆盖形态，等待更强反转确认".to_string()
             }
         } else {
             "b端后尚未出现与原方向一致的反转预警".to_string()
         };
         return sc;
-    };
-    let wick_penalty = if warning_is_wick {
-        long_wick_reverse_shadow_penalty(bars, p.dir, w)
-    } else {
-        0.0
     };
     let weak_confirm = !v2_strict && warn_kind == WarnKind::Cumulative;
     sc.warning = Some(w);
@@ -777,7 +905,7 @@ fn evaluate_signal_inner(
             sc.state = "结构失效";
             sc.total = 0.0;
             sc.category = "结构硬失效，不参与";
-            sc.note = "b段已经突破a段起点，结构事实失效".to_string();
+            sc.note = "b段已破位或深V折返，结构事实失效".to_string();
             return sc;
         }
         if sc.risk <= 0.0 || sc.space <= 0.0 {
@@ -817,7 +945,6 @@ fn evaluate_signal_inner(
             0,
             0,
             weak_confirm,
-            wick_penalty,
         );
         sc.dims = dims;
         sc.total = total;
@@ -924,14 +1051,13 @@ fn evaluate_signal_inner(
         local_block_count,
         entry_block_count,
         weak_confirm,
-        wick_penalty,
     );
     sc.dims = dims;
 
     if p.hard_failure || p.grade == Grade::Invalid {
         sc.total = 0.0;
         sc.category = "结构硬失效，不参与";
-        sc.note = "b段已经突破a段起点，结构事实失效".to_string();
+        sc.note = "b段已破位或深V折返，结构事实失效".to_string();
         return sc;
     }
 
@@ -963,13 +1089,6 @@ fn evaluate_signal_inner(
             Dir::Down => "追空",
         };
         sc.note = format!("{}；触发受阻，不宜急于{}", sc.note, verb);
-    }
-    if wick_penalty > 0.0 {
-        let shadow_note = match p.dir {
-            Dir::Up => "做多预警K线为长下影，上影偏长",
-            Dir::Down => "做空预警K线为长上影，下影偏长",
-        };
-        sc.note = format!("{}；{}，触发分已相应扣减", sc.note, shadow_note);
     }
     if stale_by_price {
         sc.note = format!(
@@ -1046,6 +1165,8 @@ mod tests {
             a_too_long: false,
             b_too_long: false,
             b_fast: false,
+            b_weakening: false,
+            b_weakening_ratio: None,
             a_strong_trend: 1,
             b_strong_reverse: 0,
             c_move: 0.0,
@@ -1113,8 +1234,8 @@ mod tests {
             bar(0.6, 1.0, 0.5, 0.7),
         ];
 
-        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0, 0.0);
-        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2, 0.0);
+        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0);
+        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2);
         assert!((blocked_trigger - clean_trigger + 1.4).abs() < 1e-9);
 
         let clean_momentum = score_momentum(&p, &trend, &atr, 0);
@@ -1167,17 +1288,114 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_score_uses_amplitude_quality_and_length() {
-        // a段质量分=乘法短板：幅度×强K密度，长度单独轻扣（纯公式单测）。
-        // 幅度：10倍ATR满档；5倍ATR只有一半。
-        assert!((a_leg_score_formula(100.0, 8, 5, 10.0) - 5.0).abs() < 1e-9);
-        assert!((a_leg_score_formula(50.0, 8, 5, 10.0) - 2.75).abs() < 1e-9);
-        // 强K密度：0根只有地板分。
-        assert!((a_leg_score_formula(100.0, 8, 0, 10.0) - 0.5).abs() < 1e-9);
-        // 长腿动能扣分：33根、强K密度满也扣0.8。
-        assert!((a_leg_score_formula(100.0, 33, 12, 10.0) - 4.2).abs() < 1e-9);
-        // 短腿保底2根：3根腿只有1根强K → 质量0.5。
-        assert!((a_leg_score_formula(100.0, 3, 1, 10.0) - 2.75).abs() < 1e-9);
+    fn a_leg_score_uses_amplitude_quality_speed_and_length() {
+        // a段质量分=乘法短板：幅度×强K密度×推进速度，长度单独轻扣（纯公式单测）。
+        // 幅度：8倍ATR满档；5倍ATR只有 5/8。
+        // 8倍ATR满档分与旧公式8倍ATR持平，不因满档前移而加分。
+        assert!((a_leg_score_formula(80.0, 8, 5, 10.0, 0.0) - 4.1).abs() < 1e-9);
+        assert!((a_leg_score_formula(50.0, 8, 5, 10.0, 0.0) - 2.75).abs() < 1e-9);
+        // 强K密度：0根只有地板分；用8倍ATR避免叠加超大扣分。
+        assert!((a_leg_score_formula(80.0, 8, 0, 10.0, 0.0) - 0.5).abs() < 1e-9);
+        // 33根慢腿：速度约0.303 ATR/根，推动分只剩约0.44，超长扣0.8、超大扣0.2。
+        assert!((a_leg_score_formula(100.0, 33, 12, 10.0, 0.0) - 1.074025974).abs() < 1e-9);
+        // 短腿保底2根：3根腿只有1根强K → 质量0.5，10倍ATR轻扣0.2。
+        assert!((a_leg_score_formula(100.0, 3, 1, 10.0, 0.0) - 2.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_speed_is_the_third_short_board_factor() {
+        // 同样的幅度和强K密度：8根（0.5 ATR/根）拿满速度分；
+        // 16根（0.25 ATR/根）只剩约28.6%，速度短板直接压低A段分。
+        assert!((a_leg_score_formula(40.0, 8, 3, 10.0, 0.0) - 2.3).abs() < 1e-9);
+        assert!((a_leg_score_formula(40.0, 16, 6, 10.0, 0.0) - 1.014285714).abs() < 1e-9);
+        // 速度低到 v2 门槛 0.15 以下时，推动分为 0，只剩地板分。
+        assert!((a_leg_score_formula(10.0, 10, 5, 10.0, 0.0) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_slow_short_leg_loses_momentum_points() {
+        // C0 1261 复盘：10根K线只推进8点（约0.31 ATR/根），
+        // 即使幅度和强K密度都不差，速度短板也会把A段分明显压下来。
+        assert!((a_leg_score_formula(8.0, 10, 5, 2.6, 0.0) - 1.123837701).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_leg_oversize_penalty_is_mild_and_not_quality_scaled() {
+        // 8倍ATR不扣分：质量1 → 0.5 + 3.6 = 4.1。
+        assert!((a_leg_score_formula(80.0, 8, 5, 10.0, 0.0) - 4.1).abs() < 1e-9);
+        // 9倍ATR轻扣0.1，10倍ATR扣0.2，12倍ATR封顶0.3。
+        assert!((a_leg_score_formula(90.0, 8, 5, 10.0, 0.0) - 4.0).abs() < 1e-9);
+        assert!((a_leg_score_formula(100.0, 8, 5, 10.0, 0.0) - 3.9).abs() < 1e-9);
+        assert!((a_leg_score_formula(120.0, 8, 5, 10.0, 0.0) - 3.8).abs() < 1e-9);
+        // 扣分不随质量缩放：质量0.5时同样扣0.1，不因质量低而少扣。
+        assert!((a_leg_score_formula(90.0, 3, 1, 10.0, 0.0) - 2.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_gap_penalty_counts_both_directions_and_ignores_small_gaps() {
+        let p = NPattern {
+            s0: Swing {
+                index: 0,
+                price: 0.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 2,
+                price: 100.0,
+                is_high: true,
+            },
+            a_bars: 2,
+            a_move: 100.0,
+            ..pattern()
+        };
+        // 向上跳空12点、向下跳空12点，都达到 1 倍 ATR（10）门槛，
+        // 合计 24 / a_move 100 = 24%，扣 24% × 0.4 = 0.096。
+        let both = vec![
+            bar(0.0, 100.0, 100.0, 100.0),
+            bar(110.0, 112.0, 112.0, 112.0),
+            bar(90.0, 100.0, 90.0, 90.0),
+        ];
+        assert!((a_leg_gap_penalty(&both, &p, 10.0) - 0.096).abs() < 1e-9);
+
+        // 单根缺口 8 点小于 1 倍 ATR（10），小跳空不扣分。
+        let small = vec![
+            bar(0.0, 100.0, 100.0, 100.0),
+            bar(106.0, 108.0, 108.0, 108.0),
+            bar(90.0, 100.0, 90.0, 90.0),
+        ];
+        assert_eq!(a_leg_gap_penalty(&small, &p, 10.0), 0.0);
+
+        // rollover bar 的跨合约跳空不参与统计。
+        let mut rollover_gap = both.clone();
+        rollover_gap[1].rollover = true;
+        assert_eq!(a_leg_gap_penalty(&rollover_gap, &p, 10.0), 0.0);
+    }
+
+    #[test]
+    fn b_leg_weakening_adds_to_b_score() {
+        let clean = NPattern {
+            grade: Grade::B,
+            ..pattern()
+        };
+        assert!((score_b(&clean) - 3.8).abs() < 1e-9);
+
+        let weakening = NPattern {
+            grade: Grade::B,
+            b_weakening: true,
+            b_weakening_ratio: Some(0.5),
+            ..pattern()
+        };
+        assert!((score_b(&weakening) - 4.1).abs() < 1e-9);
+
+        // 长b已经扣过动能消耗分，后半段变小不再叠加衰减加分。
+        let long_weakening = NPattern {
+            grade: Grade::B,
+            b_too_long: true,
+            b_weakening: true,
+            b_weakening_ratio: Some(0.5),
+            ..pattern()
+        };
+        assert!((score_b(&long_weakening) - 3.3).abs() < 1e-9);
     }
 
     #[test]
@@ -1373,10 +1591,50 @@ mod tests {
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(3));
-        assert_eq!(sc.warning_kind, "engulf");
+        assert_eq!(sc.warning_kind, "strong");
         assert_eq!(sc.trigger, Some(4));
         assert!(!sc.note.contains("累积确认"));
         assert!(!sc.note.contains("触发分已相应扣减"));
+    }
+
+    #[test]
+    fn merged_strong_rejects_reverse_shadow_at_or_over_half_range() {
+        let atr = atrs(2, 100.0);
+        let flags = vec![(false, false); 2];
+        let prev_up = bar(100.0, 110.0, 90.0, 91.0);
+        let prev_down = bar(82.0, 100.0, 80.0, 100.0);
+
+        let up_clean = vec![prev_up.clone(), bar(90.0, 101.0, 89.0, 101.0)];
+        assert_eq!(
+            single_reversal_pattern(&up_clean, &atr, &flags, Dir::Up, 1, 1),
+            Some(SingleReversalKind::Strong)
+        );
+        let up_exact = vec![prev_up.clone(), bar(90.0, 111.0, 89.0, 100.0)];
+        assert_eq!(
+            single_reversal_pattern(&up_exact, &atr, &flags, Dir::Up, 1, 1),
+            None
+        );
+        let up_over = vec![prev_up, bar(90.0, 112.0, 89.0, 100.0)];
+        assert_eq!(
+            single_reversal_pattern(&up_over, &atr, &flags, Dir::Up, 1, 1),
+            None
+        );
+
+        let down_clean = vec![prev_down.clone(), bar(110.0, 110.0, 61.0, 80.0)];
+        assert_eq!(
+            single_reversal_pattern(&down_clean, &atr, &flags, Dir::Down, 1, 1),
+            Some(SingleReversalKind::Strong)
+        );
+        let down_exact = vec![prev_down.clone(), bar(110.0, 110.0, 50.0, 80.0)];
+        assert_eq!(
+            single_reversal_pattern(&down_exact, &atr, &flags, Dir::Down, 1, 1),
+            None
+        );
+        let down_over = vec![prev_down, bar(110.0, 110.0, 40.0, 80.0)];
+        assert_eq!(
+            single_reversal_pattern(&down_over, &atr, &flags, Dir::Down, 1, 1),
+            None
+        );
     }
 
     #[test]
@@ -1428,8 +1686,8 @@ mod tests {
         };
         let bars = vec![
             bar(4066.0, 4066.0, 4055.0, 4060.0), // s0 高点
-            bar(4050.0, 4055.0, 3996.0, 4000.0), // s1 低点
-            bar(4023.0, 4030.0, 4019.0, 4021.0), // s2 长上影线
+            bar(4050.0, 4060.0, 4000.0, 4005.0), // s1 低点，振幅足够支撑上影线
+            bar(4023.0, 4055.0, 4020.0, 4021.0), // s2 长上影线，反向影线仅占振幅约3%
             bar(4021.0, 4021.0, 4002.0, 4007.0), // 触发：跌破s2低点
         ];
 
@@ -1437,92 +1695,201 @@ mod tests {
         assert_eq!(sc.warning, Some(2));
         assert_eq!(sc.warning_kind, "wick");
         assert_eq!(sc.trigger, Some(3));
-        assert_eq!(sc.entry, 4018.0);
+        assert_eq!(sc.entry, 4019.0);
         assert_eq!(sc.state, "当前已触发");
-        assert!((sc.dims[3] - 3.9).abs() < 1e-9);
-        assert!(sc.note.contains("下影偏长"));
+        assert!((sc.dims[3] - 4.2).abs() < 1e-9);
         assert!(!sc.note.contains("累积确认"));
     }
 
     #[test]
-    fn long_wick_reverse_shadow_penalty_follows_ratio_thresholds() {
-        // 做空：长上影的反向影线是下影；≤10%不扣，10%-20%扣0.3，>20%扣0.5
-        let short_clean = vec![bar(100.0, 109.0, 99.0, 99.0)];
-        let short_boundary_low = vec![bar(100.0, 108.0, 98.0, 99.0)];
-        let short_medium = vec![bar(100.0, 107.5, 97.5, 99.0)];
-        let short_boundary_high = vec![bar(100.0, 107.0, 97.0, 99.0)];
-        let short_heavy = vec![bar(100.0, 106.9, 96.9, 99.0)];
-        assert_eq!(
-            long_wick_reverse_shadow_penalty(&short_clean, Dir::Down, 0),
-            0.0
-        );
-        assert_eq!(
-            long_wick_reverse_shadow_penalty(&short_boundary_low, Dir::Down, 0),
-            0.0
-        );
-        assert_eq!(
-            long_wick_reverse_shadow_penalty(&short_medium, Dir::Down, 0),
-            0.3
-        );
-        assert_eq!(
-            long_wick_reverse_shadow_penalty(&short_boundary_high, Dir::Down, 0),
-            0.3
-        );
-        assert_eq!(
-            long_wick_reverse_shadow_penalty(&short_heavy, Dir::Down, 0),
-            0.5
-        );
+    fn wick_warning_requires_all_hard_gates() {
+        // 前一根 b 向K线振幅足够，主影线正好为其 50% 时放行
+        let prev = bar(100.0, 118.0, 100.0, 117.0);
+        // 反向影线正好 10% 时放行（上下影方向对称）
+        let short_clean = bar(100.0, 109.0, 99.0, 99.0);
+        let long_clean = bar(100.0, 101.0, 91.0, 101.0);
+        assert!(is_wick_warning_bar(
+            &short_clean,
+            10.0,
+            Dir::Down,
+            Some(&prev)
+        ));
+        assert!(is_wick_warning_bar(&long_clean, 10.0, Dir::Up, Some(&prev)));
 
-        // 做多：长下影的反向影线是上影，扣分口径对称
-        let long_clean = vec![bar(100.0, 101.0, 91.0, 101.0)];
-        let long_medium = vec![bar(100.0, 102.5, 92.5, 101.0)];
-        let long_heavy = vec![bar(100.0, 103.1, 93.1, 101.0)];
+        // 反向影线超过 10% 直接不识别
+        let short_reverse_heavy = bar(100.0, 107.0, 97.0, 99.0);
+        let long_reverse_heavy = bar(100.0, 103.0, 93.0, 101.0);
+        assert!(!is_wick_warning_bar(
+            &short_reverse_heavy,
+            10.0,
+            Dir::Down,
+            Some(&prev)
+        ));
+        assert!(!is_wick_warning_bar(
+            &long_reverse_heavy,
+            10.0,
+            Dir::Up,
+            Some(&prev)
+        ));
+
+        // 实体为 0 的十字星不识别
+        let doji = bar(100.0, 110.0, 90.0, 100.0);
+        assert!(!is_wick_warning_bar(&doji, 10.0, Dir::Up, Some(&prev)));
+        assert!(!is_wick_warning_bar(&doji, 10.0, Dir::Down, Some(&prev)));
+
+        // 主影线不足 3 倍实体不识别
+        let short_body_heavy = bar(100.0, 120.0, 88.0, 90.0);
+        let long_body_heavy = bar(90.0, 102.0, 80.0, 100.0);
+        assert!(!is_wick_warning_bar(
+            &short_body_heavy,
+            30.0,
+            Dir::Down,
+            Some(&prev)
+        ));
+        assert!(!is_wick_warning_bar(
+            &long_body_heavy,
+            30.0,
+            Dir::Up,
+            Some(&prev)
+        ));
+    }
+
+    #[test]
+    fn wick_requires_prev_b_bar_range_at_least_half_amplitude() {
+        // PB0 178 复盘对照：21:45 大阴线振幅 60，22:00 下影 20，
+        // 主影线只到前一根振幅的 1/3，不再识别为 wick。
+        let prev_small = bar(15715.0, 15715.0, 15655.0, 15675.0);
+        let pb0_178 = bar(15675.0, 15680.0, 15655.0, 15680.0);
+        assert!(!is_wick_warning_bar(
+            &pb0_178,
+            32.0,
+            Dir::Up,
+            Some(&prev_small)
+        ));
+
+        // 前一根振幅放大到 40（主影线恰好为其 50%）时，其他门槛全过则识别
+        let prev_ok = bar(15715.0, 15715.0, 15675.0, 15695.0);
+        assert!(is_wick_warning_bar(&pb0_178, 32.0, Dir::Up, Some(&prev_ok)));
+
+        // 前一根缺失同样不识别
+        assert!(!is_wick_warning_bar(&pb0_178, 32.0, Dir::Up, None));
+    }
+
+    #[test]
+    fn wick_close_direction_is_a_small_quality_downgrade_not_a_hard_gate() {
+        // 方向契合不扣分：做多收阳、做空收阴
         assert_eq!(
-            long_wick_reverse_shadow_penalty(&long_clean, Dir::Up, 0),
+            wick_direction_penalty(&bar(100.0, 101.0, 91.0, 101.0), Dir::Up),
             0.0
         );
         assert_eq!(
-            long_wick_reverse_shadow_penalty(&long_medium, Dir::Up, 0),
-            0.3
+            wick_direction_penalty(&bar(100.0, 109.0, 99.0, 99.0), Dir::Down),
+            0.0
+        );
+        // 方向不契合只轻扣 0.1：做多收阴、做空收阳
+        assert_eq!(
+            wick_direction_penalty(&bar(100.0, 101.0, 91.0, 99.0), Dir::Up),
+            0.1
         );
         assert_eq!(
-            long_wick_reverse_shadow_penalty(&long_heavy, Dir::Up, 0),
-            0.5
+            wick_direction_penalty(&bar(100.0, 109.0, 99.0, 101.0), Dir::Down),
+            0.1
         );
     }
 
     #[test]
-    fn long_wick_warning_with_reverse_shadow_lowers_trigger_score() {
-        // 做空：s2长上影本身就是预警，下影占振幅20%，触发分3.5降为3.2
-        let atr = atrs(5, 15.4);
-        let p = NPattern {
+    fn compute_scores_applies_wick_direction_penalty_once() {
+        let atr = atrs(4, 15.0);
+        let p = pattern();
+        let trend = trend60();
+        let clean_bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(100.0, 110.0, 90.0, 101.0),
+            bar(101.0, 102.0, 100.0, 101.5),
+        ];
+        let penalized_bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(100.0, 110.0, 90.0, 99.0),
+            bar(101.0, 102.0, 100.0, 101.5),
+        ];
+
+        let (_, clean) = compute_scores(
+            &clean_bars,
+            &atr,
+            &p,
+            &trend,
+            2.0,
+            "wick",
+            Some(2),
+            Some(3),
+            0,
+            0,
+            false,
+        );
+        let (_, penalized) = compute_scores(
+            &penalized_bars,
+            &atr,
+            &p,
+            &trend,
+            2.0,
+            "wick",
+            Some(2),
+            Some(3),
+            0,
+            0,
+            false,
+        );
+        assert!((clean - penalized - 0.1).abs() < 1e-9);
+        assert_eq!(wick_direction_penalty(&penalized_bars[2], p.dir), 0.1);
+    }
+
+    #[test]
+    fn warning_space_overrun_penalty_is_linear_and_symmetric() {
+        let up = pattern();
+        let up_bars = vec![
+            bar(0.0, 1.0, 0.0, 0.5),
+            bar(0.5, 1.0, 0.4, 0.6),
+            bar(0.8, 0.9, 0.79, 0.9),
+            bar(0.9, 1.0, 0.8, 0.95),
+        ];
+        // 实体覆盖剩余空间 50%：不扣；100%：线性扣 0.5；150%：扣满 1.0。
+        let mut bars_50 = up_bars.clone();
+        bars_50[2] = bar(0.85, 0.9, 0.84, 0.9);
+        let mut bars_100 = up_bars.clone();
+        bars_100[2] = bar(0.8, 0.9, 0.79, 0.9);
+        let mut bars_150 = up_bars.clone();
+        bars_150[2] = bar(0.75, 0.9, 0.74, 0.9);
+        assert!((warning_space_overrun_penalty(&bars_50, &up, 2) - 0.0).abs() < 1e-9);
+        assert!((warning_space_overrun_penalty(&bars_100, &up, 2) - 0.5).abs() < 1e-9);
+        assert!((warning_space_overrun_penalty(&bars_150, &up, 2) - 1.0).abs() < 1e-9);
+
+        // 做空镜像：S1=1，预警K线低点1.1，实体按相同比例覆盖剩余空间。
+        let down = NPattern {
             dir: Dir::Down,
             s1: Swing {
                 index: 1,
-                price: 3996.0,
+                price: 1.0,
                 is_high: false,
             },
-            s2: Swing {
-                index: 2,
-                price: 4029.0,
-                is_high: true,
-            },
-            grade: Grade::C,
             ..pattern()
         };
-        let bars = vec![
-            bar(4066.0, 4066.0, 4055.0, 4060.0), // s0 高点
-            bar(4050.0, 4055.0, 3996.0, 4000.0), // s1 低点
-            bar(4023.0, 4029.0, 4019.0, 4021.0), // s2 长上影，下影占振幅20%
-            bar(4021.0, 4022.0, 4020.0, 4021.5), // 延迟K线，未跌破s2低点
-            bar(4019.0, 4020.0, 3998.0, 4002.0), // 触发：跌破s2低点
+        let down_bars = vec![
+            bar(1.0, 1.0, 0.9, 0.95),
+            bar(1.1, 1.2, 1.0, 1.1),
+            bar(1.2, 1.3, 1.1, 1.1),
+            bar(1.1, 1.2, 1.0, 1.1),
         ];
-
-        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
-        assert_eq!(sc.warning, Some(2));
-        assert_eq!(sc.trigger, Some(4));
-        assert!((sc.dims[3] - 3.2).abs() < 1e-9);
-        assert!(sc.note.contains("下影偏长"));
+        let mut down_50 = down_bars.clone();
+        down_50[2] = bar(1.15, 1.3, 1.1, 1.1);
+        let mut down_100 = down_bars.clone();
+        down_100[2] = bar(1.2, 1.3, 1.1, 1.1);
+        let mut down_150 = down_bars.clone();
+        down_150[2] = bar(1.25, 1.35, 1.1, 1.1);
+        assert!((warning_space_overrun_penalty(&down_50, &down, 2) - 0.0).abs() < 1e-9);
+        assert!((warning_space_overrun_penalty(&down_100, &down, 2) - 0.5).abs() < 1e-9);
+        assert!((warning_space_overrun_penalty(&down_150, &down, 2) - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1546,7 +1913,7 @@ mod tests {
         let bars = vec![
             bar(4066.0, 4066.0, 4055.0, 4060.0),
             bar(4000.0, 4010.0, 3999.0, 4008.0), // 上涨K线
-            bar(4010.0, 4030.0, 4009.0, 4015.0), // s2 收阳长上影线
+            bar(4010.0, 4030.0, 4009.0, 4012.0), // s2 收阳长上影线，收盘贴近低点
             bar(4015.0, 4016.0, 3995.0, 4000.0), // 触发：跌破s2低点
         ];
 
@@ -1825,7 +2192,7 @@ mod tests {
 
     #[test]
     fn a_grade_fast_path_marks_warning_kind_as_fast() {
-        // A级普通b端：小阳线收盘位置合格但不算吞没/强趋势K/长影线时，
+        // A级普通b端：小阳线收盘位置合格但不算强反转/长影线时，
         // 走快速路径出预警，warning_kind 记为 fast，且不给强预警加成。
         let atr = atrs(6, 40.0);
         let p = NPattern {
@@ -1858,6 +2225,41 @@ mod tests {
     }
 
     #[test]
+    fn long_b_blocks_fast_path_warning() {
+        // 同一根小阳线：b段长度正常时走快速路径；b段超过8根后快速路径关闭，
+        // 只有强反转/长影线等自证形态才能预警。
+        let atr = atrs(6, 40.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 5910.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 5856.0,
+                is_high: false,
+            },
+            b_bars: 12,
+            b_too_long: true,
+            ..pattern()
+        };
+        let bars = vec![
+            bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
+            bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
+            bar(5880.0, 5890.0, 5856.0, 5866.0), // s2 普通阴线（非强锚）
+            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径被长b禁用
+            bar(5874.0, 5878.0, 5870.0, 5872.0), // 阴线打断反转段
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, None);
+        assert_eq!(sc.warning_kind, "none");
+        assert_eq!(sc.state, "等待预警");
+    }
+
+    #[test]
     fn strong_warning_kinds_beat_other_paths_by_three_tenths() {
         let atr = atrs(4, 10.0);
         let p = pattern();
@@ -1880,9 +2282,8 @@ mod tests {
             0,
             0,
             false,
-            0.0,
         );
-        for kind in ["strong", "engulf", "wick"] {
+        for kind in ["strong", "wick"] {
             let strong = compute_scores(
                 &bars,
                 &atr,
@@ -1895,7 +2296,6 @@ mod tests {
                 0,
                 0,
                 false,
-                0.0,
             );
             assert!((strong.1 - fast.1 - 0.3).abs() < 1e-9, "kind={kind}");
         }

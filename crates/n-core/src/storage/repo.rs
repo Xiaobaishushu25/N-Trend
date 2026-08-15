@@ -2,13 +2,14 @@
 
 use anyhow::{anyhow, Context, Result};
 use sea_orm::sea_query::OnConflict;
+use sea_orm::ConnectionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
 };
 
 use crate::storage::entities::{
-    groups, klines, rollovers, scans, settings, signal_outcomes, signals, symbol_groups, symbols,
+    groups, klines, pattern_events, rollovers, settings, symbol_groups, symbols,
 };
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
@@ -64,6 +65,16 @@ pub async fn delete_symbol_rollovers(db: &DatabaseConnection, symbol: &str) -> R
         .exec(db)
         .await
         .context("删除品种换月记录失败")?;
+    Ok(())
+}
+
+pub async fn delete_symbol_rollover(db: &DatabaseConnection, symbol: &str, ts: &str) -> Result<()> {
+    rollovers::Entity::delete_many()
+        .filter(rollovers::Column::Symbol.eq(symbol))
+        .filter(rollovers::Column::Ts.eq(ts))
+        .exec(db)
+        .await
+        .context("删除单条换月记录失败")?;
     Ok(())
 }
 
@@ -543,231 +554,191 @@ pub async fn reorder_symbols(db: &DatabaseConnection, codes: &[String]) -> Resul
     Ok(())
 }
 
-pub async fn insert_scan(
+/// 写入一条前向识别出的信号事件。
+pub async fn insert_pattern_event(
     db: &DatabaseConnection,
-    started_at: String,
-    finished_at: String,
-    status: String,
-    scanned: i64,
-    active_count: i64,
-    summary: String,
+    row: pattern_events::ActiveModel,
 ) -> Result<i64> {
-    let model = scans::ActiveModel {
-        id: sea_orm::NotSet,
-        started_at: Set(started_at),
-        finished_at: Set(finished_at),
-        status: Set(status),
-        scanned: Set(scanned),
-        active_count: Set(active_count),
-        summary: Set(summary),
-    };
-    let res = scans::Entity::insert(model)
+    let res = pattern_events::Entity::insert(row)
         .exec(db)
         .await
-        .context("写入扫描记录失败")?;
+        .context("写入信号事件失败")?;
     Ok(res.last_insert_id)
 }
 
-/// 结构身份键：品种 + 版本 + 方向 + 级别 + 结构时间戳（箱体用上下轨 + 预警K）。
-/// 与复盘统计的去重口径保持一致，跨扫描的重复快照不会重复落库；
-/// 版本纳入 key 后，2.0 扫描不会覆盖 1.x 历史记录。
-fn signal_structure_key(
-    symbol: &str,
-    level: &str,
-    direction: &str,
-    detail: &str,
-) -> Option<String> {
-    let v = serde_json::from_str::<serde_json::Value>(detail).ok()?;
-    let version = v
-        .get("logic_version")
-        .and_then(|x| x.as_str())
-        .unwrap_or("1");
-    let s2 = v.get("s2")?.get("ts")?.as_str()?;
-    if level == "box" {
-        let (upper, lower) = if let Some(b) = v.get("box") {
-            (b.get("upper")?.as_f64()?, b.get("lower")?.as_f64()?)
-        } else {
-            let s0 = v.get("s0")?.get("price")?.as_f64()?;
-            let s1 = v.get("s1")?.get("price")?.as_f64()?;
-            (s0.max(s1), s0.min(s1))
-        };
-        Some(format!(
-            "{symbol}|{version}|{direction}|box|{upper}|{lower}|{s2}"
-        ))
-    } else {
-        let s1 = v.get("s1")?.get("ts")?.as_str()?;
-        Some(format!("{symbol}|{version}|{direction}|{level}|{s1}|{s2}"))
-    }
-}
-
-/// 写入信号：同一结构只保留一条记录，后续扫描更新这条记录的状态与扫描信息。
-pub async fn upsert_signals(
-    db: &DatabaseConnection,
-    rows: Vec<signals::ActiveModel>,
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let existing = signals::Entity::find()
+/// 全部信号事件（复盘统计用）。
+pub async fn all_pattern_events(db: &DatabaseConnection) -> Result<Vec<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .order_by_asc(pattern_events::Column::Id)
         .all(db)
         .await
-        .context("查询信号失败")?;
-    let mut by_key: std::collections::HashMap<String, signals::Model> =
-        std::collections::HashMap::new();
-    for s in existing {
-        if let Some(key) = signal_structure_key(&s.symbol, &s.level, &s.direction, &s.detail) {
-            by_key.entry(key).or_insert(s);
-        }
-    }
-
-    let mut inserts = Vec::new();
-    for row in rows {
-        let symbol = row.symbol.clone().take().unwrap_or_default();
-        let level = row.level.clone().take().unwrap_or_default();
-        let direction = row.direction.clone().take().unwrap_or_default();
-        let detail = row.detail.clone().take().unwrap_or_default();
-        let Some(key) = signal_structure_key(&symbol, &level, &direction, &detail) else {
-            inserts.push(row);
-            continue;
-        };
-        if let Some(existing) = by_key.get(&key) {
-            let mut updated = row;
-            updated.id = Set(existing.id);
-            updated.created_at = Set(existing.created_at.clone());
-            signals::Entity::update(updated)
-                .exec(db)
-                .await
-                .context("更新信号失败")?;
-        } else {
-            inserts.push(row);
-        }
-    }
-
-    if !inserts.is_empty() {
-        signals::Entity::insert_many(inserts)
-            .exec(db)
-            .await
-            .context("写入信号失败")?;
-    }
-    Ok(())
+        .context("查询信号事件失败")?)
 }
 
-/// 全部信号（复盘统计/结局回填用；量级为万级以内，内存过滤足够）。
-pub async fn all_signals(db: &DatabaseConnection) -> Result<Vec<signals::Model>> {
-    Ok(signals::Entity::find()
-        .order_by_asc(signals::Column::Id)
-        .all(db)
-        .await
-        .context("查询信号失败")?)
-}
-
-/// 按 id 查询单条信号（复盘跳转K线图用）。
-pub async fn signal_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<signals::Model>> {
-    Ok(signals::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("查询信号失败")?)
-}
-
-/// 按 signal_id 查询单条结局（复盘跳转K线图用）。
-pub async fn outcome_by_signal(
+/// 按 id 查询单条信号事件。
+pub async fn pattern_event_by_id(
     db: &DatabaseConnection,
     id: i64,
-) -> Result<Option<signal_outcomes::Model>> {
-    Ok(signal_outcomes::Entity::find_by_id(id)
+) -> Result<Option<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find_by_id(id)
         .one(db)
         .await
-        .context("查询信号结局失败")?)
+        .context("查询信号事件失败")?)
 }
 
-/// 全部信号结局（与 all_signals 在内存中按 signal_id 关联）。
-pub async fn all_outcomes(db: &DatabaseConnection) -> Result<Vec<signal_outcomes::Model>> {
-    Ok(signal_outcomes::Entity::find()
-        .all(db)
-        .await
-        .context("查询信号结局失败")?)
-}
-
-/// 批量 upsert 信号结局：同一 signal_id 覆盖为最新模拟结果。
-pub async fn upsert_outcomes(
+/// 某品种指定状态的信号事件。
+pub async fn pattern_events_by_symbol(
     db: &DatabaseConnection,
-    rows: Vec<signal_outcomes::ActiveModel>,
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
+    symbol: &str,
+    state: Option<&str>,
+) -> Result<Vec<pattern_events::Model>> {
+    let mut q = pattern_events::Entity::find()
+        .filter(pattern_events::Column::Symbol.eq(symbol))
+        .order_by_asc(pattern_events::Column::WarningTs);
+    if let Some(state) = state {
+        q = q.filter(pattern_events::Column::State.eq(state));
     }
-    // 批量插入时列数 × 行数会超过 SQLite 变量上限（约 999/32766），分块写入
-    for chunk in rows.chunks(200) {
-        signal_outcomes::Entity::insert_many(chunk.to_vec())
-            .on_conflict(
-                OnConflict::column(signal_outcomes::Column::SignalId)
-                    .update_columns([
-                        signal_outcomes::Column::SimVersion,
-                        signal_outcomes::Column::Outcome,
-                        signal_outcomes::Column::ExitReason,
-                        signal_outcomes::Column::EntryTs,
-                        signal_outcomes::Column::ExitTs,
-                        signal_outcomes::Column::ExitPrice,
-                        signal_outcomes::Column::RMultiple,
-                        signal_outcomes::Column::MfeR,
-                        signal_outcomes::Column::MaeR,
-                        signal_outcomes::Column::BarsHeld,
-                        signal_outcomes::Column::VolRatio,
-                        signal_outcomes::Column::OiIncrease,
-                        signal_outcomes::Column::Trend60Score,
-                        signal_outcomes::Column::AtrPercentile,
-                        signal_outcomes::Column::TargetTier,
-                        signal_outcomes::Column::BVolRatio,
-                        signal_outcomes::Column::AMoveAtr,
-                        signal_outcomes::Column::TriggerLagBars,
-                        signal_outcomes::Column::TriggerOvershootR,
-                        signal_outcomes::Column::RolloverCrossed,
-                        signal_outcomes::Column::GapCrossedEntry,
-                        signal_outcomes::Column::GapCrossedExit,
-                        signal_outcomes::Column::UpdatedAt,
-                    ])
-                    .to_owned(),
-            )
-            .exec(db)
-            .await
-            .context("写入信号结局失败")?;
+    Ok(q.all(db).await.context("查询信号事件失败")?)
+}
+
+/// 更新单条信号事件（推进触发/持仓/出场状态）。
+pub async fn update_pattern_event(
+    db: &DatabaseConnection,
+    row: pattern_events::Model,
+) -> Result<()> {
+    let res = db
+        .execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            r#"
+                UPDATE pattern_events SET
+                    symbol = ?1, direction = ?2, grade = ?3, level = ?4,
+                    s0_ts = ?5, s0_price = ?6, s1_ts = ?7, s1_price = ?8,
+                    s2_ts = ?9, s2_price = ?10, a_move = ?11, b_move = ?12,
+                    a_bars = ?13, b_bars = ?14, retracement = ?15,
+                    warning_ts = ?16, detected_at = ?17, warning_kind = ?18,
+                    entry_score = ?19, entry_score_dims = ?20, entry = ?21,
+                    stop = ?22, target = ?23, risk = ?24, rr = ?25,
+                    state = ?26, last_advance_ts = ?27, trigger_ts = ?28,
+                    trigger_bar_ts = ?29, trigger_price = ?30, trigger_score = ?31,
+                    trigger_volume_ratio = ?32, overshoot_r = ?33, hold_score = ?34,
+                    hold_score_history = ?35, outcome = ?36, exit_reason = ?37,
+                    exit_ts = ?38, exit_price = ?39, r_multiple = ?40, mfe_r = ?41,
+                    mae_r = ?42, created_at = ?43, updated_at = ?44
+                WHERE id = ?45
+                "#,
+            vec![
+                row.symbol.into(),
+                row.direction.into(),
+                row.grade.into(),
+                row.level.into(),
+                row.s0_ts.into(),
+                row.s0_price.into(),
+                row.s1_ts.into(),
+                row.s1_price.into(),
+                row.s2_ts.into(),
+                row.s2_price.into(),
+                row.a_move.into(),
+                row.b_move.into(),
+                row.a_bars.into(),
+                row.b_bars.into(),
+                row.retracement.into(),
+                row.warning_ts.into(),
+                row.detected_at.into(),
+                row.warning_kind.into(),
+                row.entry_score.into(),
+                row.entry_score_dims.into(),
+                row.entry.into(),
+                row.stop.into(),
+                row.target.into(),
+                row.risk.into(),
+                row.rr.into(),
+                row.state.into(),
+                row.last_advance_ts.into(),
+                row.trigger_ts.into(),
+                row.trigger_bar_ts.into(),
+                row.trigger_price.into(),
+                row.trigger_score.into(),
+                row.trigger_volume_ratio.into(),
+                row.overshoot_r.into(),
+                row.hold_score.into(),
+                row.hold_score_history.into(),
+                row.outcome.into(),
+                row.exit_reason.into(),
+                row.exit_ts.into(),
+                row.exit_price.into(),
+                row.r_multiple.into(),
+                row.mfe_r.into(),
+                row.mae_r.into(),
+                row.created_at.into(),
+                row.updated_at.into(),
+                row.id.into(),
+            ],
+        ))
+        .await
+        .context("更新信号事件失败")?;
+    if res.rows_affected() != 1 {
+        return Err(anyhow!(
+            "更新信号事件失败: 影响行数 {}",
+            res.rows_affected()
+        ));
     }
     Ok(())
 }
 
-pub async fn recent_scans(db: &DatabaseConnection, limit: u64) -> Result<Vec<scans::Model>> {
-    Ok(scans::Entity::find()
-        .order_by_desc(scans::Column::Id)
-        .limit(limit)
-        .all(db)
+/// 重建复盘数据时清空事件表。
+pub async fn clear_pattern_events(db: &DatabaseConnection) -> Result<()> {
+    pattern_events::Entity::delete_many()
+        .exec(db)
         .await
-        .context("查询扫描记录失败")?)
+        .context("清空信号事件失败")?;
+    db.execute_unprepared("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'pattern_events'")
+        .await
+        .context("重置信号事件编号失败")?;
+    Ok(())
 }
 
-pub async fn signals_for_scan(
+/// 按 id 删除单条信号事件（重复信号清理用）。
+pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()> {
+    let res = pattern_events::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("删除信号事件失败")?;
+    if res.rows_affected != 1 {
+        return Err(anyhow!("删除信号事件失败: 影响行数 {}", res.rows_affected));
+    }
+    Ok(())
+}
+
+/// 按 (symbol, direction, warning_ts) 查已有事件，避免同一预警K线重复建事件。
+pub async fn pattern_event_by_warning(
     db: &DatabaseConnection,
-    scan_id: i64,
-) -> Result<Vec<signals::Model>> {
-    Ok(signals::Entity::find()
-        .filter(signals::Column::ScanId.eq(scan_id))
-        .order_by_desc(signals::Column::Id)
-        .all(db)
-        .await
-        .context("查询信号失败")?)
-}
-
-/// 最近一次扫描产出的信号（与图表页口径一致，避免展示旧扫描的过期信号）。
-pub async fn latest_signals(db: &DatabaseConnection, _limit: u64) -> Result<Vec<signals::Model>> {
-    let Some(latest) = scans::Entity::find()
-        .order_by_desc(scans::Column::Id)
+    symbol: &str,
+    direction: &str,
+    warning_ts: &str,
+) -> Result<Option<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::Symbol.eq(symbol))
+        .filter(pattern_events::Column::Direction.eq(direction))
+        .filter(pattern_events::Column::WarningTs.eq(warning_ts))
         .one(db)
         .await
-        .context("查询最新扫描失败")?
-    else {
-        return Ok(Vec::new());
-    };
-    signals_for_scan(db, latest.id).await
+        .context("查询信号事件失败")?)
+}
+
+/// 按品种 + 方向查所有未了结的 pending 事件，供上层按预警K线距离与入场价差
+/// 做相似预警抑制。不再要求 s0/s1 同源或入场价完全相同。
+pub async fn pending_pattern_events_by_symbol_direction(
+    db: &DatabaseConnection,
+    symbol: &str,
+    direction: &str,
+) -> Result<Vec<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::Symbol.eq(symbol))
+        .filter(pattern_events::Column::Direction.eq(direction))
+        .filter(pattern_events::Column::State.eq("pending"))
+        .all(db)
+        .await
+        .context("查询待触发信号事件失败")?)
 }
 
 pub async fn all_settings(
@@ -876,77 +847,172 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_signals_keeps_one_row_per_structure() {
+    async fn pattern_events_roundtrip_and_dedup_by_warning() {
         let db = test_db().await;
-        let row = |scan_id: i64, state: &str, s2: &str, created_at: &str, score: f64| {
-            let detail = format!(r#"{{"s1":{{"ts":"2026-08-03 09:00"}},"s2":{{"ts":"{s2}"}}}}"#);
-            signals::ActiveModel {
-                id: sea_orm::NotSet,
-                scan_id: Set(scan_id),
-                symbol: Set("RB0".to_string()),
-                level: Set("fine".to_string()),
-                direction: Set("down".to_string()),
-                grade: Set("A级".to_string()),
-                state: Set(state.to_string()),
-                category: Set("默认观察，不主动开仓".to_string()),
-                entry: Set(3000.0),
-                stop: Set(3050.0),
-                target: Set(2900.0),
-                rr: Set(2.0),
-                score: Set(score),
-                note: Set(String::new()),
-                detail: Set(detail),
-                created_at: Set(created_at.to_string()),
-            }
+        let row = |warning_ts: &str, state: &str, score: f64| pattern_events::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("BU0".to_string()),
+            direction: Set("up".to_string()),
+            grade: Set("A级".to_string()),
+            level: Set("fine".to_string()),
+            s0_ts: Set("2026-08-14 09:15".to_string()),
+            s0_price: Set(4128.0),
+            s1_ts: Set("2026-08-14 09:30".to_string()),
+            s1_price: Set(4150.0),
+            s2_ts: Set("2026-08-14 09:45".to_string()),
+            s2_price: Set(4137.0),
+            a_move: Set(22.0),
+            b_move: Set(13.0),
+            a_bars: Set(1),
+            b_bars: Set(1),
+            retracement: Set(0.59),
+            warning_ts: Set(warning_ts.to_string()),
+            detected_at: Set(warning_ts.to_string()),
+            warning_kind: Set("wick".to_string()),
+            entry_score: Set(score),
+            entry_score_dims: Set(r#"{"dim_a":3.8,"dim_b":3.4,"dim_warning":3.5}"#.to_string()),
+            entry: Set(4162.0),
+            stop: Set(4137.0),
+            target: Set(4216.0),
+            risk: Set(25.0),
+            rr: Set(2.16),
+            state: Set(state.to_string()),
+            last_advance_ts: Set(None),
+            trigger_ts: Set(None),
+            trigger_bar_ts: Set(None),
+            trigger_price: Set(None),
+            trigger_score: Set(None),
+            trigger_volume_ratio: Set(None),
+            overshoot_r: Set(None),
+            hold_score: Set(None),
+            hold_score_history: Set("[]".to_string()),
+            outcome: Set(None),
+            exit_reason: Set(None),
+            exit_ts: Set(None),
+            exit_price: Set(None),
+            r_multiple: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            created_at: Set("2026-08-14 11:30".to_string()),
+            updated_at: Set("2026-08-14 11:30".to_string()),
         };
 
-        upsert_signals(
-            &db,
-            vec![row(
-                1,
-                "即将触发",
-                "2026-08-03 10:00",
-                "2026-08-03 10:05",
-                3.1,
-            )],
-        )
-        .await
-        .unwrap();
-        upsert_signals(
-            &db,
-            vec![row(
-                2,
-                "当前已触发",
-                "2026-08-03 10:00",
-                "2026-08-03 11:00",
-                3.6,
-            )],
-        )
-        .await
-        .unwrap();
+        let id = insert_pattern_event(&db, row("2026-08-14 11:30", "pending", 3.6))
+            .await
+            .unwrap();
+        assert_eq!(
+            pattern_event_by_warning(&db, "BU0", "up", "2026-08-14 11:30")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        let events = all_pattern_events(&db).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!((events[0].entry_score - 3.6).abs() < 1e-9);
 
-        let rows = all_signals(&db).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, 1);
-        assert_eq!(rows[0].scan_id, 2);
-        assert_eq!(rows[0].state, "当前已触发");
-        assert!((rows[0].score - 3.6).abs() < 1e-9);
-        assert_eq!(rows[0].created_at, "2026-08-03 10:05");
+        let mut model = pattern_event_by_id(&db, id).await.unwrap().unwrap();
+        model.state = "triggered".to_string();
+        model.trigger_ts = Some("2026-08-14 13:45".to_string());
+        model.trigger_price = Some(4162.0);
+        model.hold_score = Some(3.8);
+        model.updated_at = "2026-08-14 13:45".to_string();
+        update_pattern_event(&db, model).await.unwrap();
 
-        upsert_signals(
-            &db,
-            vec![row(
-                3,
-                "即将触发",
-                "2026-08-03 11:00",
-                "2026-08-03 12:00",
-                2.9,
-            )],
-        )
-        .await
-        .unwrap();
-        let rows = all_signals(&db).await.unwrap();
-        assert_eq!(rows.len(), 2);
+        let updated = pattern_event_by_id(&db, id).await.unwrap().unwrap();
+        assert_eq!(updated.state, "triggered");
+        assert_eq!(updated.trigger_ts.as_deref(), Some("2026-08-14 13:45"));
+        assert_eq!(updated.hold_score, Some(3.8));
+
+        clear_pattern_events(&db).await.unwrap();
+        assert!(all_pattern_events(&db).await.unwrap().is_empty());
+        let next_id = insert_pattern_event(&db, row("2026-08-14 12:00", "pending", 3.6))
+            .await
+            .unwrap();
+        assert_eq!(next_id, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_pattern_events_by_symbol_direction_lists_pending() {
+        let db = test_db().await;
+        let row = |warning_ts: &str, entry: f64, state: &str| pattern_events::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("UR0".to_string()),
+            direction: Set("up".to_string()),
+            grade: Set("C级".to_string()),
+            level: Set("fine".to_string()),
+            s0_ts: Set("2026-08-13 09:30".to_string()),
+            s0_price: Set(1660.0),
+            s1_ts: Set("2026-08-13 13:45".to_string()),
+            s1_price: Set(1685.0),
+            s2_ts: Set("2026-08-13 14:00".to_string()),
+            s2_price: Set(1668.0),
+            a_move: Set(25.0),
+            b_move: Set(17.0),
+            a_bars: Set(4),
+            b_bars: Set(2),
+            retracement: Set(0.68),
+            warning_ts: Set(warning_ts.to_string()),
+            detected_at: Set(warning_ts.to_string()),
+            warning_kind: Set("wick".to_string()),
+            entry_score: Set(2.9),
+            entry_score_dims: Set(r#"{"dim_a":3.2,"dim_b":2.8,"dim_warning":3.4}"#.to_string()),
+            entry: Set(entry),
+            stop: Set(1658.0),
+            target: Set(1685.0),
+            risk: Set(17.0),
+            rr: Set(1.0),
+            state: Set(state.to_string()),
+            last_advance_ts: Set(None),
+            trigger_ts: Set(None),
+            trigger_bar_ts: Set(None),
+            trigger_price: Set(None),
+            trigger_score: Set(None),
+            trigger_volume_ratio: Set(None),
+            overshoot_r: Set(None),
+            hold_score: Set(None),
+            hold_score_history: Set("[]".to_string()),
+            outcome: Set(None),
+            exit_reason: Set(None),
+            exit_ts: Set(None),
+            exit_price: Set(None),
+            r_multiple: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            created_at: Set(warning_ts.to_string()),
+            updated_at: Set(warning_ts.to_string()),
+        };
+
+        let first = insert_pattern_event(&db, row("2026-08-13 09:30", 1675.0, "pending"))
+            .await
+            .unwrap();
+        let second = insert_pattern_event(&db, row("2026-08-13 09:45", 1676.0, "pending"))
+            .await
+            .unwrap();
+        insert_pattern_event(&db, row("2026-08-13 10:00", 1676.0, "triggered"))
+            .await
+            .unwrap();
+        insert_pattern_event(&db, row("2026-08-13 10:15", 1676.0, "down"))
+            .await
+            .unwrap();
+
+        let pending = pending_pattern_events_by_symbol_direction(&db, "UR0", "up")
+            .await
+            .unwrap();
+        let ids: Vec<i64> = pending.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&first));
+        assert!(ids.contains(&second));
+
+        // 已离开 pending 的事件不再参与相似预警抑制
+        let mut model = pattern_event_by_id(&db, first).await.unwrap().unwrap();
+        model.state = "triggered".to_string();
+        model.trigger_ts = Some("2026-08-14 10:00".to_string());
+        update_pattern_event(&db, model).await.unwrap();
+        let pending = pending_pattern_events_by_symbol_direction(&db, "UR0", "up")
+            .await
+            .unwrap();
+        assert!(!pending.iter().any(|e| e.id == first));
     }
 
     #[tokio::test]

@@ -57,61 +57,6 @@ pub mod klines {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-pub mod scans {
-    use sea_orm::entity::prelude::*;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-    #[sea_orm(table_name = "scans")]
-    pub struct Model {
-        #[sea_orm(primary_key)]
-        pub id: i64,
-        pub started_at: String,
-        pub finished_at: String,
-        pub status: String,
-        pub scanned: i64,
-        pub active_count: i64,
-        pub summary: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
-pub mod signals {
-    use sea_orm::entity::prelude::*;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-    #[sea_orm(table_name = "signals")]
-    pub struct Model {
-        #[sea_orm(primary_key)]
-        pub id: i64,
-        pub scan_id: i64,
-        pub symbol: String,
-        pub level: String,
-        pub direction: String,
-        pub grade: String,
-        pub state: String,
-        pub category: String,
-        pub entry: f64,
-        pub stop: f64,
-        pub target: f64,
-        pub rr: f64,
-        pub score: f64,
-        pub note: String,
-        pub detail: String,
-        pub created_at: String,
-    }
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-
-    impl ActiveModelBehavior for ActiveModel {}
-}
-
 pub mod settings {
     use sea_orm::entity::prelude::*;
     use serde::{Deserialize, Serialize};
@@ -174,55 +119,69 @@ pub mod symbol_groups {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
-/// 信号结局与首批诊断特征（复盘统计用）。
-/// 每个信号一行（signal_id 主键），由扫描后的结局回填任务写入/覆盖。
-pub mod signal_outcomes {
+/// 前向信号事件表。预警K线收盘即创建事件，AB端点/预警K线/入场评分落库后不再回改；
+/// 后续行情只推进 state 并记录真实触发与出场。
+pub mod pattern_events {
     use sea_orm::entity::prelude::*;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
-    #[sea_orm(table_name = "signal_outcomes")]
+    #[sea_orm(table_name = "pattern_events")]
     pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub signal_id: i64,
-        /// 模拟规则版本（简化出场规则 = 1），规则升级后按版本重新回填
-        pub sim_version: i64,
-        /// win / loss / no_trigger / open / insufficient_data
-        pub outcome: String,
-        /// stop / target / no_follow / time_exit / （空）
-        pub exit_reason: String,
-        /// 模拟回放找到的入场触达时间（快照 trigger_ts 缺失时用于图上补画触发标记）
-        pub entry_ts: Option<String>,
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub direction: String,
+        pub grade: String,
+        pub level: String,
+        pub s0_ts: String,
+        pub s0_price: f64,
+        pub s1_ts: String,
+        pub s1_price: f64,
+        pub s2_ts: String,
+        pub s2_price: f64,
+        /// AB 段结构与复盘统计用快照，识别时定死
+        pub a_move: f64,
+        pub b_move: f64,
+        pub a_bars: i64,
+        pub b_bars: i64,
+        pub retracement: f64,
+        /// 预警K线收盘时间（15m）
+        pub warning_ts: String,
+        /// 实际发现预警的时间（通常等于 warning_ts）
+        pub detected_at: String,
+        /// strong / wick / fast / cumulative；历史记录可能为 engulf（按强反转兼容）
+        pub warning_kind: String,
+        pub entry_score: f64,
+        /// JSON: {"dim_a": x, "dim_b": y, "dim_warning": z}
+        pub entry_score_dims: String,
+        pub entry: f64,
+        pub stop: f64,
+        pub target: f64,
+        pub risk: f64,
+        pub rr: f64,
+        /// pending / triggered / expired / closed
+        pub state: String,
+        /// 上次推进到哪一根 15m K 线（避免重复扫描已处理行情）
+        pub last_advance_ts: Option<String>,
+        pub trigger_ts: Option<String>,
+        /// 触发所在 15m K线收盘时间
+        pub trigger_bar_ts: Option<String>,
+        pub trigger_price: Option<f64>,
+        pub trigger_score: Option<f64>,
+        pub trigger_volume_ratio: Option<f64>,
+        pub overshoot_r: Option<f64>,
+        pub hold_score: Option<f64>,
+        /// JSON 数组，记录触发后每次扫描的持仓评分历史
+        pub hold_score_history: String,
+        pub outcome: Option<String>,
+        pub exit_reason: Option<String>,
         pub exit_ts: Option<String>,
         pub exit_price: Option<f64>,
         pub r_multiple: Option<f64>,
         pub mfe_r: Option<f64>,
         pub mae_r: Option<f64>,
-        pub bars_held: Option<i64>,
-        /// 触发 bar 成交量 / 前 20 根均量（15m）
-        pub vol_ratio: Option<f64>,
-        /// 触发 bar 持仓量较前一根增加
-        pub oi_increase: Option<bool>,
-        /// 60m 连续趋势分 0~5（信号时刻截断计算）
-        pub trend60_score: Option<f64>,
-        /// 触发 bar 的 ATR20 相对前 60 根 15m bar 的分位（0~1）
-        pub atr_percentile: Option<f64>,
-        /// 止盈层级：tp1 / tp2
-        pub target_tier: Option<String>,
-        /// b段均量 / a段均量（15m）
-        pub b_vol_ratio: Option<f64>,
-        /// a_move / 触发bar ATR20
-        pub a_move_atr: Option<f64>,
-        /// 预警K线到触发K线的根数差
-        pub trigger_lag_bars: Option<i64>,
-        /// 触发K线超出入场价的深度（按R归一化）
-        pub trigger_overshoot_r: Option<f64>,
-        /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
-        pub rollover_crossed: Option<bool>,
-        /// 入场价被跳空穿越：按更保守的 current.open 成交
-        pub gap_crossed_entry: Option<bool>,
-        /// 止损价被跳空穿越：按 current.open 成交
-        pub gap_crossed_exit: Option<bool>,
+        pub created_at: String,
         pub updated_at: String,
     }
 

@@ -14,7 +14,8 @@ import {
   NText,
   type DataTableColumns,
 } from 'naive-ui'
-import { onScanCompleted } from '../services/api'
+import { api, onScanCompleted } from '../services/api'
+import { confirmAction } from '../utils/confirm'
 import {
   REVIEW_DIMENSIONS,
   REVIEW_STATS_SCOPES,
@@ -28,6 +29,7 @@ import type { GroupStat, OpenReviewChartPayload, OutcomeDetail } from '../types'
 
 const review = useReviewStore()
 const loading = ref(false)
+const rebuilding = ref(false)
 const error = ref('')
 /** 品种筛选本地输入（防抖后再生效） */
 const symbolInput = ref('')
@@ -62,6 +64,21 @@ const rColor = (v: number | null | undefined) => (v == null || v >= 0 ? '#e03131
 function outcomeTag(outcome: string) {
   const meta = outcomeLabel[outcome] ?? { text: outcome, type: 'default' as const }
   return h(NTag, { type: meta.type, size: 'small' }, { default: () => meta.text })
+}
+
+function stateLabel(state: string) {
+  switch (state) {
+    case 'pending':
+      return '等待触发'
+    case 'triggered':
+      return '已触发'
+    case 'closed':
+      return '已了结'
+    case 'expired':
+      return '已失效'
+    default:
+      return state
+  }
 }
 
 function sampleTag(n: number) {
@@ -226,7 +243,7 @@ const groupColumns: DataTableColumns<GroupStat> = [
 ]
 
 const recentColumns: DataTableColumns<OutcomeDetail> = [
-  { title: 'ID', key: 'signal_id', width: 70 },
+  { title: 'ID', key: 'event_id', width: 70 },
   { title: '品种', key: 'symbol', width: 80 },
   { title: '方向', key: 'direction', width: 70, render: (r) => dirLabel(r.direction) },
   { title: '级别', key: 'level', width: 70, render: (r) => levelLabel(r.level) },
@@ -239,11 +256,13 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   { title: '等级', key: 'grade', width: 90 },
   {
     title: '评分',
-    key: 'score',
+    key: 'entry_score',
     width: 80,
     align: 'right',
-    render: (r) => r.score.toFixed(2),
+    render: (r) => r.entry_score.toFixed(2),
   },
+  { title: '预警K线', key: 'warning_ts', width: 150, render: (r) => r.warning_ts },
+  { title: '状态', key: 'state', width: 80, render: (r) => stateLabel(r.state) },
   { title: '入场', key: 'entry', width: 90, align: 'right', render: (r) => r.entry.toFixed(1) },
   { title: '止损', key: 'stop', width: 90, align: 'right', render: (r) => r.stop.toFixed(1) },
   { title: '目标位(参考)', key: 'target', width: 100, align: 'right', render: (r) => r.target.toFixed(1) },
@@ -312,36 +331,18 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   },
   {
     title: '量能',
-    key: 'vol_ratio',
+    key: 'trigger_volume_ratio',
     width: 80,
     align: 'right',
-    render: (r) => (r.vol_ratio == null ? '—' : r.vol_ratio.toFixed(2)),
+    render: (r) => (r.trigger_volume_ratio == null ? '—' : r.trigger_volume_ratio.toFixed(2)),
   },
+  { title: '触发时间', key: 'trigger_ts', width: 150, render: (r) => r.trigger_ts ?? '—' },
   {
-    title: '增仓',
-    key: 'oi_increase',
-    width: 70,
-    render: (r) => (r.oi_increase == null ? '—' : r.oi_increase ? '是' : '否'),
-  },
-  {
-    title: '60m分',
-    key: 'trend60_score',
+    title: '持仓评分',
+    key: 'hold_score',
     width: 80,
     align: 'right',
-    render: (r) => (r.trend60_score == null ? '—' : r.trend60_score.toFixed(2)),
-  },
-  {
-    title: '止盈层级',
-    key: 'target_tier',
-    width: 90,
-    render: (r) => (r.target_tier === 'tp2' ? 'TP2扩展' : r.target_tier === 'tp1' ? 'TP1' : '—'),
-  },
-  {
-    title: 'b/a量比',
-    key: 'b_vol_ratio',
-    width: 90,
-    align: 'right',
-    render: (r) => (r.b_vol_ratio == null ? '—' : r.b_vol_ratio.toFixed(2)),
+    render: (r) => (r.hold_score == null ? '—' : r.hold_score.toFixed(2)),
   },
   {
     title: 'b/a速度',
@@ -364,24 +365,11 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
         : (r.b_bars / r.a_bars).toFixed(2),
   },
   {
-    title: '触发延迟',
-    key: 'trigger_lag_bars',
-    width: 90,
-    render: (r) => (r.trigger_lag_bars == null ? '—' : `${r.trigger_lag_bars}根`),
-  },
-  {
     title: '追价深度',
-    key: 'trigger_overshoot_r',
+    key: 'overshoot_r',
     width: 100,
     align: 'right',
-    render: (r) => (r.trigger_overshoot_r == null ? '—' : `${r.trigger_overshoot_r.toFixed(2)}R`),
-  },
-  {
-    title: 'a段强度',
-    key: 'a_move_atr',
-    width: 100,
-    align: 'right',
-    render: (r) => (r.a_move_atr == null ? '—' : `${r.a_move_atr.toFixed(1)}×ATR`),
+    render: (r) => (r.overshoot_r == null ? '—' : `${r.overshoot_r.toFixed(2)}R`),
   },
   {
     title: '净R',
@@ -405,8 +393,7 @@ const levelOptions = [
   { label: '箱体', value: 'box' },
 ]
 const versionOptions = [
-  { label: '1.x', value: '1' },
-  { label: '2.0', value: '2' },
+  { label: '3.0', value: '3' },
 ]
 const gradeOptions = [
   { label: 'A级', value: 'A级' },
@@ -451,6 +438,27 @@ async function refresh() {
   }
 }
 
+async function rebuildAll() {
+  const ok = await confirmAction({
+    title: '重建全部识别',
+    content: '将清空所有旧信号记录，并用当前K线重新识别一遍，结果不可撤销。确定继续吗？',
+    positiveText: '重建并重新识别',
+  })
+  if (!ok) return
+  rebuilding.value = true
+  try {
+    const result = await api.rebuildEventsNow()
+    await review.load()
+    notify.success(
+      `重建完成：${result.scanned} 个品种，当前 ${result.active_count} 个信号`,
+    )
+  } catch (e) {
+    notify.error(String(e))
+  } finally {
+    rebuilding.value = false
+  }
+}
+
 let symbolTimer: ReturnType<typeof setTimeout> | undefined
 function onSymbolInput() {
   if (symbolTimer) clearTimeout(symbolTimer)
@@ -482,7 +490,7 @@ async function openReviewChart(row: OutcomeDetail) {
   try {
     const payload: OpenReviewChartPayload = {
       symbol: row.symbol,
-      signalId: row.signal_id,
+      eventId: row.event_id,
       filters: { ...review.recentFilters },
     }
     await emit('open-review-chart', payload)
@@ -547,6 +555,9 @@ onBeforeUnmount(() => {
           />
           <n-button size="small" type="primary" :loading="review.refreshing" @click="refresh">
             刷新
+          </n-button>
+          <n-button size="small" :loading="rebuilding" @click="rebuildAll">
+            重建全部识别
           </n-button>
         </n-space>
       </n-space>

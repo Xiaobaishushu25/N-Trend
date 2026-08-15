@@ -353,6 +353,13 @@ onMounted(async () => {
                 style="width: 200px"
               />
             </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                进入K线图默认显示首个信号
+                <Tip text="进入图表时自动在K线图上显示排序最靠前的信号形态；关闭后所有形态默认隐藏。" />
+              </div>
+              <n-switch v-model:value="form.ui.chart_show_first_signal" />
+            </div>
           </div>
         </div>
       </n-tab-pane>

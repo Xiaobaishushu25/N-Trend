@@ -3,6 +3,7 @@
 use crate::analyze::dto::BoxDto;
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, Dir, Grade, NPattern, SignalCheck, Swing, Trend60};
+use crate::analyze::scoring;
 
 const RAIL_TOUCH_TOLERANCE_ATR: f64 = 0.65;
 const WARNING_TOUCH_TOLERANCE_ATR: f64 = 0.40;
@@ -137,36 +138,6 @@ fn box_candidates(
     candidates
 }
 
-fn long_lower_wick(bars: &[Bar], atr20: &[Option<f64>], j: usize) -> bool {
-    let Some(bar) = bars.get(j) else {
-        return false;
-    };
-    let range = bar.high - bar.low;
-    if range <= 0.0 {
-        return false;
-    }
-    let body = (bar.close - bar.open).abs();
-    let lower = bar.open.min(bar.close) - bar.low;
-    let atr = atr_at(atr20, j);
-    let close_ok = (bar.high - bar.close) / range <= 0.35;
-    lower > body && lower >= 0.25 * atr && lower >= 0.5 * range && close_ok
-}
-
-fn short_upper_wick(bars: &[Bar], atr20: &[Option<f64>], j: usize) -> bool {
-    let Some(bar) = bars.get(j) else {
-        return false;
-    };
-    let range = bar.high - bar.low;
-    if range <= 0.0 {
-        return false;
-    }
-    let body = (bar.close - bar.open).abs();
-    let upper = bar.high - bar.open.max(bar.close);
-    let atr = atr_at(atr20, j);
-    let close_ok = (bar.close - bar.low) / range <= 0.35;
-    upper > body && upper >= 0.25 * atr && upper >= 0.5 * range && close_ok
-}
-
 /// 在箱体确认后寻找最新一根满足触轨条件的预警K线。
 fn find_warning(
     bars: &[Bar],
@@ -191,7 +162,7 @@ fn find_warning(
             Dir::Up => {
                 if trend_k[j].0 {
                     "strong"
-                } else if long_lower_wick(bars, atr20, j) {
+                } else if scoring::is_wick_warning_bar(&bars[j], atr, dir, bars.get(j - 1)) {
                     "wick"
                 } else {
                     continue;
@@ -200,7 +171,7 @@ fn find_warning(
             Dir::Down => {
                 if trend_k[j].1 {
                     "strong"
-                } else if short_upper_wick(bars, atr20, j) {
+                } else if scoring::is_wick_warning_bar(&bars[j], atr, dir, bars.get(j - 1)) {
                     "wick"
                 } else {
                     continue;
@@ -369,6 +340,8 @@ fn build_box_pattern(
         a_too_long: false,
         b_too_long: false,
         b_fast: false,
+        b_weakening: false,
+        b_weakening_ratio: None,
         a_strong_trend: 0,
         b_strong_reverse: 0,
         c_move: 0.0,

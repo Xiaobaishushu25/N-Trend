@@ -1,23 +1,7 @@
-//! 信号结局回填与复盘统计。
+//! 复盘统计与出场规则常量。
 //!
-//! 简化出场规则（SIM_VERSION = 9）：
-//! - 入场价 = 信号落库时的 entry（预警K线极值 ± tick），不重算、不回看；
-//! - 入场/止损被跳空穿越时按更保守的 current.open 成交，并标记 gap_crossed；
-//! - 在 15m 上逐根模拟：先到 stop → −1R；
-//! - 第一止盈位 TP1 = 1R（entry ± 1R）；
-//! - 触及 TP1 后采用推动止盈：每达到 0.8×2R、0.8×3R、0.8×4R…… 就把该阈值作为新的止盈位，
-//!   随后回落触到该止盈位即平仓；未到更高阈值前回落 1R 则按 1R 止盈；
-//! - 同一根 bar 双触按止损优先（保守）；
-//! - 入场后第 5 根 bar（含入场bar共 6 根）若 MFE < 0.5R → 按该 bar 收盘平仓；
-//! - 60 根 bar 内未决 → 按第 60 根收盘平仓（时间退出）；
-//! - 预警后 12 根内未触及 entry → no_trigger；
-//! - 数据不足 → open / insufficient_data。
-//!
-//! 首批诊断特征只落库、不改评分：vol_ratio（触发量能）、oi_increase（增仓）、
-//! trend60_score（60m 连续趋势分）、b_vol_ratio（b段相对a段量能）、
-//! a_move_atr（a段强度）、trigger_lag_bars（预警到触发延迟）、
-//! trigger_overshoot_r（触发K线追价深度）、target_tier（止盈层级），
-//! 供复盘页按特征分组统计，为 v2 权重校准提供证据。
+//! 前向事件识别、入场评分、触发与持仓推进由 analyze::event 与 service 负责；
+//! 本模块保留复盘聚合统计、分组口径和出场规则常量。
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -25,10 +9,16 @@ use std::collections::HashMap;
 use chrono::{Datelike, Timelike};
 use serde::Serialize;
 
-use crate::analyze::indicators;
-use crate::analyze::model::{Bar, Dir, ATR_PERIOD};
+use crate::analyze::model::Bar;
 
-pub const SIM_VERSION: i64 = 9;
+/// 前向事件系统版本号，写入复盘统计结果。
+pub const SIM_VERSION: i64 = 11;
+/// 相似预警去重：预警K线最多相隔多少根 15m。
+pub const DEDUP_WARNING_BARS: usize = 5;
+/// 相似预警去重：计划/实际入场价差上限（按前一条信号的 risk 折算）。
+pub const DEDUP_ENTRY_R: f64 = 0.3;
+/// 品种 + 预警K线时间到实际 15m 序列位置的映射，用于按K线根数做去重距离。
+pub type WarningBarIndex = HashMap<(String, String), usize>;
 /// 预警后最多等待多少根 15m bar 触发，与分析器 PENDING_MAX_AGE 对齐
 pub const PENDING_BARS: usize = 12;
 /// 入场后第 5 根 bar 做无跟随检查
@@ -41,14 +31,10 @@ pub const TRAIL_START_R: f64 = 1.0;
 pub const TRAIL_STEP_R: f64 = 0.8;
 /// 时间退出上限：入场后 60 根 15m bar 未决按收盘平仓
 pub const TIME_HORIZON_BARS: usize = 60;
-/// 入场后至少几根 bar 才允许判定为 open（更少视为数据不足）
-pub const MIN_BARS_FOR_SETTLED: usize = 3;
 /// 量能确认窗口：触发 bar 前 20 根 15m 均量
 pub const VOL_AVG_WINDOW: usize = 20;
 /// 量能确认阈值：触发 bar 成交量 ≥ 前 20 根均量的 2.0 倍（复盘分桶显示 ≥2.0 才有明显区分度）
 pub const VOL_CONFIRM_RATIO: f64 = 2.0;
-/// ATR 分位窗口：触发 bar 的 ATR20 与之前 60 根 15m bar 比较
-pub const ATR_PERCENTILE_WINDOW: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -127,63 +113,6 @@ impl ExitReason {
     }
 }
 
-/// 模拟所需的信号快照（由 service 从 signals 表 + detail JSON 组装）。
-#[derive(Debug, Clone)]
-pub struct SignalInput {
-    pub symbol: String,
-    pub direction: String,
-    pub level: String,
-    pub entry: f64,
-    pub stop: f64,
-    pub target: f64,
-    pub risk: f64,
-    pub created_at: String,
-    pub warning_ts: Option<String>,
-    /// 已落盘信号明确记录触发K线时，直接用该根K线做入场模拟。
-    pub trigger_ts: Option<String>,
-    pub s0_ts: Option<String>,
-    pub s1_ts: Option<String>,
-    pub s2_ts: Option<String>,
-    pub a_move: Option<f64>,
-}
-
-/// 单条信号的结局 + 特征（对应 signal_outcomes 一行）。
-#[derive(Debug, Clone)]
-pub struct SignalAnnotation {
-    pub sim_version: i64,
-    pub outcome: Outcome,
-    pub exit_reason: ExitReason,
-    /// 模拟回放找到的入场触达时间（入场价被触及的那根 15m bar）
-    pub entry_ts: Option<String>,
-    pub exit_ts: Option<String>,
-    pub exit_price: Option<f64>,
-    pub r_multiple: Option<f64>,
-    pub mfe_r: Option<f64>,
-    pub mae_r: Option<f64>,
-    pub bars_held: Option<usize>,
-    pub vol_ratio: Option<f64>,
-    pub oi_increase: Option<bool>,
-    pub trend60_score: Option<f64>,
-    pub atr_percentile: Option<f64>,
-    /// 止盈时记录 tp1 / tp2，其他出场为空
-    pub target_tier: Option<String>,
-    /// b段均量 / a段均量（15m）
-    pub b_vol_ratio: Option<f64>,
-    /// a_move / 触发bar ATR20
-    pub a_move_atr: Option<f64>,
-    /// 预警K线到触发K线的根数差
-    pub trigger_lag_bars: Option<usize>,
-    /// 触发K线超出入场价的深度（按R归一化）
-    pub trigger_overshoot_r: Option<f64>,
-    pub rollover_crossed: bool,
-    pub gap_crossed_entry: bool,
-    pub gap_crossed_exit: bool,
-}
-
-fn dt_minute(b: &Bar) -> (i32, i32, i32, i32, i32) {
-    (b.dt.year, b.dt.month, b.dt.day, b.dt.hour, b.dt.minute)
-}
-
 /// 兼容两种时间格式：K线 ts 带秒、signals.created_at/预警时间无秒。
 pub fn parse_minute(ts: &str) -> Option<(i32, i32, i32, i32, i32)> {
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
@@ -198,81 +127,6 @@ pub fn parse_minute(ts: &str) -> Option<(i32, i32, i32, i32, i32)> {
         }
     }
     None
-}
-
-fn signal_dir(direction: &str) -> Dir {
-    if direction == "down" {
-        Dir::Down
-    } else {
-        Dir::Up
-    }
-}
-
-/// 推动止盈第 n 级对应的 R 倍数：第 1 级 = 1R，之后为 0.8×nR。
-fn trail_r_for(grade: usize) -> f64 {
-    if grade == 1 {
-        TRAIL_START_R
-    } else {
-        TRAIL_STEP_R * grade as f64
-    }
-}
-
-fn empty_annotation(outcome: Outcome, trend60_score: Option<f64>) -> SignalAnnotation {
-    SignalAnnotation {
-        sim_version: SIM_VERSION,
-        outcome,
-        exit_reason: ExitReason::None,
-        entry_ts: None,
-        exit_ts: None,
-        exit_price: None,
-        r_multiple: None,
-        mfe_r: None,
-        mae_r: None,
-        bars_held: None,
-        vol_ratio: None,
-        oi_increase: None,
-        trend60_score,
-        atr_percentile: None,
-        target_tier: None,
-        b_vol_ratio: None,
-        a_move_atr: None,
-        trigger_lag_bars: None,
-        trigger_overshoot_r: None,
-        rollover_crossed: false,
-        gap_crossed_entry: false,
-        gap_crossed_exit: false,
-    }
-}
-
-fn rollover_annotation(
-    trend60_score: Option<f64>,
-    entry_ts: Option<String>,
-    exit_ts: Option<String>,
-) -> SignalAnnotation {
-    SignalAnnotation {
-        sim_version: SIM_VERSION,
-        outcome: Outcome::Rollover,
-        exit_reason: ExitReason::Rollover,
-        entry_ts,
-        exit_ts,
-        exit_price: None,
-        r_multiple: None,
-        mfe_r: None,
-        mae_r: None,
-        bars_held: None,
-        vol_ratio: None,
-        oi_increase: None,
-        trend60_score,
-        atr_percentile: None,
-        target_tier: None,
-        b_vol_ratio: None,
-        a_move_atr: None,
-        trigger_lag_bars: None,
-        trigger_overshoot_r: None,
-        rollover_crossed: true,
-        gap_crossed_entry: false,
-        gap_crossed_exit: false,
-    }
 }
 
 /// 触发 bar 的量能比：成交量 / 前 20 根均量；均量缺失时返回 None。
@@ -297,442 +151,6 @@ pub(crate) fn vol_ratio_at(bars: &[Bar], ec: usize) -> Option<f64> {
         return None;
     }
     Some(vol / (sum / count as f64))
-}
-
-/// 闭区间 `[start, end]` 内成交量 > 0 的 K 线均量；区间为空或全为 0 时返回 None。
-fn avg_volume_between(bars: &[Bar], start: usize, end: usize) -> Option<f64> {
-    if start > end || end >= bars.len() {
-        return None;
-    }
-    let mut sum = 0.0;
-    let mut count = 0usize;
-    for b in &bars[start..=end] {
-        if b.volume > 0.0 {
-            sum += b.volume;
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return None;
-    }
-    Some(sum / count as f64)
-}
-
-/// b段均量 / a段均量：a段取 s0 后到 s1，b段取 s1 后到 s2。
-fn b_vol_ratio_at(
-    bars: &[Bar],
-    s0_ts: Option<&str>,
-    s1_ts: Option<&str>,
-    s2_ts: Option<&str>,
-) -> Option<f64> {
-    let (s0, s1, s2) = (s0_ts?, s1_ts?, s2_ts?);
-    let s0 = parse_minute(s0)?;
-    let s1 = parse_minute(s1)?;
-    let s2 = parse_minute(s2)?;
-    let i0 = bars.iter().position(|b| dt_minute(b) >= s0)?;
-    let i1 = bars.iter().position(|b| dt_minute(b) >= s1)?;
-    let i2 = bars.iter().position(|b| dt_minute(b) >= s2)?;
-    let a_avg = avg_volume_between(bars, i0, i1)?;
-    let b_avg = avg_volume_between(bars, i1, i2)?;
-    if a_avg <= 0.0 {
-        return None;
-    }
-    Some(b_avg / a_avg)
-}
-
-/// 触发 bar 持仓量较前一根增加；持仓量为 0（数据缺失）时返回 None。
-fn oi_increase_at(bars: &[Bar], ec: usize) -> Option<bool> {
-    let cur = bars.get(ec)?.hold;
-    let prev = bars.get(ec.checked_sub(1)?)?.hold;
-    if cur <= 0.0 || prev <= 0.0 {
-        return None;
-    }
-    Some(cur > prev)
-}
-
-/// 触发 bar 的 ATR20 在当前品种近 60 根 15m bar 中的分位（0~1）。
-fn atr_percentile_at(atr20: &[Option<f64>], ec: usize) -> Option<f64> {
-    let cur = atr20.get(ec).copied().flatten()?;
-    let lo = ec.saturating_sub(ATR_PERCENTILE_WINDOW);
-    let mut lower = 0usize;
-    let mut total = 0usize;
-    for i in lo..ec {
-        if let Some(v) = atr20[i] {
-            total += 1;
-            if v <= cur {
-                lower += 1;
-            }
-        }
-    }
-    if total == 0 {
-        return None;
-    }
-    Some(lower as f64 / total as f64)
-}
-
-/// 60m 连续趋势分 0~5：按信号时刻截断的 60m 序列计算。
-/// 方向基础分 + ATR 归一化离均线距离 + 斜率强度 + HH/HL 摆动结构。
-fn trend60_score_at(bars60: &[Bar], created_at: &str, dir: Dir) -> Option<f64> {
-    let end = parse_minute(created_at)?;
-    let slice: Vec<&Bar> = bars60.iter().filter(|b| dt_minute(b) <= end).collect();
-    if slice.len() < ATR_PERIOD + 1 {
-        return None;
-    }
-    let owned: Vec<Bar> = slice.into_iter().cloned().collect();
-    let trend = indicators::analyze_60m(&owned);
-    let atr = indicators::atr(&owned, ATR_PERIOD)
-        .last()
-        .copied()
-        .flatten()
-        .unwrap_or(1.0)
-        .max(1e-9);
-
-    let aligned = trend.aligned_with(dir);
-    let opposite = trend.opposite_to(dir);
-    let mut s = if aligned {
-        2.75
-    } else if opposite {
-        1.25
-    } else {
-        2.0
-    };
-
-    let dist = (trend.price_vs_ma / atr).clamp(-2.0, 2.0) * 0.5;
-    s += match dir {
-        Dir::Up => dist,
-        Dir::Down => -dist,
-    };
-
-    let slope = (trend.slope / atr).clamp(-1.0, 1.0) * 0.5;
-    s += match dir {
-        Dir::Up => slope,
-        Dir::Down => -slope,
-    };
-
-    let bonus = |cond: bool, mult: f64| if cond { 0.25 * mult } else { 0.0 };
-    match dir {
-        Dir::Up => {
-            s += bonus(trend.higher_highs, 1.0);
-            s += bonus(trend.higher_lows, 1.0);
-            s += bonus(trend.lower_highs, -1.0);
-            s += bonus(trend.lower_lows, -1.0);
-        }
-        Dir::Down => {
-            s += bonus(trend.lower_highs, 1.0);
-            s += bonus(trend.lower_lows, 1.0);
-            s += bonus(trend.higher_highs, -1.0);
-            s += bonus(trend.higher_lows, -1.0);
-        }
-    }
-
-    Some(s.clamp(0.0, 5.0))
-}
-
-/// 对一条信号做结局模拟 + 特征计算。
-/// 返回 None 表示信号数据不可用（entry/risk 异常），不落库。
-pub fn annotate(input: &SignalInput, bars15: &[Bar], bars60: &[Bar]) -> Option<SignalAnnotation> {
-    let risk = input.risk;
-    if risk <= 0.0 || input.entry <= 0.0 {
-        return None;
-    }
-    let dir = signal_dir(&input.direction);
-    let warning_ts = input
-        .warning_ts
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&input.created_at);
-    let warning_minute = parse_minute(warning_ts)?;
-    let start = bars15.iter().position(|b| dt_minute(b) >= warning_minute);
-    let trend60_score = trend60_score_at(bars60, &input.created_at, dir);
-    let Some(start) = start else {
-        return Some(empty_annotation(Outcome::InsufficientData, trend60_score));
-    };
-    let atr15 = indicators::atr(bars15, ATR_PERIOD);
-    let mut ec = None;
-    if let Some(trigger_ts) = input.trigger_ts.as_deref() {
-        if let Some(t_minute) = parse_minute(trigger_ts) {
-            if let Some(j) = (start + 1..bars15.len()).find(|&j| dt_minute(&bars15[j]) >= t_minute)
-            {
-                if dt_minute(&bars15[j]) == t_minute {
-                    ec = Some(j);
-                }
-            }
-        }
-    }
-    if let Some(ec_known) = ec {
-        if let Some(rb) = (start + 1..=ec_known).find(|&j| bars15[j].rollover) {
-            return Some(rollover_annotation(
-                trend60_score,
-                None,
-                Some(bars15[rb].dt.to_string()),
-            ));
-        }
-    } else {
-        // 预警后 12 根内寻找入场触发（做多突破 entry、做空跌破 entry）
-        let scan_end = (start + 1 + PENDING_BARS).min(bars15.len());
-        for j in start + 1..scan_end {
-            if bars15[j].rollover {
-                return Some(SignalAnnotation {
-                    sim_version: SIM_VERSION,
-                    outcome: Outcome::Rollover,
-                    exit_reason: ExitReason::Rollover,
-                    entry_ts: None,
-                    exit_ts: Some(bars15[j].dt.to_string()),
-                    exit_price: None,
-                    r_multiple: None,
-                    mfe_r: None,
-                    mae_r: None,
-                    bars_held: None,
-                    vol_ratio: vol_ratio_at(bars15, j),
-                    oi_increase: oi_increase_at(bars15, j),
-                    trend60_score,
-                    atr_percentile: atr_percentile_at(&atr15, j),
-                    target_tier: None,
-                    b_vol_ratio: None,
-                    a_move_atr: None,
-                    trigger_lag_bars: None,
-                    trigger_overshoot_r: None,
-                    rollover_crossed: true,
-                    gap_crossed_entry: false,
-                    gap_crossed_exit: false,
-                });
-            }
-            let hit = match dir {
-                Dir::Up => bars15[j].high >= input.entry,
-                Dir::Down => bars15[j].low <= input.entry,
-            };
-            if hit {
-                ec = Some(j);
-                break;
-            }
-        }
-    }
-
-    let Some(ec) = ec else {
-        return Some(if bars15.len() - 1 >= start + PENDING_BARS {
-            empty_annotation(Outcome::NoTrigger, trend60_score)
-        } else {
-            empty_annotation(Outcome::InsufficientData, trend60_score)
-        });
-    };
-    let vol_ratio = vol_ratio_at(bars15, ec);
-    let oi_increase = oi_increase_at(bars15, ec);
-    let atr_percentile = atr_percentile_at(&atr15, ec);
-    let b_vol_ratio = b_vol_ratio_at(
-        bars15,
-        input.s0_ts.as_deref(),
-        input.s1_ts.as_deref(),
-        input.s2_ts.as_deref(),
-    );
-    let a_move_atr = input.a_move.and_then(|a| {
-        atr15
-            .get(ec)
-            .copied()
-            .flatten()
-            .filter(|atr| *atr > 0.0)
-            .map(|atr| a / atr)
-    });
-    let trigger_lag_bars = Some(ec.saturating_sub(start));
-    let trigger_overshoot_r = Some(match dir {
-        Dir::Up => (bars15[ec].high - input.entry) / risk,
-        Dir::Down => (input.entry - bars15[ec].low) / risk,
-    });
-    let mut entry_fill = input.entry;
-    let mut gap_crossed_entry = false;
-    let mut gap_crossed_exit = false;
-    if ec > 0 && !bars15[ec - 1].rollover {
-        let prev_close = bars15[ec - 1].close;
-        let cur_open = bars15[ec].open;
-        let crossed = match dir {
-            Dir::Up => prev_close < input.entry && cur_open > input.entry,
-            Dir::Down => prev_close > input.entry && cur_open < input.entry,
-        };
-        if crossed {
-            entry_fill = cur_open;
-            gap_crossed_entry = true;
-        }
-    }
-
-    // 第一止盈位 TP1 = 1R；此后按 0.8×2R、0.8×3R…… 逐级推动止盈位
-    let base_tp = match dir {
-        Dir::Up => input.entry + risk,
-        Dir::Down => input.entry - risk,
-    };
-
-    let mut mfe = 0.0_f64;
-    let mut mae = 0.0_f64;
-    let mut trail_grade: Option<usize> = None;
-    let mut target_tier: Option<&'static str> = None;
-    let mut result: Option<(ExitReason, f64, usize, usize)> = None;
-
-    for i in ec..bars15.len() {
-        let bar = &bars15[i];
-        if bar.rollover {
-            return Some(SignalAnnotation {
-                sim_version: SIM_VERSION,
-                outcome: Outcome::Rollover,
-                exit_reason: ExitReason::Rollover,
-                entry_ts: Some(bars15[ec].dt.to_string()),
-                exit_ts: Some(bar.dt.to_string()),
-                exit_price: None,
-                r_multiple: None,
-                mfe_r: None,
-                mae_r: None,
-                bars_held: None,
-                vol_ratio,
-                oi_increase,
-                trend60_score,
-                atr_percentile,
-                target_tier: None,
-                b_vol_ratio,
-                a_move_atr,
-                trigger_lag_bars,
-                trigger_overshoot_r,
-                rollover_crossed: true,
-                gap_crossed_entry: false,
-                gap_crossed_exit: false,
-            });
-        }
-        let held = i - ec + 1;
-        let mfe_contrib = match dir {
-            Dir::Up => (bar.high - entry_fill) / risk,
-            Dir::Down => (entry_fill - bar.low) / risk,
-        };
-        let mae_contrib = match dir {
-            Dir::Up => (bar.low - entry_fill) / risk,
-            Dir::Down => (entry_fill - bar.high) / risk,
-        };
-        mfe = mfe.max(mfe_contrib);
-        mae = mae.min(mae_contrib);
-
-        let stop_hit = match dir {
-            Dir::Up => bar.low <= input.stop,
-            Dir::Down => bar.high >= input.stop,
-        };
-        // 同一根 bar 双触按止损优先（保守）
-        if stop_hit {
-            let stop_gap = i > 0
-                && !bars15[i - 1].rollover
-                && match dir {
-                    Dir::Up => bars15[i - 1].close > input.stop && bar.open < input.stop,
-                    Dir::Down => bars15[i - 1].close < input.stop && bar.open > input.stop,
-                };
-            if stop_gap {
-                gap_crossed_exit = true;
-            }
-            let exit_price = if stop_gap { bar.open } else { input.stop };
-            result = Some((ExitReason::Stop, exit_price, i, held));
-            break;
-        }
-
-        let reached_tp1 = match dir {
-            Dir::Up => bar.high >= base_tp,
-            Dir::Down => bar.low <= base_tp,
-        };
-        if trail_grade.is_none() && reached_tp1 {
-            trail_grade = Some(1);
-            target_tier = Some("tp1");
-        }
-        if let Some(mut grade) = trail_grade {
-            // 单根 bar 可一次跨过多个档位：一直推进到该 bar 触及的最高档
-            loop {
-                let next_grade = grade + 1;
-                let next_r = trail_r_for(next_grade);
-                let next_price = match dir {
-                    Dir::Up => input.entry + next_r * risk,
-                    Dir::Down => input.entry - next_r * risk,
-                };
-                let next_hit = match dir {
-                    Dir::Up => bar.high >= next_price,
-                    Dir::Down => bar.low <= next_price,
-                };
-                if !next_hit {
-                    break;
-                }
-                grade = next_grade;
-                target_tier = Some("tp2");
-            }
-            trail_grade = Some(grade);
-            let trail_r = trail_r_for(grade);
-            let trail_price = match dir {
-                Dir::Up => input.entry + trail_r * risk,
-                Dir::Down => input.entry - trail_r * risk,
-            };
-            let fell_back = match dir {
-                Dir::Up => bar.low <= trail_price,
-                Dir::Down => bar.high >= trail_price,
-            };
-            if fell_back {
-                result = Some((ExitReason::Target, trail_price, i, held));
-                break;
-            }
-        }
-        if i == ec + NO_FOLLOW_BAR && mfe < NO_FOLLOW_MFE_R {
-            result = Some((ExitReason::NoFollow, bar.close, i, held));
-            break;
-        }
-        if held >= TIME_HORIZON_BARS {
-            result = Some((ExitReason::TimeExit, bar.close, i, held));
-            break;
-        }
-    }
-
-    let (outcome, exit_reason, exit_price, exit_ts, r_multiple, bars_held) = match result {
-        Some((reason, price, i, held)) => {
-            let r = match dir {
-                Dir::Up => (price - entry_fill) / risk,
-                Dir::Down => (entry_fill - price) / risk,
-            };
-            let outcome = if r > 0.0 { Outcome::Win } else { Outcome::Loss };
-            (
-                outcome,
-                reason,
-                Some(price),
-                Some(bars15[i].dt.to_string()),
-                Some(r),
-                Some(held),
-            )
-        }
-        None => {
-            if bars15.len() - ec < MIN_BARS_FOR_SETTLED {
-                (
-                    Outcome::InsufficientData,
-                    ExitReason::None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            } else {
-                (Outcome::Open, ExitReason::None, None, None, None, None)
-            }
-        }
-    };
-
-    Some(SignalAnnotation {
-        sim_version: SIM_VERSION,
-        outcome,
-        exit_reason,
-        entry_ts: Some(bars15[ec].dt.to_string()),
-        exit_ts,
-        exit_price,
-        r_multiple,
-        mfe_r: Some(mfe),
-        mae_r: Some(mae),
-        bars_held,
-        vol_ratio,
-        oi_increase,
-        trend60_score,
-        atr_percentile,
-        target_tier: target_tier.map(str::to_string),
-        b_vol_ratio,
-        a_move_atr,
-        trigger_lag_bars,
-        trigger_overshoot_r,
-        rollover_crossed: false,
-        gap_crossed_entry,
-        gap_crossed_exit,
-    })
 }
 
 // ===== 复盘统计 =====
@@ -764,6 +182,7 @@ pub enum GroupBy {
     DimTrend,
     DimALeg,
     DimBLeg,
+    DimWarning,
     DimTrigger,
     DimRr,
     DimMomentum,
@@ -796,6 +215,7 @@ impl GroupBy {
             "dim_trend" => GroupBy::DimTrend,
             "dim_a" => GroupBy::DimALeg,
             "dim_b" => GroupBy::DimBLeg,
+            "dim_warning" => GroupBy::DimWarning,
             "dim_trigger" => GroupBy::DimTrigger,
             "dim_rr" => GroupBy::DimRr,
             "dim_momentum" => GroupBy::DimMomentum,
@@ -860,8 +280,16 @@ pub struct StatRow {
     pub score: f64,
     pub created_at: String,
     pub warning_ts: Option<String>,
+    /// a 段起点（s0）K线时间，用于判断多个预警是否同源
+    pub s0_ts: Option<String>,
     pub s1_ts: Option<String>,
     pub s2_ts: Option<String>,
+    /// 触发所在 15m K线收盘时间；未触发事件为 None
+    pub trigger_bar_ts: Option<String>,
+    /// 实际入场价；未触发事件为 None
+    pub entry: Option<f64>,
+    /// 单笔风险，用于相似预警的入场价差折算
+    pub risk: f64,
     pub outcome: Option<Outcome>,
     pub r_multiple: Option<f64>,
     pub mfe_r: Option<f64>,
@@ -930,32 +358,119 @@ pub struct ReviewStats {
     pub groups: Vec<GroupStat>,
 }
 
-/// 结构键去重：同一演变结构跨扫描的重复信号只保留首条（min signal_id）。
-fn dedup_first_seen(rows: &[StatRow]) -> Vec<&StatRow> {
-    let mut seen: HashMap<String, &StatRow> = HashMap::new();
-    for r in rows {
-        let key = match (&r.s1_ts, &r.s2_ts) {
-            (Some(s1), Some(s2)) => {
-                format!(
-                    "{}|{}|{}|{}|{}|{}",
-                    r.symbol, r.logic_version, r.direction, r.level, s1, s2
-                )
-            }
-            // 旧数据缺少结构时间戳时退回信号自身，不做合并
-            _ => format!(
-                "{}|{}|{}|{}|id{}",
-                r.symbol, r.logic_version, r.direction, r.level, r.signal_id
-            ),
-        };
-        seen.entry(key)
-            .and_modify(|cur| {
-                if r.signal_id < cur.signal_id {
-                    *cur = r;
-                }
-            })
-            .or_insert(r);
+/// 结构键：同一演变结构跨扫描的重复信号按首条（min signal_id）去重。
+/// 仅用于未触发事件及缺少交易族信息的旧记录。
+fn structure_key(r: &StatRow) -> String {
+    match (&r.s1_ts, &r.s2_ts) {
+        (Some(s1), Some(s2)) => {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                r.symbol, r.logic_version, r.direction, r.level, s1, s2
+            )
+        }
+        // 旧数据缺少结构时间戳时退回信号自身，不做合并
+        _ => format!(
+            "{}|{}|{}|{}|id{}",
+            r.symbol, r.logic_version, r.direction, r.level, r.signal_id
+        ),
     }
-    let mut out: Vec<&StatRow> = seen.into_values().collect();
+}
+
+fn warning_bars_gap_str(later: &str, earlier: &str) -> Option<usize> {
+    let (a, b) = (later, earlier);
+    let pa = parse_minute(a)?;
+    let pb = parse_minute(b)?;
+    let minutes = chrono::NaiveDate::from_ymd_opt(pa.0, pa.1 as u32, pa.2 as u32)?
+        .and_hms_opt(pa.3 as u32, pa.4 as u32, 0)?
+        .signed_duration_since(
+            chrono::NaiveDate::from_ymd_opt(pb.0, pb.1 as u32, pb.2 as u32)?.and_hms_opt(
+                pb.3 as u32,
+                pb.4 as u32,
+                0,
+            )?,
+        )
+        .num_minutes();
+    Some((minutes / 15).max(0) as usize)
+}
+
+/// 优先按实际 15m K线序号差计算；旧数据或K线范围外找不到序号时退回自然时间估算。
+fn warning_bars_gap(
+    symbol: &str,
+    later: &str,
+    earlier: &str,
+    bar_index: &WarningBarIndex,
+) -> Option<usize> {
+    match (
+        bar_index.get(&(symbol.to_string(), later.to_string())),
+        bar_index.get(&(symbol.to_string(), earlier.to_string())),
+    ) {
+        (Some(&li), Some(&ei)) => Some(li.abs_diff(ei)),
+        _ => warning_bars_gap_str(later, earlier),
+    }
+}
+
+/// 入场价差按族首（更早一条）信号的 risk 折算，与实时层口径一致。
+fn entries_close(candidate: &StatRow, anchor: &StatRow) -> bool {
+    match (candidate.entry, anchor.entry) {
+        (Some(x), Some(y)) => (x - y).abs() <= DEDUP_ENTRY_R * anchor.risk.max(1e-9),
+        _ => false,
+    }
+}
+
+/// 统计去重：同品种、同方向、预警K线相差不超过 5 根 15m、入场价差不超过
+/// 0.3R 的信号聚成同一族，族内保留首见（min signal_id）；不再依赖 A/B 段、
+/// 级别或评级是否相同。缺少入场价的旧记录退回结构键。
+fn dedup_first_seen<'a>(rows: &'a [StatRow], bar_index: &WarningBarIndex) -> Vec<&'a StatRow> {
+    let mut ordered: Vec<&StatRow> = rows.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.warning_ts
+            .as_deref()
+            .cmp(&b.warning_ts.as_deref())
+            .then_with(|| a.signal_id.cmp(&b.signal_id))
+    });
+
+    // 族内保存族首（用于入场价/风险比较）和最近一条预警K线时间（用于连续
+    // 预警的 5 根距离判断，允许 0/5/10 这类连续节奏持续并入同一族）。
+    let mut families: Vec<(&StatRow, String)> = Vec::new();
+    let mut structure_min: HashMap<String, &StatRow> = HashMap::new();
+    for r in ordered {
+        if r.entry.is_some() {
+            let mut merged = false;
+            for (anchor, last_warning_ts) in &mut families {
+                if r.symbol == anchor.symbol
+                    && r.logic_version == anchor.logic_version
+                    && r.direction == anchor.direction
+                    && entries_close(r, anchor)
+                    && r.warning_ts
+                        .as_deref()
+                        .zip(Some(last_warning_ts.as_str()))
+                        .and_then(|(a, b)| warning_bars_gap(&r.symbol, a, b, bar_index))
+                        .is_some_and(|gap| gap <= DEDUP_WARNING_BARS)
+                {
+                    merged = true;
+                    if let Some(ts) = r.warning_ts.as_deref() {
+                        *last_warning_ts = ts.to_string();
+                    }
+                    break;
+                }
+            }
+            if !merged {
+                families.push((r, r.warning_ts.clone().unwrap_or_default()));
+            }
+        } else {
+            let key = structure_key(r);
+            structure_min
+                .entry(key)
+                .and_modify(|cur| {
+                    if r.signal_id < cur.signal_id {
+                        *cur = r;
+                    }
+                })
+                .or_insert(r);
+        }
+    }
+    let mut out: Vec<&StatRow> = families.into_iter().map(|(r, _)| r).collect();
+    out.extend(structure_min.into_values());
     out.sort_by_key(|r| r.signal_id);
     out
 }
@@ -1350,6 +865,7 @@ fn bucket(group_by: GroupBy, r: &StatRow) -> String {
         GroupBy::DimTrend => dim_band(r.dims.map(|d| d[0])),
         GroupBy::DimALeg => dim_band(r.dims.map(|d| d[1])),
         GroupBy::DimBLeg => dim_band(r.dims.map(|d| d[2])),
+        GroupBy::DimWarning => dim_band(r.dims.map(|d| d[3])),
         GroupBy::DimTrigger => dim_band(r.dims.map(|d| d[3])),
         GroupBy::DimRr => dim_band(r.dims.map(|d| d[4])),
         GroupBy::DimMomentum => dim_band(r.dims.map(|d| d[5])),
@@ -1496,6 +1012,7 @@ fn group_rank(group_by: GroupBy, key: &str) -> (u8, String) {
         GroupBy::DimTrend
         | GroupBy::DimALeg
         | GroupBy::DimBLeg
+        | GroupBy::DimWarning
         | GroupBy::DimTrigger
         | GroupBy::DimRr
         | GroupBy::DimMomentum => match key {
@@ -1520,7 +1037,17 @@ pub fn aggregate_stats_scoped(
     group_by: GroupBy,
     scope: StatsScope,
 ) -> ReviewStats {
-    let dedup: Vec<&StatRow> = dedup_first_seen(rows)
+    aggregate_stats_scoped_with_bar_index(rows, group_by, scope, &HashMap::new())
+}
+
+/// 带实际 15m K线序号的聚合：去重距离按序号差计算，避免午休/夜盘自然时间被折算成根数。
+pub fn aggregate_stats_scoped_with_bar_index(
+    rows: &[StatRow],
+    group_by: GroupBy,
+    scope: StatsScope,
+    warning_bar_index: &WarningBarIndex,
+) -> ReviewStats {
+    let dedup: Vec<&StatRow> = dedup_first_seen(rows, warning_bar_index)
         .into_iter()
         .filter(|r| scope.matches(r.score))
         .collect();
@@ -1553,562 +1080,6 @@ pub fn aggregate_stats_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::model::DT;
-
-    fn bar(open: f64, high: f64, low: f64, close: f64) -> Bar {
-        Bar {
-            dt: DT {
-                year: 2026,
-                month: 8,
-                day: 3,
-                hour: 9,
-                minute: 15,
-            },
-            open,
-            high,
-            low,
-            close,
-            volume: 100.0,
-            hold: 1000.0,
-            rollover: false,
-        }
-    }
-
-    fn bar_seq(n: usize) -> Vec<Bar> {
-        let mut out = Vec::new();
-        for i in 0..n {
-            let b = bar(100.0, 100.5, 99.5, 100.0);
-            let mut b = b;
-            b.dt.minute = 15 + i as i32 * 15;
-            out.push(b);
-        }
-        out
-    }
-
-    fn input() -> SignalInput {
-        SignalInput {
-            symbol: "RB0".to_string(),
-            direction: "up".to_string(),
-            level: "fine".to_string(),
-            entry: 101.0,
-            stop: 99.0,
-            target: 105.0,
-            risk: 2.0,
-            created_at: "2026-08-03 09:15".to_string(),
-            warning_ts: Some("2026-08-03 09:15".to_string()),
-            s0_ts: Some("2026-08-03 09:15".to_string()),
-            s1_ts: Some("2026-08-03 08:45".to_string()),
-            s2_ts: Some("2026-08-03 09:15".to_string()),
-            a_move: Some(4.0),
-            trigger_ts: None,
-        }
-    }
-
-    /// 构造带 dt 序列的 bar：起点 09:15，每根 +15 分钟。
-    fn timed_bars(specs: &[(f64, f64, f64, f64)]) -> Vec<Bar> {
-        specs
-            .iter()
-            .enumerate()
-            .map(|(i, &(o, h, l, c))| Bar {
-                dt: DT {
-                    year: 2026,
-                    month: 8,
-                    day: 3,
-                    hour: 9,
-                    minute: 15 + i as i32 * 15,
-                },
-                open: o,
-                high: h,
-                low: l,
-                close: c,
-                volume: 100.0,
-                hold: 1000.0,
-                rollover: false,
-            })
-            .collect()
-    }
-
-    /// 从指定小时/分钟开始生成 15m K线序列，便于覆盖 ATR20 所需的较长窗口。
-    fn timed_bars_at(hour: i32, minute: i32, specs: &[(f64, f64, f64, f64)]) -> Vec<Bar> {
-        specs
-            .iter()
-            .enumerate()
-            .map(|(i, &(o, h, l, c))| {
-                let m = minute + i as i32 * 15;
-                Bar {
-                    dt: DT {
-                        year: 2026,
-                        month: 8,
-                        day: 3,
-                        hour: hour + m / 60,
-                        minute: m % 60,
-                    },
-                    open: o,
-                    high: h,
-                    low: l,
-                    close: c,
-                    volume: 100.0,
-                    hold: 1000.0,
-                    rollover: false,
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn long_1r_take_profit_instead_of_target() {
-        // 落库目标位是 105，但价格只到 103.5；1R 止盈位是 103，仍应按 +1R 平仓
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning bar
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 103.5, 100.5, 103.0), // 1R (103) hit, 原目标 105 未到
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Win);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert_eq!(ann.r_multiple, Some(1.0));
-        assert_eq!(ann.exit_price, Some(103.0));
-        assert_eq!(ann.bars_held, Some(2));
-        assert_eq!(ann.mae_r, Some(-0.5));
-        // 入场触达时间 = 入场bar（09:30）的时间戳
-        assert_eq!(ann.entry_ts.as_deref(), Some("2026-08-03 09:30"));
-    }
-
-    #[test]
-    fn entry_gap_fills_at_open_and_marks() {
-        // 前一根 close=100，当前 open=102 跳过 entry=101：按 open 成交并标记缺口。
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning
-            (102.0, 102.5, 101.8, 102.2), // 跳空越过 entry
-            (102.2, 104.0, 102.0, 103.5), // 触及 TP1=103 后回落平仓
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert!(ann.gap_crossed_entry);
-        assert!(!ann.gap_crossed_exit);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.exit_price.unwrap() - 103.0).abs() < 1e-9);
-        assert!((ann.r_multiple.unwrap() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn long_extends_to_second_target() {
-        // 触及 1R 后推动止盈：0.8×2R = 1.6R = 104.2，回落触到该位止盈
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning bar
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 103.2, 103.1, 103.1), // 触及 1R(103) 未回落
-            (103.1, 104.5, 103.2, 104.4), // 触及 1.6R(104.2) 并回落，按该位止盈
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Win);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 104.2).abs() < 1e-9);
-        assert_eq!(ann.bars_held, Some(3));
-    }
-
-    #[test]
-    fn trailing_profit_locks_1r_then_moves_to_1_6r() {
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning bar
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 103.5, 103.1, 103.2), // 触及 1R(103) 未回落
-            (103.2, 104.5, 104.3, 104.4), // 触及 1.6R(104.2) 未回落
-            (104.4, 104.5, 103.8, 103.9), // 回落到 1.6R 止盈
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.r_multiple.unwrap() - 1.6).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 104.2).abs() < 1e-9);
-        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
-        assert_eq!(ann.bars_held, Some(4));
-    }
-
-    #[test]
-    fn trailing_profit_advances_to_2_4r() {
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0),  // warning bar
-            (100.0, 102.0, 100.0, 101.0),  // entry-cross
-            (101.0, 103.5, 103.2, 103.3),  // 触及 1R(103)
-            (103.3, 104.5, 104.3, 104.4),  // 触及 1.6R(104.2)
-            (104.4, 106.0, 105.9, 105.95), // 触及 2.4R(105.8) 未回落
-            (105.9, 106.1, 105.6, 105.7),  // 回落到 2.4R 止盈
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 105.8).abs() < 1e-9);
-        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
-        assert_eq!(ann.bars_held, Some(5));
-    }
-
-    #[test]
-    fn trailing_profit_skips_levels_on_one_bar() {
-        // 单根 bar 从下方跳空直触 1R/1.6R/2.4R 并回落到 2.4R(105.8)：应直接锁到 2.4R
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning bar
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (105.5, 106.0, 105.5, 105.8), // 触及 1.6R/2.4R，回落到 2.4R 止盈
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 105.8).abs() < 1e-9);
-        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
-        assert_eq!(ann.bars_held, Some(2));
-    }
-
-    #[test]
-    fn sub_1r_target_holds_to_1r() {
-        // 目标位 102 → 目标R=0.5 ≤ 1：不按目标位止盈，持有到 1R(103) 才平
-        let mut inp = input();
-        inp.target = 102.0;
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning bar
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 103.5, 101.5, 103.0), // 越过目标位 102，达到 1R 止盈
-        ]);
-        let ann = annotate(&inp, &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Win);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert_eq!(ann.r_multiple, Some(1.0));
-        assert_eq!(ann.exit_price, Some(103.0));
-    }
-
-    #[test]
-    fn long_stop_first_loses() {
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0),
-            (100.0, 102.0, 100.0, 101.0),
-            (101.0, 101.5, 98.0, 99.0), // stop hit
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Loss);
-        assert_eq!(ann.exit_reason, ExitReason::Stop);
-        assert_eq!(ann.r_multiple, Some(-1.0));
-    }
-
-    #[test]
-    fn stop_gap_fills_at_open_and_marks() {
-        // 前一根 close=101.5，当前 open=98.5 跳过 stop=99：按 open 成交并标记止损缺口。
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0), // warning
-            (100.0, 102.0, 99.5, 101.5),  // entry，无入场缺口
-            (98.5, 99.0, 98.0, 98.2),     // 跳空跌破 stop
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert!(!ann.gap_crossed_entry);
-        assert!(ann.gap_crossed_exit);
-        assert_eq!(ann.outcome, Outcome::Loss);
-        assert_eq!(ann.exit_reason, ExitReason::Stop);
-        assert!((ann.exit_price.unwrap() - 98.5).abs() < 1e-9);
-        assert!((ann.r_multiple.unwrap() + 1.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn same_bar_both_hit_stop_wins_conservative() {
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0),
-            (100.0, 102.0, 100.0, 101.0),
-            (101.0, 106.0, 98.0, 100.0), // both stop & target in one bar
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Loss);
-        assert_eq!(ann.exit_reason, ExitReason::Stop);
-    }
-
-    #[test]
-    fn no_follow_exit_at_bar5_when_mfe_low() {
-        // 入场后 5 根 bar 都小幅度波动，MFE < 0.5R(1点)
-        let mut specs = vec![(100.0, 100.0, 100.0, 100.0)];
-        specs.push((100.0, 101.0, 100.0, 100.5)); // entry-cross
-        for _ in 0..5 {
-            specs.push((100.5, 100.5, 100.0, 100.0));
-        }
-        let bars = timed_bars(&specs);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Loss); // close 100.0 < entry 101.0
-        assert_eq!(ann.exit_reason, ExitReason::NoFollow);
-        assert_eq!(ann.bars_held, Some(6));
-        assert_eq!(ann.r_multiple, Some(-0.5));
-    }
-
-    #[test]
-    fn no_follow_skipped_when_mfe_enough() {
-        let mut specs = vec![(100.0, 100.0, 100.0, 100.0)];
-        specs.push((100.0, 101.0, 100.0, 100.5)); // entry-cross
-        for _ in 0..5 {
-            specs.push((100.5, 102.0, 100.0, 100.5)); // mfe = 1.0R >= 0.5R
-        }
-        let bars = timed_bars(&specs);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Open);
-        assert_eq!(ann.exit_reason, ExitReason::None);
-    }
-
-    #[test]
-    fn time_exit_after_60_bars() {
-        let mut specs = vec![(100.0, 100.0, 100.0, 100.0)];
-        specs.push((100.0, 101.0, 100.0, 100.5));
-        // 59 根：第 5 根 mfe 足够避免 no_follow，且不触 target/stop
-        for _ in 0..59 {
-            specs.push((100.5, 102.0, 100.0, 100.8));
-        }
-        let bars = timed_bars(&specs);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.exit_reason, ExitReason::TimeExit);
-        assert_eq!(ann.bars_held, Some(60));
-        assert_eq!(ann.outcome, Outcome::Loss); // close 100.8 < entry 101.0
-    }
-
-    #[test]
-    fn no_trigger_within_12_bars() {
-        let mut specs = vec![(100.0, 100.0, 100.0, 100.0)];
-        for _ in 0..13 {
-            specs.push((100.0, 100.5, 99.5, 100.0)); // never reach 101.0
-        }
-        let bars = timed_bars(&specs);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::NoTrigger);
-        assert_eq!(ann.entry_ts, None);
-        assert_eq!(ann.target_tier, None);
-        assert_eq!(ann.b_vol_ratio, None);
-        assert_eq!(ann.a_move_atr, None);
-        assert_eq!(ann.trigger_lag_bars, None);
-        assert_eq!(ann.trigger_overshoot_r, None);
-    }
-
-    #[test]
-    fn insufficient_data_when_bars_too_short() {
-        let bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0),
-            (100.0, 102.0, 100.0, 101.0),
-            (101.0, 101.0, 100.0, 100.5), // only 2 bars after entry-cross
-        ]);
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::InsufficientData);
-    }
-
-    #[test]
-    fn rollover_before_entry_counts_separately() {
-        // 预警后尚未触发入场，先跨过换月：直接记为 Rollover，不带盈亏
-        let mut bars = timed_bars(&[(100.0, 100.0, 100.0, 100.0), (100.0, 100.5, 99.5, 100.0)]);
-        bars[1].rollover = true;
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Rollover);
-        assert_eq!(ann.exit_reason, ExitReason::Rollover);
-        assert_eq!(ann.entry_ts, None);
-        assert!(ann.mfe_r.is_none());
-        assert!(ann.mae_r.is_none());
-        assert!(ann.bars_held.is_none());
-        assert!(ann.rollover_crossed);
-        assert_eq!(ann.target_tier, None);
-        assert_eq!(ann.b_vol_ratio, None);
-        assert_eq!(ann.a_move_atr, None);
-        assert_eq!(ann.trigger_lag_bars, None);
-        assert_eq!(ann.trigger_overshoot_r, None);
-    }
-
-    #[test]
-    fn rollover_after_entry_clears_mfe_mae() {
-        let mut bars = timed_bars(&[
-            (100.0, 100.0, 100.0, 100.0),
-            (100.0, 102.0, 100.0, 101.0), // entry-cross
-            (101.0, 101.5, 100.5, 101.0),
-        ]);
-        bars[2].rollover = true;
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Rollover);
-        assert_eq!(ann.exit_reason, ExitReason::Rollover);
-        assert_eq!(ann.entry_ts.as_deref(), Some("2026-08-03 09:30"));
-        assert!(ann.r_multiple.is_none());
-        assert!(ann.mfe_r.is_none());
-        assert!(ann.mae_r.is_none());
-        assert!(ann.bars_held.is_none());
-        assert!(ann.rollover_crossed);
-        assert_eq!(ann.target_tier, None);
-        assert_eq!(ann.trigger_lag_bars, Some(1));
-        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
-    }
-
-    #[test]
-    fn short_direction_symmetric() {
-        let mut inp = input();
-        inp.direction = "down".to_string();
-        inp.entry = 100.0;
-        inp.stop = 102.0;
-        inp.target = 96.0;
-        inp.risk = 2.0;
-        let bars = timed_bars(&[
-            (101.0, 101.0, 101.0, 101.0),
-            (101.0, 101.0, 99.0, 100.0), // entry-cross (low <= 100)
-            (99.0, 99.5, 95.0, 96.0),    // 触及 2.4R=95.2 并回落，按该位止盈
-        ]);
-        let ann = annotate(&inp, &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Win);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        // 触及 1R 后推动止盈：单根触到 0.8×3R = 2.4R = 95.2，回落到该位止盈
-        assert!((ann.r_multiple.unwrap() - 2.4).abs() < 1e-9);
-        assert!((ann.exit_price.unwrap() - 95.2).abs() < 1e-9);
-        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
-        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
-    }
-
-    #[test]
-    fn short_entry_gap_fills_at_open_and_marks() {
-        let mut inp = input();
-        inp.direction = "down".to_string();
-        inp.entry = 100.0;
-        inp.stop = 102.0;
-        inp.target = 96.5;
-        inp.risk = 2.0;
-        let bars = timed_bars(&[
-            (101.0, 101.0, 101.0, 101.0), // warning
-            (98.0, 98.5, 98.1, 98.2),     // 跳空跌破 entry，但未触及 TP1
-            (98.2, 99.0, 96.5, 97.0),     // 触及推动止盈 1.6R=96.8
-        ]);
-        let ann = annotate(&inp, &bars, &[]).unwrap();
-        assert!(ann.gap_crossed_entry);
-        assert!(!ann.gap_crossed_exit);
-        assert_eq!(ann.exit_reason, ExitReason::Target);
-        assert!((ann.exit_price.unwrap() - 96.8).abs() < 1e-9);
-        assert!((ann.r_multiple.unwrap() - 0.6).abs() < 1e-9);
-    }
-
-    #[test]
-    fn invalid_risk_skipped() {
-        let mut inp = input();
-        inp.risk = 0.0; // 入场=止损
-        let bars = bar_seq(10);
-        assert!(annotate(&inp, &bars, &[]).is_none());
-    }
-
-    #[test]
-    fn features_volume_and_oi() {
-        // 触发 bar：成交量 500（前一根 100），持仓量较前一根增加
-        let specs = vec![(100.0, 100.0, 100.0, 100.0), (100.0, 102.0, 100.0, 101.0)];
-        let mut bars = timed_bars(&specs);
-        bars[0].volume = 100.0;
-        bars[0].hold = 900.0;
-        bars[1].volume = 500.0;
-        bars[1].hold = 1200.0;
-        let ann = annotate(&input(), &bars, &[]).unwrap();
-        assert_eq!(ann.vol_ratio, Some(5.0));
-        assert_eq!(ann.oi_increase, Some(true));
-    }
-
-    #[test]
-    fn diagnostics_capture_tier_volume_lag_overshoot_and_a_strength() {
-        // 30 根 15m K线从 05:45 开始，触发 bar 位于 10:45（index=20），保证 ATR20 可用。
-        let mut bars = timed_bars_at(5, 45, &[(100.0, 100.5, 99.5, 100.0); 30]);
-        // a 段（05:45..=06:15）均量 100；b 段（06:15..=10:30）均量 50，缩量比为 0.5。
-        for i in 3..=19 {
-            bars[i].volume = 50.0;
-        }
-        bars[20] = Bar {
-            open: 100.0,
-            high: 102.0,
-            low: 100.0,
-            close: 101.0,
-            ..bars[20]
-        };
-        bars[21] = Bar {
-            open: 101.0,
-            high: 103.2,
-            low: 103.1,
-            close: 103.1,
-            ..bars[21]
-        };
-        bars[22] = Bar {
-            open: 103.1,
-            high: 104.5,
-            low: 103.2,
-            close: 104.4,
-            ..bars[22]
-        };
-
-        let mut inp = input();
-        inp.s0_ts = Some("2026-08-03 05:45".to_string());
-        inp.s1_ts = Some("2026-08-03 06:15".to_string());
-        inp.s2_ts = Some("2026-08-03 10:30".to_string());
-        inp.warning_ts = Some("2026-08-03 10:30".to_string());
-        inp.created_at = "2026-08-03 10:30".to_string();
-
-        let ann = annotate(&inp, &bars, &[]).unwrap();
-        assert_eq!(ann.outcome, Outcome::Win);
-        assert_eq!(ann.target_tier.as_deref(), Some("tp2"));
-        // a/b 段共享 s1 那根 K 线：a 均量 100，b 均量 (100 + 17×50)/18
-        assert!((ann.b_vol_ratio.unwrap() - 0.5277777777777778).abs() < 1e-9);
-        assert_eq!(ann.trigger_lag_bars, Some(1));
-        assert_eq!(ann.trigger_overshoot_r, Some(0.5));
-        let atr20 = ann.a_move_atr.expect("a段强度应有值");
-        assert!(atr20 > 3.0 && atr20 < 5.0, "a_move_atr = {atr20}");
-    }
-
-    #[test]
-    fn atr_percentile_uses_previous_window() {
-        let mut atr20: Vec<Option<f64>> = (0..61).map(|i| Some(i as f64)).collect();
-        atr20.push(Some(10.0));
-        assert_eq!(
-            atr_percentile_at(&atr20, 61),
-            Some(10.0 / 60.0),
-            "前 60 根中 1~10 共 10 根不高于当前值 10"
-        );
-        assert_eq!(atr_percentile_at(&atr20, 0), None);
-
-        let sparse = vec![Some(3.0), None, Some(2.0)];
-        assert_eq!(atr_percentile_at(&sparse, 2), Some(0.0));
-    }
-
-    #[test]
-    fn trend60_score_bounds_and_direction() {
-        let mut up: Vec<Bar> = Vec::new();
-        for i in 0..40 {
-            let close = 100.0 + i as f64;
-            up.push(Bar {
-                dt: DT {
-                    year: 2026,
-                    month: 8,
-                    day: 3,
-                    hour: 9,
-                    minute: 0 + i as i32,
-                },
-                open: close - 1.0,
-                high: close + 0.5,
-                low: close - 1.5,
-                close,
-                volume: 100.0,
-                hold: 1000.0,
-                rollover: false,
-            });
-        }
-        let up_score = trend60_score_at(&up, "2026-08-03 10:00", Dir::Up).unwrap();
-        assert!(up_score >= 3.0 && up_score <= 5.0);
-        let down_score = trend60_score_at(&up, "2026-08-03 10:00", Dir::Down).unwrap();
-        assert!(down_score < up_score);
-
-        // 横盘序列：NEUTRAL，两种方向都应落在中间区间
-        let flat: Vec<Bar> = (0..40)
-            .map(|i| Bar {
-                dt: DT {
-                    year: 2026,
-                    month: 8,
-                    day: 3,
-                    hour: 9,
-                    minute: 0 + i as i32,
-                },
-                open: 100.0,
-                high: 101.0,
-                low: 99.0,
-                close: 100.0,
-                volume: 100.0,
-                hold: 1000.0,
-                rollover: false,
-            })
-            .collect();
-        let flat_score = trend60_score_at(&flat, "2026-08-03 10:00", Dir::Up).unwrap();
-        assert!((flat_score - 2.0).abs() < 0.6);
-    }
 
     #[test]
     fn stats_dedup_and_grouping() {
@@ -2128,8 +1099,12 @@ mod tests {
                 score,
                 created_at: "2026-08-03 09:15".to_string(),
                 warning_ts: Some("2026-08-03 09:15".to_string()),
+                s0_ts: Some("2026-08-03 08:30".to_string()),
                 s1_ts: Some("2026-08-03 08:45".to_string()),
                 s2_ts: Some(s2_ts.to_string()),
+                trigger_bar_ts: None,
+                entry: None,
+                risk: 0.0,
                 outcome,
                 r_multiple: r,
                 mfe_r: Some(2.0),
@@ -2227,8 +1202,12 @@ mod tests {
             score: 3.8,
             created_at: "2026-08-03 09:15".to_string(),
             warning_ts: Some("2026-08-03 09:15".to_string()),
+            s0_ts: Some("2026-08-03 08:30".to_string()),
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some("2026-08-03 09:15".to_string()),
+            trigger_bar_ts: None,
+            entry: None,
+            risk: 0.0,
             outcome: Some(Outcome::Win),
             r_multiple: Some(1.0),
             mfe_r: Some(1.5),
@@ -2263,6 +1242,177 @@ mod tests {
     }
 
     #[test]
+    fn stats_merge_same_trade_family_keep_first_seen() {
+        let mk =
+            |id: i64, warning: &str, trigger: &str, entry: f64, outcome: Outcome, r: f64| StatRow {
+                signal_id: id,
+                symbol: "UR0".to_string(),
+                logic_version: "3".to_string(),
+                direction: "up".to_string(),
+                level: "fine".to_string(),
+                grade: "C级".to_string(),
+                score: 3.8,
+                created_at: warning.to_string(),
+                warning_ts: Some(warning.to_string()),
+                s0_ts: Some(format!("2026-08-13 09:{id:02}")),
+                s1_ts: Some(format!("2026-08-13 13:{id:02}")),
+                s2_ts: Some(warning.to_string()),
+                trigger_bar_ts: Some(trigger.to_string()),
+                entry: Some(entry),
+                risk: 17.0,
+                outcome: Some(outcome),
+                r_multiple: Some(r),
+                mfe_r: Some(2.0),
+                mae_r: Some(-1.0),
+                bars_held: Some(3),
+                vol_ratio: Some(1.0),
+                oi_increase: Some(true),
+                trend60_score: Some(3.0),
+                atr_percentile: Some(0.4),
+                exit_reason: None,
+                target_tier: None,
+                extended_target: false,
+                b_vol_ratio: None,
+                a_move_atr: None,
+                trigger_lag_bars: None,
+                trigger_overshoot_r: None,
+                a_move: None,
+                b_move: None,
+                a_bars: None,
+                b_bars: None,
+                retracement: None,
+                dims: None,
+                net_r: None,
+                rollover_crossed: false,
+                gap_crossed_entry: false,
+                gap_crossed_exit: false,
+            };
+        // 1436/1437 场景：同品种同方向、预警K线相差 1 根、入场价相同，只算首见一笔；
+        // 预警K线相隔 6 根后即使入场价相同，也算另一笔实际交易。
+        let rows = vec![
+            mk(
+                1,
+                "2026-08-13 09:30",
+                "2026-08-14 10:00",
+                1675.0,
+                Outcome::Loss,
+                -0.375,
+            ),
+            mk(
+                2,
+                "2026-08-13 09:45",
+                "2026-08-14 10:00",
+                1675.0,
+                Outcome::Loss,
+                -1.0,
+            ),
+            mk(
+                3,
+                "2026-08-13 11:15",
+                "2026-08-14 10:45",
+                1675.0,
+                Outcome::Win,
+                1.0,
+            ),
+        ];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.n, 2);
+        assert_eq!(stats.overall.settled, 2);
+        assert_eq!(stats.overall.losses, 1);
+        assert_eq!(stats.overall.wins, 1);
+        assert_eq!(stats.overall.avg_r, Some(0.3125));
+        assert_eq!(stats.overall.avg_loss_r, Some(-0.375));
+    }
+
+    #[test]
+    fn stats_dedup_similar_warnings_by_proximity_only() {
+        let mk = |id: i64, warning: &str, entry: f64, risk: f64, outcome: Outcome| StatRow {
+            signal_id: id,
+            symbol: "JD0".to_string(),
+            logic_version: "3".to_string(),
+            direction: "down".to_string(),
+            level: "large".to_string(),
+            grade: "A级".to_string(),
+            score: 3.8,
+            created_at: warning.to_string(),
+            warning_ts: Some(warning.to_string()),
+            s0_ts: Some("2026-08-13 09:30".to_string()),
+            s1_ts: Some(format!("2026-08-13 13:{id:02}")),
+            s2_ts: Some(warning.to_string()),
+            trigger_bar_ts: None,
+            entry: Some(entry),
+            risk,
+            outcome: Some(outcome),
+            r_multiple: Some(if outcome == Outcome::Loss { -1.0 } else { 1.0 }),
+            mfe_r: Some(1.5),
+            mae_r: Some(-0.5),
+            bars_held: Some(3),
+            vol_ratio: Some(1.0),
+            oi_increase: Some(true),
+            trend60_score: Some(3.0),
+            atr_percentile: Some(0.4),
+            exit_reason: None,
+            target_tier: None,
+            extended_target: false,
+            b_vol_ratio: None,
+            a_move_atr: None,
+            trigger_lag_bars: None,
+            trigger_overshoot_r: None,
+            a_move: Some(140.0),
+            b_move: Some(60.0),
+            a_bars: Some(20),
+            b_bars: Some(4),
+            retracement: Some(0.5),
+            dims: None,
+            net_r: None,
+            rollover_crossed: false,
+            gap_crossed_entry: false,
+            gap_crossed_exit: false,
+        };
+        // 655/656 场景：A 段不同、预警K线仅差 1 根、入场价接近，仍只算首见一笔。
+        let rows = vec![
+            mk(1, "2026-08-13 13:45", 3950.0, 50.0, Outcome::Loss),
+            mk(2, "2026-08-13 14:00", 3955.0, 50.0, Outcome::Win),
+        ];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.n, 1);
+        assert_eq!(stats.overall.avg_r, Some(-1.0));
+
+        // 入场价差超过 0.3R 时不合并。
+        let rows = vec![
+            mk(1, "2026-08-13 13:45", 3950.0, 50.0, Outcome::Loss),
+            mk(2, "2026-08-13 14:00", 3968.0, 50.0, Outcome::Win),
+        ];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.n, 2);
+
+        // 预警K线相隔 6 根时不合并。
+        let rows = vec![
+            mk(1, "2026-08-13 13:45", 3950.0, 50.0, Outcome::Loss),
+            mk(2, "2026-08-13 15:15", 3950.0, 50.0, Outcome::Win),
+        ];
+        let stats = aggregate_stats(&rows, GroupBy::ScoreBand);
+        assert_eq!(stats.overall.n, 2);
+
+        // 午休跨段按实际 15m 根数计：11:15 到 14:00 实际相隔 3 根，
+        // 按自然时间却会算成 11 根并错误拆成两笔。
+        let mut bar_index = HashMap::new();
+        bar_index.insert(("JD0".to_string(), "2026-08-13 11:15".to_string()), 0usize);
+        bar_index.insert(("JD0".to_string(), "2026-08-13 14:00".to_string()), 3usize);
+        let rows = vec![
+            mk(1, "2026-08-13 11:15", 3950.0, 50.0, Outcome::Loss),
+            mk(2, "2026-08-13 14:00", 3950.0, 50.0, Outcome::Win),
+        ];
+        let stats = aggregate_stats_scoped_with_bar_index(
+            &rows,
+            GroupBy::ScoreBand,
+            StatsScope::All,
+            &bar_index,
+        );
+        assert_eq!(stats.overall.n, 1);
+    }
+
+    #[test]
     fn stats_composite_dimensions() {
         let mk =
             |id: i64, symbol: &str, ts: &str, score: f64, vol: f64, atr: Option<f64>| StatRow {
@@ -2275,8 +1425,12 @@ mod tests {
                 score,
                 created_at: ts.to_string(),
                 warning_ts: Some(ts.to_string()),
+                s0_ts: Some("2026-08-03 08:30".to_string()),
                 s1_ts: Some("2026-08-03 08:45".to_string()),
                 s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+                trigger_bar_ts: None,
+                entry: None,
+                risk: 0.0,
                 outcome: Some(Outcome::Win),
                 r_multiple: Some(1.0),
                 mfe_r: Some(1.5),
@@ -2340,8 +1494,12 @@ mod tests {
             score: 3.5,
             created_at: "2026-08-03 09:15".to_string(),
             warning_ts: Some("2026-08-03 09:15".to_string()),
+            s0_ts: Some("2026-08-03 08:30".to_string()),
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            trigger_bar_ts: None,
+            entry: None,
+            risk: 0.0,
             outcome: Some(Outcome::Win),
             r_multiple: Some(1.0),
             mfe_r: Some(1.5),
@@ -2386,8 +1544,12 @@ mod tests {
             score: 3.5,
             created_at: "2026-08-03 09:15".to_string(),
             warning_ts: Some("2026-08-03 09:15".to_string()),
+            s0_ts: Some("2026-08-03 08:30".to_string()),
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            trigger_bar_ts: None,
+            entry: None,
+            risk: 0.0,
             outcome,
             r_multiple: r,
             mfe_r: Some(1.5),
@@ -2665,8 +1827,12 @@ mod tests {
             score,
             created_at: "2026-08-03 09:15".to_string(),
             warning_ts: Some("2026-08-03 09:15".to_string()),
+            s0_ts: Some("2026-08-03 08:30".to_string()),
             s1_ts: Some("2026-08-03 08:45".to_string()),
             s2_ts: Some(format!("2026-08-03 09:{id:02}")),
+            trigger_bar_ts: None,
+            entry: None,
+            risk: 0.0,
             outcome: Some(outcome),
             r_multiple: Some(r),
             mfe_r: Some(1.5),

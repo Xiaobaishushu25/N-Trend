@@ -1,5 +1,6 @@
 pub mod box_range;
 pub mod dto;
+pub mod event;
 pub mod indicators;
 pub mod io;
 pub mod model;
@@ -318,16 +319,30 @@ pub fn analyze_bars_for_version(
     }
 }
 
-/// 形态结构窗口（s0 到 s2 后 6 根）内是否跨过换月 bar。
-fn pattern_window_has_rollover(bars: &[Bar], p: &NPattern) -> bool {
+/// 形态结构窗口内是否跨过换月 bar。
+/// 前向识别口径：只看 s0 到预警K线（含）之间，绝不引用预警之后的K线。
+pub(crate) fn pattern_window_has_rollover_until(
+    bars: &[Bar],
+    p: &NPattern,
+    warning_index: usize,
+) -> bool {
     let Some(start) = bars.get(p.s0.index) else {
         return false;
     };
     if start.rollover {
         return true;
     }
-    let end = (p.s2.index + 6).min(bars.len().saturating_sub(1));
+    let end = warning_index.min(bars.len().saturating_sub(1));
+    if p.s0.index > end {
+        return false;
+    }
     bars[p.s0.index..=end].iter().any(|b| b.rollover)
+}
+
+/// 旧口径：s0 到 s2 后 6 根内是否跨过换月 bar（仅旧分析路径使用）。
+fn pattern_window_has_rollover(bars: &[Bar], p: &NPattern) -> bool {
+    let end = (p.s2.index + 6).min(bars.len().saturating_sub(1));
+    pattern_window_has_rollover_until(bars, p, end)
 }
 
 /// 旧 CSV 路径：保持与历史行为一致，供回归测试与交叉校验。
@@ -473,6 +488,8 @@ mod tests {
             a_too_long: false,
             b_too_long: false,
             b_fast: false,
+            b_weakening: false,
+            b_weakening_ratio: None,
             a_strong_trend: 0,
             b_strong_reverse: 0,
             c_move: 0.0,

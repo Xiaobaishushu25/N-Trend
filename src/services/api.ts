@@ -19,9 +19,7 @@ import type {
   ReviewSignalDetail,
   ReviewStats,
   ScanResult,
-  ScanRow,
   SchedulerStatus,
-  SignalRow,
   SymbolRow,
 } from '../types'
 
@@ -68,9 +66,7 @@ export const api = {
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
   runScanNow: () => invoke<ScanResult>('run_scan_now'),
-  getScanHistory: (limit?: number) => invoke<ScanRow[]>('get_scan_history', { limit }),
-  getScanDetail: (scanId: number) => invoke<SignalRow[]>('get_scan_detail', { scanId }),
-  getLatestSignals: (limit?: number) => invoke<SignalRow[]>('get_latest_signals', { limit }),
+  rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),
 
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
   getReviewStats: (dimension: string, scope: string, version?: string | null) =>
@@ -87,8 +83,8 @@ export const api = {
       scoreMax: filters?.scoreMax ?? null,
       outcome: filters?.outcome || null,
     }),
-  getReviewSignal: (signalId: number) =>
-    invoke<ReviewSignalDetail | null>('get_review_signal', { signalId }),
+  getReviewSignal: (eventId: number) =>
+    invoke<ReviewSignalDetail | null>('get_review_signal', { eventId }),
 
   getConfig: () => invoke<Config>('get_config'),
   updateConfig: (config: Config) => invoke<Config>('update_config', { config }),

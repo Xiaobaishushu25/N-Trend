@@ -6,7 +6,7 @@ use n_core::service::{
     KlineDto, MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail,
     ScanResult,
 };
-use n_core::storage::entities::{groups, scans, signals, symbols};
+use n_core::storage::entities::{groups, symbols};
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
@@ -300,34 +300,28 @@ pub async fn run_scan_now(
 }
 
 #[tauri::command]
-pub async fn get_scan_history(
+pub async fn rebuild_events_now(
+    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-    limit: Option<u64>,
-) -> Result<Vec<scans::Model>, String> {
-    n_core::storage::repo::recent_scans(&state.services.db, limit.unwrap_or(20))
+) -> Result<ScanResult, String> {
+    state
+        .services
+        .rebuild_events()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    state
+        .notification_history
+        .lock()
+        .expect("通知历史锁可用")
+        .clear();
+    let empty_history: Vec<NotificationHistoryItem> = Vec::new();
+    let _ = app.emit("notification-history-updated", &empty_history);
+    let result = state.services.run_scan().await.map_err(|e| e.to_string())?;
+    state.note_scan_success().await;
+    let _ = app.emit("scan-completed", &result);
+    Ok(result)
 }
 
-#[tauri::command]
-pub async fn get_scan_detail(
-    state: State<'_, Arc<AppState>>,
-    scan_id: i64,
-) -> Result<Vec<signals::Model>, String> {
-    n_core::storage::repo::signals_for_scan(&state.services.db, scan_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_latest_signals(
-    state: State<'_, Arc<AppState>>,
-    limit: Option<u64>,
-) -> Result<Vec<signals::Model>, String> {
-    n_core::storage::repo::latest_signals(&state.services.db, limit.unwrap_or(50))
-        .await
-        .map_err(|e| e.to_string())
-}
 
 /// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
 #[tauri::command]
@@ -392,11 +386,11 @@ pub async fn get_recent_outcomes(
 #[tauri::command]
 pub async fn get_review_signal(
     state: State<'_, Arc<AppState>>,
-    signal_id: i64,
+    event_id: i64,
 ) -> Result<Option<ReviewSignalDetail>, String> {
     state
         .services
-        .review_signal(signal_id)
+        .review_signal(event_id)
         .await
         .map_err(|e| e.to_string())
 }

@@ -292,6 +292,9 @@ pub struct UiConfig {
     pub chart_display_bars: u64,
     /// K线图默认向左移动距离（根），即默认视图右侧留出的空白上限
     pub chart_right_gap: u64,
+    /// 进入K线图时默认显示排序最靠前的信号形态
+    #[serde(default = "default_chart_show_first_signal")]
+    pub chart_show_first_signal: bool,
     /// 启用的K线周期（空时按全部处理）
     pub timeframes: Vec<String>,
     /// 上次打开的分组表格（null=全部品种），应用启动后恢复
@@ -306,6 +309,7 @@ impl Default for UiConfig {
             min_bar_spacing: 8,
             chart_display_bars: 140,
             chart_right_gap: 10,
+            chart_show_first_signal: true,
             timeframes: DEFAULT_TIMEFRAMES.iter().map(|s| s.to_string()).collect(),
             last_group_id: None,
         }
@@ -411,6 +415,10 @@ fn default_logic_version() -> String {
     "1".to_string()
 }
 
+fn default_chart_show_first_signal() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +450,7 @@ mod tests {
         assert_eq!(back.ui.min_bar_spacing, 8);
         assert_eq!(back.ui.chart_display_bars, 140);
         assert_eq!(back.ui.chart_right_gap, 10);
+        assert_eq!(back.ui.chart_show_first_signal, true);
         assert_eq!(
             back.ui.timeframes,
             DEFAULT_TIMEFRAMES

@@ -1,44 +1,38 @@
-﻿import { defineStore } from 'pinia'
+import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
-import type { PatternDto, ScanResult, ScanRow, SignalOutcome, SignalRow } from '../types'
+import type { PatternEvent, ScanResult } from '../types'
 
-/** 形态身份键：同一品种内用 方向+级别+s1/s2 索引 识别“同一个形态” */
-function signalKey(s: SignalOutcome): string {
-  const version = s.logic_version || '1'
-  if (s.level === 'box') {
-    const b = s.box
-    return `${s.symbol}|${version}|box|${s.direction}|${b?.upper ?? ''}|${b?.lower ?? ''}|${s.warning_ts ?? ''}`
-  }
-  return `${s.symbol}|${version}|${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
+/** 图表右侧只展示仍在途的信号：已了结、已失效、未知状态一律不进入列表 */
+const ACTIVE_STATES = new Set(['pending', 'triggered'])
+
+function activeSignals(rows: PatternEvent[]): PatternEvent[] {
+  return rows.filter((e) => ACTIVE_STATES.has(e.state))
 }
 
-/** 对比上一次扫描，找出“新出现”的即将触发信号：本次是即将触发，且上次不是 */
-function newPendingSignals(prev: SignalOutcome[] | null, next: SignalOutcome[]): SignalOutcome[] {
-  const prevPending = new Set<string>()
-  for (const s of prev ?? []) {
-    if (s.state === '即将触发') prevPending.add(signalKey(s))
+function toNotificationSignal(e: PatternEvent, name: string) {
+  return {
+    code: e.symbol,
+    name,
+    direction: e.direction,
+    level: e.level,
+    grade: e.grade,
+    score: e.entry_score,
+    entry: e.entry,
+    stop: e.stop,
+    target: e.target,
   }
-  return next.filter((s) => s.state === '即将触发' && !prevPending.has(signalKey(s)))
 }
 
 export const useScansStore = defineStore('scans', {
   state: () => ({
-    history: [] as ScanRow[],
     latest: null as ScanResult | null,
-    detail: [] as SignalRow[],
-    /** 最新一次扫描的活跃信号（直接来自数据库，避免内存里的事件结果过期） */
-    latestSignals: [] as SignalOutcome[],
-    /** 最近若干次扫描中、指定品种的活跃信号原始记录（按扫描时间排列，含当时的状态） */
-    recentSignals: [] as SignalRow[],
+    latestSignals: [] as PatternEvent[],
     running: false,
   }),
   actions: {
-    async loadHistory(limit = 20) {
-      this.history = await api.getScanHistory(limit)
-    },
     async runScan() {
       this.running = true
       try {
@@ -48,72 +42,36 @@ export const useScansStore = defineStore('scans', {
         this.running = false
       }
     },
-    async loadDetail(scanId: number) {
-      this.detail = await api.getScanDetail(scanId)
-    },
-    /** 拉取最近若干次扫描里某个品种的活跃信号历史，作为「最近活跃信号」时间线数据源 */
-    async loadRecentSignals(symbol: string, scansLimit = 10) {
-      const history = await api.getScanHistory(scansLimit)
-      const rows: SignalRow[] = []
-      for (const h of history) {
-        const detail = await api.getScanDetail(h.id)
-        rows.push(...detail.filter((r) => r.symbol === symbol))
-      }
-      this.recentSignals = rows
-    },
-    /** 从数据库拉取最新一次扫描的活跃信号，保证「全部N形态」始终和数据库一致 */
+    /** 页面加载时同步最新形态：已有扫描结果直接复用，否则触发一次扫描 */
     async refreshLatestSignals() {
-      const rows = await api.getLatestSignals(200)
-      const out: SignalOutcome[] = []
-      for (const r of rows) {
-        try {
-          const d = JSON.parse(r.detail) as PatternDto
-          const { vol_ratio, vol_confirmed, ...rest } = d
-          out.push({
-            symbol: r.symbol,
-            ...rest,
-            vol_ratio: vol_ratio ?? null,
-            vol_confirmed: vol_confirmed === true,
-          })
-        } catch {
-          // 单条记录解析失败不影响整体
+      if (!this.latest) await this.runScan()
+      else this.latestSignals = activeSignals(this.latest.signals)
+    },
+    /** 扫描完成后统一处理：更新内存结果，并按事件类型弹通知 */
+    applyScanResult(result: ScanResult) {
+      this.latest = result
+      this.latestSignals = activeSignals(result.signals)
+      const notifySettings = useSettingsStore().settings.notify
+      const symbolsStore = useSymbolsStore()
+      const nameOf = (code: string) => {
+        const sym = symbolsStore.symbols.find((x) => x.code === code)
+        return sym && sym.name !== code ? sym.name : ''
+      }
+      if (notifySettings.in_app_new_pattern) {
+        for (const e of result.new_warnings) {
+          const signal = toNotificationSignal(e, nameOf(e.symbol))
+          if (e.entry_score >= notifySettings.new_pattern_min_score) notify.signal(signal)
+          else notify.recordSignal(signal)
         }
       }
-      this.latestSignals = out
-    },
-    /**
-     * 扫描完成后统一处理：更新内存中的最新扫描结果，并对比上一次扫描，
-     * 对“新出现”的即将触发信号弹出持久通知（不自动关闭）。
-     * 应用首次启动后的第一次扫描没有上一次结果可对比，不弹通知。
-     */
-    applyScanResult(result: ScanResult) {
-      const prev = this.latest
-      this.latest = result
-      this.loadHistory(20)
-      const pendings = newPendingSignals(prev?.signals ?? null, result.signals)
-      if (!pendings.length) return
-      // 局内新形态通知开关与评分阈值
-      const notifySettings = useSettingsStore().settings.notify
-      if (!notifySettings.in_app_new_pattern) return
-      const symbolsStore = useSymbolsStore()
-      for (const s of pendings) {
-        const sym = symbolsStore.symbols.find((x) => x.code === s.symbol)
-        const signal = {
-          code: s.symbol,
-          name: sym && sym.name !== s.symbol ? sym.name : '',
-          direction: s.direction,
-          level: s.level,
-          grade: s.grade,
-          score: s.score,
-          entry: s.entry,
-          stop: s.stop,
-          target: s.target,
-        }
-        if (s.score >= notifySettings.new_pattern_min_score) {
-          notify.signal(signal)
-        } else {
-          notify.recordSignal(signal)
-        }
+      for (const e of result.newly_triggered) {
+        notify.entryTrigger({
+          symbol: e.symbol,
+          name: nameOf(e.symbol),
+          direction: e.direction,
+          entry: e.entry,
+          latest: e.trigger_price ?? e.entry,
+        })
       }
     },
     ingest(result: ScanResult) {

@@ -31,8 +31,8 @@ pub struct PatternDto {
     /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认视为 1
     #[serde(default = "legacy_logic_version")]
     pub logic_version: String,
-    /// 2026-08-14：预警K线类型，strong / engulf / wick / fast / cumulative / none；
-    /// 旧记录无此字段。质量分已计入 `score`，不再单独下发显示加成。
+    /// 2026-08-16：预警K线类型，strong / wick / fast / cumulative / none；
+    /// 历史记录仍可能为 engulf，显示时按强反转兼容。质量分已计入 `score`。
     #[serde(default)]
     pub warning_kind: String,
     pub direction: String,
@@ -311,6 +311,8 @@ mod tests {
             a_too_long: false,
             b_too_long: false,
             b_fast: true,
+            b_weakening: false,
+            b_weakening_ratio: None,
             a_strong_trend: 1,
             b_strong_reverse: 0,
             c_move: 0.0,
@@ -370,12 +372,12 @@ mod tests {
         sc.total = 3.5;
         sc.state = "当前已触发";
         sc.category = "fine";
-        sc.warning_kind = "engulf";
+        sc.warning_kind = "strong";
 
         let up = PatternDto::from_parts(&bars, 1, &pattern(Dir::Up), &sc);
         assert_eq!(up.trigger_overshoot_r, Some(0.5));
         assert!(up.vol_confirmed);
-        assert_eq!(up.warning_kind, "engulf");
+        assert_eq!(up.warning_kind, "strong");
         assert_eq!(up.score, 3.5);
 
         let down = PatternDto::from_parts(&bars, 1, &pattern(Dir::Down), &sc);

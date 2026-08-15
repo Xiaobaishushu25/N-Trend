@@ -5,18 +5,23 @@ use chrono::Timelike;
 use sea_orm::{DatabaseConnection, Set};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
 
-use crate::analyze::dto::SignalOutcome;
-use crate::analyze::model::{Bar, ATR_PERIOD, DT};
+use crate::analyze::event;
+use crate::analyze::model::{Bar, Dir, ATR_PERIOD, DT};
 use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::fetch::SinaClient;
 use crate::scheduler::SchedulerConfig;
-use crate::storage::entities::{klines, signal_outcomes, signals, symbols};
+use crate::storage::entities::{klines, pattern_events, symbols};
 use crate::storage::repo;
+
+const MONTH_KLINE_CACHE_TTL: Duration = Duration::from_secs(900);
+const ROLLOVER_SCAN_SETTING_PREFIX: &str = "rollover_scanned::";
+const ROLLOVER_PENDING_RETENTION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RefreshStats {
@@ -32,18 +37,24 @@ pub struct SymbolFailure {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanResult {
-    pub scan_id: i64,
     pub scanned: i64,
     pub active_count: i64,
     pub summary: String,
-    pub signals: Vec<SignalOutcome>,
+    pub signals: Vec<pattern_events::Model>,
+    /// 本轮扫描新识别出的预警事件
+    pub new_warnings: Vec<pattern_events::Model>,
+    /// 本轮推进时新触发的事件
+    pub newly_triggered: Vec<pattern_events::Model>,
     pub failed: Vec<SymbolFailure>,
 }
 
 impl ScanResult {
-    /// 是否存在评分达到通知阈值的活跃信号，应用内卡片与邮件共用同一门槛。
+    /// 是否存在评分达到通知阈值的新预警或新触发，应用内卡片与邮件共用同一门槛。
     pub fn has_notifiable_signal(&self, min_score: f64) -> bool {
-        self.signals.iter().any(|s| s.signal.score >= min_score)
+        self.new_warnings
+            .iter()
+            .chain(self.newly_triggered.iter())
+            .any(|e| e.entry_score >= min_score)
     }
 }
 
@@ -56,64 +67,55 @@ pub struct OutcomeRefresh {
 /// 复盘页明细表的一行（信号快照 + 结局 + 特征）。
 #[derive(Debug, Clone, Serialize)]
 pub struct OutcomeDetail {
-    pub signal_id: i64,
+    pub event_id: i64,
     pub symbol: String,
-    /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1
+    /// 事件版本：前向事件系统固定为 3
     pub logic_version: String,
-    /// 2026-08-14：预警K线类型，strong / engulf / wick / fast / cumulative / none；
-    /// 旧记录无此字段。质量分已计入 `score`，不再单独下发显示加成。
     pub warning_kind: String,
+    pub warning_ts: String,
+    pub detected_at: String,
     pub direction: String,
     pub level: String,
     pub grade: String,
-    pub score: f64,
+    pub entry_score: f64,
+    pub entry_score_dims: String,
     pub entry: f64,
     pub stop: f64,
     pub target: f64,
+    pub risk: f64,
     pub rr: f64,
     pub created_at: String,
+    pub state: String,
     pub outcome: String,
     pub exit_reason: String,
-    /// 模拟回放找到的入场触达时间（快照 trigger_ts 缺失时用于图上补画触发标记）
-    pub entry_ts: Option<String>,
+    pub trigger_ts: Option<String>,
+    pub trigger_bar_ts: Option<String>,
+    pub trigger_price: Option<f64>,
+    pub trigger_score: Option<f64>,
+    pub trigger_volume_ratio: Option<f64>,
+    pub overshoot_r: Option<f64>,
+    pub hold_score: Option<f64>,
     pub exit_ts: Option<String>,
     pub exit_price: Option<f64>,
     pub r_multiple: Option<f64>,
     pub mfe_r: Option<f64>,
     pub mae_r: Option<f64>,
-    pub bars_held: Option<i64>,
-    pub vol_ratio: Option<f64>,
-    pub oi_increase: Option<bool>,
-    pub trend60_score: Option<f64>,
-    /// 止盈层级：tp1 / tp2
-    pub target_tier: Option<String>,
-    /// b段均量 / a段均量（15m）
-    pub b_vol_ratio: Option<f64>,
-    /// 结构快照：a/b 段幅度与根数（明细表展示 b/a 速度比与根数比）
+    pub bars_held: Option<usize>,
     pub a_move: Option<f64>,
     pub b_move: Option<f64>,
     pub a_bars: Option<usize>,
     pub b_bars: Option<usize>,
-    /// a_move / 触发bar ATR20
-    pub a_move_atr: Option<f64>,
-    /// 预警K线到触发K线的根数差
-    pub trigger_lag_bars: Option<i64>,
-    /// 触发K线超出入场价的深度（按R归一化）
-    pub trigger_overshoot_r: Option<f64>,
-    /// 净R估算：R - 2.5 × tick / risk（固定往返成本）
+    pub retracement: Option<f64>,
     pub net_r: Option<f64>,
-    /// 模拟窗口内跨过连续合约换月（不计入盈亏统计）
     pub rollover_crossed: bool,
-    /// 入场价被跳空穿越
     pub gap_crossed_entry: bool,
-    /// 止损价被跳空穿越
     pub gap_crossed_exit: bool,
 }
 
-/// 复盘明细跳转K线图所需：完整形态结构 + 结局。
+/// 复盘明细跳转K线图所需：完整事件 + 结局。
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewSignalDetail {
-    pub pattern: crate::analyze::dto::PatternDto,
+    pub event: pattern_events::Model,
     pub outcome: Option<OutcomeDetail>,
 }
 
@@ -130,235 +132,770 @@ pub struct OutcomeFilter {
     pub grade: Option<String>,
     pub score_min: Option<f64>,
     pub score_max: Option<f64>,
-    /// win / loss / no_trigger / open / insufficient_data
+    /// win / loss / no_trigger / open / insufficient_data / rollover
     pub outcome: Option<String>,
-    /// 1 / 2，缺省不过滤
+    /// 3，缺省不过滤
     pub version: Option<String>,
 }
 
-fn matches_outcome_filter(
-    s: &signals::Model,
-    o: &signal_outcomes::Model,
-    f: &OutcomeFilter,
-) -> bool {
+const EVENT_LOGIC_VERSION: &str = "3";
+
+fn pattern_endpoint_prices(bars: &[Bar], candidate: &event::WarningCandidate) -> (f64, f64, f64) {
+    if candidate.direction == Dir::Up {
+        (
+            bars[candidate.s0_index].low,
+            bars[candidate.s1_index].high,
+            bars[candidate.s2_index].low,
+        )
+    } else {
+        (
+            bars[candidate.s0_index].high,
+            bars[candidate.s1_index].low,
+            bars[candidate.s2_index].high,
+        )
+    }
+}
+
+async fn insert_warning_event(
+    db: &DatabaseConnection,
+    symbol: &str,
+    bars: &[Bar],
+    candidate: &event::WarningCandidate,
+) -> Result<pattern_events::Model> {
+    let direction = if candidate.direction == Dir::Up {
+        "up"
+    } else {
+        "down"
+    };
+    let warning_ts = bar_ts(&bars[candidate.warning_index]);
+    let now = now_ts();
+    let dims = serde_json::json!({
+        "dim_a": candidate.dim_a,
+        "dim_b": candidate.dim_b,
+        "dim_warning": candidate.dim_warning,
+    })
+    .to_string();
+    let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);
+    let row = pattern_events::ActiveModel {
+        symbol: Set(symbol.to_string()),
+        direction: Set(direction.to_string()),
+        grade: Set(candidate.grade.clone()),
+        level: Set(candidate.level.to_string()),
+        s0_ts: Set(bar_ts(&bars[candidate.s0_index])),
+        s0_price: Set(s0_price),
+        s1_ts: Set(bar_ts(&bars[candidate.s1_index])),
+        s1_price: Set(s1_price),
+        s2_ts: Set(bar_ts(&bars[candidate.s2_index])),
+        s2_price: Set(s2_price),
+        a_move: Set(candidate.a_move),
+        b_move: Set(candidate.b_move),
+        a_bars: Set(candidate.a_bars as i64),
+        b_bars: Set(candidate.b_bars as i64),
+        retracement: Set(candidate.retracement),
+        warning_ts: Set(warning_ts.clone()),
+        detected_at: Set(warning_ts.clone()),
+        warning_kind: Set(candidate.warning_kind.to_string()),
+        entry_score: Set(candidate.entry_score),
+        entry_score_dims: Set(dims),
+        entry: Set(candidate.entry),
+        stop: Set(candidate.stop),
+        target: Set(candidate.target),
+        risk: Set(candidate.risk),
+        rr: Set(candidate.rr),
+        state: Set("pending".to_string()),
+        last_advance_ts: Set(Some(warning_ts)),
+        trigger_ts: Set(None),
+        trigger_bar_ts: Set(None),
+        trigger_price: Set(None),
+        trigger_score: Set(None),
+        trigger_volume_ratio: Set(None),
+        overshoot_r: Set(None),
+        hold_score: Set(None),
+        hold_score_history: Set("[]".to_string()),
+        outcome: Set(None),
+        exit_reason: Set(None),
+        exit_ts: Set(None),
+        exit_price: Set(None),
+        r_multiple: Set(None),
+        mfe_r: Set(None),
+        mae_r: Set(None),
+        created_at: Set(now.clone()),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    let id = repo::insert_pattern_event(db, row).await?;
+    repo::pattern_event_by_id(db, id)
+        .await?
+        .ok_or_else(|| anyhow!("写入事件 {id} 后读取失败"))
+}
+
+/// 相似预警抑制：同品种、同方向、预警K线相差不超过 5 根 15m、入场价差
+/// 不超过 0.3R 时，不再新建事件。历史重放时会按预警K线先后逐条插入，
+/// 因此这里比对全部既有事件（含已触发/已了结），避免前一条离开 pending
+/// 后同族事件又被重新识别出来。
+fn has_similar_warning(
+    bars: &[Bar],
+    candidate: &event::WarningCandidate,
+    events: &[pattern_events::Model],
+) -> Result<bool> {
+    let direction = if candidate.direction == Dir::Up {
+        "up"
+    } else {
+        "down"
+    };
+    let warning_ts = bar_ts(&bars[candidate.warning_index]);
+    Ok(events.iter().any(|e| {
+        e.direction == direction
+            && bar_gap(bars, &warning_ts, &e.warning_ts)
+                .is_some_and(|bars_gap| bars_gap <= outcome::DEDUP_WARNING_BARS)
+            && e.risk > 0.0
+            && (candidate.entry - e.entry).abs() <= outcome::DEDUP_ENTRY_R * e.risk
+    }))
+}
+
+/// 找出应删除的重复事件：与复盘统计同口径，同品种、同方向、预警K线相差
+/// 不超过 5 根 15m 且入场价差不超过 0.3R 的事件聚成同一族，族内只保留首见
+/// 一条，其余返回给调用方删除。旧数据缺少入场价时退回结构键去重。
+fn duplicate_event_ids(
+    events: &[pattern_events::Model],
+    bar_index: &outcome::WarningBarIndex,
+) -> Vec<i64> {
+    let mut ordered = events.to_vec();
+    ordered.sort_by(|a, b| {
+        a.warning_ts
+            .cmp(&b.warning_ts)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let mut families: Vec<(&pattern_events::Model, String)> = Vec::new();
+    let mut structure_min: HashMap<String, &pattern_events::Model> = HashMap::new();
+    let mut delete_ids: Vec<i64> = Vec::new();
+
+    for e in &ordered {
+        if e.risk > 0.0 {
+            let mut merged = false;
+            for (anchor, last_warning_ts) in &mut families {
+                if e.symbol == anchor.symbol
+                    && e.direction == anchor.direction
+                    && (e.entry - anchor.entry).abs()
+                        <= outcome::DEDUP_ENTRY_R * anchor.risk.max(1e-9)
+                    && bar_index
+                        .get(&(e.symbol.clone(), e.warning_ts.clone()))
+                        .zip(bar_index.get(&(anchor.symbol.clone(), last_warning_ts.clone())))
+                        .is_some_and(|(li, ei)| li.abs_diff(*ei) <= outcome::DEDUP_WARNING_BARS)
+                {
+                    merged = true;
+                    delete_ids.push(e.id);
+                    *last_warning_ts = e.warning_ts.clone();
+                    break;
+                }
+            }
+            if merged {
+                continue;
+            }
+            families.push((e, e.warning_ts.clone()));
+            continue;
+        }
+
+        // 缺少入场价的历史记录不做删除，避免误伤；这里保留结构键分支以便
+        // 与复盘统计口径一致地说明旧数据不会进入删除范围。
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}",
+            e.symbol, EVENT_LOGIC_VERSION, e.direction, e.level, e.s1_ts, e.s2_ts
+        );
+        if let Some(cur) = structure_min.get(&key) {
+            if e.id < cur.id {
+                delete_ids.push(cur.id);
+                structure_min.insert(key, e);
+            } else {
+                delete_ids.push(e.id);
+            }
+        } else {
+            structure_min.insert(key, e);
+        }
+    }
+    delete_ids
+}
+
+fn event_outcome_str(e: &pattern_events::Model) -> String {
+    if let Some(outcome) = e.outcome.as_deref() {
+        return outcome.to_string();
+    }
+    if e.state == "expired" {
+        "no_trigger".to_string()
+    } else {
+        "open".to_string()
+    }
+}
+
+fn matches_outcome_filter(e: &pattern_events::Model, f: &OutcomeFilter) -> bool {
     if let Some(sym) = f.symbol.as_deref().filter(|x| !x.is_empty()) {
-        if !s.symbol.to_lowercase().contains(&sym.to_lowercase()) {
+        if !e.symbol.to_lowercase().contains(&sym.to_lowercase()) {
             return false;
         }
     }
     if let Some(d) = f.direction.as_deref().filter(|x| !x.is_empty()) {
-        if s.direction != d {
+        if e.direction != d {
             return false;
         }
     }
     if let Some(l) = f.level.as_deref().filter(|x| !x.is_empty()) {
-        if s.level != l {
+        if e.level != l {
             return false;
         }
     }
     if let Some(g) = f.grade.as_deref().filter(|x| !x.is_empty()) {
-        if s.grade != g {
+        if e.grade != g {
             return false;
         }
     }
     if let Some(min) = f.score_min {
-        if s.score < min {
+        if e.entry_score < min {
             return false;
         }
     }
     if let Some(max) = f.score_max {
-        if s.score > max {
+        if e.entry_score > max {
             return false;
         }
     }
     if let Some(out) = f.outcome.as_deref().filter(|x| !x.is_empty()) {
-        if o.outcome != out {
+        if event_outcome_str(e) != out {
             return false;
         }
     }
     if let Some(v) = f.version.as_deref().filter(|x| !x.is_empty()) {
-        let detail_version = serde_json::from_str::<serde_json::Value>(&s.detail)
-            .ok()
-            .and_then(|x| {
-                x.get("logic_version")
-                    .and_then(|y| y.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "1".to_string());
-        if detail_version != v {
+        if EVENT_LOGIC_VERSION != v {
             return false;
         }
     }
     true
 }
 
-/// 从 signals.detail JSON 读取预警时间与结构两端时间戳。
-fn parse_detail_ts(detail: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) else {
-        return (None, None, None);
-    };
-    let get = |path: &[&str]| -> Option<String> {
-        let mut cur: &serde_json::Value = &v;
-        for p in path {
-            cur = cur.get(p)?;
-        }
-        cur.as_str().map(|s| s.to_string())
-    };
-    (get(&["warning_ts"]), get(&["s1", "ts"]), get(&["s2", "ts"]))
+fn parse_entry_dims(dims: &str) -> Option<[f64; 6]> {
+    let v: serde_json::Value = serde_json::from_str(dims).ok()?;
+    let a = v.get("dim_a")?.as_f64()?;
+    let b = v.get("dim_b")?.as_f64()?;
+    let w = v.get("dim_warning")?.as_f64()?;
+    Some([0.0, a, b, w, 0.0, 0.0])
 }
 
-fn parse_detail(detail: &str) -> Option<crate::analyze::dto::PatternDto> {
-    serde_json::from_str(detail).ok()
-}
-
-fn signal_input_from(s: &signals::Model) -> Option<outcome::SignalInput> {
-    let p = parse_detail(&s.detail);
-    Some(outcome::SignalInput {
-        symbol: s.symbol.clone(),
-        direction: s.direction.clone(),
-        level: s.level.clone(),
-        entry: s.entry,
-        stop: s.stop,
-        target: s.target,
-        risk: (s.entry - s.stop).abs(),
-        created_at: s.created_at.clone(),
-        warning_ts: p.as_ref().and_then(|p| p.warning_ts.clone()),
-        trigger_ts: p.as_ref().and_then(|p| p.trigger_ts.clone()),
-        s0_ts: p.as_ref().map(|p| p.s0.ts.clone()),
-        s1_ts: p.as_ref().map(|p| p.s1.ts.clone()),
-        s2_ts: p.as_ref().map(|p| p.s2.ts.clone()),
-        a_move: p.as_ref().map(|p| p.a_move),
-    })
-}
-
-/// 换月记录更新晚于结果回填时，已终局的信号也要重算（可能因新确认换月而改为 rollover）。
-fn needs_outcome_refresh(
-    outcome: Option<&signal_outcomes::Model>,
-    latest_rollover_updated: Option<&str>,
-) -> bool {
-    let Some(outcome) = outcome else {
-        return true;
-    };
-    if outcome.sim_version != outcome::SIM_VERSION
-        || !outcome::Outcome::parse(&outcome.outcome).is_some_and(|x| x.is_terminal())
-    {
-        return true;
-    }
-    latest_rollover_updated.is_some_and(|ts| ts > outcome.updated_at.as_str())
-}
-
-fn stat_row_from(
-    s: &signals::Model,
-    o: Option<&signal_outcomes::Model>,
-    tick: Option<f64>,
-) -> Option<outcome::StatRow> {
-    let p = parse_detail(&s.detail);
-    let risk = (s.entry - s.stop).abs();
+fn stat_row_from(e: &pattern_events::Model, tick: Option<f64>) -> Option<outcome::StatRow> {
+    let risk = e.risk;
+    let outcome = e
+        .outcome
+        .as_deref()
+        .and_then(outcome::Outcome::parse)
+        .or_else(|| {
+            if e.state == "expired" {
+                Some(outcome::Outcome::NoTrigger)
+            } else {
+                Some(outcome::Outcome::Open)
+            }
+        });
     Some(outcome::StatRow {
-        signal_id: s.id,
-        symbol: s.symbol.clone(),
-        logic_version: p
-            .as_ref()
-            .map(|x| x.logic_version.clone())
-            .unwrap_or_else(|| "1".to_string()),
-        direction: s.direction.clone(),
-        level: s.level.clone(),
-        grade: s.grade.clone(),
-        score: s.score,
-        created_at: s.created_at.clone(),
-        warning_ts: p.as_ref().and_then(|p| p.warning_ts.clone()),
-        s1_ts: p.as_ref().map(|p| p.s1.ts.clone()),
-        s2_ts: p.as_ref().map(|p| p.s2.ts.clone()),
-        outcome: o.and_then(|x| outcome::Outcome::parse(&x.outcome)),
-        r_multiple: o.and_then(|x| x.r_multiple),
-        mfe_r: o.and_then(|x| x.mfe_r),
-        mae_r: o.and_then(|x| x.mae_r),
-        bars_held: o.and_then(|x| x.bars_held.map(|b| b as usize)),
-        vol_ratio: o.and_then(|x| x.vol_ratio),
-        oi_increase: o.and_then(|x| x.oi_increase),
-        trend60_score: o.and_then(|x| x.trend60_score),
-        atr_percentile: o.and_then(|x| x.atr_percentile),
-        exit_reason: o.map(|x| outcome::ExitReason::parse(&x.exit_reason)),
-        target_tier: o.and_then(|x| x.target_tier.clone()),
-        extended_target: s.rr > 1.0,
-        b_vol_ratio: o.and_then(|x| x.b_vol_ratio),
-        a_move_atr: o.and_then(|x| x.a_move_atr),
-        trigger_lag_bars: o.and_then(|x| x.trigger_lag_bars.map(|b| b as usize)),
-        trigger_overshoot_r: o.and_then(|x| x.trigger_overshoot_r),
-        a_move: p.as_ref().map(|p| p.a_move),
-        b_move: p.as_ref().map(|p| p.b_move),
-        a_bars: p.as_ref().map(|p| p.a_bars),
-        b_bars: p.as_ref().map(|p| p.b_bars),
-        retracement: p.as_ref().map(|p| p.retracement),
-        dims: p.as_ref().map(|p| p.dims),
-        net_r: o
-            .and_then(|x| x.r_multiple)
-            .zip(tick)
-            .filter(|_| risk > 0.0)
-            .map(|(r, t)| r - 2.5 * t / risk),
-        rollover_crossed: o.is_some_and(|x| x.rollover_crossed.unwrap_or(false)),
-        gap_crossed_entry: o.is_some_and(|x| x.gap_crossed_entry.unwrap_or(false)),
-        gap_crossed_exit: o.is_some_and(|x| x.gap_crossed_exit.unwrap_or(false)),
-    })
-}
-
-fn outcome_detail_from(
-    s: &signals::Model,
-    o: &signal_outcomes::Model,
-    tick: Option<f64>,
-) -> OutcomeDetail {
-    let risk = (s.entry - s.stop).abs();
-    let p = parse_detail(&s.detail);
-    OutcomeDetail {
-        signal_id: s.id,
-        symbol: s.symbol.clone(),
-        logic_version: p
-            .as_ref()
-            .map(|x| x.logic_version.clone())
-            .unwrap_or_else(|| "1".to_string()),
-        warning_kind: p
-            .as_ref()
-            .map(|x| x.warning_kind.clone())
-            .unwrap_or_default(),
-        direction: s.direction.clone(),
-        level: s.level.clone(),
-        grade: s.grade.clone(),
-        score: s.score,
-        entry: s.entry,
-        stop: s.stop,
-        target: s.target,
-        rr: s.rr,
-        created_at: s.created_at.clone(),
-        outcome: o.outcome.clone(),
-        exit_reason: o.exit_reason.clone(),
-        entry_ts: o.entry_ts.clone(),
-        exit_ts: o.exit_ts.clone(),
-        exit_price: o.exit_price,
-        r_multiple: o.r_multiple,
-        mfe_r: o.mfe_r,
-        mae_r: o.mae_r,
-        bars_held: o.bars_held,
-        vol_ratio: o.vol_ratio,
-        oi_increase: o.oi_increase,
-        trend60_score: o.trend60_score,
-        target_tier: o.target_tier.clone(),
-        b_vol_ratio: o.b_vol_ratio,
-        a_move: p.as_ref().map(|p| p.a_move),
-        b_move: p.as_ref().map(|p| p.b_move),
-        a_bars: p.as_ref().map(|p| p.a_bars),
-        b_bars: p.as_ref().map(|p| p.b_bars),
-        a_move_atr: o.a_move_atr,
-        trigger_lag_bars: o.trigger_lag_bars,
-        trigger_overshoot_r: o.trigger_overshoot_r,
-        net_r: o
+        signal_id: e.id,
+        symbol: e.symbol.clone(),
+        logic_version: EVENT_LOGIC_VERSION.to_string(),
+        direction: e.direction.clone(),
+        level: e.level.clone(),
+        grade: e.grade.clone(),
+        score: e.entry_score,
+        created_at: e.created_at.clone(),
+        warning_ts: Some(e.warning_ts.clone()),
+        s0_ts: Some(e.s0_ts.clone()),
+        s1_ts: Some(e.s1_ts.clone()),
+        s2_ts: Some(e.s2_ts.clone()),
+        trigger_bar_ts: e.trigger_bar_ts.clone(),
+        entry: Some(e.entry),
+        risk: e.risk,
+        outcome,
+        r_multiple: e.r_multiple,
+        mfe_r: e.mfe_r,
+        mae_r: e.mae_r,
+        bars_held: e
+            .trigger_ts
+            .as_deref()
+            .zip(e.exit_ts.as_deref())
+            .and_then(|(a, b)| ts_diff_bars(a, b).map(|n| n + 1)),
+        vol_ratio: e.trigger_volume_ratio,
+        oi_increase: None,
+        trend60_score: None,
+        atr_percentile: None,
+        exit_reason: e.exit_reason.as_deref().map(outcome::ExitReason::parse),
+        target_tier: None,
+        extended_target: e.rr > 1.0,
+        b_vol_ratio: None,
+        a_move_atr: None,
+        trigger_lag_bars: Some(e.warning_ts.as_str())
+            .zip(e.trigger_bar_ts.as_deref())
+            .and_then(|(a, b)| ts_diff_bars(a, b)),
+        trigger_overshoot_r: e.overshoot_r,
+        a_move: Some(e.a_move),
+        b_move: Some(e.b_move),
+        a_bars: Some(e.a_bars as usize),
+        b_bars: Some(e.b_bars as usize),
+        retracement: Some(e.retracement),
+        dims: parse_entry_dims(&e.entry_score_dims),
+        net_r: e
             .r_multiple
             .zip(tick)
             .filter(|_| risk > 0.0)
             .map(|(r, t)| r - 2.5 * t / risk),
-        rollover_crossed: o.rollover_crossed.unwrap_or(false),
-        gap_crossed_entry: o.gap_crossed_entry.unwrap_or(false),
-        gap_crossed_exit: o.gap_crossed_exit.unwrap_or(false),
+        rollover_crossed: e.outcome.as_deref() == Some("rollover"),
+        gap_crossed_entry: false,
+        gap_crossed_exit: false,
+    })
+}
+
+fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeDetail {
+    let risk = e.risk;
+    OutcomeDetail {
+        event_id: e.id,
+        symbol: e.symbol.clone(),
+        logic_version: EVENT_LOGIC_VERSION.to_string(),
+        warning_kind: e.warning_kind.clone(),
+        warning_ts: e.warning_ts.clone(),
+        detected_at: e.detected_at.clone(),
+        direction: e.direction.clone(),
+        level: e.level.clone(),
+        grade: e.grade.clone(),
+        entry_score: e.entry_score,
+        entry_score_dims: e.entry_score_dims.clone(),
+        entry: e.entry,
+        stop: e.stop,
+        target: e.target,
+        risk: e.risk,
+        rr: e.rr,
+        created_at: e.created_at.clone(),
+        state: e.state.clone(),
+        outcome: event_outcome_str(e),
+        exit_reason: e.exit_reason.clone().unwrap_or_default(),
+        trigger_ts: e.trigger_ts.clone(),
+        trigger_bar_ts: e.trigger_bar_ts.clone(),
+        trigger_price: e.trigger_price,
+        trigger_score: e.trigger_score,
+        trigger_volume_ratio: e.trigger_volume_ratio,
+        overshoot_r: e.overshoot_r,
+        hold_score: e.hold_score,
+        exit_ts: e.exit_ts.clone(),
+        exit_price: e.exit_price,
+        r_multiple: e.r_multiple,
+        mfe_r: e.mfe_r,
+        mae_r: e.mae_r,
+        bars_held: e
+            .trigger_ts
+            .as_deref()
+            .zip(e.exit_ts.as_deref())
+            .and_then(|(a, b)| ts_diff_bars(a, b).map(|n| n + 1)),
+        a_move: Some(e.a_move),
+        b_move: Some(e.b_move),
+        a_bars: Some(e.a_bars as usize),
+        b_bars: Some(e.b_bars as usize),
+        retracement: Some(e.retracement),
+        net_r: e
+            .r_multiple
+            .zip(tick)
+            .filter(|_| risk > 0.0)
+            .map(|(r, t)| r - 2.5 * t / risk),
+        rollover_crossed: e.outcome.as_deref() == Some("rollover"),
+        gap_crossed_entry: false,
+        gap_crossed_exit: false,
     }
+}
+
+fn now_ts() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn bar_ts(bar: &Bar) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:00",
+        bar.dt.year, bar.dt.month, bar.dt.day, bar.dt.hour, bar.dt.minute
+    )
+}
+
+fn event_dir(e: &pattern_events::Model) -> Dir {
+    if e.direction == "down" {
+        Dir::Down
+    } else {
+        Dir::Up
+    }
+}
+
+fn trail_r(grade: usize) -> f64 {
+    if grade == 1 {
+        1.0
+    } else {
+        outcome::TRAIL_STEP_R * grade as f64
+    }
+}
+
+fn trigger_k_adj(bars: &[Bar], dir: Dir, i: usize) -> f64 {
+    let atr20 = crate::analyze::indicators::atr(bars, ATR_PERIOD);
+    let trend_k = crate::analyze::indicators::trend_flags(bars, &atr20);
+    match crate::analyze::scoring::single_reversal_pattern(bars, &atr20, &trend_k, dir, i, i) {
+        Some(kind) if matches!(kind.as_str(), "strong" | "engulf") => 0.5,
+        Some(_) => 0.2,
+        None => -0.3,
+    }
+}
+
+fn append_hold_history(e: &mut pattern_events::Model, ts: &str, score: f64) {
+    let mut history: Vec<serde_json::Value> =
+        serde_json::from_str(&e.hold_score_history).unwrap_or_default();
+    if history
+        .last()
+        .and_then(|v| v.get("ts"))
+        .and_then(|v| v.as_str())
+        == Some(ts)
+    {
+        return;
+    }
+    history.push(serde_json::json!({ "ts": ts, "score": score }));
+    e.hold_score_history = serde_json::json!(history).to_string();
+}
+
+fn hold_score_for(
+    e: &pattern_events::Model,
+    bars: &[Bar],
+    dir: Dir,
+    tc: usize,
+    mfe_r: f64,
+    mae_r: f64,
+    held: usize,
+) -> f64 {
+    let volume_adj = match e.trigger_volume_ratio {
+        Some(v) if v >= outcome::VOL_CONFIRM_RATIO => 0.5,
+        Some(v) if v < 0.8 => -0.3,
+        _ => 0.0,
+    };
+    let chase_adj = match e.overshoot_r {
+        Some(v) if v >= 0.6 => 0.5,
+        Some(v) if v < 0.1 => -0.5,
+        _ => 0.0,
+    };
+    let time_adj = if held >= outcome::NO_FOLLOW_BAR && mfe_r < outcome::NO_FOLLOW_MFE_R {
+        -0.6
+    } else if held >= 3 && mfe_r <= 0.0 {
+        -0.3
+    } else {
+        0.0
+    };
+    let pnl_adj = if mfe_r >= 1.0 { 0.5 } else { 0.0 } + if mae_r <= -0.8 { -0.5 } else { 0.0 };
+    let score =
+        e.entry_score + trigger_k_adj(bars, dir, tc) + volume_adj + chase_adj + time_adj + pnl_adj;
+    score.clamp(0.0, 5.0)
+}
+
+fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], w: usize) -> bool {
+    let mut changed = false;
+    let dir = event_dir(e);
+    let risk = e.risk;
+    if risk <= 0.0 || e.entry <= 0.0 {
+        return false;
+    }
+
+    let crossed = |bar: &Bar| match dir {
+        Dir::Up => bar.high >= e.entry,
+        Dir::Down => bar.low <= e.entry,
+    };
+    let tc = if let Some(ts) = e.trigger_bar_ts.as_deref() {
+        bars.iter().position(|b| bar_ts(b) == ts)
+    } else {
+        bars.iter()
+            .enumerate()
+            .skip(w + 1)
+            .find(|(_, b)| crossed(b))
+            .map(|(i, _)| i)
+    };
+    let Some(tc) = tc else {
+        return false;
+    };
+
+    if e.trigger_bar_ts.is_none() {
+        e.trigger_bar_ts = Some(bar_ts(&bars[tc]));
+        if e.trigger_ts.is_none() {
+            e.trigger_ts = Some(bar_ts(&bars[tc]));
+        }
+        e.trigger_price = Some(e.entry);
+        changed = true;
+    }
+
+    if e.trigger_volume_ratio.is_none() {
+        e.trigger_volume_ratio = outcome::vol_ratio_at(bars, tc);
+        changed = true;
+    }
+    if e.overshoot_r.is_none() {
+        let overshoot = match dir {
+            Dir::Up => (bars[tc].high - e.entry) / risk,
+            Dir::Down => (e.entry - bars[tc].low) / risk,
+        };
+        e.overshoot_r = Some(overshoot.max(0.0));
+        changed = true;
+    }
+    if e.trigger_score.is_none() {
+        let volume_adj = match e.trigger_volume_ratio {
+            Some(v) if v >= outcome::VOL_CONFIRM_RATIO => 0.5,
+            Some(v) if v < 0.8 => -0.3,
+            _ => 0.0,
+        };
+        let chase_adj = match e.overshoot_r {
+            Some(v) if v >= 0.6 => 0.5,
+            Some(v) if v < 0.1 => -0.5,
+            _ => 0.0,
+        };
+        e.trigger_score = Some(
+            (e.entry_score + trigger_k_adj(bars, dir, tc) + volume_adj + chase_adj).clamp(0.0, 5.0),
+        );
+        changed = true;
+    }
+
+    let mut fill = e.trigger_price.unwrap_or(e.entry);
+    if tc > 0 && !bars[tc - 1].rollover {
+        let prev_close = bars[tc - 1].close;
+        let cur_open = bars[tc].open;
+        let gap = match dir {
+            Dir::Up => prev_close < e.entry && cur_open > e.entry,
+            Dir::Down => prev_close > e.entry && cur_open < e.entry,
+        };
+        if gap {
+            fill = cur_open;
+        }
+    }
+    if e.trigger_price != Some(fill) {
+        e.trigger_price = Some(fill);
+        changed = true;
+    }
+
+    let base_tp = match dir {
+        Dir::Up => fill + risk,
+        Dir::Down => fill - risk,
+    };
+    let mut mfe = e.mfe_r.unwrap_or(0.0);
+    let mut mae = e.mae_r.unwrap_or(0.0);
+    let mut trail_grade: Option<usize> = None;
+    let mut exit: Option<(String, f64, String, f64, usize)> = None;
+    let mut last_idx = tc;
+
+    for i in tc..bars.len() {
+        let bar = &bars[i];
+        if bar.rollover {
+            exit = Some((
+                "rollover".to_string(),
+                bar.open,
+                bar_ts(bar),
+                0.0,
+                i - tc + 1,
+            ));
+            last_idx = i;
+            break;
+        }
+        let held = i - tc + 1;
+        let mfe_contrib = match dir {
+            Dir::Up => (bar.high - fill) / risk,
+            Dir::Down => (fill - bar.low) / risk,
+        };
+        let mae_contrib = match dir {
+            Dir::Up => (bar.low - fill) / risk,
+            Dir::Down => (fill - bar.high) / risk,
+        };
+        mfe = mfe.max(mfe_contrib);
+        mae = mae.min(mae_contrib);
+
+        let stop_hit = match dir {
+            Dir::Up => bar.low <= e.stop,
+            Dir::Down => bar.high >= e.stop,
+        };
+        if stop_hit {
+            let stop_gap = i > 0
+                && !bars[i - 1].rollover
+                && match dir {
+                    Dir::Up => bars[i - 1].close > e.stop && bar.open < e.stop,
+                    Dir::Down => bars[i - 1].close < e.stop && bar.open > e.stop,
+                };
+            let exit_price = if stop_gap { bar.open } else { e.stop };
+            let r = match dir {
+                Dir::Up => (exit_price - fill) / risk,
+                Dir::Down => (fill - exit_price) / risk,
+            };
+            exit = Some(("stop".to_string(), exit_price, bar_ts(bar), r, held));
+            last_idx = i;
+            break;
+        }
+
+        let reached_tp1 = match dir {
+            Dir::Up => bar.high >= base_tp,
+            Dir::Down => bar.low <= base_tp,
+        };
+        if trail_grade.is_none() && reached_tp1 {
+            trail_grade = Some(1);
+        }
+        if let Some(mut grade) = trail_grade {
+            loop {
+                let next_grade = grade + 1;
+                let next_r = trail_r(next_grade);
+                let next_price = match dir {
+                    Dir::Up => fill + next_r * risk,
+                    Dir::Down => fill - next_r * risk,
+                };
+                let next_hit = match dir {
+                    Dir::Up => bar.high >= next_price,
+                    Dir::Down => bar.low <= next_price,
+                };
+                if !next_hit {
+                    break;
+                }
+                grade = next_grade;
+            }
+            trail_grade = Some(grade);
+            let trail_price = match dir {
+                Dir::Up => fill + trail_r(grade) * risk,
+                Dir::Down => fill - trail_r(grade) * risk,
+            };
+            let fell_back = match dir {
+                Dir::Up => bar.low <= trail_price,
+                Dir::Down => bar.high >= trail_price,
+            };
+            if fell_back {
+                let r = match dir {
+                    Dir::Up => (trail_price - fill) / risk,
+                    Dir::Down => (fill - trail_price) / risk,
+                };
+                exit = Some(("target".to_string(), trail_price, bar_ts(bar), r, held));
+                last_idx = i;
+                break;
+            }
+        }
+
+        if i == tc + outcome::NO_FOLLOW_BAR && mfe < outcome::NO_FOLLOW_MFE_R {
+            let r = match dir {
+                Dir::Up => (bar.close - fill) / risk,
+                Dir::Down => (fill - bar.close) / risk,
+            };
+            exit = Some(("no_follow".to_string(), bar.close, bar_ts(bar), r, held));
+            last_idx = i;
+            break;
+        }
+        if held >= outcome::TIME_HORIZON_BARS {
+            let r = match dir {
+                Dir::Up => (bar.close - fill) / risk,
+                Dir::Down => (fill - bar.close) / risk,
+            };
+            exit = Some(("time_exit".to_string(), bar.close, bar_ts(bar), r, held));
+            last_idx = i;
+            break;
+        }
+        last_idx = i;
+    }
+
+    let current_ts = bar_ts(&bars[last_idx]);
+    if let Some((reason, price, ts, r, held)) = exit {
+        let outcome_str = if reason == "rollover" {
+            "rollover"
+        } else if r > 0.0 {
+            "win"
+        } else {
+            "loss"
+        };
+        e.state = "closed".to_string();
+        e.outcome = Some(outcome_str.to_string());
+        e.exit_reason = Some(reason);
+        e.exit_ts = Some(ts.clone());
+        e.exit_price = Some(price);
+        e.r_multiple = if outcome_str == "rollover" {
+            None
+        } else {
+            Some(r)
+        };
+        e.mfe_r = Some(mfe);
+        e.mae_r = Some(mae);
+        e.last_advance_ts = Some(ts);
+        e.hold_score = Some(hold_score_for(e, bars, dir, tc, mfe, mae, held));
+        append_hold_history(e, &current_ts, e.hold_score.unwrap_or(0.0));
+        return true;
+    }
+
+    if e.mfe_r != Some(mfe) || e.mae_r != Some(mae) {
+        e.mfe_r = Some(mfe);
+        e.mae_r = Some(mae);
+        changed = true;
+    }
+    let held = last_idx - tc + 1;
+    let score = hold_score_for(e, bars, dir, tc, mfe, mae, held);
+    if e.hold_score != Some(score) {
+        e.hold_score = Some(score);
+        changed = true;
+    }
+    if e.last_advance_ts.as_deref() != Some(current_ts.as_str()) {
+        e.last_advance_ts = Some(current_ts.clone());
+        changed = true;
+    }
+    append_hold_history(e, &current_ts, score);
+    changed
+}
+
+fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
+    let Some(w) = bars.iter().position(|b| bar_ts(b) == e.warning_ts) else {
+        return false;
+    };
+    let mut changed = false;
+
+    if e.state == "pending" {
+        let scan_end = (w + 1 + outcome::PENDING_BARS).min(bars.len());
+        let mut triggered = false;
+        for j in w + 1..scan_end {
+            if bars[j].rollover {
+                e.state = "expired".to_string();
+                e.outcome = Some("rollover".to_string());
+                e.exit_reason = Some("rollover".to_string());
+                e.exit_ts = Some(bar_ts(&bars[j]));
+                e.last_advance_ts = Some(bar_ts(&bars[j]));
+                changed = true;
+                break;
+            }
+            let hit = match event_dir(e) {
+                Dir::Up => bars[j].high >= e.entry,
+                Dir::Down => bars[j].low <= e.entry,
+            };
+            if hit {
+                e.state = "triggered".to_string();
+                triggered = true;
+                changed = true;
+                break;
+            }
+            let stop_hit = match event_dir(e) {
+                Dir::Up => bars[j].low <= e.stop,
+                Dir::Down => bars[j].high >= e.stop,
+            };
+            if stop_hit {
+                e.state = "expired".to_string();
+                e.outcome = Some("no_trigger".to_string());
+                e.exit_reason = Some("no_trigger".to_string());
+                e.exit_ts = Some(bar_ts(&bars[j]));
+                e.last_advance_ts = Some(bar_ts(&bars[j]));
+                changed = true;
+                break;
+            }
+        }
+        if !changed && bars.len() > w + outcome::PENDING_BARS {
+            e.state = "expired".to_string();
+            e.outcome = Some("no_trigger".to_string());
+            e.exit_reason = Some("no_trigger".to_string());
+            e.last_advance_ts = Some(bar_ts(bars.last().expect("bars 非空")));
+            changed = true;
+        }
+        if triggered && e.state == "triggered" {
+            changed = advance_triggered(e, bars, w) || changed;
+        }
+    } else if e.state == "triggered" && advance_triggered(e, bars, w) {
+        changed = true;
+    }
+
+    if changed {
+        e.updated_at = now_ts();
+    }
+    changed
 }
 
 /// 单个品种的行情快照（最新价 + 相对上一交易日的涨跌幅）。
@@ -389,7 +926,7 @@ pub struct KlineDto {
 /// 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EntryTriggerHit {
-    pub signal_id: i64,
+    pub event_id: i64,
     pub symbol: String,
     pub name: String,
     pub direction: String,
@@ -411,6 +948,10 @@ pub struct Services {
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
+    /// 月合约 5m K 线缓存：同一品种换月确认短时间不重复抓取
+    month_kline_cache: RwLock<HashMap<String, (Instant, usize, Vec<Kline>)>>,
+    /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
+    scan_lock: Mutex<()>,
 }
 
 impl Services {
@@ -437,6 +978,8 @@ impl Services {
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
             deep_backfilled: RwLock::new(HashSet::new()),
+            month_kline_cache: RwLock::new(HashMap::new()),
+            scan_lock: Mutex::new(()),
         })
     }
 
@@ -473,7 +1016,8 @@ impl Services {
         if !cfg.notify.in_app_entry_trigger && !cfg.notify.system_entry_trigger {
             return Ok(Vec::new());
         }
-        let rows = repo::latest_signals(&self.db, 500).await?;
+        let min_score = cfg.notify.new_pattern_min_score;
+        let rows = repo::all_pattern_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
         let name_by_code: HashMap<String, String> = symbols
             .iter()
@@ -486,7 +1030,7 @@ impl Services {
         let mut notified = self.entry_notified.write().await;
         let mut hits = Vec::new();
         for row in rows {
-            if !is_pending_entry_signal(&row) {
+            if row.state != "pending" || row.trigger_ts.is_some() || row.entry_score < min_score {
                 continue;
             }
             let Some(latest) = by_code.get(row.symbol.as_str()).copied() else {
@@ -507,8 +1051,17 @@ impl Services {
                 row.entry.to_bits(),
             );
             if notified.insert(key) {
+                let now = now_ts();
+                let mut next = row.clone();
+                next.state = "triggered".to_string();
+                next.trigger_ts = Some(now.clone());
+                next.trigger_price = Some(row.entry);
+                next.updated_at = now;
+                if let Err(e) = repo::update_pattern_event(&self.db, next).await {
+                    tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
+                }
                 hits.push(EntryTriggerHit {
-                    signal_id: row.id,
+                    event_id: row.id,
                     symbol: row.symbol,
                     name,
                     direction: row.direction,
@@ -843,26 +1396,63 @@ impl Services {
         }
         repo::delete_derived_klines(&self.db, symbol).await?;
         repo::upsert_klines(&self.db, models).await?;
-        self.sync_rollovers(symbol, &bars).await?;
         Ok(())
     }
 
-    /// 轻量换月识别：只在连续 5m 上找候选断点，对少量月合约拉数据做价格确认。
-    /// 网络失败时保留已有记录，不阻塞行情派生。
-    async fn sync_rollovers(&self, symbol: &str, bars: &[Kline]) -> Result<()> {
-        let candidates = rollover::detect_candidates(symbol, bars);
+    /// 低频换月扫描入口：只处理有新增断点或仍待确认的品种，
+    /// 首次会按本地连续 5m 全量回扫，之后按进度增量扫描。
+    pub async fn sync_rollovers_if_needed(&self) -> Result<()> {
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let codes: Vec<String> = symbols.into_iter().map(|s| s.code).collect();
+        self.sync_rollovers_for_symbols(&codes).await
+    }
+
+    /// 只扫描指定品种（测试/运维用）。
+    pub async fn sync_rollovers_for_symbols(&self, symbols: &[String]) -> Result<()> {
+        for code in symbols {
+            if let Err(e) = self.sync_symbol_rollovers_if_needed(code).await {
+                tracing::warn!("{} 换月扫描失败: {e}", code);
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_symbol_rollovers_if_needed(&self, symbol: &str) -> Result<()> {
+        let raw = repo::raw_klines(&self.db, symbol).await?;
+        if raw.len() < 3 {
+            return Ok(());
+        }
+        let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
+        let candidates = rollover::detect_candidates(symbol, &bars);
         if candidates.is_empty() {
             return Ok(());
         }
+
         let existing = repo::symbol_rollovers(&self.db, symbol).await?;
         let confirmed_ts: HashSet<String> = existing
             .iter()
             .filter(|r| r.confirmed)
             .map(|r| r.ts.clone())
             .collect();
+        let pending_ts: HashSet<String> = existing
+            .iter()
+            .filter(|r| !r.confirmed)
+            .map(|r| r.ts.clone())
+            .collect();
+        let mut confirmed_pairs: HashSet<(String, String)> = existing
+            .iter()
+            .filter(|r| r.confirmed && !r.from_contract.is_empty() && !r.to_contract.is_empty())
+            .map(|r| (r.from_contract.clone(), r.to_contract.clone()))
+            .collect();
+        let progress_key = format!("{ROLLOVER_SCAN_SETTING_PREFIX}{symbol}");
+        let progress = repo::get_setting(&self.db, &progress_key).await?;
         let pending: Vec<rollover::RolloverCandidate> = candidates
             .into_iter()
             .filter(|c| !confirmed_ts.contains(&c.ts))
+            .filter(|c| {
+                pending_ts.contains(&c.ts)
+                    || progress.as_deref().map_or(true, |p| c.ts.as_str() > p)
+            })
             .collect();
         if pending.is_empty() {
             return Ok(());
@@ -883,10 +1473,6 @@ impl Services {
             .collect();
         month_codes.sort();
         month_codes.dedup();
-        if month_codes.is_empty() {
-            tracing::warn!("{symbol} 换月确认跳过（未找到月合约）");
-            return Ok(());
-        }
 
         // 一次按最早断点估足抓取深度，避免对同一合约重复请求。
         let count = pending
@@ -897,9 +1483,7 @@ impl Services {
             .max(300);
         let mut month_bars: HashMap<String, Vec<Kline>> = HashMap::new();
         for code in &month_codes {
-            match crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count)
-                .await
-            {
+            match self.month_kline_cached(code, count).await {
                 Ok(rows) => {
                     month_bars.insert(code.clone(), rows);
                 }
@@ -911,9 +1495,15 @@ impl Services {
 
         let now = crate::analyze::time::now_display();
         let mut rows = Vec::new();
+        let mut stale: Vec<(String, String)> = Vec::new();
         for c in &pending {
             match rollover::confirm_candidate(c, &month_bars) {
-                Ok(Some((from, to))) => {
+                Ok(rollover::ConfirmResult::Confirmed(from, to)) => {
+                    if confirmed_pairs.contains(&(from.clone(), to.clone())) {
+                        tracing::debug!("{symbol} 已记录过 {from} -> {to}，忽略重复点 @ {}", c.ts);
+                        continue;
+                    }
+                    confirmed_pairs.insert((from.clone(), to.clone()));
                     tracing::info!("{symbol} 识别换月 {from} -> {to} @ {}", c.ts);
                     rows.push(rollover_row(
                         symbol,
@@ -924,9 +1514,22 @@ impl Services {
                         &now,
                     ));
                 }
-                Ok(None) => {
-                    tracing::debug!("{symbol} 候选断点 {} 未获月合约确认，落库为待确认", c.ts);
-                    rows.push(rollover_row(symbol, &c.ts, None, None, false, &now));
+                Ok(rollover::ConfirmResult::NotRollover) => {
+                    tracing::debug!("{symbol} 候选断点 {} 判定为普通断点", c.ts);
+                    if pending_ts.contains(&c.ts) {
+                        stale.push((symbol.to_string(), c.ts.clone()));
+                    }
+                }
+                Ok(rollover::ConfirmResult::InsufficientData) => {
+                    if candidate_within_retention(&c.ts) {
+                        tracing::debug!("{symbol} 候选断点 {} 月合约数据不足，保留待确认", c.ts);
+                        rows.push(rollover_row(symbol, &c.ts, None, None, false, &now));
+                    } else {
+                        tracing::debug!("{symbol} 候选断点 {} 数据不足且已超期，不再保留", c.ts);
+                        if pending_ts.contains(&c.ts) {
+                            stale.push((symbol.to_string(), c.ts.clone()));
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("{symbol} 候选断点 {} 确认失败: {e}", c.ts);
@@ -934,8 +1537,40 @@ impl Services {
                 }
             }
         }
+        for (sym, ts) in stale {
+            repo::delete_symbol_rollover(&self.db, &sym, &ts).await?;
+        }
         repo::upsert_rollovers(&self.db, rows).await?;
+
+        let latest = pending.iter().map(|c| c.ts.as_str()).max().unwrap_or("");
+        if !latest.is_empty() {
+            let mut map = HashMap::new();
+            map.insert(progress_key, latest.to_string());
+            repo::set_settings(&self.db, &map).await?;
+        }
         Ok(())
+    }
+
+    async fn month_kline_cached(&self, code: &str, count: usize) -> Result<Vec<Kline>> {
+        let fresh = {
+            let guard = self.month_kline_cache.read().await;
+            guard
+                .get(code)
+                .filter(|(at, cached_count, _)| {
+                    at.elapsed() < MONTH_KLINE_CACHE_TTL && *cached_count >= count
+                })
+                .map(|(_, _, rows)| rows.clone())
+        };
+        if let Some(rows) = fresh {
+            return Ok(rows);
+        }
+        let rows =
+            crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count).await?;
+        self.month_kline_cache
+            .write()
+            .await
+            .insert(code.to_string(), (Instant::now(), count, rows.clone()));
+        Ok(rows)
     }
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
@@ -1062,202 +1697,192 @@ impl Services {
             .collect())
     }
 
-    /// 全品种扫描：15m 结构 + 60m 趋势 → 信号持久化。
+    /// 全品种扫描：15m 前向重放识别预警，插入 pattern_events 并推进在途事件。
     pub async fn run_scan(&self) -> Result<ScanResult> {
-        let started = crate::analyze::time::now_display();
-        let logic_version = self.config().await.app_config.logic_version;
+        let _scan_guard = self.scan_lock.lock().await;
+        let started = now_ts();
+        self.sync_rollovers_if_needed().await?;
+        let cfg = self.config().await;
+        let min_score = cfg.notify.new_pattern_min_score;
         let symbols = repo::list_symbols(&self.db, true).await?;
-        let mut active: Vec<SignalOutcome> = Vec::new();
         let mut failed: Vec<SymbolFailure> = Vec::new();
+        let mut new_warnings: Vec<pattern_events::Model> = Vec::new();
+        let mut newly_triggered: Vec<pattern_events::Model> = Vec::new();
+        let mut signals: Vec<pattern_events::Model> = Vec::new();
         let mut scanned = 0i64;
 
         for sym in symbols {
             let bars15 = self.bars_for(&sym.code, "15m").await?;
-            let bars60 = self.bars_for(&sym.code, "60m").await?;
-            if bars15.len() < ATR_PERIOD + 2 || bars60.len() < ATR_PERIOD + 2 {
+            if bars15.len() < ATR_PERIOD + 2 {
                 failed.push(SymbolFailure {
                     symbol: sym.code,
                     reason: "K线数据不足".to_string(),
                 });
                 continue;
             }
+            scanned += 1;
             let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
-            match crate::analyze::analyze_bars_for_version(
-                &sym.code,
-                &bars15,
-                &bars60,
-                tick,
-                &logic_version,
-            ) {
-                Ok(outcome) => {
-                    scanned += 1;
-                    active.extend(crate::analyze::collect_active(&outcome));
+            let candidates = event::replay_warnings(&sym.code, &bars15, tick);
+            let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            for c in candidates {
+                let direction = if c.direction == Dir::Up { "up" } else { "down" };
+                let warning_ts = bar_ts(&bars15[c.warning_index]);
+                if repo::pattern_event_by_warning(&self.db, &sym.code, direction, &warning_ts)
+                    .await?
+                    .is_some()
+                    || has_similar_warning(&bars15, &c, &events)?
+                {
+                    continue;
                 }
-                Err(e) => failed.push(SymbolFailure {
-                    symbol: sym.code,
-                    reason: e.to_string(),
-                }),
+                let model = insert_warning_event(&self.db, &sym.code, &bars15, &c).await?;
+                events.push(model.clone());
+                new_warnings.push(model);
+            }
+
+            let events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            for mut e in events {
+                let was_triggered = e.trigger_ts.is_some();
+                let changed = advance_event_model(&mut e, &bars15);
+                if changed {
+                    repo::update_pattern_event(&self.db, e.clone()).await?;
+                }
+                if !was_triggered && e.trigger_ts.is_some() {
+                    newly_triggered.push(e.clone());
+                }
+                signals.push(e);
             }
         }
 
-        let finished = crate::analyze::time::now_display();
-        let active_count = active.len() as i64;
-        let status = if scanned > 0 { "ok" } else { "no_data" };
-        let summary = build_scan_summary(&started, &finished, scanned, active_count, &failed);
+        self.cleanup_duplicate_events().await?;
+        signals = repo::all_pattern_events(&self.db).await?;
 
-        let scan_id = repo::insert_scan(
-            &self.db,
-            started,
-            finished,
-            status.to_string(),
+        let finished = now_ts();
+        let active_count = signals
+            .iter()
+            .filter(|e| matches!(e.state.as_str(), "pending" | "triggered"))
+            .count() as i64;
+        let summary = build_scan_summary(
+            &started,
+            &finished,
             scanned,
             active_count,
-            summary.clone(),
-        )
-        .await?;
-
-        let now = crate::analyze::time::now_display();
-        let rows: Vec<signals::ActiveModel> = active
-            .iter()
-            .map(|o| {
-                let s = &o.signal;
-                signals::ActiveModel {
-                    id: sea_orm::NotSet,
-                    scan_id: Set(scan_id),
-                    symbol: Set(o.symbol.clone()),
-                    level: Set(s.level.clone()),
-                    direction: Set(s.direction.clone()),
-                    grade: Set(s.grade.clone()),
-                    state: Set(s.state.clone()),
-                    category: Set(s.category.clone()),
-                    entry: Set(s.entry),
-                    stop: Set(s.stop),
-                    target: Set(s.target),
-                    rr: Set(s.rr),
-                    score: Set(s.score),
-                    note: Set(s.note.clone()),
-                    detail: Set(serde_json::to_string(s).unwrap_or_default()),
-                    created_at: Set(now.clone()),
-                }
-            })
-            .collect();
-        repo::upsert_signals(&self.db, rows).await?;
-
-        // 扫描后顺手刷新信号结局：新增信号第一次回填，在途信号按最新K线更新
-        if let Err(e) = self.refresh_outcomes().await {
-            tracing::warn!("信号结局回填失败: {e}");
-        }
-
+            min_score,
+            &signals,
+            &failed,
+        );
         Ok(ScanResult {
-            scan_id,
             scanned,
             active_count,
             summary,
-            signals: active,
+            signals,
+            new_warnings,
+            newly_triggered,
             failed,
         })
     }
 
-    /// 结局回填：对尚无终局（或 open / 数据不足）的信号重新模拟并落库。
-    pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
-        let sigs = repo::all_signals(&self.db).await?;
-        let outs = repo::all_outcomes(&self.db).await?;
-        // 跳过已终结且之后没有换月记录更新的信号；旧版本、未终结或换月更新过的信号重算
-        let rollovers = repo::all_rollovers(&self.db).await?;
-        let mut latest_rollover_updated: HashMap<String, String> = HashMap::new();
-        for r in rollovers {
-            let symbol = r.symbol.clone();
-            match latest_rollover_updated.get_mut(&symbol) {
-                Some(cur) if *cur < r.updated_at => *cur = r.updated_at.clone(),
-                Some(_) => {}
-                None => {
-                    latest_rollover_updated.insert(symbol, r.updated_at);
-                }
+    /// 清理历史遗留的重复事件：与复盘统计去重同口径，族内只保留首见一条，
+    /// 其余物理删除，保证K线右侧与复盘明细不会再出现被去重信号。
+    async fn cleanup_duplicate_events(&self) -> Result<usize> {
+        let events = repo::all_pattern_events(&self.db).await?;
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut symbols_with_events: Vec<&str> = Vec::new();
+        for e in &events {
+            if !symbols_with_events.contains(&e.symbol.as_str()) {
+                symbols_with_events.push(e.symbol.as_str());
             }
         }
-        let by_id: HashMap<i64, &signal_outcomes::Model> =
-            outs.iter().map(|o| (o.signal_id, o)).collect();
-        let need: Vec<signals::Model> = sigs
-            .into_iter()
-            .filter(|s| {
-                needs_outcome_refresh(
-                    by_id.get(&s.id).copied(),
-                    latest_rollover_updated.get(&s.symbol).map(String::as_str),
-                )
-            })
-            .collect();
-        if need.is_empty() {
-            return Ok(OutcomeRefresh { updated: 0 });
+        let mut warning_bar_index: outcome::WarningBarIndex = HashMap::new();
+        for symbol in symbols_with_events {
+            let bars = self.bars_for(symbol, "15m").await?;
+            for (idx, bar) in bars.iter().enumerate() {
+                warning_bar_index.insert((symbol.to_string(), bar_ts(bar)), idx);
+            }
         }
+        let ids = duplicate_event_ids(&events, &warning_bar_index);
+        let mut deleted = 0usize;
+        for id in ids {
+            repo::delete_pattern_event(&self.db, id).await?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
 
-        let mut by_symbol: HashMap<String, Vec<signals::Model>> = HashMap::new();
-        for s in need {
-            by_symbol.entry(s.symbol.clone()).or_default().push(s);
-        }
-        let mut annotations: Vec<(i64, outcome::SignalAnnotation)> = Vec::new();
-        for (symbol, list) in by_symbol {
-            let bars15 = self.bars_for(&symbol, "15m").await?;
-            let bars60 = self.bars_for(&symbol, "60m").await?;
-            if bars15.len() < 3 {
+    /// 清空旧事件后按当前全部 15m K 线重建：前向识别预警并插入，
+    /// 再把每个事件推进到现在的真实状态（触发/失效/已了结）。
+    pub async fn rebuild_events(&self) -> Result<usize> {
+        let _scan_guard = self.scan_lock.lock().await;
+        repo::clear_pattern_events(&self.db).await?;
+        self.entry_notified.write().await.clear();
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let mut inserted = 0usize;
+        for sym in symbols {
+            let bars15 = self.bars_for(&sym.code, "15m").await?;
+            if bars15.len() < ATR_PERIOD + 2 {
                 continue;
             }
-            for s in list {
-                if let Some(input) = signal_input_from(&s) {
-                    if let Some(ann) = outcome::annotate(&input, &bars15, &bars60) {
-                        annotations.push((s.id, ann));
-                    }
+            let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
+            let candidates = event::replay_warnings(&sym.code, &bars15, tick);
+            let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            for c in candidates {
+                let direction = if c.direction == Dir::Up { "up" } else { "down" };
+                let warning_ts = bar_ts(&bars15[c.warning_index]);
+                if repo::pattern_event_by_warning(&self.db, &sym.code, direction, &warning_ts)
+                    .await?
+                    .is_some()
+                    || has_similar_warning(&bars15, &c, &events)?
+                {
+                    continue;
+                }
+                let model = insert_warning_event(&self.db, &sym.code, &bars15, &c).await?;
+                events.push(model);
+                inserted += 1;
+            }
+
+            let events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            for mut e in events {
+                if advance_event_model(&mut e, &bars15) {
+                    repo::update_pattern_event(&self.db, e).await?;
                 }
             }
         }
+        self.cleanup_duplicate_events().await?;
+        Ok(inserted)
+    }
 
-        let now = crate::analyze::time::now_display();
-        let rows: Vec<signal_outcomes::ActiveModel> = annotations
-            .into_iter()
-            .map(|(id, ann)| signal_outcomes::ActiveModel {
-                signal_id: Set(id),
-                sim_version: Set(ann.sim_version),
-                outcome: Set(ann.outcome.as_str().to_string()),
-                exit_reason: Set(ann.exit_reason.as_str().to_string()),
-                entry_ts: Set(ann.entry_ts),
-                exit_ts: Set(ann.exit_ts),
-                exit_price: Set(ann.exit_price),
-                r_multiple: Set(ann.r_multiple),
-                mfe_r: Set(ann.mfe_r),
-                mae_r: Set(ann.mae_r),
-                bars_held: Set(ann.bars_held.map(|b| b as i64)),
-                vol_ratio: Set(ann.vol_ratio),
-                oi_increase: Set(ann.oi_increase),
-                trend60_score: Set(ann.trend60_score),
-                atr_percentile: Set(ann.atr_percentile),
-                target_tier: Set(ann.target_tier),
-                b_vol_ratio: Set(ann.b_vol_ratio),
-                a_move_atr: Set(ann.a_move_atr),
-                trigger_lag_bars: Set(ann.trigger_lag_bars.map(|b| b as i64)),
-                trigger_overshoot_r: Set(ann.trigger_overshoot_r),
-                rollover_crossed: Set(Some(ann.rollover_crossed)),
-                gap_crossed_entry: Set(Some(ann.gap_crossed_entry)),
-                gap_crossed_exit: Set(Some(ann.gap_crossed_exit)),
-                updated_at: Set(now.clone()),
-                ..Default::default()
-            })
-            .collect();
-        let updated = rows.len();
-        repo::upsert_outcomes(&self.db, rows).await?;
+    /// 复盘页“刷新”：只推进在途事件，不重新识别新预警。
+    pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
+        let _scan_guard = self.scan_lock.lock().await;
+        let events = repo::all_pattern_events(&self.db).await?;
+        let mut by_symbol: HashMap<String, Vec<pattern_events::Model>> = HashMap::new();
+        for e in events {
+            if matches!(e.state.as_str(), "pending" | "triggered") {
+                by_symbol.entry(e.symbol.clone()).or_default().push(e);
+            }
+        }
+        let mut updated = 0usize;
+        for (symbol, list) in by_symbol {
+            let bars15 = self.bars_for(&symbol, "15m").await?;
+            for mut e in list {
+                if advance_event_model(&mut e, &bars15) {
+                    repo::update_pattern_event(&self.db, e).await?;
+                    updated += 1;
+                }
+            }
+        }
         Ok(OutcomeRefresh { updated })
     }
 
-    /// 复盘统计：先按结构键去重（取首条），再按维度分组汇总；
-    /// scope 控制统计口径（all/tradable/standard）。
+    /// 复盘统计：直接汇总 pattern_events，不再回放补标。
     pub async fn review_stats(
         &self,
         dimension: &str,
         scope: &str,
         version: Option<&str>,
     ) -> Result<outcome::ReviewStats> {
-        let sigs = repo::all_signals(&self.db).await?;
-        let outs = repo::all_outcomes(&self.db).await?;
-        let by_id: HashMap<i64, signal_outcomes::Model> =
-            outs.into_iter().map(|o| (o.signal_id, o)).collect();
+        let events = repo::all_pattern_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
         let tick_by_symbol: HashMap<String, f64> = symbols
             .iter()
@@ -1268,42 +1893,43 @@ impl Services {
                 )
             })
             .collect();
-        let rows: Vec<outcome::StatRow> = sigs
+        let rows: Vec<outcome::StatRow> = events
             .iter()
-            .filter_map(|s| {
+            .filter_map(|e| {
                 if let Some(v) = version {
-                    let detail_version = serde_json::from_str::<serde_json::Value>(&s.detail)
-                        .ok()
-                        .and_then(|x| {
-                            x.get("logic_version")
-                                .and_then(|y| y.as_str())
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "1".to_string());
-                    if detail_version != v {
+                    if EVENT_LOGIC_VERSION != v {
                         return None;
                     }
                 }
-                stat_row_from(s, by_id.get(&s.id), tick_by_symbol.get(&s.symbol).copied())
+                stat_row_from(e, tick_by_symbol.get(&e.symbol).copied())
             })
             .collect();
-        Ok(outcome::aggregate_stats_scoped(
+        let symbols_with_events: HashSet<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
+        let mut warning_bar_index: outcome::WarningBarIndex = HashMap::new();
+        for sym in symbols
+            .iter()
+            .filter(|s| symbols_with_events.contains(s.code.as_str()))
+        {
+            let bars = self.bars_for(&sym.code, "15m").await?;
+            for (idx, bar) in bars.iter().enumerate() {
+                warning_bar_index.insert((sym.code.clone(), bar_ts(bar)), idx);
+            }
+        }
+        Ok(outcome::aggregate_stats_scoped_with_bar_index(
             &rows,
             outcome::GroupBy::parse(dimension),
             outcome::StatsScope::parse(scope),
+            &warning_bar_index,
         ))
     }
 
-    /// 最近信号明细（复盘页明细表）：已回填结局的信号，按 signal_id 倒序。
+    /// 最近信号明细（复盘页明细表）：真实事件，按 event_id 倒序。
     pub async fn recent_outcomes(
         &self,
         limit: usize,
         filter: &OutcomeFilter,
     ) -> Result<Vec<OutcomeDetail>> {
-        let sigs = repo::all_signals(&self.db).await?;
-        let outs = repo::all_outcomes(&self.db).await?;
-        let by_id: HashMap<i64, signal_outcomes::Model> =
-            outs.into_iter().map(|o| (o.signal_id, o)).collect();
+        let events = repo::all_pattern_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
         let tick_by_symbol: HashMap<String, f64> = symbols
             .iter()
@@ -1314,66 +1940,24 @@ impl Services {
                 )
             })
             .collect();
-        // 与统计口径一致：同一结构（品种+方向+级别+s1/s2 时间）只保留首次识别的快照
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut rows: Vec<OutcomeDetail> = Vec::new();
-        for s in &sigs {
-            let Some(o) = by_id.get(&s.id) else {
-                continue;
-            };
-            let p = parse_detail(&s.detail);
-            let version = p
-                .as_ref()
-                .map(|x| x.logic_version.clone())
-                .unwrap_or_else(|| "1".to_string());
-            let key = if s.level == "box" {
-                if let Some(b) = p.as_ref().and_then(|x| x.r#box.as_ref()) {
-                    let w = p
-                        .as_ref()
-                        .and_then(|x| x.warning_ts.clone())
-                        .unwrap_or_default();
-                    format!("{}|{}|box|{}|{}|{}", s.symbol, version, b.upper, b.lower, w)
-                } else {
-                    format!("{}|{}|box|id{}", s.symbol, version, s.id)
-                }
-            } else {
-                let (_, s1_ts, s2_ts) = parse_detail_ts(&s.detail);
-                match (&s1_ts, &s2_ts) {
-                    (Some(a), Some(b)) => format!(
-                        "{}|{}|{}|{}|{}|{}",
-                        s.symbol, version, s.direction, s.level, a, b
-                    ),
-                    // 旧数据缺少结构时间戳时退回信号自身，不做合并
-                    _ => format!(
-                        "{}|{}|{}|{}|id{}",
-                        s.symbol, version, s.direction, s.level, s.id
-                    ),
-                }
-            };
-            if !seen.insert(key) {
-                continue;
-            }
-            if !matches_outcome_filter(s, o, filter) {
-                continue;
-            }
-            rows.push(outcome_detail_from(
-                s,
-                o,
-                tick_by_symbol.get(&s.symbol).copied(),
-            ));
-        }
-        rows.sort_by(|a, b| b.signal_id.cmp(&a.signal_id));
+        let mut rows: Vec<OutcomeDetail> = events
+            .iter()
+            .filter(|e| matches_outcome_filter(e, filter))
+            .filter_map(|e| {
+                Some(outcome_detail_from(
+                    e,
+                    tick_by_symbol.get(&e.symbol).copied(),
+                ))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.event_id.cmp(&a.event_id));
         rows.truncate(limit);
         Ok(rows)
     }
 
-    /// 复盘跳转K线图：按 signal_id 返回完整形态 + 结局。
-    pub async fn review_signal(&self, signal_id: i64) -> Result<Option<ReviewSignalDetail>> {
-        let Some(row) = repo::signal_by_id(&self.db, signal_id).await? else {
-            return Ok(None);
-        };
-        let Ok(pattern) = serde_json::from_str::<crate::analyze::dto::PatternDto>(&row.detail)
-        else {
+    /// 复盘跳转K线图：按 event_id 返回完整事件 + 真实结局。
+    pub async fn review_signal(&self, event_id: i64) -> Result<Option<ReviewSignalDetail>> {
+        let Some(row) = repo::pattern_event_by_id(&self.db, event_id).await? else {
             return Ok(None);
         };
         let symbols = repo::list_symbols(&self.db, false).await?;
@@ -1381,11 +1965,11 @@ impl Services {
             (sym.code == row.symbol)
                 .then(|| crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety))
         });
-        let outcome = match repo::outcome_by_signal(&self.db, signal_id).await? {
-            Some(o) => Some(outcome_detail_from(&row, &o, tick)),
-            None => None,
-        };
-        Ok(Some(ReviewSignalDetail { pattern, outcome }))
+        let outcome = Some(outcome_detail_from(&row, tick));
+        Ok(Some(ReviewSignalDetail {
+            event: row,
+            outcome,
+        }))
     }
 }
 
@@ -1394,24 +1978,108 @@ fn build_scan_summary(
     finished: &str,
     scanned: i64,
     active_count: i64,
+    min_score: f64,
+    signals: &[pattern_events::Model],
     failed: &[SymbolFailure],
 ) -> String {
+    let qualifying_count = signals
+        .iter()
+        .filter(|e| e.entry_score >= min_score)
+        .count();
+    let pending = signals
+        .iter()
+        .filter(|e| e.state == "pending")
+        .collect::<Vec<_>>();
+    let triggered = signals
+        .iter()
+        .filter(|e| e.state != "pending")
+        .collect::<Vec<_>>();
     let mut out = String::new();
     out.push_str("=== 综合结论 ===\n");
     out.push_str(&format!("扫描时间: {started}\n"));
     out.push_str(&format!("完成时间: {finished}\n"));
     out.push_str(&format!(
-        "共扫描 {scanned} 个品种，{active_count} 个品种有关注信号\n"
+        "共扫描 {scanned} 个品种，{active_count} 条关注信号，其中 {qualifying_count} 条达到通知评分阈值（{min_score} 分）\n",
+        qualifying_count = qualifying_count,
+        min_score = min_score
     ));
+    if !pending.is_empty() {
+        out.push_str("\n=== 预警信号（等待触发）===\n");
+        for (i, e) in pending.iter().enumerate() {
+            out.push_str(&format_scan_signal(i + 1, e, min_score));
+        }
+    }
+    if !triggered.is_empty() {
+        out.push_str("\n=== 已触发信号 ===\n");
+        for (i, e) in triggered.iter().enumerate() {
+            out.push_str(&format_scan_signal(pending.len() + i + 1, e, min_score));
+        }
+    }
     if !failed.is_empty() {
         let list = failed
             .iter()
             .map(|f| format!("{}: {}", f.symbol, f.reason))
             .collect::<Vec<_>>()
-            .join("；");
+            .join("; ");
         out.push_str(&format!("以下品种分析失败: {list}\n"));
     }
     out
+}
+
+fn format_scan_signal(index: usize, e: &pattern_events::Model, min_score: f64) -> String {
+    let dir = if e.direction == "up" {
+        "做多"
+    } else {
+        "做空"
+    };
+    let level = match e.level.as_str() {
+        "fine" => "精细",
+        "large" => "较大",
+        "box" => "箱体",
+        other => other,
+    };
+    let pattern = if e.level == "box" {
+        level.to_string()
+    } else {
+        format!("{level}N")
+    };
+    let threshold_flag = if e.entry_score >= min_score {
+        "达标"
+    } else {
+        "未达阈值"
+    };
+    let state = match e.state.as_str() {
+        "pending" => "等待触发",
+        "triggered" => "已触发",
+        "expired" => "已失效",
+        "closed" => "已平仓",
+        other => other,
+    };
+    let warning_kind = match e.warning_kind.as_str() {
+        "strong" => "强反转",
+        // 历史落盘记录兼容：旧 engulf 与合并后的 strong 显示同一标签。
+        "engulf" => "强反转",
+        "wick" => "长影线",
+        "fast" => "快速反转",
+        "cumulative" => "累积反转",
+        other => other,
+    };
+    format!(
+        "{index}. {symbol} {dir} {pattern} | {grade} | {state} | 形态: {warning_kind} | 评分 {score:.2} | {threshold_flag}\n   入场: {entry:.1} | 止损: {stop:.1} | 目标: {target:.1} | R/R: {rr:.2}\n",
+        index = index,
+        symbol = e.symbol,
+        dir = dir,
+        pattern = pattern,
+        grade = e.grade,
+        state = state,
+        warning_kind = warning_kind,
+        score = e.entry_score,
+        entry = e.entry,
+        stop = e.stop,
+        target = e.target,
+        rr = e.rr,
+        threshold_flag = threshold_flag,
+    )
 }
 
 fn apply_limit(rows: Vec<klines::Model>, limit: Option<usize>) -> Vec<klines::Model> {
@@ -1479,23 +2147,6 @@ fn ts_gap_minutes(later: &str, earlier: &str) -> Option<i64> {
     Some((a - b).num_minutes())
 }
 
-/// 信号是否处于关注中（未过期/未失效），入场价提醒只针对这些信号。
-fn is_active_signal_state(state: &str) -> bool {
-    matches!(state, "即将触发" | "当前已触发" | "已触发，接近时效边界")
-}
-
-/// 入场价提醒只针对尚未触发的形态；detail 已带 trigger_ts 说明之前已经命中过，
-/// 即使最新价仍满足方向条件也不再通知，避免旧信号在重启/后续轮询里再次弹出。
-fn is_pending_entry_signal(row: &signals::Model) -> bool {
-    if !is_active_signal_state(&row.state) {
-        return false;
-    }
-    match parse_detail(&row.detail) {
-        Some(p) => p.trigger_ts.is_none(),
-        None => row.state == "即将触发",
-    }
-}
-
 pub fn model_to_fetch(m: &klines::Model) -> Kline {
     Kline {
         datetime: m.ts.clone(),
@@ -1542,6 +2193,17 @@ fn model_to_bar(m: &klines::Model) -> Option<Bar> {
     })
 }
 
+fn ts_diff_bars(later: &str, earlier: &str) -> Option<usize> {
+    ts_gap_minutes(later, earlier).map(|m| (m / 15).max(0) as usize)
+}
+
+/// 两条时间在同一 15m K线序列里的序号差；任一K线不在序列内时返回 None。
+fn bar_gap(bars: &[Bar], later: &str, earlier: &str) -> Option<usize> {
+    let li = bars.iter().position(|b| bar_ts(b) == later)?;
+    let ei = bars.iter().position(|b| bar_ts(b) == earlier)?;
+    Some(li.abs_diff(ei))
+}
+
 fn fetch_to_bar(k: &Kline) -> Option<Bar> {
     let dt = parse_dt(&k.datetime)?;
     Some(Bar {
@@ -1575,6 +2237,15 @@ fn bars_needed_for(ts: &str) -> usize {
     let now = chrono::Local::now().naive_local();
     let mins = (now - dt).num_minutes().max(0);
     ((mins / 5) as usize).max(300)
+}
+
+fn candidate_within_retention(ts: &str) -> bool {
+    let fmt = "%Y-%m-%d %H:%M:%S";
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, fmt) else {
+        return false;
+    };
+    let now = chrono::Local::now().naive_local();
+    (now - dt).num_days() <= ROLLOVER_PENDING_RETENTION_DAYS
 }
 
 fn rollover_row(
@@ -1662,79 +2333,136 @@ fn parse_dt(s: &str) -> Option<DT> {
 mod tests {
     use super::*;
 
-    fn pending_signal_model(state: &str, detail: &str) -> signals::Model {
-        signals::Model {
-            id: 1,
-            scan_id: 1,
+    fn pattern_event(id: i64, score: f64, state: &str) -> pattern_events::Model {
+        pattern_events::Model {
+            id,
             symbol: "MA0".to_string(),
-            level: "L1".to_string(),
             direction: "up".to_string(),
             grade: "A".to_string(),
-            state: state.to_string(),
-            category: "N".to_string(),
+            level: "fine".to_string(),
+            s0_ts: "2026-08-11 09:15:00".to_string(),
+            s0_price: 2550.0,
+            s1_ts: "2026-08-11 09:30:00".to_string(),
+            s1_price: 2590.0,
+            s2_ts: "2026-08-11 09:45:00".to_string(),
+            s2_price: 2570.0,
+            a_move: 40.0,
+            b_move: 20.0,
+            a_bars: 1,
+            b_bars: 1,
+            retracement: 0.5,
+            warning_ts: "2026-08-11 09:45:00".to_string(),
+            detected_at: "2026-08-11 09:45:00".to_string(),
+            warning_kind: "wick".to_string(),
+            entry_score: score,
+            entry_score_dims: serde_json::json!({
+                "dim_a": 3.8,
+                "dim_b": 3.4,
+                "dim_warning": 3.5,
+            })
+            .to_string(),
             entry: 2577.0,
             stop: 2564.0,
             target: 2584.0,
+            risk: 13.0,
             rr: 0.54,
-            score: 80.0,
-            note: String::new(),
-            detail: detail.to_string(),
-            created_at: "2026-08-11 09:15:00".to_string(),
+            state: state.to_string(),
+            last_advance_ts: Some("2026-08-11 09:45:00".to_string()),
+            trigger_ts: None,
+            trigger_bar_ts: None,
+            trigger_price: None,
+            trigger_score: None,
+            trigger_volume_ratio: None,
+            overshoot_r: None,
+            hold_score: None,
+            hold_score_history: "[]".to_string(),
+            outcome: None,
+            exit_reason: None,
+            exit_ts: None,
+            exit_price: None,
+            r_multiple: None,
+            mfe_r: None,
+            mae_r: None,
+            created_at: "2026-08-11 09:45:00".to_string(),
+            updated_at: "2026-08-11 09:45:00".to_string(),
         }
     }
 
-    fn pending_pattern_detail(with_trigger: bool) -> String {
-        let mut detail = serde_json::json!({
-            "number": 1,
-            "level": "L1",
-            "direction": "up",
-            "grade": "A",
-            "s0": {"index": 0, "price": 2550.0, "is_high": false, "ts": "2026-08-11 09:15:00"},
-            "s1": {"index": 1, "price": 2590.0, "is_high": true, "ts": "2026-08-11 09:30:00"},
-            "s2": {"index": 2, "price": 2570.0, "is_high": false, "ts": "2026-08-11 09:45:00"},
-            "a_bars": 1,
-            "b_bars": 1,
-            "a_move": 40.0,
-            "b_move": 20.0,
-            "retracement": 0.5,
-            "state": "即将触发",
-            "category": "N",
-            "entry": 2577.0,
-            "stop": 2564.0,
-            "target": 2584.0,
-            "risk": 13.0,
-            "space": 7.0,
-            "rr": 0.54,
-            "score": 80.0,
-            "dims": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            "note": "",
-            "active": true
-        });
-        if with_trigger {
-            detail["trigger_ts"] = serde_json::json!("2026-08-11 14:00:00");
-        }
-        detail.to_string()
-    }
-
-    fn signal_outcome(score: f64) -> SignalOutcome {
-        let mut detail =
-            serde_json::from_str::<serde_json::Value>(&pending_pattern_detail(false)).unwrap();
-        detail["score"] = serde_json::json!(score);
-        SignalOutcome {
-            symbol: "MA0".to_string(),
-            signal: serde_json::from_value(detail).unwrap(),
-        }
+    fn bar_model(ts: &str, o: f64, h: f64, l: f64, c: f64) -> Bar {
+        let mut b = dt_to_bar(parse_dt(ts).unwrap());
+        b.open = o;
+        b.high = h;
+        b.low = l;
+        b.close = c;
+        b
     }
 
     fn scan_result(scores: &[f64]) -> ScanResult {
         ScanResult {
-            scan_id: 0,
             scanned: 0,
             active_count: scores.len() as i64,
             summary: String::new(),
-            signals: scores.iter().map(|&s| signal_outcome(s)).collect(),
+            signals: scores
+                .iter()
+                .map(|&s| pattern_event(1, s, "pending"))
+                .collect(),
+            new_warnings: scores
+                .iter()
+                .map(|&s| pattern_event(1, s, "pending"))
+                .collect(),
+            newly_triggered: Vec::new(),
             failed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pattern_endpoint_prices_use_swing_extremes_not_closes() {
+        let bars = vec![
+            bar_model("2026-08-12 22:15:00", 2222.0, 2223.0, 2221.0, 2222.0),
+            bar_model("2026-08-13 14:15:00", 2232.0, 2233.0, 2229.0, 2230.0),
+            bar_model("2026-08-14 09:30:00", 2228.0, 2230.0, 2227.0, 2230.0),
+        ];
+        let candidate = event::WarningCandidate {
+            direction: Dir::Up,
+            grade: "A级".to_string(),
+            level: "large",
+            s0_index: 0,
+            s1_index: 1,
+            s2_index: 2,
+            a_move: 11.0,
+            b_move: 6.0,
+            a_bars: 15,
+            b_bars: 13,
+            retracement: 0.545,
+            warning_index: 2,
+            warning_kind: "fast",
+            entry_score: 2.99,
+            dim_a: 3.0,
+            dim_b: 3.0,
+            dim_warning: 2.5,
+            entry: 2231.0,
+            stop: 2226.0,
+            target: 2233.0,
+            risk: 5.0,
+            rr: 0.4,
+        };
+
+        assert_eq!(
+            pattern_endpoint_prices(&bars, &candidate),
+            (2221.0, 2233.0, 2227.0)
+        );
+
+        let down = event::WarningCandidate {
+            direction: Dir::Down,
+            s0_index: 0,
+            s1_index: 1,
+            s2_index: 2,
+            ..candidate
+        };
+        assert_eq!(
+            pattern_endpoint_prices(&bars, &down),
+            (2223.0, 2229.0, 2230.0)
+        );
     }
 
     #[test]
@@ -1742,6 +2470,47 @@ mod tests {
         assert!(!scan_result(&[2.0, 2.4]).has_notifiable_signal(2.5));
         assert!(scan_result(&[2.0, 2.5]).has_notifiable_signal(2.5));
         assert!(scan_result(&[3.0]).has_notifiable_signal(2.5));
+    }
+
+    #[test]
+    fn scan_summary_lists_all_signals_with_threshold_flags() {
+        let mut fine = pattern_event(1, 3.8, "pending");
+        fine.direction = "down".to_string();
+        let low = pattern_event(2, 2.3, "pending");
+        let summary = build_scan_summary(
+            "2026-08-14 09:30",
+            "2026-08-14 09:35",
+            23,
+            2,
+            2.5,
+            &[fine, low],
+            &[],
+        );
+
+        assert!(
+            summary.contains("共扫描 23 个品种，2 条关注信号，其中 1 条达到通知评分阈值（2.5 分）")
+        );
+        assert!(summary.contains("=== 预警信号（等待触发）==="));
+        assert!(summary.contains("MA0 做空 精细N | A | 等待触发 | 形态: 长影线 | 评分 3.80 | 达标"));
+        assert!(
+            summary.contains("MA0 做多 精细N | A | 等待触发 | 形态: 长影线 | 评分 2.30 | 未达阈值")
+        );
+        assert!(summary.contains("入场: 2577.0 | 止损: 2564.0 | 目标: 2584.0 | R/R: 0.54"));
+    }
+
+    #[test]
+    fn pending_stop_breach_expires_without_trigger() {
+        let mut e = pattern_event(1, 3.8, "pending");
+        let bars = vec![
+            bar_model("2026-08-11 09:45:00", 2572.0, 2576.0, 2566.0, 2570.0),
+            bar_model("2026-08-11 10:00:00", 2568.0, 2570.0, 2563.0, 2564.0),
+        ];
+
+        assert!(advance_event_model(&mut e, &bars));
+        assert_eq!(e.state, "expired");
+        assert_eq!(e.outcome.as_deref(), Some("no_trigger"));
+        assert_eq!(e.exit_reason.as_deref(), Some("no_trigger"));
+        assert_eq!(e.exit_ts.as_deref(), Some("2026-08-11 10:00:00"));
     }
 
     #[test]
@@ -1764,21 +2533,104 @@ mod tests {
     }
 
     #[test]
-    fn pending_entry_signal_allows_untriggered_pattern() {
-        let row = pending_signal_model("即将触发", &pending_pattern_detail(false));
-        assert!(is_pending_entry_signal(&row));
+    fn bar_gap_counts_actual_bars_across_lunch_and_night() {
+        let bars = vec![
+            bar_model("2026-07-23 11:15:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-23 11:30:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-23 13:45:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-23 14:00:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-23 21:00:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-23 21:15:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-24 09:00:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-07-24 09:15:00", 0.0, 0.0, 0.0, 0.0),
+        ];
+        assert_eq!(
+            bar_gap(&bars, "2026-07-23 14:00:00", "2026-07-23 11:15:00"),
+            Some(3)
+        );
+        assert_eq!(
+            bar_gap(&bars, "2026-07-24 09:15:00", "2026-07-23 21:00:00"),
+            Some(3)
+        );
+        assert_eq!(
+            bar_gap(&bars, "2026-07-24 09:15:00", "2026-07-23 11:15:00"),
+            Some(7)
+        );
     }
 
     #[test]
-    fn pending_entry_signal_skips_already_triggered_pattern() {
-        let row = pending_signal_model("已触发，接近时效边界", &pending_pattern_detail(true));
-        assert!(!is_pending_entry_signal(&row));
+    fn similar_warning_suppresses_existing_events_in_any_state() {
+        let bars = vec![
+            bar_model("2026-08-14 22:30:00", 14160.0, 14180.0, 14150.0, 14170.0),
+            bar_model("2026-08-14 22:45:00", 14165.0, 14185.0, 14155.0, 14175.0),
+        ];
+        let candidate = event::WarningCandidate {
+            direction: Dir::Up,
+            grade: "A级".to_string(),
+            level: "fine",
+            s0_index: 0,
+            s1_index: 0,
+            s2_index: 1,
+            a_move: 20.0,
+            b_move: 10.0,
+            a_bars: 1,
+            b_bars: 1,
+            retracement: 0.5,
+            warning_index: 1,
+            warning_kind: "strong",
+            entry_score: 3.8,
+            dim_a: 3.0,
+            dim_b: 3.0,
+            dim_warning: 3.5,
+            entry: 14175.0,
+            stop: 14140.0,
+            target: 14210.0,
+            risk: 35.0,
+            rr: 1.0,
+        };
+        let mut existing = pattern_event(397, 3.8, "triggered");
+        existing.warning_ts = "2026-08-14 22:30:00".to_string();
+        existing.entry = 14170.0;
+        existing.risk = 38.675;
+        assert!(has_similar_warning(&bars, &candidate, &[existing]).unwrap());
     }
 
     #[test]
-    fn pending_entry_signal_skips_inactive_state() {
-        let row = pending_signal_model("已失效", &pending_pattern_detail(false));
-        assert!(!is_pending_entry_signal(&row));
+    fn duplicate_event_ids_keeps_family_first_and_drops_rest() {
+        let mut first = pattern_event(397, 3.8, "triggered");
+        first.symbol = "SS0".to_string();
+        first.direction = "up".to_string();
+        first.warning_ts = "2026-08-14 22:30:00".to_string();
+        first.entry = 14170.0;
+        first.risk = 38.675;
+
+        let mut second = pattern_event(1712, 3.6, "triggered");
+        second.symbol = "SS0".to_string();
+        second.direction = "up".to_string();
+        second.warning_ts = "2026-08-14 22:45:00".to_string();
+        second.entry = 14175.0;
+        second.risk = 28.65;
+
+        let mut far = pattern_event(1713, 3.4, "pending");
+        far.symbol = "SS0".to_string();
+        far.direction = "up".to_string();
+        far.warning_ts = "2026-08-14 23:00:00".to_string();
+        far.entry = 14250.0;
+        far.risk = 30.0;
+
+        let bars = vec![
+            bar_model("2026-08-14 22:30:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-14 22:45:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-14 23:00:00", 0.0, 0.0, 0.0, 0.0),
+        ];
+        let mut bar_index: outcome::WarningBarIndex = HashMap::new();
+        for (idx, bar) in bars.iter().enumerate() {
+            bar_index.insert(("SS0".to_string(), bar_ts(bar)), idx);
+        }
+
+        let mut ids = duplicate_event_ids(&[first, second, far], &bar_index);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1712]);
     }
 
     #[test]
@@ -1849,45 +2701,6 @@ mod tests {
         assert_eq!(contract_prefix("RB2610"), "RB");
         assert_eq!(contract_prefix("0"), "0");
     }
-
-    #[test]
-    fn needs_refresh_when_rollover_updated_after_terminal_outcome() {
-        let o = outcome_model("win", outcome::SIM_VERSION, "2026-08-10 02:05:00");
-        assert!(needs_outcome_refresh(Some(&o), Some("2026-08-10 09:26:00")));
-        assert!(!needs_outcome_refresh(
-            Some(&o),
-            Some("2026-08-10 02:05:00")
-        ));
-        assert!(!needs_outcome_refresh(
-            Some(&o),
-            Some("2026-08-10 01:00:00")
-        ));
-        assert!(!needs_outcome_refresh(Some(&o), None));
-    }
-
-    #[test]
-    fn needs_refresh_for_missing_or_non_terminal_outcome() {
-        assert!(needs_outcome_refresh(None, None));
-
-        let rollover = outcome_model("rollover", outcome::SIM_VERSION, "2026-08-10 02:05:00");
-        assert!(needs_outcome_refresh(
-            Some(&rollover),
-            Some("2026-08-10 09:26:00")
-        ));
-
-        let old_version = outcome_model("win", outcome::SIM_VERSION - 1, "2026-08-10 02:05:00");
-        assert!(needs_outcome_refresh(Some(&old_version), None));
-
-        let open = outcome_model("open", outcome::SIM_VERSION, "2026-08-10 02:05:00");
-        assert!(needs_outcome_refresh(Some(&open), None));
-    }
-
-    #[test]
-    fn sim_version_9_recomputes_legacy_outcomes() {
-        assert_eq!(outcome::SIM_VERSION, 9);
-        let legacy = outcome_model("win", 8, "2026-08-10 02:05:00");
-        assert!(needs_outcome_refresh(Some(&legacy), None));
-    }
 }
 
 #[cfg(test)]
@@ -1917,35 +2730,5 @@ fn kline_model(ts: &str) -> klines::Model {
         volume: 0.0,
         hold: 0.0,
         source: "derived".to_string(),
-    }
-}
-
-#[cfg(test)]
-fn outcome_model(outcome: &str, sim_version: i64, updated_at: &str) -> signal_outcomes::Model {
-    signal_outcomes::Model {
-        signal_id: 1,
-        sim_version,
-        outcome: outcome.to_string(),
-        exit_reason: String::new(),
-        entry_ts: None,
-        exit_ts: None,
-        exit_price: None,
-        r_multiple: None,
-        mfe_r: None,
-        mae_r: None,
-        bars_held: None,
-        vol_ratio: None,
-        oi_increase: None,
-        trend60_score: None,
-        atr_percentile: None,
-        target_tier: None,
-        b_vol_ratio: None,
-        a_move_atr: None,
-        trigger_lag_bars: None,
-        trigger_overshoot_r: None,
-        rollover_crossed: Some(false),
-        gap_crossed_entry: Some(false),
-        gap_crossed_exit: Some(false),
-        updated_at: updated_at.to_string(),
     }
 }

@@ -70,11 +70,12 @@ fn write_pattern_body(out: &mut dyn Write, bars: &[Bar], p: &NPattern) -> io::Re
     )?;
     writeln!(
         out,
-        "质量: 硬失效={} a段过长={} b段过长={} b段过快={} 强反向K={}",
+        "质量: 硬失效={} a段过长={} b段过长={} b段过快={} b段动能衰减={} 强反向K={}",
         yn(p.hard_failure),
         yn(p.a_too_long),
         yn(p.b_too_long),
         yn(p.b_fast),
+        yn(p.b_weakening),
         p.b_strong_reverse
     )?;
     writeln!(

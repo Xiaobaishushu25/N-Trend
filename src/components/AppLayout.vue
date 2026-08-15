@@ -261,13 +261,13 @@ onMounted(async () => {
     if (getCurrentWindow().label === 'main') {
       unlisteners.push(
         await listen<OpenReviewChartPayload>('open-review-chart', (e) => {
-          const { symbol: sym, signalId, filters } = e.payload
+          const { symbol: sym, eventId, filters } = e.payload
           if (sym) {
             appStore.reviewJumpFilters = filters ?? null
             void router.push({
               name: 'chart',
               params: { symbol: sym },
-              query: { review: String(signalId) },
+              query: { review: String(eventId) },
             })
           }
         }),

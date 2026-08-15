@@ -42,7 +42,7 @@ pub struct Swing {
     pub is_high: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dir {
     Up,
     Down,
@@ -113,10 +113,15 @@ pub struct NPattern {
     pub b_move: f64,
     pub retracement: f64,
     pub grade: Grade,
+    /// b段端点或中间路径跌破/突破 a 段起点，结构硬失效。
     pub hard_failure: bool,
     pub a_too_long: bool,
     pub b_too_long: bool,
     pub b_fast: bool,
+    /// b段反向K线实体是否整体收敛（回调动能衰减）。
+    pub b_weakening: bool,
+    /// 后/前半段反向K线平均实体比，样本不足时为 None。
+    pub b_weakening_ratio: Option<f64>,
     pub a_strong_trend: usize,
     pub b_strong_reverse: usize,
     pub c_move: f64,
@@ -202,9 +207,9 @@ impl SignalCheck {
         }
     }
 
-    /// 2026-08-14：预警K线质量改为真实综合评分项。
-    /// 强趋势K/吞没/长影线统一计入 0.3 分，快速路径/累计覆盖/无预警不计分，
-    /// 让三类强预警在最终评分上比其余预警明显高出约 0.3 分。
+    /// 2026-08-16：预警K线质量改为真实综合评分项。
+    /// 强反转（强趋势K与干净吞没合并）/长影线统一计入 0.3 分，
+    /// 快速路径/累计覆盖/无预警不计分。
     pub const WARNING_QUALITY_POINTS: f64 = 0.3;
 
     pub fn warning_quality_points(&self) -> f64 {
@@ -229,6 +234,7 @@ mod tests {
         let mut sc = SignalCheck::new();
         for (kind, points) in [
             ("strong", 0.3),
+            // 历史落盘仍可能为 engulf，按同一强反转口径计分。
             ("engulf", 0.3),
             ("wick", 0.3),
             ("fast", 0.0),

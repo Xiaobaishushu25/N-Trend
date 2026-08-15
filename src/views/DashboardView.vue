@@ -32,7 +32,7 @@ import { useActionsStore } from '../stores/actions'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
-import type { GroupRow, MarketSnapshot, SignalOutcome, SymbolRow } from '../types'
+import type { GroupRow, MarketSnapshot, PatternEvent, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
 defineOptions({ name: 'DashboardView' })
@@ -49,7 +49,7 @@ interface WatchRow {
   latest: number | null
   changePct: number | null
   changePts: number | null
-  signal: SignalOutcome | null
+  signal: PatternEvent | null
   /** 最近一次行情跳动的方向：up=上涨(红) / down=下跌(绿)，用于行呼吸闪烁 */
   flash: 'up' | 'down' | null
 }
@@ -98,22 +98,22 @@ const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 /** 信号状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
 function signalStateRank(state: string): number {
-  if (state === '即将触发') return 0
-  if (state === '当前已触发') return 1
-  if (state === '已触发，接近时效边界') return 2
-  if (state === '已过时，仅复盘') return 3
+  if (state === 'pending') return 0
+  if (state === 'triggered') return 1
+  if (state === 'closed') return 2
+  if (state === 'expired') return 3
   return 4
 }
 
 /** 每个品种取优先级最高的形态：先按状态（即将触发 > 已触发 > 接近时效），同状态按评分从高到低 */
-function bestSignal(signals: SignalOutcome[]): SignalOutcome | null {
+function bestSignal(signals: PatternEvent[]): PatternEvent | null {
   if (!signals.length) return null
   return [...signals].sort((a, b) => {
     const rankA = signalStateRank(a.state)
     const rankB = signalStateRank(b.state)
     if (rankA !== rankB) return rankA - rankB
-    if (b.score !== a.score) return b.score - a.score
-    return a.number - b.number
+    if (b.entry_score !== a.entry_score) return b.entry_score - a.entry_score
+    return a.id - b.id
   })[0]
 }
 
@@ -129,7 +129,7 @@ async function loadAll() {
     // 与K线页共用同一份信号数据（scansStore.latestSignals），避免两处各自拉取不同步
     await scansStore.refreshLatestSignals()
     const signals = scansStore.latestSignals
-    const bySymbol = new Map<string, SignalOutcome[]>()
+    const bySymbol = new Map<string, PatternEvent[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
       arr.push(s)
@@ -606,26 +606,28 @@ const fmtPoints = (v: number | null | undefined) => {
   return `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`
 }
 
-function dirLabel(s: SignalOutcome) {
+function dirLabel(s: PatternEvent) {
   return s.direction === 'up' ? '做多' : s.direction === 'down' ? '做空' : s.direction
 }
 
-function levelLabel(s: SignalOutcome) {
+function levelLabel(s: PatternEvent) {
   return s.level === 'fine' ? '精细' : s.level === 'large' ? '较大' : s.level === 'box' ? '箱体' : s.level
 }
 
-function patternLabel(s: SignalOutcome) {
+function patternLabel(s: PatternEvent) {
   return `${dirLabel(s)} ${levelLabel(s)}${s.level === 'box' ? '' : 'N'}`
 }
 
 /** 状态胶囊的短标签（与 K 线图左侧品种列表一致） */
 function stateLabel(state: string) {
   switch (state) {
-    case '当前已触发':
+    case 'pending':
+      return '等待触发'
+    case 'triggered':
       return '已触发'
-    case '已触发，接近时效边界':
-      return '接近时效'
-    case '已过时，仅复盘':
+    case 'closed':
+      return '已了结'
+    case 'expired':
       return '过时'
     default:
       return state
@@ -634,11 +636,10 @@ function stateLabel(state: string) {
 
 /** 状态胶囊配色：与 K 线图左侧品种列表一致 */
 function stateCls(state: string): string {
-  if (state === '即将触发') return 'pending'
-  if (state === '当前已触发') return 'triggered'
-  if (state === '已触发，接近时效边界') return 'stale'
-  if (state === '已过时，仅复盘') return 'expired'
-  if (state === '结构失效' || state === '空间异常') return 'error'
+  if (state === 'pending') return 'pending'
+  if (state === 'triggered') return 'triggered'
+  if (state === 'closed') return 'stale'
+  if (state === 'expired') return 'expired'
   return 'muted'
 }
 
@@ -719,7 +720,7 @@ const columns: DataTableColumns<WatchRow> = [
     render: (r) => {
       const s = r.signal
       if (!s) return h('span', { class: 'cell-empty' }, '—')
-      const tip = `${patternLabel(s)} · ${s.grade} · 评分 ${s.score.toFixed(2)}`
+      const tip = `${patternLabel(s)} · ${s.grade} · 评分 ${s.entry_score.toFixed(2)}`
       return h(
         'div',
         { class: 'pattern-pills', title: tip },
@@ -744,7 +745,7 @@ const columns: DataTableColumns<WatchRow> = [
         ? h(
             'span',
             {
-              class: `state-pill is-${stateCls(sig.state)} is-${scoreTier(sig.score)}`,
+              class: `state-pill is-${stateCls(sig.state)} is-${scoreTier(sig.entry_score)}`,
               title: sig.state,
             },
             [h('span', { class: 'state-dot' }), stateLabel(sig.state)],
@@ -780,7 +781,7 @@ const columns: DataTableColumns<WatchRow> = [
     align: 'right',
     render: (r) =>
       r.signal
-        ? h('span', { class: 'cell-score' }, r.signal.score.toFixed(2))
+        ? h('span', { class: 'cell-score' }, r.signal.entry_score.toFixed(2))
         : h('span', { class: 'cell-empty' }, '—'),
   },
   {

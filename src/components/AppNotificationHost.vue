@@ -141,12 +141,34 @@ function fmtPrice(v: number): string {
   right: 16px;
   z-index: 9999;
   pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  /* 40px 标题栏 + 12px 间距 + 66px 底部留白，通知区始终不盖住标题栏 */
+  max-height: calc(100vh - 40px - 66px - 12px);
 }
 .notify-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
   align-items: flex-end;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  pointer-events: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.notify-list::-webkit-scrollbar {
+  width: 6px;
+}
+.notify-list::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+.notify-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 .notify-item {
   display: flex;

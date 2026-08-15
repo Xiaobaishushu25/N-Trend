@@ -61,6 +61,7 @@ interface EventLabelData {
   price: number | null
   priority: number
   side: 'above' | 'below'
+  marker?: 'dot' | 'square'
 }
 
 class EventLabelPaneRenderer implements IPrimitivePaneRenderer {
@@ -138,9 +139,14 @@ class EventLabelPaneRenderer implements IPrimitivePaneRenderer {
         context.globalAlpha = 1
 
         context.fillStyle = d.label.color
-        context.beginPath()
-        context.arc(d.x, d.anchorY, 3, 0, Math.PI * 2)
-        context.fill()
+        if (d.label.marker === 'square') {
+          const halfSize = 2
+          context.fillRect(d.x - halfSize, d.anchorY - halfSize, halfSize * 2, halfSize * 2)
+        } else {
+          context.beginPath()
+          context.arc(d.x, d.anchorY, 3, 0, Math.PI * 2)
+          context.fill()
+        }
 
         context.fillStyle = 'rgba(255, 255, 255, 0.86)'
         context.strokeStyle = 'rgba(100, 116, 139, 0.55)'
@@ -578,14 +584,6 @@ function buildMarkers(): SeriesMarker<Time>[] {
           shape: 'arrowDown',
           text: '触发',
         })
-      } else if (ex?.entryTs) {
-        markers.push({
-          time: toTs(ex.entryTs),
-          position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
-          color: '#fb8c00',
-          shape: 'arrowDown',
-          text: '回放触发',
-        })
       }
       continue
     }
@@ -602,13 +600,6 @@ function buildMarkers(): SeriesMarker<Time>[] {
       shape: 'circle',
       size: 0.5,
     })
-    markers.push({
-      time: toTs(s.s2.ts),
-      position: s.direction === 'up' ? 'belowBar' : 'aboveBar',
-      color,
-      shape: 'square',
-      size: 0.5,
-    })
     if (s.warning_ts) {
       markers.push({
         time: toTs(s.warning_ts),
@@ -623,14 +614,6 @@ function buildMarkers(): SeriesMarker<Time>[] {
         time: toTs(s.trigger_ts),
         position: 'aboveBar',
         color: '#e53935',
-        shape: 'arrowDown',
-      })
-    } else if (ex?.entryTs) {
-      // 快照落库时仍是"即将触发"没有 trigger_ts：用回放找到的入场触达时间补画
-      markers.push({
-        time: toTs(ex.entryTs),
-        position: 'aboveBar',
-        color: '#fb8c00',
         shape: 'arrowDown',
       })
     }
@@ -1029,6 +1012,7 @@ function buildEventLabels(): EventLabelData[] {
         price: s.s2.price,
         priority: 0,
         side: swingSide(s.s2.is_high),
+        marker: 'square',
       })
     }
 
@@ -1046,15 +1030,14 @@ function buildEventLabels(): EventLabelData[] {
       }
     }
 
-    const triggerTs = s.trigger_ts ?? (ex?.entryTs ? ex.entryTs : null)
+    const triggerTs = s.trigger_ts
     if (triggerTs) {
       const row = rowAt(triggerTs)
-      const replay = !s.trigger_ts && !!ex?.entryTs
       if (row) {
         labels.push({
           time: toTs(triggerTs),
-          text: replay ? '回放触发' : '触发',
-          color: replay ? '#b45309' : '#c0392b',
+          text: '触发',
+          color: '#c0392b',
           price: s.direction === 'up' ? row.high : row.low,
           priority: 2,
           side: s.direction === 'up' ? 'above' : 'below',

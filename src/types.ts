@@ -121,74 +121,53 @@ export interface AnalysisDetail {
   full_report: string
 }
 
-export interface SignalOutcome {
+/** 前向信号事件：预警K线收盘即创建，AB端点/预警K线/入场评分落库后永不回改 */
+export interface PatternEvent {
+  id: number
   symbol: string
-  number: number
-  level: string
-  logic_version: string
-  /** 2026-08-14：预警K线类型；质量分已计入 score */
-  warning_kind?: string
   direction: string
   grade: string
-  s0: SwingDto
-  s1: SwingDto
-  s2: SwingDto
-  a_bars: number
-  b_bars: number
+  level: string
+  s0_ts: string
+  s0_price: number
+  s1_ts: string
+  s1_price: number
+  s2_ts: string
+  s2_price: number
   a_move: number
   b_move: number
+  a_bars: number
+  b_bars: number
   retracement: number
-  state: string
-  category: string
+  warning_ts: string
+  detected_at: string
+  warning_kind: string
+  entry_score: number
+  entry_score_dims: string
   entry: number
   stop: number
   target: number
   risk: number
-  space: number
   rr: number
-  score: number
-  dims: number[]
-  warning_ts: string | null
-  trigger_ts: string | null
-  /** 触发bar量能：成交量 / 前20根15m均量 */
-  vol_ratio: number | null
-  /** 触发bar之后还有K线，量能已走完可确认 */
-  vol_confirmed: boolean
-  /** 触发K线相对入场价的追价深度（按R归一化），触发K线收盘前只有实时值 */
-  trigger_overshoot_r?: number | null
-  /** 箱体信号元数据（仅 level="box" 时存在） */
-  box?: BoxDto | null
-  note: string
-  active: boolean
-}
-
-export interface SignalRow {
-  id: number
-  scan_id: number
-  symbol: string
-  level: string
-  direction: string
-  grade: string
   state: string
-  category: string
-  entry: number
-  stop: number
-  target: number
-  rr: number
-  score: number
-  note: string
-  detail: string
+  last_advance_ts: string | null
+  trigger_ts: string | null
+  trigger_bar_ts: string | null
+  trigger_price: number | null
+  trigger_score: number | null
+  trigger_volume_ratio: number | null
+  overshoot_r: number | null
+  hold_score: number | null
+  hold_score_history: string
+  outcome: string | null
+  exit_reason: string | null
+  exit_ts: string | null
+  exit_price: number | null
+  r_multiple: number | null
+  mfe_r: number | null
+  mae_r: number | null
   created_at: string
-}
-
-export interface ScanRow {
-  id: number
-  started_at: string
-  finished_at: string
-  status: string
-  scanned: number
-  active_count: number
-  summary: string
+  updated_at: string
 }
 
 export interface SymbolFailure {
@@ -197,11 +176,12 @@ export interface SymbolFailure {
 }
 
 export interface ScanResult {
-  scan_id: number
   scanned: number
   active_count: number
   summary: string
-  signals: SignalOutcome[]
+  signals: PatternEvent[]
+  new_warnings: PatternEvent[]
+  newly_triggered: PatternEvent[]
   failed: SymbolFailure[]
 }
 
@@ -268,6 +248,8 @@ export interface UiConfig {
   chart_display_bars: number
   /** K线图默认向左移动距离（根） */
   chart_right_gap: number
+  /** 进入K线图时默认显示首个信号形态 */
+  chart_show_first_signal: boolean
   /** 启用的K线周期，K线页切换栏只显示勾选的周期 */
   timeframes: string[]
   /** 上次打开的分组表格（null=全部品种），应用启动后恢复 */
@@ -287,7 +269,7 @@ export interface Config {
 
 /** 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破） */
 export interface EntryTriggerHit {
-  signal_id: number
+  event_id: number
   symbol: string
   name: string
   direction: string
@@ -361,49 +343,47 @@ export interface ReviewStats {
 
 /** 复盘页明细表一行 */
 export interface OutcomeDetail {
-  signal_id: number
+  event_id: number
   symbol: string
-  /** 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1 */
   logic_version: string
-  /** 2026-08-14：预警K线类型；质量分已计入 score */
-  warning_kind?: string
+  warning_kind: string
+  warning_ts: string
+  detected_at: string
   direction: string
   level: string
   grade: string
-  score: number
+  entry_score: number
+  entry_score_dims: string
   entry: number
   stop: number
   target: number
+  risk: number
   rr: number
   created_at: string
+  state: string
   outcome: string
   exit_reason: string
-  /** 模拟回放找到的入场触达时间（快照 trigger_ts 缺失时补画触发标记用） */
-  entry_ts: string | null
+  trigger_ts: string | null
+  trigger_bar_ts: string | null
+  trigger_price: number | null
+  trigger_score: number | null
+  trigger_volume_ratio: number | null
+  overshoot_r: number | null
+  hold_score: number | null
   exit_ts: string | null
   exit_price: number | null
   r_multiple: number | null
   mfe_r: number | null
   mae_r: number | null
   bars_held: number | null
-  vol_ratio: number | null
-  oi_increase: boolean | null
-  trend60_score: number | null
-  target_tier: string | null
-  b_vol_ratio: number | null
   a_move: number | null
   b_move: number | null
   a_bars: number | null
   b_bars: number | null
-  a_move_atr: number | null
-  trigger_lag_bars: number | null
-  trigger_overshoot_r: number | null
+  retracement: number | null
   net_r: number | null
-  /** 模拟窗口内跨过连续合约换月 */
   rollover_crossed: boolean
-  /** 入场价被跳空穿越，按当前 bar open 成交 */
   gap_crossed_entry: boolean
-  /** 止损价被跳空穿越，按当前 bar open 成交 */
   gap_crossed_exit: boolean
 }
 
@@ -413,7 +393,7 @@ export interface OutcomeRefresh {
 
 /** 复盘明细跳转K线图：完整形态结构 + 结局 */
 export interface ReviewSignalDetail {
-  pattern: PatternDto
+  event: PatternEvent
   outcome: OutcomeDetail | null
 }
 
@@ -421,7 +401,6 @@ export interface ReviewSignalDetail {
 export interface ReviewExitOverlay {
   price: number | null
   ts: string | null
-  entryTs: string | null
   outcome: string
   r: number | null
 }
@@ -441,7 +420,7 @@ export interface RecentOutcomeFilters {
 /** 复盘明细跳转K线图时从复盘窗口带往主窗口的上下文 */
 export interface OpenReviewChartPayload {
   symbol: string
-  signalId: number
+  eventId: number
   filters?: RecentOutcomeFilters
 }
 

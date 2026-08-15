@@ -205,9 +205,7 @@ pub fn run() {
             commands::get_market_snapshot,
             commands::refresh_data_now,
             commands::run_scan_now,
-            commands::get_scan_history,
-            commands::get_scan_detail,
-            commands::get_latest_signals,
+            commands::rebuild_events_now,
             commands::refresh_outcomes_now,
             commands::get_review_stats,
             commands::get_recent_outcomes,
@@ -363,10 +361,26 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
             );
             let cfg = state.services.config().await;
             let min_score = cfg.notify.new_pattern_min_score;
-            if res.has_notifiable_signal(min_score) && cfg.email.enabled && cfg.email.sendable() {
-                let (subject, body) = n_core::notify::email::scan_email_payload(&res.summary);
-                if let Err(e) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
-                    tracing::error!("邮件发送失败: {e}");
+            if cfg.email.enabled && cfg.email.sendable() {
+                let mut emails = Vec::new();
+                for e in res.new_warnings.iter().filter(|e| e.entry_score >= min_score) {
+                    emails.push((
+                        n_core::notify::email::EventEmailKind::Warning,
+                        e,
+                    ));
+                }
+                for e in res
+                    .newly_triggered
+                    .iter()
+                    .filter(|e| e.entry_score >= min_score)
+                {
+                    emails.push((n_core::notify::email::EventEmailKind::Trigger, e));
+                }
+                for (kind, e) in emails {
+                    let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
+                    if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                        tracing::error!("邮件发送失败: {err}");
+                    }
                 }
             }
         }

@@ -29,10 +29,10 @@ import type {
   KlineRow,
   MarketSnapshot,
   OutcomeDetail,
+  PatternEvent,
   PatternDto,
   ReviewExitOverlay,
   ReviewSignalDetail,
-  SignalOutcome,
   SymbolRow,
   Timeframe,
 } from '../types'
@@ -73,7 +73,7 @@ function toggleTimeframe(t: Timeframe, checked: boolean) {
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
 
-/** 复盘跳转模式：从 /chart/:symbol?review=<signalId> 进入时重绘该信号形态与进出场点位 */
+/** 复盘跳转模式：从 /chart/:symbol?review=<eventId> 进入时重绘该事件形态与进出场点位 */
 const reviewOverlay = ref<ReviewSignalDetail | null>(null)
 /** 复盘模式下被点击隐藏绘制的信号ID */
 const reviewHidden = ref<Set<number>>(new Set())
@@ -88,7 +88,7 @@ const reviewListKey = ref('')
 const reviewIndex = computed(() =>
   reviewSignalId.value == null
     ? -1
-    : reviewRows.value.findIndex((r) => r.signal_id === reviewSignalId.value),
+    : reviewRows.value.findIndex((r) => r.event_id === reviewSignalId.value),
 )
 const reviewExit = computed<ReviewExitOverlay | null>(() => {
   const o = reviewOverlay.value?.outcome
@@ -96,7 +96,6 @@ const reviewExit = computed<ReviewExitOverlay | null>(() => {
   return {
     price: o.exit_price,
     ts: o.exit_ts,
-    entryTs: o.entry_ts,
     outcome: o.outcome,
     r: o.r_multiple,
   }
@@ -134,7 +133,7 @@ async function loadReviewList(force = false) {
   try {
     let rows = await api.getRecentOutcomes(2000, filters ?? undefined)
     // 目标信号不在筛选结果里时退化为全量明细，保证滚轮列表能覆盖当前信号
-    if (!rows.some((r) => r.signal_id === id)) {
+    if (!rows.some((r) => r.event_id === id)) {
       rows = await api.getRecentOutcomes(2000)
     }
     if (seq !== reviewListSeq || reviewSignalId.value == null) return
@@ -152,24 +151,24 @@ async function loadReviewList(force = false) {
 
 function selectReviewSignal(row: OutcomeDetail) {
   if (!row) return
-  reviewHidden.value.delete(row.signal_id)
-  if (row.signal_id === reviewSignalId.value && row.symbol === symbol.value) return
+  reviewHidden.value.delete(row.event_id)
+  if (row.event_id === reviewSignalId.value && row.symbol === symbol.value) return
   void router.replace({
     name: 'chart',
     params: { symbol: row.symbol },
-    query: { review: String(row.signal_id) },
+    query: { review: String(row.event_id) },
   })
 }
 
 /** 复盘卡片：点击当前信号切换隐藏/显示，点击其他信号则先切过去并显示 */
 function toggleReviewSignal(row: OutcomeDetail) {
   if (!row) return
-  if (row.signal_id === reviewSignalId.value && row.symbol === symbol.value) {
+  if (row.event_id === reviewSignalId.value && row.symbol === symbol.value) {
     const next = new Set(reviewHidden.value)
-    if (next.has(row.signal_id)) {
-      next.delete(row.signal_id)
+    if (next.has(row.event_id)) {
+      next.delete(row.event_id)
     } else {
-      next.add(row.signal_id)
+      next.add(row.event_id)
     }
     reviewHidden.value = next
     return
@@ -213,66 +212,71 @@ function onReviewKeydown(e: KeyboardEvent) {
   }
 }
 
-/** 形态状态优先级：即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常 */
+/** 形态状态优先级：等待触发 > 已触发 > 已了结 > 已失效 */
 function patternStateRank(state: string): number {
-  if (state === '即将触发') return 0
-  if (state === '当前已触发') return 1
-  if (state === '已触发，接近时效边界') return 2
-  if (state === '已过时，仅复盘') return 3
+  if (state === 'pending') return 0
+  if (state === 'triggered') return 1
+  if (state === 'closed') return 2
+  if (state === 'expired') return 3
   return 4
 }
 
+/** 把新事件表记录转换成图表组件使用的旧形态结构 */
+function toChartSignal(e: PatternEvent): PatternDto {
+  const s0High = e.direction === 'down'
+  return {
+    number: e.id,
+    level: e.level,
+    logic_version: '3',
+    warning_kind: e.warning_kind,
+    direction: e.direction,
+    grade: e.grade,
+    s0: { index: 0, price: e.s0_price, is_high: s0High, ts: e.s0_ts },
+    s1: { index: 0, price: e.s1_price, is_high: !s0High, ts: e.s1_ts },
+    s2: { index: 0, price: e.s2_price, is_high: s0High, ts: e.s2_ts },
+    a_bars: e.a_bars,
+    b_bars: e.b_bars,
+    a_move: e.a_move,
+    b_move: e.b_move,
+    retracement: e.retracement,
+    state: e.state,
+    category: '',
+    entry: e.entry,
+    stop: e.stop,
+    target: e.target,
+    risk: e.risk,
+    space: 0,
+    rr: e.rr,
+    score: e.entry_score,
+    dims: [0, 0, 0],
+    warning_ts: e.warning_ts,
+    trigger_ts: e.trigger_ts,
+    vol_ratio: e.trigger_volume_ratio,
+    vol_confirmed: e.trigger_ts != null,
+    trigger_overshoot_r: e.overshoot_r,
+    box: null,
+    note: '',
+    active: true,
+  }
+}
+
 /**
- * 最近一次扫描识别出的该品种全部N形态（策略基于 15m/60m，与图表显示级别无关）。
- * 排序规则：先按状态（即将触发 > 当前已触发 > 接近时效边界 > 过时 > 失效/异常），
+ * 最近一次扫描识别出的该品种仍在途N形态（策略基于 15m，与图表显示级别无关）。
+ * 已了结、已失效、未知状态由信号源统一过滤，不进入右侧列表。
+ * 排序规则：先按状态（等待触发 > 已触发），
  * 同一状态内按评分从高到低，评分相同按编号小的优先。
  */
 const signals = computed<PatternDto[]>(() => {
   return scansStore.latestSignals
     .filter((s) => s.symbol === symbol.value)
-    .map((s) => s as unknown as PatternDto)
+    .map(toChartSignal)
     .sort((a, b) => {
       const rankA = patternStateRank(a.state)
       const rankB = patternStateRank(b.state)
       if (rankA !== rankB) return rankA - rankB
       if (b.score !== a.score) return b.score - a.score
       return a.number - b.number
-    })
-})
-
-/**
- * 形态身份键：方向+级别+s1/s2 索引，用于把「最近活跃信号」历史挂到对应的形态卡片上
- */
-function historyKey(s: PatternDto) {
-  return `${s.direction}|${s.level}|${s.s1.index}|${s.s2.index}`
-}
-
-/**
- * 每个形态的状态演变历史：来自最近若干次扫描的实时记录（不是事后回算），
- * 同一形态连续几轮状态不变时只保留一次。挂在对应形态卡片下展示。
- */
-const patternHistory = computed(() => {
-  const map = new Map<string, { time: string; state: string }[]>()
-  const rows = [...scansStore.recentSignals].sort((a, b) =>
-    a.created_at.localeCompare(b.created_at),
-  )
-  for (const r of rows) {
-    let d: PatternDto | null = null
-    try {
-      d = JSON.parse(r.detail) as PatternDto
-    } catch {
-      d = null
-    }
-    if (!d) continue
-    const key = `${r.direction}|${r.level}|${d.s1.index}|${d.s2.index}`
-    const arr = map.get(key) ?? []
-    const last = arr[arr.length - 1]
-    if (!last || last.state !== r.state) {
-      arr.push({ time: r.created_at, state: r.state })
-    }
-    map.set(key, arr)
-  }
-  return map
+  })
 })
 
 /** 被点击隐藏的形态编号（用于控制K线图上的展示） */
@@ -281,20 +285,22 @@ const hiddenNumbers = ref<Set<number>>(new Set())
 /** 是否在K线图上标记当前视图的最高价/最低价 */
 const showExtremes = ref(true)
 
-/** 记录“默认全部隐藏”是否已应用到当前 品种+周期 */
+/** 记录“默认隐藏规则”是否已应用到当前 品种+周期+设置 */
 const hiddenApplied = ref('')
 
 /**
- * 默认不展示任何形态：全部在K线图上隐藏，避免画线/标点堆叠看不清。
- * 用户手动点开/隐藏后不再自动重置；切换品种或周期时重新按默认应用。
+ * 默认隐藏规则：设置开启时保留排序最靠前的首个信号，其余隐藏；
+ * 设置关闭时全部隐藏，避免画线/标点堆叠看不清。
+ * 用户手动点开/隐藏后不再自动重置；切换品种、周期或修改设置时重新按默认应用。
  */
 function applyDefaultHidden() {
-  const key = `${symbol.value}|${timeframe.value}`
+  const showFirst = settingsStore.settings.ui.chart_show_first_signal ?? true
+  const key = `${symbol.value}|${timeframe.value}|${showFirst}`
   if (hiddenApplied.value === key) return
   const nums = signals.value.map((s) => s.number)
   if (!nums.length) return
   hiddenApplied.value = key
-  hiddenNumbers.value = new Set(nums)
+  hiddenNumbers.value = showFirst ? new Set(nums.slice(1)) : new Set(nums)
 }
 
 /** 左侧品种列表开关与行情快照 */
@@ -620,15 +626,15 @@ function fmtSigned(v: number | null) {
 }
 
 /** 每个品种取优先级最高的信号：与表格页同源同规则 */
-const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
-  const out: Record<string, SignalOutcome | null> = {}
+const signalBySymbol = computed<Record<string, PatternEvent | null>>(() => {
+  const out: Record<string, PatternEvent | null> = {}
   const latest = scansStore.latestSignals
   if (!latest.length) return out
-  const rankOf = (s: SignalOutcome): number => {
-    if (s.state === '即将触发') return 0
-    if (s.state === '当前已触发') return 1
-    if (s.state === '已触发，接近时效边界') return 2
-    if (s.state === '已过时，仅复盘') return 3
+  const rankOf = (s: PatternEvent): number => {
+    if (s.state === 'pending') return 0
+    if (s.state === 'triggered') return 1
+    if (s.state === 'closed') return 2
+    if (s.state === 'expired') return 3
     return 4
   }
   for (const s of latest) {
@@ -642,7 +648,7 @@ const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
     if (a < b) {
       out[s.symbol] = s
     } else if (a === b) {
-      if (s.score > prev.score || (s.score === prev.score && s.number < prev.number)) {
+      if (s.entry_score > prev.entry_score || (s.entry_score === prev.entry_score && s.id < prev.id)) {
         out[s.symbol] = s
       }
     }
@@ -653,14 +659,14 @@ const signalBySymbol = computed<Record<string, SignalOutcome | null>>(() => {
 /** 信号状态 → 列表里的短标签 */
 function sigLabel(state: string) {
   switch (state) {
-    case '即将触发':
-      return '即将触发'
-    case '当前已触发':
+    case 'pending':
+      return '等待触发'
+    case 'triggered':
       return '已触发'
-    case '已触发，接近时效边界':
-      return '接近时效'
-    case '已过时，仅复盘':
-      return '过时'
+    case 'closed':
+      return '已了结'
+    case 'expired':
+      return '已失效'
     default:
       return state
   }
@@ -668,9 +674,9 @@ function sigLabel(state: string) {
 
 /** 信号状态 → 样式类型 */
 function sigType(state: string) {
-  if (state === '即将触发') return 'pending'
-  if (state === '当前已触发') return 'triggered'
-  if (state === '已触发，接近时效边界') return 'stale'
+  if (state === 'pending') return 'pending'
+  if (state === 'triggered') return 'triggered'
+  if (state === 'closed') return 'stale'
   return 'expired'
 }
 
@@ -685,10 +691,10 @@ function scoreTier(score: number | null | undefined) {
 }
 
 /** 悬停提示：形态编号、方向、级别、状态与触发/预警时间 */
-function sigTitle(s: SignalOutcome) {
+function sigTitle(s: PatternEvent) {
   const dir = s.direction === 'up' ? '做多' : s.direction === 'down' ? '做空' : s.direction
   const t = s.trigger_ts || s.warning_ts || ''
-  return `#${s.number} ${dir} ${levelSuffix(s.level)} ${s.state}${t ? ` ${t}` : ''} 评分 ${s.score.toFixed(2)}`
+  return `#${s.id} ${dir} ${levelSuffix(s.level)} ${sigLabel(s.state)}${t ? ` ${t}` : ''} 评分 ${s.entry_score.toFixed(2)}`
 }
 
 function trendColor(v: number | null) {
@@ -731,7 +737,9 @@ function setRowFlash(code: string, dir: 'up' | 'down') {
 
 const visibleSignals = computed<PatternDto[]>(() => {
   if (reviewOverlay.value) {
-    return reviewHidden.value.has(reviewSignalId.value ?? -1) ? [] : [reviewOverlay.value.pattern]
+    return reviewHidden.value.has(reviewSignalId.value ?? -1)
+      ? []
+      : [toChartSignal(reviewOverlay.value.event)]
   }
   if (reviewMode.value) return []
   return signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
@@ -799,9 +807,9 @@ function levelSuffix(l: string) {
 function warningKindText(kind?: string) {
   switch (kind) {
     case 'strong':
-      return '强趋势K'
+      return '强反转'
     case 'engulf':
-      return '吞没'
+      return '强反转'
     case 'wick':
       return '长影线'
     case 'fast':
@@ -858,12 +866,6 @@ function rvGap(row: OutcomeDetail) {
   return parts.length ? parts.join('/') : '—'
 }
 
-function rvTier(row: OutcomeDetail) {
-  if (row.target_tier === 'tp2') return 'TP2扩展'
-  if (row.target_tier === 'tp1') return 'TP1'
-  return '—'
-}
-
 function rvSpeed(row: OutcomeDetail) {
   return row.a_move == null || row.b_move == null || row.a_move === 0
     ? '—'
@@ -877,9 +879,9 @@ function rvBarRatio(row: OutcomeDetail) {
 }
 
 function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 'error' {
-  if (state === '即将触发') return 'info'
-  if (state === '当前已触发') return 'success'
-  if (state === '已触发，接近时效边界') return 'warning'
+  if (state === 'pending') return 'info'
+  if (state === 'triggered') return 'success'
+  if (state === 'closed') return 'warning'
   return 'default'
 }
 
@@ -924,6 +926,12 @@ let unlisteners: (() => void)[] = []
 // 形态列表就绪后（含进入页面、扫描完成刷新）按默认规则隐藏非首个形态
 watch(signals, applyDefaultHidden, { immediate: true })
 
+// 修改“默认显示首个信号”设置后，重新应用K线图上的默认隐藏规则
+watch(() => settingsStore.settings.ui.chart_show_first_signal, () => {
+  hiddenApplied.value = ''
+  applyDefaultHidden()
+})
+
 // 复盘模式：query.review 变化（或切换品种）时重新加载复盘点位
 watch([symbol, reviewSignalId], () => {
   reviewHidden.value = new Set()
@@ -952,7 +960,6 @@ watch([symbol, timeframe], async () => {
   liveBars.value = []
   if (symbol.value) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
-    scansStore.loadRecentSignals(symbol.value)
     scansStore.refreshLatestSignals()
   }
 })
@@ -966,7 +973,6 @@ onMounted(async () => {
     await onScanCompleted((result) => {
       scansStore.ingest(result)
       loadSnapshots()
-      scansStore.loadRecentSignals(symbol.value)
       scansStore.refreshLatestSignals()
     }),
   )
@@ -1006,7 +1012,6 @@ onMounted(async () => {
   if (!scansStore.latest) {
     try {
       await scansStore.runScan()
-      scansStore.loadRecentSignals(symbol.value)
       scansStore.refreshLatestSignals()
     } catch {
       // 无数据时扫描失败不影响看图
@@ -1014,7 +1019,6 @@ onMounted(async () => {
   }
   if (symbol.value) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
-    scansStore.loadRecentSignals(symbol.value)
     scansStore.refreshLatestSignals()
   }
 })
@@ -1180,7 +1184,7 @@ onBeforeUnmount(() => {
                   class="sl-sig"
                   :class="[
                     'is-' + sigType(signalBySymbol[element.code]?.state ?? ''),
-                    'is-' + scoreTier(signalBySymbol[element.code]?.score),
+                    'is-' + scoreTier(signalBySymbol[element.code]?.entry_score),
                   ]"
                   :title="sigTitle(signalBySymbol[element.code]!)"
                 >
@@ -1267,18 +1271,18 @@ onBeforeUnmount(() => {
             <div v-else-if="reviewRows.length" class="review-list">
               <div
                 v-for="row in reviewRows"
-                :key="row.signal_id"
+                :key="row.event_id"
                 class="review-row"
                 :class="[
                   row.direction === 'up' ? 'is-up' : 'is-down',
                   {
-                    'is-active': row.signal_id === reviewSignalId,
-                    'is-hidden': isReviewHidden(row.signal_id),
+                    'is-active': row.event_id === reviewSignalId,
+                    'is-hidden': isReviewHidden(row.event_id),
                   },
                 ]"
                 :title="
-                  row.signal_id === reviewSignalId
-                    ? isReviewHidden(row.signal_id)
+                  row.event_id === reviewSignalId
+                    ? isReviewHidden(row.event_id)
                       ? '点击显示该信号绘制'
                       : '点击隐藏该信号绘制'
                     : '点击查看该信号'
@@ -1286,7 +1290,7 @@ onBeforeUnmount(() => {
                 @click="toggleReviewSignal(row)"
               >
                 <div class="rv-head">
-                  <span class="rv-id">#{{ row.signal_id }}</span>
+                  <span class="rv-id">#{{ row.event_id }}</span>
                   <span class="rv-symbol">{{ row.symbol }}</span>
                   <span class="rv-badge">
                     {{ dirText(row.direction) }} {{ levelSuffix(row.level) }}
@@ -1294,18 +1298,18 @@ onBeforeUnmount(() => {
                   <span class="rv-grade">{{ row.grade }}</span>
                   <span class="rv-warning">{{ warningKindText(row.warning_kind) }}</span>
                   <span class="rv-score">
-                    <b>{{ row.score.toFixed(2) }}</b>
+                    <b>{{ row.entry_score.toFixed(2) }}</b>
                     <em>评分</em>
                   </span>
                   <span
-                    v-if="row.signal_id === reviewSignalId"
+                    v-if="row.event_id === reviewSignalId"
                     class="rv-eye"
-                    :title="isReviewHidden(row.signal_id) ? '点击显示该信号绘制' : '点击隐藏该信号绘制'"
+                    :title="isReviewHidden(row.event_id) ? '点击显示该信号绘制' : '点击隐藏该信号绘制'"
                   >
                     <n-icon
-                      :component="isReviewHidden(row.signal_id) ? EyeOff : Eye"
+                      :component="isReviewHidden(row.event_id) ? EyeOff : Eye"
                       :size="14"
-                      :color="isReviewHidden(row.signal_id) ? '#94a3b8' : '#f97316'"
+                      :color="isReviewHidden(row.event_id) ? '#94a3b8' : '#f97316'"
                     />
                   </span>
                 </div>
@@ -1319,6 +1323,14 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div class="rv-grid">
+                  <div class="rv-item">
+                    <span>预警时间</span>
+                    <b>{{ fmtRecentTime(row.warning_ts) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>触发时间</span>
+                    <b>{{ row.trigger_ts ? fmtRecentTime(row.trigger_ts) : '—' }}</b>
+                  </div>
                   <div class="rv-item">
                     <span>入场</span>
                     <b>{{ row.entry.toFixed(1) }}</b>
@@ -1334,6 +1346,22 @@ onBeforeUnmount(() => {
                   <div class="rv-item">
                     <span>RR</span>
                     <b>{{ row.rr.toFixed(2) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>触发价</span>
+                    <b>{{ row.trigger_price == null ? '—' : row.trigger_price.toFixed(1) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>追价深度</span>
+                    <b>{{ row.overshoot_r == null ? '—' : `${row.overshoot_r.toFixed(2)}R` }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>触发量能</span>
+                    <b>{{ rvMult(row.trigger_volume_ratio) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>持仓评分</span>
+                    <b>{{ rvNum(row.hold_score) }}</b>
                   </div>
                   <div class="rv-item">
                     <span>出场价</span>
@@ -1360,24 +1388,16 @@ onBeforeUnmount(() => {
                     <b :class="rvRClass(row.net_r)">{{ fmtR(row.net_r) }}</b>
                   </div>
                   <div class="rv-item">
-                    <span>量能</span>
-                    <b>{{ rvMult(row.vol_ratio) }}</b>
+                    <span>A段</span>
+                    <b>{{ row.a_move == null ? '—' : `${row.a_move.toFixed(1)}点/${row.a_bars ?? '?'}根` }}</b>
                   </div>
                   <div class="rv-item">
-                    <span>增仓</span>
-                    <b>{{ rvBool(row.oi_increase) }}</b>
+                    <span>B段</span>
+                    <b>{{ row.b_move == null ? '—' : `${row.b_move.toFixed(1)}点/${row.b_bars ?? '?'}根` }}</b>
                   </div>
                   <div class="rv-item">
-                    <span>60m分</span>
-                    <b>{{ rvNum(row.trend60_score) }}</b>
-                  </div>
-                  <div class="rv-item">
-                    <span>止盈层级</span>
-                    <b>{{ rvTier(row) }}</b>
-                  </div>
-                  <div class="rv-item">
-                    <span>b/a量比</span>
-                    <b>{{ rvNum(row.b_vol_ratio) }}</b>
+                    <span>回撤</span>
+                    <b>{{ row.retracement == null ? '—' : `${(row.retracement * 100).toFixed(1)}%` }}</b>
                   </div>
                   <div class="rv-item">
                     <span>b/a速度</span>
@@ -1386,18 +1406,6 @@ onBeforeUnmount(() => {
                   <div class="rv-item">
                     <span>根数比</span>
                     <b>{{ rvBarRatio(row) }}</b>
-                  </div>
-                  <div class="rv-item">
-                    <span>触发延迟</span>
-                    <b>{{ row.trigger_lag_bars == null ? '—' : `${row.trigger_lag_bars}根` }}</b>
-                  </div>
-                  <div class="rv-item">
-                    <span>追价深度</span>
-                    <b>{{ row.trigger_overshoot_r == null ? '—' : `${row.trigger_overshoot_r.toFixed(2)}R` }}</b>
-                  </div>
-                  <div class="rv-item">
-                    <span>a段强度</span>
-                    <b>{{ row.a_move_atr == null ? '—' : `${row.a_move_atr.toFixed(1)}×ATR` }}</b>
                   </div>
                   <div class="rv-item">
                     <span>换月</span>
@@ -1449,7 +1457,14 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div class="pc-state" :class="stateType(s.state)">
-                  <span class="dot"></span>{{ s.state }}
+                  <span class="dot"></span>{{ sigLabel(s.state) }}
+                </div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">预警</span>
+                  <span>{{ s.warning_ts ? fmtRecentTime(s.warning_ts) : '—' }}</span>
+                  <span v-if="s.trigger_ts" class="pc-history-label"> / 触发</span>
+                  <span v-if="s.trigger_ts">{{ fmtRecentTime(s.trigger_ts) }}</span>
                 </div>
 
                 <div v-if="s.trigger_ts" class="pc-vol" :class="volStatusClass(s)">
@@ -1462,13 +1477,6 @@ onBeforeUnmount(() => {
                   <span>追价深度</span>
                   <b v-if="s.trigger_overshoot_r != null">{{ s.trigger_overshoot_r.toFixed(2) }}R</b>
                   <em>{{ overshootStatusText(s) }}</em>
-                </div>
-
-                <div v-if="patternHistory.get(historyKey(s))?.length" class="pc-history">
-                  <span class="pc-history-label">状态演变</span>
-                  <span v-for="(h, i) in patternHistory.get(historyKey(s))" :key="i">
-                    {{ i > 0 ? ' → ' : '' }}{{ fmtRecentTime(h.time) }} {{ h.state }}
-                  </span>
                 </div>
 
                 <div class="pc-prices">
