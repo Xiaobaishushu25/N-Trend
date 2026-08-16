@@ -229,10 +229,10 @@ async fn insert_warning_event(
         .ok_or_else(|| anyhow!("写入事件 {id} 后读取失败"))
 }
 
-/// 相似预警抑制：同品种、同方向、预警K线相差不超过 5 根 15m、入场价差
-/// 不超过 0.3R 时，不再新建事件。历史重放时会按预警K线先后逐条插入，
-/// 因此这里比对全部既有事件（含已触发/已了结），避免前一条离开 pending
-/// 后同族事件又被重新识别出来。
+/// 相似预警抑制：同品种、同方向、预警K线相差不超过 5 根 15m 时，如果既有
+/// 事件仍处于未触发或已触发持仓状态，直接抑制新事件；前一条已离场后才退回
+/// 入场价差不超过 0.3R 的相似判断。历史重放时会按预警K线先后逐条插入，
+/// 因此这里比对全部既有事件（含已触发/已了结），避免旧事件重新生成。
 fn has_similar_warning(
     bars: &[Bar],
     candidate: &event::WarningCandidate,
@@ -249,13 +249,29 @@ fn has_similar_warning(
             && bar_gap(bars, &warning_ts, &e.warning_ts)
                 .is_some_and(|bars_gap| bars_gap <= outcome::DEDUP_WARNING_BARS)
             && e.risk > 0.0
-            && (candidate.entry - e.entry).abs() <= outcome::DEDUP_ENTRY_R * e.risk
+            && (event_active_at(e, &warning_ts)
+                || (candidate.entry - e.entry).abs() <= outcome::DEDUP_ENTRY_R * e.risk)
     }))
 }
 
-/// 找出应删除的重复事件：与复盘统计同口径，同品种、同方向、预警K线相差
-/// 不超过 5 根 15m 且入场价差不超过 0.3R 的事件聚成同一族，族内只保留首见
-/// 一条，其余返回给调用方删除。旧数据缺少入场价时退回结构键去重。
+/// 既有事件在指定预警K线收盘时间是否仍处于“未触发/已触发持仓”状态。
+fn event_active_at(e: &pattern_events::Model, warning_ts: &str) -> bool {
+    match e.state.as_str() {
+        "pending" => true,
+        "triggered" => e.exit_ts.as_deref().map_or(true, |exit| exit > warning_ts),
+        "closed" => e
+            .trigger_ts
+            .as_deref()
+            .zip(e.exit_ts.as_deref())
+            .is_some_and(|(trigger, exit)| trigger <= warning_ts && warning_ts < exit),
+        _ => false,
+    }
+}
+
+/// 找出应删除的重复事件：同品种、同方向、预警K线相差不超过 5 根 15m 时，
+/// 若最近一条族内事件在后续预警时仍持仓/未触发则直接并入；最近一条已离场
+/// 则要求与族首的入场价差不超过 0.3R。族内只保留首见一条，其余返回给调用方
+/// 删除。旧数据缺少入场价时退回结构键去重。
 fn duplicate_event_ids(
     events: &[pattern_events::Model],
     bar_index: &outcome::WarningBarIndex,
@@ -267,33 +283,35 @@ fn duplicate_event_ids(
             .then_with(|| a.id.cmp(&b.id))
     });
 
-    let mut families: Vec<(&pattern_events::Model, String)> = Vec::new();
+    let mut families: Vec<(&pattern_events::Model, &pattern_events::Model, String)> = Vec::new();
     let mut structure_min: HashMap<String, &pattern_events::Model> = HashMap::new();
     let mut delete_ids: Vec<i64> = Vec::new();
 
     for e in &ordered {
         if e.risk > 0.0 {
             let mut merged = false;
-            for (anchor, last_warning_ts) in &mut families {
+            for (anchor, last, last_warning_ts) in &mut families {
                 if e.symbol == anchor.symbol
                     && e.direction == anchor.direction
-                    && (e.entry - anchor.entry).abs()
-                        <= outcome::DEDUP_ENTRY_R * anchor.risk.max(1e-9)
                     && bar_index
                         .get(&(e.symbol.clone(), e.warning_ts.clone()))
                         .zip(bar_index.get(&(anchor.symbol.clone(), last_warning_ts.clone())))
                         .is_some_and(|(li, ei)| li.abs_diff(*ei) <= outcome::DEDUP_WARNING_BARS)
+                    && (event_active_at(last, &e.warning_ts)
+                        || (e.entry - anchor.entry).abs()
+                            <= outcome::DEDUP_ENTRY_R * anchor.risk.max(1e-9))
                 {
                     merged = true;
                     delete_ids.push(e.id);
                     *last_warning_ts = e.warning_ts.clone();
+                    *last = e;
                     break;
                 }
             }
             if merged {
                 continue;
             }
-            families.push((e, e.warning_ts.clone()));
+            families.push((e, e, e.warning_ts.clone()));
             continue;
         }
 
@@ -2596,13 +2614,122 @@ mod tests {
     }
 
     #[test]
+    fn similar_warning_suppresses_active_event_even_when_entry_far() {
+        let bars = vec![
+            bar_model("2026-08-14 22:30:00", 14160.0, 14180.0, 14150.0, 14170.0),
+            bar_model("2026-08-14 22:45:00", 14165.0, 14185.0, 14155.0, 14175.0),
+        ];
+        let candidate = event::WarningCandidate {
+            direction: Dir::Up,
+            grade: "A级".to_string(),
+            level: "fine",
+            s0_index: 0,
+            s1_index: 0,
+            s2_index: 1,
+            a_move: 20.0,
+            b_move: 10.0,
+            a_bars: 1,
+            b_bars: 1,
+            retracement: 0.5,
+            warning_index: 1,
+            warning_kind: "strong",
+            entry_score: 3.8,
+            dim_a: 3.0,
+            dim_b: 3.0,
+            dim_warning: 3.5,
+            entry: 15000.0,
+            stop: 14950.0,
+            target: 15100.0,
+            risk: 50.0,
+            rr: 1.0,
+        };
+        let mut existing = pattern_event(397, 3.8, "triggered");
+        existing.warning_ts = "2026-08-14 22:30:00".to_string();
+        existing.entry = 14170.0;
+        existing.risk = 38.675;
+        existing.trigger_ts = Some("2026-08-14 22:30:00".to_string());
+        assert!(has_similar_warning(&bars, &candidate, &[existing]).unwrap());
+    }
+
+    #[test]
+    fn similar_warning_requires_entry_closeness_after_exit() {
+        let bars = vec![
+            bar_model("2026-08-14 22:30:00", 14160.0, 14180.0, 14150.0, 14170.0),
+            bar_model("2026-08-14 22:45:00", 14165.0, 14185.0, 14155.0, 14175.0),
+            bar_model("2026-08-14 23:00:00", 14170.0, 14190.0, 14160.0, 14180.0),
+        ];
+        let candidate = event::WarningCandidate {
+            direction: Dir::Up,
+            grade: "A级".to_string(),
+            level: "fine",
+            s0_index: 0,
+            s1_index: 0,
+            s2_index: 2,
+            a_move: 20.0,
+            b_move: 10.0,
+            a_bars: 1,
+            b_bars: 1,
+            retracement: 0.5,
+            warning_index: 2,
+            warning_kind: "strong",
+            entry_score: 3.8,
+            dim_a: 3.0,
+            dim_b: 3.0,
+            dim_warning: 3.5,
+            entry: 15000.0,
+            stop: 14950.0,
+            target: 15100.0,
+            risk: 50.0,
+            rr: 1.0,
+        };
+        let mut existing = pattern_event(397, 3.8, "closed");
+        existing.warning_ts = "2026-08-14 22:30:00".to_string();
+        existing.entry = 14170.0;
+        existing.risk = 38.675;
+        existing.trigger_ts = Some("2026-08-14 22:30:00".to_string());
+        existing.exit_ts = Some("2026-08-14 22:45:00".to_string());
+        assert!(!has_similar_warning(&bars, &candidate, &[existing]).unwrap());
+    }
+
+    #[test]
+    fn duplicate_event_ids_keeps_active_family_even_when_entry_far() {
+        let mut first = pattern_event(1179, 3.8, "closed");
+        first.symbol = "SA0".to_string();
+        first.direction = "up".to_string();
+        first.warning_ts = "2026-07-23 09:45:00".to_string();
+        first.entry = 1015.0;
+        first.risk = 6.0;
+        first.trigger_ts = Some("2026-07-23 10:00:00".to_string());
+        first.exit_ts = Some("2026-07-23 13:45:00".to_string());
+
+        let mut second = pattern_event(1180, 3.6, "closed");
+        second.symbol = "SA0".to_string();
+        second.direction = "up".to_string();
+        second.warning_ts = "2026-07-23 10:00:00".to_string();
+        second.entry = 1017.0;
+        second.risk = 7.0;
+        second.trigger_ts = Some("2026-07-23 10:15:00".to_string());
+        second.exit_ts = Some("2026-07-23 13:45:00".to_string());
+
+        let mut bar_index: outcome::WarningBarIndex = HashMap::new();
+        bar_index.insert(("SA0".to_string(), "2026-07-23 09:45:00".to_string()), 0usize);
+        bar_index.insert(("SA0".to_string(), "2026-07-23 10:00:00".to_string()), 1usize);
+
+        let mut ids = duplicate_event_ids(&[first, second], &bar_index);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1180]);
+    }
+
+    #[test]
     fn duplicate_event_ids_keeps_family_first_and_drops_rest() {
-        let mut first = pattern_event(397, 3.8, "triggered");
+        let mut first = pattern_event(397, 3.8, "closed");
         first.symbol = "SS0".to_string();
         first.direction = "up".to_string();
         first.warning_ts = "2026-08-14 22:30:00".to_string();
         first.entry = 14170.0;
         first.risk = 38.675;
+        first.trigger_ts = Some("2026-08-14 22:30:00".to_string());
+        first.exit_ts = Some("2026-08-14 22:45:00".to_string());
 
         let mut second = pattern_event(1712, 3.6, "triggered");
         second.symbol = "SS0".to_string();
@@ -2622,6 +2749,50 @@ mod tests {
             bar_model("2026-08-14 22:30:00", 0.0, 0.0, 0.0, 0.0),
             bar_model("2026-08-14 22:45:00", 0.0, 0.0, 0.0, 0.0),
             bar_model("2026-08-14 23:00:00", 0.0, 0.0, 0.0, 0.0),
+        ];
+        let mut bar_index: outcome::WarningBarIndex = HashMap::new();
+        for (idx, bar) in bars.iter().enumerate() {
+            bar_index.insert(("SS0".to_string(), bar_ts(bar)), idx);
+        }
+
+        let mut ids = duplicate_event_ids(&[first, second, far], &bar_index);
+        ids.sort_unstable();
+        // 1712 在 1713 预警时仍处于 triggered 持仓，入场价差再大也并入同一族。
+        assert_eq!(ids, vec![1712, 1713]);
+    }
+
+    #[test]
+    fn duplicate_event_ids_requires_entry_closeness_after_family_exits() {
+        let mut first = pattern_event(397, 3.8, "closed");
+        first.symbol = "SS0".to_string();
+        first.direction = "up".to_string();
+        first.warning_ts = "2026-08-14 22:30:00".to_string();
+        first.entry = 14170.0;
+        first.risk = 38.675;
+        first.trigger_ts = Some("2026-08-14 22:30:00".to_string());
+        first.exit_ts = Some("2026-08-14 22:45:00".to_string());
+
+        let mut second = pattern_event(1712, 3.6, "closed");
+        second.symbol = "SS0".to_string();
+        second.direction = "up".to_string();
+        second.warning_ts = "2026-08-14 22:45:00".to_string();
+        second.entry = 14175.0;
+        second.risk = 28.65;
+        second.trigger_ts = Some("2026-08-14 22:45:00".to_string());
+        second.exit_ts = Some("2026-08-14 23:00:00".to_string());
+
+        let mut far = pattern_event(1713, 3.4, "pending");
+        far.symbol = "SS0".to_string();
+        far.direction = "up".to_string();
+        far.warning_ts = "2026-08-14 23:15:00".to_string();
+        far.entry = 14250.0;
+        far.risk = 30.0;
+
+        let bars = vec![
+            bar_model("2026-08-14 22:30:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-14 22:45:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-14 23:00:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-14 23:15:00", 0.0, 0.0, 0.0, 0.0),
         ];
         let mut bar_index: outcome::WarningBarIndex = HashMap::new();
         for (idx, bar) in bars.iter().enumerate() {

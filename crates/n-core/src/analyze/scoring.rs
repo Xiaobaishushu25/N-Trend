@@ -64,6 +64,10 @@ const WICK_PREV_BAR_RANGE_MIN: f64 = 0.50;
 // 强反转（强趋势K/干净吞没合并）硬门槛：反向影线必须严格小于 50% 振幅。
 // 等于或超过 50% 说明收盘只回到振幅中点或更差，吞没质量不足，不再识别为 strong。
 const STRONG_REVERSE_SHADOW_MAX_RATIO: f64 = 0.5;
+// 吞没型强反转的实体硬门槛：实体至少达到 0.25 倍 ATR20，否则只是“包住前一根”的
+// 小实体K线，收盘位置再合格也不作为强反转预警，避免 L0 944 22:45 这类
+// 实体仅 2 点、约 0.06 ATR 的弱吞没虚高预警质量。
+const STRONG_ENGULF_BODY_ATR_MIN: f64 = 0.25;
 /// 长影线收盘方向微调：做多长下影收阴、做空长上影收阳时，预警K线质量略扣 0.1 分。
 /// 只影响评分，不改变七条识别门槛。
 const WICK_DIRECTION_PENALTY: f64 = 0.1;
@@ -551,7 +555,12 @@ pub(crate) fn single_reversal_pattern(
         Dir::Up => bar.high - bar.open.max(bar.close),
         Dir::Down => bar.open.min(bar.close) - bar.low,
     };
-    if engulf && reverse_shadow < STRONG_REVERSE_SHADOW_MAX_RATIO * range {
+    let body = (bar.close - bar.open).abs();
+    let atr = atr_at(atr20, w);
+    if engulf
+        && reverse_shadow < STRONG_REVERSE_SHADOW_MAX_RATIO * range
+        && body >= STRONG_ENGULF_BODY_ATR_MIN * atr
+    {
         return Some(SingleReversalKind::Strong);
     }
 
@@ -563,7 +572,6 @@ pub(crate) fn single_reversal_pattern(
         return Some(SingleReversalKind::Strong);
     }
 
-    let atr = atr_at(atr20, w);
     is_wick_warning_bar(bar, atr, dir, bars.get(w.saturating_sub(1)))
         .then_some(SingleReversalKind::Wick)
 }
@@ -1604,7 +1612,8 @@ mod tests {
         let prev_up = bar(100.0, 110.0, 90.0, 91.0);
         let prev_down = bar(82.0, 100.0, 80.0, 100.0);
 
-        let up_clean = vec![prev_up.clone(), bar(90.0, 101.0, 89.0, 101.0)];
+        // 实体 25 = 0.25 ATR，恰好过吞没强反转实体门槛。
+        let up_clean = vec![prev_up.clone(), bar(88.0, 113.0, 87.0, 113.0)];
         assert_eq!(
             single_reversal_pattern(&up_clean, &atr, &flags, Dir::Up, 1, 1),
             Some(SingleReversalKind::Strong)
@@ -1633,6 +1642,35 @@ mod tests {
         let down_over = vec![prev_down, bar(110.0, 110.0, 40.0, 80.0)];
         assert_eq!(
             single_reversal_pattern(&down_over, &atr, &flags, Dir::Down, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn weak_engulf_body_is_not_strong_reversal() {
+        // L0 944 22:45 这类：几何上吞没前一根，但实体只有约 0.06 ATR，
+        // 不能因为“包住前实体”就按强反转计。
+        let atr = atrs(2, 36.0);
+        let flags = vec![(false, false); 2];
+        let prev_down = bar(8012.0, 8019.0, 7997.0, 8011.0);
+        let weak_up = vec![prev_down, bar(8011.0, 8015.0, 8002.0, 8013.0)];
+        assert_eq!(
+            single_reversal_pattern(&weak_up, &atr, &flags, Dir::Up, 1, 1),
+            None
+        );
+
+        // 同样干净的吞没形状，实体达到 0.25 ATR 后仍识别为 strong。
+        let strong_up = vec![bar(100.0, 110.0, 90.0, 91.0), bar(88.0, 136.0, 87.0, 135.0)];
+        assert_eq!(
+            single_reversal_pattern(&strong_up, &atr, &flags, Dir::Up, 1, 1),
+            Some(SingleReversalKind::Strong)
+        );
+
+        // 做空镜像：小实体吞没同样不识别为 strong。
+        let prev_up = bar(100.0, 101.0, 99.0, 100.9);
+        let weak_down = vec![prev_up, bar(100.9, 101.0, 99.7, 99.9)];
+        assert_eq!(
+            single_reversal_pattern(&weak_down, &atr, &flags, Dir::Down, 1, 1),
             None
         );
     }
@@ -2215,6 +2253,40 @@ mod tests {
             bar(5880.0, 5890.0, 5856.0, 5866.0), // s2 普通阴线（非强锚）
             bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径可过
             bar(5874.0, 5890.0, 5872.0, 5884.0), // 触发
+        ];
+
+        let sc = evaluate_signal(&bars, &atr, &p, &trend60());
+        assert_eq!(sc.warning, Some(3));
+        assert_eq!(sc.warning_kind, "fast");
+        assert_eq!(sc.warning_quality_points(), 0.0);
+        assert_eq!(sc.trigger, Some(4));
+    }
+
+    #[test]
+    fn weak_engulf_only_reaches_fast_path_not_strong() {
+        // L0 944 22:45 对照：小实体吞没不再按 strong 计，
+        // A级短b仍走快速路径，warning_kind 记为 fast。
+        let atr = atrs(5, 36.0);
+        let p = NPattern {
+            dir: Dir::Up,
+            s1: Swing {
+                index: 1,
+                price: 8091.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 2,
+                price: 8002.0,
+                is_high: false,
+            },
+            ..pattern()
+        };
+        let bars = vec![
+            bar(7806.0, 7824.0, 7800.0, 7820.0), // s0 低点
+            bar(8012.0, 8019.0, 7997.0, 8011.0), // s1 高点后普通阴线（弱锚）
+            bar(8011.0, 8015.0, 8002.0, 8013.0), // s2 小实体吞没
+            bar(8014.0, 8020.0, 8011.0, 8018.0), // 触发
+            bar(8015.0, 8023.0, 8013.0, 8021.0), // 突破预警高点
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
