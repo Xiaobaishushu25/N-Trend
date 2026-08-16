@@ -208,8 +208,8 @@ impl SignalCheck {
     }
 
     /// 2026-08-16：预警K线质量改为真实综合评分项。
-    /// 强反转（强趋势K与干净吞没合并）/长影线统一计入 0.3 分，
-    /// 快速路径/累计覆盖/无预警不计分。
+    /// 强反转（干净吞没）/长影线统一计入 0.3 分，
+    /// 累计覆盖/无预警不计分；历史 fast 记录同样不计分。
     pub const WARNING_QUALITY_POINTS: f64 = 0.3;
 
     pub fn warning_quality_points(&self) -> f64 {
@@ -237,6 +237,7 @@ mod tests {
             // 历史落盘仍可能为 engulf，按同一强反转口径计分。
             ("engulf", 0.3),
             ("wick", 0.3),
+            // 历史落盘兼容；新扫描不再产生 fast。
             ("fast", 0.0),
             ("cumulative", 0.0),
             ("none", 0.0),

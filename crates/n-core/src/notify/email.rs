@@ -123,6 +123,7 @@ fn event_warning_label(e: &pattern_events::Model) -> String {
                 "长上影线".to_string()
             }
         }
+        // 历史记录兼容；新扫描不再产生 fast。
         "fast" => "快速反转".to_string(),
         "cumulative" => "累积反转".to_string(),
         other => other.to_string(),

@@ -227,7 +227,7 @@ function toChartSignal(e: PatternEvent): PatternDto {
   return {
     number: e.id,
     level: e.level,
-    logic_version: '3',
+    logic_version: '4',
     warning_kind: e.warning_kind,
     direction: e.direction,
     grade: e.grade,
@@ -813,6 +813,7 @@ function warningKindText(kind?: string) {
     case 'wick':
       return '长影线'
     case 'fast':
+      // 历史记录兼容；新扫描不再产生 fast。
       return '快速路径'
     case 'cumulative':
       return '累计覆盖'

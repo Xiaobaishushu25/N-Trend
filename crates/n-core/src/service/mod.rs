@@ -69,7 +69,7 @@ pub struct OutcomeRefresh {
 pub struct OutcomeDetail {
     pub event_id: i64,
     pub symbol: String,
-    /// 事件版本：前向事件系统固定为 3
+    /// 事件版本：前向事件系统固定为 4
     pub logic_version: String,
     pub warning_kind: String,
     pub warning_ts: String,
@@ -134,11 +134,11 @@ pub struct OutcomeFilter {
     pub score_max: Option<f64>,
     /// win / loss / no_trigger / open / insufficient_data / rollover
     pub outcome: Option<String>,
-    /// 3，缺省不过滤
+    /// 4，缺省不过滤
     pub version: Option<String>,
 }
 
-const EVENT_LOGIC_VERSION: &str = "3";
+const EVENT_LOGIC_VERSION: &str = "4";
 
 fn pattern_endpoint_prices(bars: &[Bar], candidate: &event::WarningCandidate) -> (f64, f64, f64) {
     if candidate.direction == Dir::Up {
@@ -551,8 +551,7 @@ fn trail_r(grade: usize) -> f64 {
 
 fn trigger_k_adj(bars: &[Bar], dir: Dir, i: usize) -> f64 {
     let atr20 = crate::analyze::indicators::atr(bars, ATR_PERIOD);
-    let trend_k = crate::analyze::indicators::trend_flags(bars, &atr20);
-    match crate::analyze::scoring::single_reversal_pattern(bars, &atr20, &trend_k, dir, i, i) {
+    match crate::analyze::scoring::single_reversal_pattern(bars, &atr20, dir, i, i) {
         Some(kind) if matches!(kind.as_str(), "strong" | "engulf") => 0.5,
         Some(_) => 0.2,
         None => -0.3,
@@ -1720,6 +1719,7 @@ impl Services {
         let _scan_guard = self.scan_lock.lock().await;
         let started = now_ts();
         self.sync_rollovers_if_needed().await?;
+        repo::delete_fast_pattern_events(&self.db).await?;
         let cfg = self.config().await;
         let min_score = cfg.notify.new_pattern_min_score;
         let symbols = repo::list_symbols(&self.db, true).await?;
@@ -1873,6 +1873,7 @@ impl Services {
     /// 复盘页“刷新”：只推进在途事件，不重新识别新预警。
     pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
         let _scan_guard = self.scan_lock.lock().await;
+        repo::delete_fast_pattern_events(&self.db).await?;
         let events = repo::all_pattern_events(&self.db).await?;
         let mut by_symbol: HashMap<String, Vec<pattern_events::Model>> = HashMap::new();
         for e in events {
@@ -2078,6 +2079,7 @@ fn format_scan_signal(index: usize, e: &pattern_events::Model, min_score: f64) -
         // 历史落盘记录兼容：旧 engulf 与合并后的 strong 显示同一标签。
         "engulf" => "强反转",
         "wick" => "长影线",
+        // 历史记录兼容；新扫描不再产生 fast，旧记录也会被清理。
         "fast" => "快速反转",
         "cumulative" => "累积反转",
         other => other,
@@ -2453,7 +2455,7 @@ mod tests {
             b_bars: 13,
             retracement: 0.545,
             warning_index: 2,
-            warning_kind: "fast",
+            warning_kind: "strong",
             entry_score: 2.99,
             dim_a: 3.0,
             dim_b: 3.0,
@@ -2712,8 +2714,14 @@ mod tests {
         second.exit_ts = Some("2026-07-23 13:45:00".to_string());
 
         let mut bar_index: outcome::WarningBarIndex = HashMap::new();
-        bar_index.insert(("SA0".to_string(), "2026-07-23 09:45:00".to_string()), 0usize);
-        bar_index.insert(("SA0".to_string(), "2026-07-23 10:00:00".to_string()), 1usize);
+        bar_index.insert(
+            ("SA0".to_string(), "2026-07-23 09:45:00".to_string()),
+            0usize,
+        );
+        bar_index.insert(
+            ("SA0".to_string(), "2026-07-23 10:00:00".to_string()),
+            1usize,
+        );
 
         let mut ids = duplicate_event_ids(&[first, second], &bar_index);
         ids.sort_unstable();

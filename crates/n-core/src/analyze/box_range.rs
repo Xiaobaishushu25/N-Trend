@@ -142,7 +142,6 @@ fn box_candidates(
 fn find_warning(
     bars: &[Bar],
     atr20: &[Option<f64>],
-    trend_k: &[(bool, bool)],
     dir: Dir,
     upper: f64,
     lower: f64,
@@ -158,25 +157,9 @@ fn find_warning(
         if !ok {
             continue;
         }
-        let kind = match dir {
-            Dir::Up => {
-                if trend_k[j].0 {
-                    "strong"
-                } else if scoring::is_wick_warning_bar(&bars[j], atr, dir, bars.get(j - 1)) {
-                    "wick"
-                } else {
-                    continue;
-                }
-            }
-            Dir::Down => {
-                if trend_k[j].1 {
-                    "strong"
-                } else if scoring::is_wick_warning_bar(&bars[j], atr, dir, bars.get(j - 1)) {
-                    "wick"
-                } else {
-                    continue;
-                }
-            }
+        let kind = match scoring::single_reversal_pattern(bars, atr20, dir, j, j) {
+            Some(kind) => kind.as_str(),
+            None => continue,
         };
         found = Some((j, kind));
     }
@@ -294,7 +277,7 @@ fn build_box_check(
         0.0,
     ];
     // 2026-08-14：箱体与N字共用同一套预警K线质量分，
-    // 强趋势K/长影线预警同样计入综合评分（+0.3）。
+    // 干净吞没/长影线预警同样计入综合评分（+0.3）。
     sc.total =
         (BOX_BASE_SCORE + trend_score + touch_score + rr_score + sc.warning_quality_points())
             .min(5.0);
@@ -407,7 +390,6 @@ fn select_box_signals(mut signals: Vec<BoxSignal>, atr20: &[Option<f64>]) -> Vec
 pub fn detect_boxes(
     bars: &[Bar],
     atr20: &[Option<f64>],
-    trend_k: &[(bool, bool)],
     trend60: &Trend60,
     tick: f64,
 ) -> Vec<BoxSignal> {
@@ -421,7 +403,7 @@ pub fn detect_boxes(
     for c in candidates {
         for dir in [Dir::Up, Dir::Down] {
             let Some((w, warning_kind)) =
-                find_warning(bars, atr20, trend_k, dir, c.upper, c.lower, c.confirm_index)
+                find_warning(bars, atr20, dir, c.upper, c.lower, c.confirm_index)
             else {
                 continue;
             };
@@ -522,8 +504,9 @@ mod tests {
                 35 => bar(99.8, 100.0, 98.2, 98.4, minute),
                 12 | 27 | 42 => bar(91.0, 91.5, 90.0, 90.8, minute),
                 50 => bar(95.0, 95.2, 90.0, 95.1, minute),
-                55 => bar(100.0, 100.2, 96.2, 96.4, minute),
-                56..=59 => bar(95.0, 97.5, 96.5, 95.2, minute),
+                55 => bar(96.0, 100.0, 94.0, 94.8, minute), // 干净吞没阴线，触上轨
+                56 => bar(94.0, 96.0, 90.0, 96.0, minute),  // 干净吞没阳线，触下轨
+                57..=59 => bar(95.0, 97.5, 96.5, 95.2, minute),
                 _ => bar(94.8, 95.5, 94.7, 95.2, minute),
             };
             bars.push(b);
@@ -535,8 +518,7 @@ mod tests {
     fn detects_both_rail_signals() {
         let bars = box_series();
         let atr20 = indicators::atr(&bars, 20);
-        let trend_k = indicators::trend_flags(&bars, &atr20);
-        let signals = detect_boxes(&bars, &atr20, &trend_k, &neutral_trend(), 1.0);
+        let signals = detect_boxes(&bars, &atr20, &neutral_trend(), 1.0);
         assert_eq!(signals.len(), 2);
         let dirs: Vec<Dir> = signals.iter().map(|s| s.pattern.dir).collect();
         assert!(dirs.contains(&Dir::Up));
@@ -561,8 +543,7 @@ mod tests {
         let mut bars = box_series();
         bars[10].rollover = true;
         let atr20 = indicators::atr(&bars, 20);
-        let trend_k = indicators::trend_flags(&bars, &atr20);
-        let signals = detect_boxes(&bars, &atr20, &trend_k, &neutral_trend(), 1.0);
+        let signals = detect_boxes(&bars, &atr20, &neutral_trend(), 1.0);
         assert!(signals.is_empty());
     }
 }

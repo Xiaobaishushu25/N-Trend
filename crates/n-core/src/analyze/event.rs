@@ -45,7 +45,6 @@ fn warning_base(kind: &str) -> f64 {
     match kind {
         // engulf 仅保留给历史落盘记录，新识别统一为 strong。
         "strong" | "engulf" | "wick" => 3.5,
-        "fast" => 2.5,
         _ => 2.0,
     }
 }
@@ -78,7 +77,7 @@ fn warning_kind_at(
     p: &NPattern,
     w: usize,
 ) -> Option<&'static str> {
-    if let Some(kind) = scoring::single_reversal_pattern(bars, atr20, trend_k, p.dir, w, w) {
+    if let Some(kind) = scoring::single_reversal_pattern(bars, atr20, p.dir, w, w) {
         return Some(kind.as_str());
     }
     if !is_opposite_close(&bars[w], p.dir) || w == 0 {
@@ -93,14 +92,6 @@ fn warning_kind_at(
     let anchor_strong = anchor_is_strong(bars, atr20, trend_k, p.dir, anchor);
     let strict_confirm = matches!(p.grade, Grade::B | Grade::C);
 
-    if run_start == w
-        && !anchor_strong
-        && !strict_confirm
-        && !p.b_too_long
-        && scoring::fast_path_close_ok(bars, p.dir, w)
-    {
-        return Some("fast");
-    }
     if w > run_start
         && (anchor_strong || strict_confirm)
         && scoring::cumulative_coverage(bars, run_start, w, bars[anchor].open, p.dir)
@@ -562,8 +553,8 @@ mod tests {
 
     #[test]
     fn low_a_full_b_stays_below_2_5() {
-        // C0 1251 对照：A 腿 1.207、B 腿满分 5.0、fast 预警 2.5。
-        let score = composite_entry_score(1.207, 5.0, 2.5, "fast");
+        // C0 1251 对照：A 腿 1.207、B 腿满分 5.0、弱预警 2.5。
+        let score = composite_entry_score(1.207, 5.0, 2.5, "weak");
         assert!((score - 2.2243).abs() < 1e-4);
         assert!(score < 2.5);
     }
@@ -601,18 +592,19 @@ mod tests {
         let atr20 = vec![Some(10.0), Some(10.0), Some(10.0)];
         let t = dt(2026, 8, 7, 21, 15);
 
-        // 做多镜像：S1=150，预警K线高点148、实体140→147，实体覆盖剩余空间3.5倍。
+        // 做多镜像：S1=150，前一根阴线 O141 C140，预警K线干净吞没，
+        // 大实体高点148、实体覆盖剩余空间3.5倍，小实体K线不触发透支扣分。
         let up_trend = vec![(false, false), (false, false), (true, false)];
         let up_relaxed = vec![(false, false), (true, false), (false, false)];
         let up_bars = vec![
             bar(t, 100.0, 100.0, 100.0, 100.0),
-            bar(t, 110.0, 150.0, 109.0, 149.0),
+            bar(t, 141.0, 150.0, 109.0, 140.0),
             bar(t, 140.0, 148.0, 138.0, 147.0),
         ];
         let up_small_bars = vec![
             bar(t, 100.0, 100.0, 100.0, 100.0),
-            bar(t, 110.0, 150.0, 109.0, 149.0),
-            bar(t, 140.0, 148.0, 138.0, 141.0),
+            bar(t, 141.0, 150.0, 109.0, 140.0),
+            bar(t, 139.0, 144.0, 138.0, 141.5),
         ];
         let p_up = pattern_for(Dir::Up, 100.0, 150.0, 138.0);
         let big_up = candidate_for(&up_bars, &atr20, &up_trend, &up_relaxed, &p_up, 2, 1.0)
@@ -632,18 +624,19 @@ mod tests {
         assert!((small_up.dim_warning - 3.5).abs() < 1e-9);
         assert!((small_up.entry_score - big_up.entry_score - 0.2).abs() < 1e-9);
 
-        // 做空镜像：S1=100，预警K线低点102、实体110→103，同样扣满1.0。
+        // 做空镜像：S1=100，前一根阳线 O108 C107，预警K线干净吞没，
+        // 大实体低点102、实体覆盖剩余空间2倍，小实体K线不触发透支扣分。
         let down_trend = vec![(false, false), (false, false), (false, true)];
         let down_relaxed = vec![(false, false), (false, true), (false, false)];
         let down_bars = vec![
             bar(t, 150.0, 150.0, 149.0, 149.0),
-            bar(t, 110.0, 112.0, 100.0, 101.0),
-            bar(t, 110.0, 112.0, 102.0, 103.0),
+            bar(t, 106.0, 110.0, 100.0, 107.0),
+            bar(t, 108.0, 112.0, 102.0, 103.0),
         ];
         let down_small_bars = vec![
             bar(t, 150.0, 150.0, 149.0, 149.0),
-            bar(t, 110.0, 112.0, 100.0, 101.0),
-            bar(t, 110.0, 112.0, 102.0, 109.0),
+            bar(t, 106.0, 110.0, 100.0, 107.0),
+            bar(t, 107.5, 112.0, 105.0, 105.0),
         ];
         let p_down = pattern_for(Dir::Down, 150.0, 100.0, 112.0);
         let big_down = candidate_for(
@@ -673,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn long_b_blocks_fast_warning_kind() {
+    fn a_grade_weak_reversal_candle_does_not_warn() {
         let atr20 = vec![Some(30.0); 3];
         let trend_k = vec![(false, false); 3];
         let bars = vec![
@@ -694,9 +687,7 @@ mod tests {
             b_too_long: false,
             ..p
         };
-        assert_eq!(
-            warning_kind_at(&bars, &atr20, &trend_k, &short_b, 2),
-            Some("fast")
-        );
+        // 快速路径删除后，普通小阳线不再单独预警，b 段长短不再影响结果。
+        assert_eq!(warning_kind_at(&bars, &atr20, &trend_k, &short_b, 2), None);
     }
 }

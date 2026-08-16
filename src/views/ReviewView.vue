@@ -393,7 +393,7 @@ const levelOptions = [
   { label: '箱体', value: 'box' },
 ]
 const versionOptions = [
-  { label: '3.0', value: '3' },
+  { label: '4.0', value: '4' },
 ]
 const gradeOptions = [
   { label: 'A级', value: 'A级' },

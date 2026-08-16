@@ -697,6 +697,16 @@ pub async fn clear_pattern_events(db: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
+/// 删除历史上落盘的快速路径预警记录（2026-08-16 起不再生成该类型）。
+pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> {
+    let res = pattern_events::Entity::delete_many()
+        .filter(pattern_events::Column::WarningKind.eq("fast"))
+        .exec(db)
+        .await
+        .context("清理快速路径信号失败")?;
+    Ok(res.rows_affected)
+}
+
 /// 按 id 删除单条信号事件（重复信号清理用）。
 pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()> {
     let res = pattern_events::Entity::delete_by_id(id)
@@ -849,55 +859,56 @@ mod tests {
     #[tokio::test]
     async fn pattern_events_roundtrip_and_dedup_by_warning() {
         let db = test_db().await;
-        let row = |warning_ts: &str, state: &str, score: f64| pattern_events::ActiveModel {
-            id: sea_orm::NotSet,
-            symbol: Set("BU0".to_string()),
-            direction: Set("up".to_string()),
-            grade: Set("A级".to_string()),
-            level: Set("fine".to_string()),
-            s0_ts: Set("2026-08-14 09:15".to_string()),
-            s0_price: Set(4128.0),
-            s1_ts: Set("2026-08-14 09:30".to_string()),
-            s1_price: Set(4150.0),
-            s2_ts: Set("2026-08-14 09:45".to_string()),
-            s2_price: Set(4137.0),
-            a_move: Set(22.0),
-            b_move: Set(13.0),
-            a_bars: Set(1),
-            b_bars: Set(1),
-            retracement: Set(0.59),
-            warning_ts: Set(warning_ts.to_string()),
-            detected_at: Set(warning_ts.to_string()),
-            warning_kind: Set("wick".to_string()),
-            entry_score: Set(score),
-            entry_score_dims: Set(r#"{"dim_a":3.8,"dim_b":3.4,"dim_warning":3.5}"#.to_string()),
-            entry: Set(4162.0),
-            stop: Set(4137.0),
-            target: Set(4216.0),
-            risk: Set(25.0),
-            rr: Set(2.16),
-            state: Set(state.to_string()),
-            last_advance_ts: Set(None),
-            trigger_ts: Set(None),
-            trigger_bar_ts: Set(None),
-            trigger_price: Set(None),
-            trigger_score: Set(None),
-            trigger_volume_ratio: Set(None),
-            overshoot_r: Set(None),
-            hold_score: Set(None),
-            hold_score_history: Set("[]".to_string()),
-            outcome: Set(None),
-            exit_reason: Set(None),
-            exit_ts: Set(None),
-            exit_price: Set(None),
-            r_multiple: Set(None),
-            mfe_r: Set(None),
-            mae_r: Set(None),
-            created_at: Set("2026-08-14 11:30".to_string()),
-            updated_at: Set("2026-08-14 11:30".to_string()),
-        };
+        let row =
+            |warning_ts: &str, state: &str, score: f64, kind: &str| pattern_events::ActiveModel {
+                id: sea_orm::NotSet,
+                symbol: Set("BU0".to_string()),
+                direction: Set("up".to_string()),
+                grade: Set("A级".to_string()),
+                level: Set("fine".to_string()),
+                s0_ts: Set("2026-08-14 09:15".to_string()),
+                s0_price: Set(4128.0),
+                s1_ts: Set("2026-08-14 09:30".to_string()),
+                s1_price: Set(4150.0),
+                s2_ts: Set("2026-08-14 09:45".to_string()),
+                s2_price: Set(4137.0),
+                a_move: Set(22.0),
+                b_move: Set(13.0),
+                a_bars: Set(1),
+                b_bars: Set(1),
+                retracement: Set(0.59),
+                warning_ts: Set(warning_ts.to_string()),
+                detected_at: Set(warning_ts.to_string()),
+                warning_kind: Set(kind.to_string()),
+                entry_score: Set(score),
+                entry_score_dims: Set(r#"{"dim_a":3.8,"dim_b":3.4,"dim_warning":3.5}"#.to_string()),
+                entry: Set(4162.0),
+                stop: Set(4137.0),
+                target: Set(4216.0),
+                risk: Set(25.0),
+                rr: Set(2.16),
+                state: Set(state.to_string()),
+                last_advance_ts: Set(None),
+                trigger_ts: Set(None),
+                trigger_bar_ts: Set(None),
+                trigger_price: Set(None),
+                trigger_score: Set(None),
+                trigger_volume_ratio: Set(None),
+                overshoot_r: Set(None),
+                hold_score: Set(None),
+                hold_score_history: Set("[]".to_string()),
+                outcome: Set(None),
+                exit_reason: Set(None),
+                exit_ts: Set(None),
+                exit_price: Set(None),
+                r_multiple: Set(None),
+                mfe_r: Set(None),
+                mae_r: Set(None),
+                created_at: Set("2026-08-14 11:30".to_string()),
+                updated_at: Set("2026-08-14 11:30".to_string()),
+            };
 
-        let id = insert_pattern_event(&db, row("2026-08-14 11:30", "pending", 3.6))
+        let id = insert_pattern_event(&db, row("2026-08-14 11:30", "pending", 3.6, "wick"))
             .await
             .unwrap();
         assert_eq!(
@@ -927,10 +938,74 @@ mod tests {
 
         clear_pattern_events(&db).await.unwrap();
         assert!(all_pattern_events(&db).await.unwrap().is_empty());
-        let next_id = insert_pattern_event(&db, row("2026-08-14 12:00", "pending", 3.6))
+        let next_id = insert_pattern_event(&db, row("2026-08-14 12:00", "pending", 3.6, "wick"))
             .await
             .unwrap();
         assert_eq!(next_id, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_fast_pattern_events_removes_only_fast_kind() {
+        let db = test_db().await;
+        let row = |warning_ts: &str, kind: &str| pattern_events::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("BU0".to_string()),
+            direction: Set("up".to_string()),
+            grade: Set("A级".to_string()),
+            level: Set("fine".to_string()),
+            s0_ts: Set("2026-08-14 09:15".to_string()),
+            s0_price: Set(4128.0),
+            s1_ts: Set("2026-08-14 09:30".to_string()),
+            s1_price: Set(4150.0),
+            s2_ts: Set("2026-08-14 09:45".to_string()),
+            s2_price: Set(4137.0),
+            a_move: Set(22.0),
+            b_move: Set(13.0),
+            a_bars: Set(1),
+            b_bars: Set(1),
+            retracement: Set(0.59),
+            warning_ts: Set(warning_ts.to_string()),
+            detected_at: Set(warning_ts.to_string()),
+            warning_kind: Set(kind.to_string()),
+            entry_score: Set(3.6),
+            entry_score_dims: Set(r#"{"dim_a":3.8,"dim_b":3.4,"dim_warning":3.5}"#.to_string()),
+            entry: Set(4162.0),
+            stop: Set(4137.0),
+            target: Set(4216.0),
+            risk: Set(25.0),
+            rr: Set(2.16),
+            state: Set("pending".to_string()),
+            last_advance_ts: Set(None),
+            trigger_ts: Set(None),
+            trigger_bar_ts: Set(None),
+            trigger_price: Set(None),
+            trigger_score: Set(None),
+            trigger_volume_ratio: Set(None),
+            overshoot_r: Set(None),
+            hold_score: Set(None),
+            hold_score_history: Set("[]".to_string()),
+            outcome: Set(None),
+            exit_reason: Set(None),
+            exit_ts: Set(None),
+            exit_price: Set(None),
+            r_multiple: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            created_at: Set("2026-08-14 11:30".to_string()),
+            updated_at: Set("2026-08-14 11:30".to_string()),
+        };
+
+        insert_pattern_event(&db, row("2026-08-14 11:30", "fast"))
+            .await
+            .unwrap();
+        insert_pattern_event(&db, row("2026-08-14 12:00", "strong"))
+            .await
+            .unwrap();
+
+        assert_eq!(delete_fast_pattern_events(&db).await.unwrap(), 1);
+        let events = all_pattern_events(&db).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].warning_kind, "strong");
     }
 
     #[tokio::test]

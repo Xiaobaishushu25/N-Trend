@@ -150,7 +150,7 @@ pub mod pattern_events {
         pub warning_ts: String,
         /// 实际发现预警的时间（通常等于 warning_ts）
         pub detected_at: String,
-        /// strong / wick / fast / cumulative；历史记录可能为 engulf（按强反转兼容）
+        /// strong / wick / cumulative；历史记录可能为 fast / engulf（按强反转兼容）
         pub warning_kind: String,
         pub entry_score: f64,
         /// JSON: {"dim_a": x, "dim_b": y, "dim_warning": z}

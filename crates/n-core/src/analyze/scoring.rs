@@ -61,7 +61,7 @@ const WICK_RANGE_MIN: f64 = 0.60;
 const WICK_CLOSE_POS_MAX: f64 = 0.25;
 const WICK_REVERSE_SHADOW_MAX_RATIO: f64 = 0.10;
 const WICK_PREV_BAR_RANGE_MIN: f64 = 0.50;
-// 强反转（强趋势K/干净吞没合并）硬门槛：反向影线必须严格小于 50% 振幅。
+// 强反转（干净吞没）硬门槛：反向影线必须严格小于 50% 振幅。
 // 等于或超过 50% 说明收盘只回到振幅中点或更差，吞没质量不足，不再识别为 strong。
 const STRONG_REVERSE_SHADOW_MAX_RATIO: f64 = 0.5;
 // 吞没型强反转的实体硬门槛：实体至少达到 0.25 倍 ATR20，否则只是“包住前一根”的
@@ -406,7 +406,8 @@ pub(crate) enum WarnKind {
     Cumulative,
 }
 
-/// 单根反转形态的具体类型：强反转包含强趋势K与干净吞没，长影线预警必须通过七条硬门槛。
+/// 单根反转形态的具体类型：强反转即干净吞没（必须吞没前一根K线实体），
+/// 长影线预警必须通过七条硬门槛。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SingleReversalKind {
     Strong,
@@ -510,11 +511,13 @@ pub(crate) fn warning_space_overrun_penalty(bars: &[Bar], p: &NPattern, w: usize
     WARNING_SPACE_OVERRUN_PENALTY_MAX * t
 }
 
-/// 单根K线构成的反转形态：干净吞没/强反向趋势K 合并为强反转，反向长影线单独识别
+/// 单根K线构成的反转形态：只有干净吞没判为强反转，反向长影线单独识别。
+/// 强趋势K不再单独作为 strong：用户口径是“强反转必须吞没前一根K线，
+/// 没吞没说明强度不够”，SA0 1154 这类无吞没的强趋势K只作为 b 段锚点，
+/// 不再直接产生预警。
 pub(crate) fn single_reversal_pattern(
     bars: &[Bar],
     atr20: &[Option<f64>],
-    trend_k: &[(bool, bool)],
     dir: Dir,
     w: usize,
     run_start: usize,
@@ -530,7 +533,7 @@ pub(crate) fn single_reversal_pattern(
     // 阴包阳/阳包阴：仅对反转段的第一根反向K线检查，目标实体是它前面的b向K线。
     // 要求前面是b向实体（做空为阳线、做多为阴线），新K线为反向收盘并包住前一根实体，
     // 且至少一侧严格超过前实体——避免"实体完全相同的镜像小K线"被误判为吞没。
-    // 2026-08-16：吞没与强趋势K合并为 strong，反向影线必须严格小于 50% 振幅。
+    // 2026-08-16：strong 只保留干净吞没，反向影线必须严格小于 50% 振幅。
     let engulf = w == run_start
         && w > 0
         && match dir {
@@ -564,14 +567,6 @@ pub(crate) fn single_reversal_pattern(
         return Some(SingleReversalKind::Strong);
     }
 
-    let strong = match dir {
-        Dir::Up => trend_k.get(w).is_some_and(|x| x.0),
-        Dir::Down => trend_k.get(w).is_some_and(|x| x.1),
-    };
-    if strong {
-        return Some(SingleReversalKind::Strong);
-    }
-
     is_wick_warning_bar(bar, atr, dir, bars.get(w.saturating_sub(1)))
         .then_some(SingleReversalKind::Wick)
 }
@@ -591,25 +586,6 @@ pub(crate) fn cumulative_coverage(
     match dir {
         Dir::Up => last_close > anchor_open,
         Dir::Down => last_close < anchor_open,
-    }
-}
-
-/// A级快速路径的最低质量门槛：反向收盘必须落在K线振幅的反向一半内。
-/// 排除"小实体+长反向影线"（十字星、射击之星变体）这类收盘被反向力量
-/// 压制的K线直接当预警，避免任意一根小阳线/小阴线都被放行。
-pub(crate) fn fast_path_close_ok(bars: &[Bar], dir: Dir, i: usize) -> bool {
-    let Some(bar) = bars.get(i) else {
-        return false;
-    };
-    let range = bar.high - bar.low;
-    if range <= 0.0 {
-        return false;
-    }
-    match dir {
-        // 做多预警要求收盘在振幅上半部分（上影不占主导）
-        Dir::Up => (bar.high - bar.close) / range <= 0.5,
-        // 做空预警要求收盘在振幅下半部分（下影不占主导）
-        Dir::Down => (bar.close - bar.low) / range <= 0.5,
     }
 }
 
@@ -684,7 +660,7 @@ fn compute_scores(
     let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
 
     // 2026-08-16：预警K线质量分直接计入综合评分。
-    // 强反转（强趋势K/干净吞没）/长影线 +0.3，快速路径/累计覆盖/无预警 +0，
+    // 强反转（干净吞没）/长影线 +0.3，累计覆盖/无预警 +0，
     // 不新增 dims 维度，避免改变旧记录的 dims 结构与去重/统计口径。
     let mut total = 0.10 * dim_trend
         + 0.40 * dim_a
@@ -733,7 +709,7 @@ pub fn evaluate_signal_with_tick(
 }
 
 /// 2.0 严格版：预警K线只接受强反转/长影线两类单K自证形态，
-/// 关闭 A 级快速路径与 B/C 级多K累积覆盖通道。
+/// 关闭 B/C 级多K累积覆盖通道。
 pub fn evaluate_signal_v2_strict_with_tick(
     bars: &[Bar],
     atr20: &[Option<f64>],
@@ -763,15 +739,15 @@ fn evaluate_signal_inner(
     }
 
     // 方案B：B/C级结构按系统文档§6.3要求更严格的反转确认——预警必须是
-    // 强反转/长影线/多K累积覆盖之一；A级保留快速预警路径，
-    // 避免浅回调结构因等待确认而错过入场。
+    // 强反转/长影线/多K累积覆盖之一；A级普通反向K线同样不再单独放行。
     let strict_confirm = if v2_strict {
         true
     } else {
         matches!(p.grade, Grade::B | Grade::C)
     };
     // b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不足以
-    // 确认b段结束，必须出现强反转/长影线/多K累积覆盖。
+    // 确认b段结束，必须出现强反转/长影线/多K累积覆盖；A级普通反向K线
+    // 同样不再有快速路径兜底，只能等自证形态。
     let trend_k = indicators::trend_flags(bars, atr20);
     let mut warning = None;
     let mut warning_kind = "";
@@ -780,7 +756,7 @@ fn evaluate_signal_inner(
     let mut gate_anchor_strong = false;
     // s2 本身构成合格反转形态（长影线/强反转）时，s2 就是预警K线。
     // 长影线不要求反向收盘：做空时上影线够长即使收阳也算预警，做多方向对称。
-    let s2_single = single_reversal_pattern(bars, atr20, &trend_k, p.dir, p.s2.index, p.s2.index);
+    let s2_single = single_reversal_pattern(bars, atr20, p.dir, p.s2.index, p.s2.index);
     if let Some(kind) = s2_single {
         warning = Some(p.s2.index);
         warning_kind = kind.as_str();
@@ -805,19 +781,10 @@ fn evaluate_signal_inner(
         let mut j = run_start;
         let mut found = false;
         while j < end && is_opposite_close(&bars[j], p.dir) {
-            // A级允许首根反向收盘直接作为预警，但仍要求收盘在反向一半内，
-            // 排除小实体+长反向影线的K线；其余情况（强b向趋势K顶、B/C级）
-            // 都要求单根反转形态自证。
-            let single_now = single_reversal_pattern(bars, atr20, &trend_k, p.dir, j, run_start);
-            let single_ok = if v2_strict {
-                single_now.is_some()
-            } else {
-                (!anchor_strong
-                    && !strict_confirm
-                    && !p.b_too_long
-                    && fast_path_close_ok(bars, p.dir, j))
-                    || single_now.is_some()
-            };
+            // 单根弱反向K线不再单独放行，只有强反转/长影线自证形态，
+            // 或需要严格确认的路径满足多K累积覆盖时，才产生预警。
+            let single_now = single_reversal_pattern(bars, atr20, p.dir, j, run_start);
+            let single_ok = single_now.is_some();
             // 多K累积覆盖同样只对需要严格确认的路径开放（连续反向收盘吞没b向实体）。
             let cumul_ok = !v2_strict
                 && (anchor_strong || strict_confirm)
@@ -830,7 +797,7 @@ fn evaluate_signal_inner(
                 } else if let Some(kind) = single_now {
                     kind.as_str()
                 } else {
-                    "fast"
+                    unreachable!("single_ok 只在 single_now 存在时为 true")
                 };
                 warn_kind = if is_cumulative {
                     WarnKind::Cumulative
@@ -1275,14 +1242,15 @@ mod tests {
         let mut p = pattern();
         // 入场价偏移一档后，决策点需高于预警K线极值，这里把价格平移到正常量级
         p.s0.price = 4500.0;
-        p.s1.price = 4503.0;
+        p.s1.price = 4550.0;
         p.s2.price = 4500.5;
         let trend = trend60();
-        let atr = vec![Some(10.0); 5];
+        let atr = vec![Some(20.0); 6];
         let bars = vec![
             bar(4500.0, 4501.0, 4500.0, 4500.5),
             bar(4500.5, 4501.0, 4500.4, 4500.6),
-            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.8, 4501.0, 4500.5, 4500.7), // s2 阴线（吞没的前一根）
+            bar(4500.6, 4516.6, 4500.6, 4515.6), // 吞没阳线 → 预警
             bar(4500.7, 4500.95, 4500.65, 4500.9),
             bar(4500.9, 4500.9, 4500.8, 4500.85),
         ];
@@ -1453,14 +1421,15 @@ mod tests {
     fn pending_signal_invalidated_when_b_leg_broken() {
         let mut p = pattern();
         p.s0.price = 4500.0;
-        p.s1.price = 4503.0;
+        p.s1.price = 4550.0;
         p.s2.price = 4500.5;
         let trend = trend60();
-        let atr = vec![Some(10.0); 10];
+        let atr = vec![Some(20.0); 6];
         let bars = vec![
             bar(4500.0, 4501.0, 4500.0, 4500.5),
             bar(4500.5, 4501.0, 4500.4, 4500.6),
-            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.8, 4501.0, 4500.5, 4500.7), // s2 阴线（吞没的前一根）
+            bar(4500.6, 4516.6, 4500.6, 4515.6), // 吞没阳线 → 预警
             bar(4500.7, 4500.9, 4500.55, 4500.75),
             bar(4500.6, 4500.7, 4500.4, 4500.45),
         ];
@@ -1476,14 +1445,15 @@ mod tests {
     fn pending_signal_goes_stale_after_too_many_bars() {
         let mut p = pattern();
         p.s0.price = 4500.0;
-        p.s1.price = 4503.0;
+        p.s1.price = 4550.0;
         p.s2.price = 4500.5;
         let trend = trend60();
-        let atr = vec![Some(10.0); 20];
+        let atr = vec![Some(20.0); 20];
         let mut bars = vec![
             bar(4500.0, 4501.0, 4500.0, 4500.5),
             bar(4500.5, 4501.0, 4500.4, 4500.6),
-            bar(4500.6, 4501.0, 4500.5, 4500.7),
+            bar(4500.8, 4501.0, 4500.5, 4500.7), // s2 阴线（吞没的前一根）
+            bar(4500.6, 4516.6, 4500.6, 4515.6), // 吞没阳线 → 预警
             bar(4500.7, 4500.9, 4500.6, 4500.75),
         ];
         for _ in 0..14 {
@@ -1573,7 +1543,7 @@ mod tests {
 
     #[test]
     fn strong_single_reversal_at_b_end_is_not_downgraded() {
-        // 做空：b段末强阳线后直接出现强趋势阴线，属于合格反转，不降级
+        // 做空：b段末强阳线后直接出现吞没阴线，属于合格反转，不降级
         let atr = atrs(5, 40.0);
         let p = NPattern {
             dir: Dir::Down,
@@ -1593,7 +1563,7 @@ mod tests {
             bar(15090.0, 15090.0, 15080.0, 15085.0),
             bar(14900.0, 14910.0, 14805.0, 14810.0),
             bar(14870.0, 14945.0, 14870.0, 14940.0), // s2 强趋势阳线
-            bar(14940.0, 14940.0, 14850.0, 14855.0), // 强趋势阴线
+            bar(14940.0, 14942.0, 14860.0, 14865.0), // 吞没阴线 → 合格预警
             bar(14855.0, 14860.0, 14820.0, 14830.0), // 触发
         ];
 
@@ -1608,42 +1578,51 @@ mod tests {
     #[test]
     fn merged_strong_rejects_reverse_shadow_at_or_over_half_range() {
         let atr = atrs(2, 100.0);
-        let flags = vec![(false, false); 2];
         let prev_up = bar(100.0, 110.0, 90.0, 91.0);
         let prev_down = bar(82.0, 100.0, 80.0, 100.0);
 
         // 实体 25 = 0.25 ATR，恰好过吞没强反转实体门槛。
         let up_clean = vec![prev_up.clone(), bar(88.0, 113.0, 87.0, 113.0)];
         assert_eq!(
-            single_reversal_pattern(&up_clean, &atr, &flags, Dir::Up, 1, 1),
+            single_reversal_pattern(&up_clean, &atr, Dir::Up, 1, 1),
             Some(SingleReversalKind::Strong)
         );
         let up_exact = vec![prev_up.clone(), bar(90.0, 111.0, 89.0, 100.0)];
         assert_eq!(
-            single_reversal_pattern(&up_exact, &atr, &flags, Dir::Up, 1, 1),
+            single_reversal_pattern(&up_exact, &atr, Dir::Up, 1, 1),
             None
         );
         let up_over = vec![prev_up, bar(90.0, 112.0, 89.0, 100.0)];
-        assert_eq!(
-            single_reversal_pattern(&up_over, &atr, &flags, Dir::Up, 1, 1),
-            None
-        );
+        assert_eq!(single_reversal_pattern(&up_over, &atr, Dir::Up, 1, 1), None);
 
         let down_clean = vec![prev_down.clone(), bar(110.0, 110.0, 61.0, 80.0)];
         assert_eq!(
-            single_reversal_pattern(&down_clean, &atr, &flags, Dir::Down, 1, 1),
+            single_reversal_pattern(&down_clean, &atr, Dir::Down, 1, 1),
             Some(SingleReversalKind::Strong)
         );
         let down_exact = vec![prev_down.clone(), bar(110.0, 110.0, 50.0, 80.0)];
         assert_eq!(
-            single_reversal_pattern(&down_exact, &atr, &flags, Dir::Down, 1, 1),
+            single_reversal_pattern(&down_exact, &atr, Dir::Down, 1, 1),
             None
         );
         let down_over = vec![prev_down, bar(110.0, 110.0, 40.0, 80.0)];
         assert_eq!(
-            single_reversal_pattern(&down_over, &atr, &flags, Dir::Down, 1, 1),
+            single_reversal_pattern(&down_over, &atr, Dir::Down, 1, 1),
             None
         );
+    }
+
+    #[test]
+    fn strong_trend_candle_without_engulf_is_not_strong() {
+        // SA0 1154 14:00 对照：O971 H971 L966 C967，ATR20=5，
+        // 收盘 967 高于前一根开盘 964，方向性强但没有吞没前一根实体，
+        // 不再单独作为 strong 预警。
+        let atr = atrs(2, 5.0);
+        let bars = vec![
+            bar(964.0, 971.0, 960.0, 970.0), // 前一根 b 向阳线
+            bar(971.0, 971.0, 966.0, 967.0), // 强趋势阴线，未吞没
+        ];
+        assert_eq!(single_reversal_pattern(&bars, &atr, Dir::Down, 1, 1), None);
     }
 
     #[test]
@@ -1651,18 +1630,14 @@ mod tests {
         // L0 944 22:45 这类：几何上吞没前一根，但实体只有约 0.06 ATR，
         // 不能因为“包住前实体”就按强反转计。
         let atr = atrs(2, 36.0);
-        let flags = vec![(false, false); 2];
         let prev_down = bar(8012.0, 8019.0, 7997.0, 8011.0);
         let weak_up = vec![prev_down, bar(8011.0, 8015.0, 8002.0, 8013.0)];
-        assert_eq!(
-            single_reversal_pattern(&weak_up, &atr, &flags, Dir::Up, 1, 1),
-            None
-        );
+        assert_eq!(single_reversal_pattern(&weak_up, &atr, Dir::Up, 1, 1), None);
 
         // 同样干净的吞没形状，实体达到 0.25 ATR 后仍识别为 strong。
         let strong_up = vec![bar(100.0, 110.0, 90.0, 91.0), bar(88.0, 136.0, 87.0, 135.0)];
         assert_eq!(
-            single_reversal_pattern(&strong_up, &atr, &flags, Dir::Up, 1, 1),
+            single_reversal_pattern(&strong_up, &atr, Dir::Up, 1, 1),
             Some(SingleReversalKind::Strong)
         );
 
@@ -1670,14 +1645,14 @@ mod tests {
         let prev_up = bar(100.0, 101.0, 99.0, 100.9);
         let weak_down = vec![prev_up, bar(100.9, 101.0, 99.7, 99.9)];
         assert_eq!(
-            single_reversal_pattern(&weak_down, &atr, &flags, Dir::Down, 1, 1),
+            single_reversal_pattern(&weak_down, &atr, Dir::Down, 1, 1),
             None
         );
     }
 
     #[test]
     fn weak_b_end_keeps_original_warning_behavior() {
-        // b段末不是强趋势K时，首根反向收盘K线仍直接作为预警（保持原逻辑）
+        // b段末普通阳线后直接出现干净吞没阴线，仍作为 strong 预警。
         let atr = atrs(4, 40.0);
         let p = NPattern {
             dir: Dir::Down,
@@ -1697,11 +1672,12 @@ mod tests {
             bar(15090.0, 15090.0, 15080.0, 15085.0),
             bar(14900.0, 14910.0, 14805.0, 14810.0),
             bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线（非强趋势）
-            bar(14890.0, 14890.0, 14860.0, 14865.0), // 首根阴线直接作为预警
+            bar(14890.0, 14890.0, 14860.0, 14865.0), // 吞没阴线 → 预警
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
         assert_eq!(sc.warning, Some(3));
+        assert_eq!(sc.warning_kind, "strong");
     }
 
     #[test]
@@ -2059,8 +2035,8 @@ mod tests {
 
     #[test]
     fn b_grade_accepts_later_strong_reversal() {
-        // 方案B：B级结构等到强趋势阴线出现后才出预警，拒绝前面的小阴线
-        let atr = atrs(6, 40.0);
+        // 方案B：B级结构等到干净吞没阴线出现后才出预警，拒绝前面的小阴线
+        let atr = atrs(7, 40.0);
         let p = NPattern {
             dir: Dir::Down,
             grade: Grade::B,
@@ -2081,15 +2057,16 @@ mod tests {
             bar(14900.0, 14910.0, 14805.0, 14810.0),
             bar(14870.0, 14900.0, 14870.0, 14890.0), // s2 普通阳线
             bar(14890.0, 14892.0, 14870.0, 14880.0), // 小阴线，不合格
-            bar(14880.0, 14880.0, 14800.0, 14805.0), // 强趋势阴线 → 合格预警
+            bar(14880.0, 14890.0, 14878.0, 14886.0), // 阳线打断反转段
+            bar(14886.0, 14886.0, 14860.0, 14865.0), // 干净吞没阴线 → 合格预警
             bar(14805.0, 14810.0, 14760.0, 14770.0), // 触发
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
-        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.warning, Some(5));
         assert_eq!(sc.warning_kind, "strong");
-        assert_eq!(sc.trigger, Some(5));
-        assert_eq!(sc.entry, 14799.0);
+        assert_eq!(sc.trigger, Some(6));
+        assert_eq!(sc.entry, 14859.0);
         assert!(!sc.note.contains("累积确认"));
     }
 
@@ -2129,10 +2106,10 @@ mod tests {
     }
 
     #[test]
-    fn a_grade_fast_path_rejects_small_bullish_with_long_upper_wick() {
-        // A级快速路径不接受"小实体+长上影"的阳线做多预警，
-        // 等到收盘位置合格的反向K线才出预警（b端为普通阴线，未触发强锚门）。
-        let atr = atrs(6, 30.0);
+    fn a_grade_weak_bullish_candles_do_not_warn_until_strong_reversal() {
+        // A级不接受"小实体+长上影"的阳线做多预警，收盘位置合格但
+        // 未达强反转/长影线门槛的普通K线同样不再单独放行，继续等干净吞没。
+        let atr = atrs(7, 30.0);
         let p = NPattern {
             dir: Dir::Up,
             s1: Swing {
@@ -2151,21 +2128,23 @@ mod tests {
             bar(14900.0, 14910.0, 14890.0, 14900.0),
             bar(15080.0, 15090.0, 15070.0, 15085.0), // s1 高点
             bar(14885.0, 14895.0, 14852.0, 14865.0), // s2 普通阴线（b段低点，不构成强反向实体）
-            bar(14835.0, 14855.0, 14830.0, 14840.0), // 小阳线+长上影 → 不合格
-            bar(14840.0, 14870.0, 14835.0, 14860.0), // 收盘位置合格的反转阳线 → 预警
-            bar(14860.0, 14890.0, 14858.0, 14885.0), // 触发
+            bar(14835.0, 14855.0, 14830.0, 14840.0), // 小阳线+长上影，不再单独预警
+            bar(14855.0, 14860.0, 14840.0, 14845.0), // 小阴线：非强反转/长影线
+            bar(14840.0, 14860.0, 14835.0, 14860.0), // 干净吞没阳线 → 预警
+            bar(14855.0, 14890.0, 14853.0, 14885.0), // 触发
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
-        assert_eq!(sc.warning, Some(4));
-        assert_eq!(sc.trigger, Some(5));
-        assert_eq!(sc.entry, 14871.0);
+        assert_eq!(sc.warning, Some(5));
+        assert_eq!(sc.warning_kind, "strong");
+        assert_eq!(sc.trigger, Some(6));
+        assert_eq!(sc.entry, 14861.0);
     }
 
     #[test]
-    fn relaxed_strong_anchor_blocks_fast_path_warning() {
+    fn strong_anchor_blocks_weak_reversal_candles() {
         // SF0场景：b端大阴线实体/振幅够大但收盘位0.75（未达严格趋势K的0.80），
-        // 强锚口径统一后仍判为“强反向实体”，禁用A级快速路径，小阳线不能直接预警。
+        // 强锚口径统一后仍判为“强反向实体”，小阳线不能单独预警。
         let atr = atrs(6, 40.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -2185,7 +2164,7 @@ mod tests {
             bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
             bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
             bar(5896.0, 5896.0, 5856.0, 5866.0), // s2 大阴线：实体75%、收盘位0.75（未到严格线）
-            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径可过，但被强锚拦截
+            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：弱K不再单独预警，强锚门持续生效
             bar(5874.0, 5884.0, 5872.0, 5878.0), // 小阳线：无合格反转
             bar(5878.0, 5882.0, 5874.0, 5880.0), // 小阳线：无合格反转，未收复锚定开盘5896
         ];
@@ -2197,8 +2176,8 @@ mod tests {
     }
 
     #[test]
-    fn a_grade_fast_path_waits_when_only_cross_star_and_weak_candles() {
-        // bu0案例：s2为十字星、后续阳线收盘位置不合格时不出预警，等待真正的反转K线
+    fn a_grade_weak_reversal_candles_do_not_warn() {
+        // bu0案例：s2为十字星、后续弱阳线不再单独预警，等待真正的反转K线
         let atr = atrs(5, 15.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -2229,9 +2208,9 @@ mod tests {
     }
 
     #[test]
-    fn a_grade_fast_path_marks_warning_kind_as_fast() {
-        // A级普通b端：小阳线收盘位置合格但不算强反转/长影线时，
-        // 走快速路径出预警，warning_kind 记为 fast，且不给强预警加成。
+    fn a_grade_weak_candle_waits_for_strong_reversal() {
+        // A级普通b端：弱阳线/阴线不算强反转/长影线时不再预警，
+        // 等到干净吞没阳线出现才出 strong 预警。
         let atr = atrs(6, 40.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -2251,21 +2230,22 @@ mod tests {
             bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
             bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
             bar(5880.0, 5890.0, 5856.0, 5866.0), // s2 普通阴线（非强锚）
-            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径可过
-            bar(5874.0, 5890.0, 5872.0, 5884.0), // 触发
+            bar(5866.0, 5878.0, 5862.0, 5864.0), // 小阴线：不再单独预警
+            bar(5862.0, 5900.0, 5856.0, 5896.0), // 干净吞没阳线 → 预警
+            bar(5896.0, 5912.0, 5894.0, 5908.0), // 触发
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
-        assert_eq!(sc.warning, Some(3));
-        assert_eq!(sc.warning_kind, "fast");
-        assert_eq!(sc.warning_quality_points(), 0.0);
-        assert_eq!(sc.trigger, Some(4));
+        assert_eq!(sc.warning, Some(4));
+        assert_eq!(sc.warning_kind, "strong");
+        assert_eq!(sc.warning_quality_points(), 0.3);
+        assert_eq!(sc.trigger, Some(5));
     }
 
     #[test]
-    fn weak_engulf_only_reaches_fast_path_not_strong() {
+    fn weak_engulf_does_not_warn_without_strong_form() {
         // L0 944 22:45 对照：小实体吞没不再按 strong 计，
-        // A级短b仍走快速路径，warning_kind 记为 fast。
+        // 也不再有快速路径兜底，继续等强反转/长影线。
         let atr = atrs(5, 36.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -2284,22 +2264,20 @@ mod tests {
         let bars = vec![
             bar(7806.0, 7824.0, 7800.0, 7820.0), // s0 低点
             bar(8012.0, 8019.0, 7997.0, 8011.0), // s1 高点后普通阴线（弱锚）
-            bar(8011.0, 8015.0, 8002.0, 8013.0), // s2 小实体吞没
-            bar(8014.0, 8020.0, 8011.0, 8018.0), // 触发
+            bar(8011.0, 8015.0, 8002.0, 8011.0), // s2 普通阴线（弱锚）
+            bar(8008.0, 8017.0, 8008.0, 8016.0), // 小实体吞没：不够 strong，也不走快速路径
             bar(8015.0, 8023.0, 8013.0, 8021.0), // 突破预警高点
         ];
 
         let sc = evaluate_signal(&bars, &atr, &p, &trend60());
-        assert_eq!(sc.warning, Some(3));
-        assert_eq!(sc.warning_kind, "fast");
-        assert_eq!(sc.warning_quality_points(), 0.0);
-        assert_eq!(sc.trigger, Some(4));
+        assert_eq!(sc.warning, None);
+        assert_eq!(sc.warning_kind, "none");
+        assert_eq!(sc.state, "等待预警");
     }
 
     #[test]
-    fn long_b_blocks_fast_path_warning() {
-        // 同一根小阳线：b段长度正常时走快速路径；b段超过8根后快速路径关闭，
-        // 只有强反转/长影线等自证形态才能预警。
+    fn weak_reversal_candle_waits_for_strong_confirm() {
+        // 同一根小阳线：b段偏长时仍保持等待，只有强反转/长影线等自证形态才能预警。
         let atr = atrs(6, 40.0);
         let p = NPattern {
             dir: Dir::Up,
@@ -2321,7 +2299,7 @@ mod tests {
             bar(5600.0, 5610.0, 5590.0, 5605.0), // s0 低点
             bar(5900.0, 5910.0, 5890.0, 5905.0), // s1 高点
             bar(5880.0, 5890.0, 5856.0, 5866.0), // s2 普通阴线（非强锚）
-            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：快速路径被长b禁用
+            bar(5864.0, 5878.0, 5862.0, 5874.0), // 小阳线：不再单独预警
             bar(5874.0, 5878.0, 5870.0, 5872.0), // 阴线打断反转段
         ];
 
@@ -2332,7 +2310,7 @@ mod tests {
     }
 
     #[test]
-    fn strong_warning_kinds_beat_other_paths_by_three_tenths() {
+    fn strong_warning_kinds_beat_cumulative_by_three_tenths() {
         let atr = atrs(4, 10.0);
         let p = pattern();
         let trend = trend60();
@@ -2342,13 +2320,13 @@ mod tests {
             bar(0.6, 1.0, 0.5, 0.7),
             bar(0.7, 1.1, 0.6, 0.9),
         ];
-        let fast = compute_scores(
+        let cumulative = compute_scores(
             &bars,
             &atr,
             &p,
             &trend,
             2.0,
-            "fast",
+            "cumulative",
             Some(2),
             Some(3),
             0,
@@ -2369,7 +2347,7 @@ mod tests {
                 0,
                 false,
             );
-            assert!((strong.1 - fast.1 - 0.3).abs() < 1e-9, "kind={kind}");
+            assert!((strong.1 - cumulative.1 - 0.3).abs() < 1e-9, "kind={kind}");
         }
     }
 

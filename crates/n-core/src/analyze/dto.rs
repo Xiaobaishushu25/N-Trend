@@ -31,8 +31,8 @@ pub struct PatternDto {
     /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认视为 1
     #[serde(default = "legacy_logic_version")]
     pub logic_version: String,
-    /// 2026-08-16：预警K线类型，strong / wick / fast / cumulative / none；
-    /// 历史记录仍可能为 engulf，显示时按强反转兼容。质量分已计入 `score`。
+    /// 2026-08-16：预警K线类型，strong / wick / cumulative / none；
+    /// 历史记录仍可能为 fast / engulf，显示时按强反转兼容。质量分已计入 `score`。
     #[serde(default)]
     pub warning_kind: String,
     pub direction: String,

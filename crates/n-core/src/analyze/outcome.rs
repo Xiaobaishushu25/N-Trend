@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::analyze::model::Bar;
 
 /// 前向事件系统版本号，写入复盘统计结果。
-pub const SIM_VERSION: i64 = 11;
+pub const SIM_VERSION: i64 = 12;
 /// 相似预警去重：预警K线最多相隔多少根 15m。
 pub const DEDUP_WARNING_BARS: usize = 5;
 /// 相似预警去重：计划/实际入场价差上限（按前一条信号的 risk 折算）。
@@ -272,7 +272,7 @@ impl StatsScope {
 pub struct StatRow {
     pub signal_id: i64,
     pub symbol: String,
-    /// 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认 1。
+    /// 前向事件系统版本，写入统计去重键；当前固定为 4。
     pub logic_version: String,
     pub direction: String,
     pub level: String,

@@ -232,7 +232,7 @@ pub fn analyze_bars_v2(
     let mut signals = dedup_signals(n_candidates);
     let mut box_meta: Vec<Option<BoxDto>> = vec![None; signals.len()];
 
-    let box_signals = box_range::detect_boxes(bars15, &atr15, &trend_k, &trend60, tick);
+    let box_signals = box_range::detect_boxes(bars15, &atr15, &trend60, tick);
     for bs in &box_signals {
         box_meta.push(Some(bs.meta.clone()));
         signals.push((signals.len() + 1, &bs.pattern, bs.check.clone()));
