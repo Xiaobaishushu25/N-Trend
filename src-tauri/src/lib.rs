@@ -179,6 +179,14 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
+            // 复盘统计等子窗口关闭后立即落盘，避免下次打开时又回到默认大小
+            if let tauri::WindowEvent::Destroyed = event {
+                if window.label() != "main" {
+                    let _ = window
+                        .app_handle()
+                        .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_symbols,
@@ -202,6 +210,7 @@ pub fn run() {
             commands::refresh_symbol_list,
             commands::enrich_symbol_names,
             commands::get_klines,
+            commands::get_trend_series,
             commands::get_market_snapshot,
             commands::refresh_data_now,
             commands::run_scan_now,

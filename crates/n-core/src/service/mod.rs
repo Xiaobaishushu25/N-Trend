@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::analyze::event;
-use crate::analyze::model::{Bar, Dir, ATR_PERIOD, DT};
+use crate::analyze::model::{Bar, Dir, Grade, NPattern, Swing, ATR_PERIOD, DT};
 use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
@@ -79,6 +79,12 @@ pub struct OutcomeDetail {
     pub grade: String,
     pub entry_score: f64,
     pub entry_score_dims: String,
+    pub s0_ts: String,
+    pub s0_price: f64,
+    pub s1_ts: String,
+    pub s1_price: f64,
+    pub s2_ts: String,
+    pub s2_price: f64,
     pub entry: f64,
     pub stop: f64,
     pub target: f64,
@@ -106,6 +112,21 @@ pub struct OutcomeDetail {
     pub a_bars: Option<usize>,
     pub b_bars: Option<usize>,
     pub retracement: Option<f64>,
+    /// A段逐K质量 q（ATR加权，不含幅度/速度项）
+    pub a_q: Option<f64>,
+    /// A段净推进幅度 = a_move - A段大跳空合计
+    pub a_net_move: Option<f64>,
+    /// A段大跳空合计（点数）
+    pub a_gap_sum: Option<f64>,
+    /// A段大跳空根数
+    pub a_gap_count: Option<usize>,
+    /// A段评分所用 ATR（S1 处）
+    pub a_atr: Option<f64>,
+    pub a_too_long: Option<bool>,
+    pub b_too_long: Option<bool>,
+    pub b_fast: Option<bool>,
+    pub b_weakening: Option<bool>,
+    pub b_weakening_ratio: Option<f64>,
     pub net_r: Option<f64>,
     pub rollover_crossed: bool,
     pub gap_crossed_entry: bool,
@@ -367,15 +388,8 @@ fn matches_outcome_filter(e: &pattern_events::Model, f: &OutcomeFilter) -> bool 
             return false;
         }
     }
-    if let Some(min) = f.score_min {
-        if e.entry_score < min {
-            return false;
-        }
-    }
-    if let Some(max) = f.score_max {
-        if e.entry_score > max {
-            return false;
-        }
+    if !score_in_range(e.entry_score, f.score_min, f.score_max) {
+        return false;
     }
     if let Some(out) = f.outcome.as_deref().filter(|x| !x.is_empty()) {
         if event_outcome_str(e) != out {
@@ -390,12 +404,26 @@ fn matches_outcome_filter(e: &pattern_events::Model, f: &OutcomeFilter) -> bool 
     true
 }
 
-fn parse_entry_dims(dims: &str) -> Option<[f64; 6]> {
+fn score_in_range(score: f64, min: Option<f64>, max: Option<f64>) -> bool {
+    if let Some(m) = min {
+        if score < m {
+            return false;
+        }
+    }
+    if let Some(m) = max {
+        if score > m {
+            return false;
+        }
+    }
+    true
+}
+
+fn parse_entry_dims(dims: &str) -> Option<[f64; 3]> {
     let v: serde_json::Value = serde_json::from_str(dims).ok()?;
     let a = v.get("dim_a")?.as_f64()?;
     let b = v.get("dim_b")?.as_f64()?;
     let w = v.get("dim_warning")?.as_f64()?;
-    Some([0.0, a, b, w, 0.0, 0.0])
+    Some([a, b, w])
 }
 
 fn stat_row_from(e: &pattern_events::Model, tick: Option<f64>) -> Option<outcome::StatRow> {
@@ -480,6 +508,12 @@ fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeD
         grade: e.grade.clone(),
         entry_score: e.entry_score,
         entry_score_dims: e.entry_score_dims.clone(),
+        s0_ts: e.s0_ts.clone(),
+        s0_price: e.s0_price,
+        s1_ts: e.s1_ts.clone(),
+        s1_price: e.s1_price,
+        s2_ts: e.s2_ts.clone(),
+        s2_price: e.s2_price,
         entry: e.entry,
         stop: e.stop,
         target: e.target,
@@ -511,6 +545,16 @@ fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeD
         a_bars: Some(e.a_bars as usize),
         b_bars: Some(e.b_bars as usize),
         retracement: Some(e.retracement),
+        a_q: None,
+        a_net_move: None,
+        a_gap_sum: None,
+        a_gap_count: None,
+        a_atr: None,
+        a_too_long: None,
+        b_too_long: None,
+        b_fast: None,
+        b_weakening: None,
+        b_weakening_ratio: None,
         net_r: e
             .r_multiple
             .zip(tick)
@@ -520,6 +564,83 @@ fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeD
         gap_crossed_entry: false,
         gap_crossed_exit: false,
     }
+}
+
+/// 用 15m K线现场回算 A/B 段结构细节，供复盘卡片展示。
+/// 只依赖 S0/S1/S2 定死的时间与幅度，不随后续行情改变。
+fn fill_leg_detail(
+    row: &mut OutcomeDetail,
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    index_by_ts: &HashMap<String, usize>,
+) {
+    let Some(&s0_index) = index_by_ts.get(&row.s0_ts) else {
+        return;
+    };
+    let Some(&s1_index) = index_by_ts.get(&row.s1_ts) else {
+        return;
+    };
+    let Some(&s2_index) = index_by_ts.get(&row.s2_ts) else {
+        return;
+    };
+    let dir = if row.direction == "down" {
+        Dir::Down
+    } else {
+        Dir::Up
+    };
+    let a_bars = row.a_bars.unwrap_or_else(|| s1_index.saturating_sub(s0_index) + 1);
+    let b_bars = row.b_bars.unwrap_or_else(|| s2_index.saturating_sub(s1_index));
+    let a_speed = row.a_move.unwrap_or(0.0) / a_bars.max(1) as f64;
+    let b_speed = row.b_move.unwrap_or(0.0) / b_bars.max(1) as f64;
+    let p = NPattern {
+        level: if row.level == "large" { "large" } else { "fine" },
+        dir,
+        s0: Swing {
+            index: s0_index,
+            price: row.s0_price,
+            is_high: dir == Dir::Down,
+        },
+        s1: Swing {
+            index: s1_index,
+            price: row.s1_price,
+            is_high: dir == Dir::Up,
+        },
+        s2: Swing {
+            index: s2_index,
+            price: row.s2_price,
+            is_high: dir == Dir::Down,
+        },
+        a_bars,
+        b_bars,
+        a_move: row.a_move.unwrap_or(0.0),
+        b_move: row.b_move.unwrap_or(0.0),
+        retracement: row.retracement.unwrap_or(0.0),
+        grade: Grade::A,
+        hard_failure: false,
+        a_too_long: a_bars > 7,
+        b_too_long: b_bars > 8,
+        b_fast: a_speed > 0.0 && b_speed > 0.8 * a_speed,
+        b_weakening: false,
+        b_weakening_ratio: None,
+        a_strong_trend: 0,
+        b_strong_reverse: 0,
+        c_move: 0.0,
+        c_bars: 0,
+        c_extended: false,
+        c_hard_failure: false,
+    };
+    let d = crate::analyze::scoring::a_leg_detail(bars, atr20, &p);
+    row.a_q = Some(d.q);
+    row.a_net_move = Some(d.net_move);
+    row.a_gap_sum = Some(d.gap_sum);
+    row.a_gap_count = Some(d.gap_count);
+    row.a_atr = Some(d.atr);
+    row.a_too_long = Some(p.a_too_long);
+    row.b_too_long = Some(p.b_too_long);
+    row.b_fast = Some(p.b_fast);
+    let (weakening, ratio) = crate::analyze::pattern::b_leg_weakening(bars, s1_index, s2_index, dir);
+    row.b_weakening = Some(weakening);
+    row.b_weakening_ratio = ratio;
 }
 
 fn now_ts() -> String {
@@ -938,6 +1059,15 @@ pub struct KlineDto {
     pub source: String,
     /// true when this bar is the first bar after a continuous-contract rollover
     pub rollover: bool,
+}
+
+/// 60m 长期趋势线的一个数据点：MA20 值及其多空方向。
+#[derive(Debug, Clone, Serialize)]
+pub struct TrendPointDto {
+    pub ts: String,
+    pub value: f64,
+    /// up = 线上且线上移；down = 线下且线下移；neutral = 其余震荡
+    pub direction: String,
 }
 
 /// 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破）。
@@ -1645,6 +1775,49 @@ impl Services {
         Ok(apply_limit_dto(rows, limit))
     }
 
+    /// 当前周期长期趋势线：逐根 MA20 及方向，供图表叠加参考线使用。
+    pub async fn trend_series(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TrendPointDto>> {
+        let bars = self.bars_for(symbol, timeframe).await?;
+        let ma = crate::analyze::indicators::ma_series(&bars, ATR_PERIOD);
+        let mut out = Vec::with_capacity(bars.len());
+        for i in 0..bars.len() {
+            let Some(value) = ma[i] else {
+                continue;
+            };
+            let prev = if i == 0 {
+                value
+            } else {
+                ma[i - 1].unwrap_or(value)
+            };
+            let close = bars[i].close;
+            let direction = if close > value && value > prev {
+                "up"
+            } else if close < value && value < prev {
+                "down"
+            } else {
+                "neutral"
+            };
+            out.push(TrendPointDto {
+                ts: format!(
+                    "{:04}-{:02}-{:02} {:02}:{:02}:00",
+                    bars[i].dt.year,
+                    bars[i].dt.month,
+                    bars[i].dt.day,
+                    bars[i].dt.hour,
+                    bars[i].dt.minute
+                ),
+                value,
+                direction: direction.to_string(),
+            });
+        }
+        Ok(apply_limit_dto(out, limit))
+    }
+
     /// 全部品种的最新价与涨跌幅（供左侧品种列表展示）。
     pub async fn market_snapshot(&self) -> Result<Vec<MarketSnapshot>> {
         let symbols = repo::list_symbols(&self.db, false).await?;
@@ -1900,6 +2073,8 @@ impl Services {
         dimension: &str,
         scope: &str,
         version: Option<&str>,
+        score_min: Option<f64>,
+        score_max: Option<f64>,
     ) -> Result<outcome::ReviewStats> {
         let events = repo::all_pattern_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
@@ -1922,6 +2097,7 @@ impl Services {
                 }
                 stat_row_from(e, tick_by_symbol.get(&e.symbol).copied())
             })
+            .filter(|r| score_in_range(r.score, score_min, score_max))
             .collect();
         let symbols_with_events: HashSet<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
         let mut warning_bar_index: outcome::WarningBarIndex = HashMap::new();
@@ -1971,6 +2147,19 @@ impl Services {
             .collect();
         rows.sort_by(|a, b| b.event_id.cmp(&a.event_id));
         rows.truncate(limit);
+        let symbols_with_rows: HashSet<String> = rows.iter().map(|r| r.symbol.clone()).collect();
+        for code in symbols_with_rows {
+            let bars = self.bars_for(&code, "15m").await?;
+            let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
+            let index_by_ts: HashMap<String, usize> = bars
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (bar_ts(b), i))
+                .collect();
+            for row in rows.iter_mut().filter(|r| r.symbol == code) {
+                fill_leg_detail(row, &bars, &atr20, &index_by_ts);
+            }
+        }
         Ok(rows)
     }
 
@@ -1984,7 +2173,16 @@ impl Services {
             (sym.code == row.symbol)
                 .then(|| crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety))
         });
-        let outcome = Some(outcome_detail_from(&row, tick));
+        let mut outcome = outcome_detail_from(&row, tick);
+        let bars = self.bars_for(&row.symbol, "15m").await?;
+        let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
+        let index_by_ts: HashMap<String, usize> = bars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (bar_ts(b), i))
+            .collect();
+        fill_leg_detail(&mut outcome, &bars, &atr20, &index_by_ts);
+        let outcome = Some(outcome);
         Ok(Some(ReviewSignalDetail {
             event: row,
             outcome,
@@ -2109,9 +2307,12 @@ fn apply_limit(rows: Vec<klines::Model>, limit: Option<usize>) -> Vec<klines::Mo
     }
 }
 
-fn apply_limit_dto(rows: Vec<KlineDto>, limit: Option<usize>) -> Vec<KlineDto> {
+fn apply_limit_dto<T>(rows: Vec<T>, limit: Option<usize>) -> Vec<T> {
     match limit {
-        Some(limit) if rows.len() > limit => rows[rows.len() - limit..].to_vec(),
+        Some(limit) if rows.len() > limit => {
+            let skip = rows.len() - limit;
+            rows.into_iter().skip(skip).collect()
+        }
         _ => rows,
     }
 }
@@ -2486,10 +2687,55 @@ mod tests {
     }
 
     #[test]
+    fn fill_leg_detail_calculates_q_net_move_and_gap() {
+        let bars = vec![
+            bar_model("2026-08-11 09:15:00", 100.0, 100.0, 100.0, 100.0),
+            bar_model("2026-08-11 09:30:00", 110.0, 140.0, 110.0, 138.0),
+            bar_model("2026-08-11 09:45:00", 130.0, 132.0, 128.0, 130.0),
+        ];
+        let atr20 = vec![Some(10.0); bars.len()];
+        let index_by_ts: HashMap<String, usize> = bars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (bar_ts(b), i))
+            .collect();
+        let mut e = pattern_event(1, 3.0, "pending");
+        e.s0_ts = "2026-08-11 09:15:00".to_string();
+        e.s0_price = 100.0;
+        e.s1_ts = "2026-08-11 09:30:00".to_string();
+        e.s1_price = 140.0;
+        e.s2_ts = "2026-08-11 09:45:00".to_string();
+        e.s2_price = 130.0;
+        e.a_move = 40.0;
+        e.a_bars = 2;
+        e.b_move = 10.0;
+        e.b_bars = 1;
+        let mut row = outcome_detail_from(&e, None);
+        fill_leg_detail(&mut row, &bars, &atr20, &index_by_ts);
+
+        assert_eq!(row.a_net_move, Some(30.0));
+        assert_eq!(row.a_gap_count, Some(1));
+        assert!((row.a_gap_sum.unwrap() - 10.0).abs() < 1e-9);
+        assert!(row.a_q.unwrap() > 0.0);
+        assert!(row.a_atr.unwrap() > 0.0);
+    }
+
+    #[test]
     fn scan_result_email_gate_respects_min_score() {
         assert!(!scan_result(&[2.0, 2.4]).has_notifiable_signal(2.5));
         assert!(scan_result(&[2.0, 2.5]).has_notifiable_signal(2.5));
         assert!(scan_result(&[3.0]).has_notifiable_signal(2.5));
+    }
+
+    #[test]
+    fn score_in_range_respects_closed_and_open_bounds() {
+        assert!(score_in_range(2.8, Some(2.8), Some(3.6)));
+        assert!(score_in_range(3.6, Some(2.8), Some(3.6)));
+        assert!(!score_in_range(2.79, Some(2.8), Some(3.6)));
+        assert!(!score_in_range(3.61, Some(2.8), Some(3.6)));
+        assert!(score_in_range(3.5, None, Some(3.6)));
+        assert!(score_in_range(3.6, Some(3.6), None));
+        assert!(score_in_range(2.0, None, None));
     }
 
     #[test]

@@ -26,7 +26,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
-import type { KlineRow, PatternDto, ReviewExitOverlay } from '../types'
+import type { KlineRow, PatternDto, ReviewExitOverlay, TrendPointDto } from '../types'
 import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
@@ -39,11 +39,16 @@ const props = defineProps<{
   loading?: boolean
   /** 复盘跳转模式：额外绘制出场价位与出场标记 */
   reviewExit?: ReviewExitOverlay | null
+  /** 复盘模式：需要自动定位到该K线时间（优先触发/预警） */
+  focusTs?: string | null
+  /** 当前周期 MA20 长期趋势线数据点 */
+  trendPoints?: TrendPointDto[]
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
 const legend = ref<HTMLDivElement | null>(null)
 const timeLeft = ref<HTMLDivElement | null>(null)
+const trendVisible = ref(true)
 const settingsStore = useSettingsStore()
 const minBarSpacing = computed(() => settingsStore.settings.ui.min_bar_spacing)
 
@@ -313,7 +318,13 @@ let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
 let eventLabelPrimitive: EventLabelPrimitive | null = null
+let focusIndex = -1
+let focusFollowsLatest = true
+/** 键盘或复盘定位后，鼠标移出图表时仍把十字光标留在焦点K线上 */
+let focusPinnedByKeys = false
+let pendingFocusTs: string | null = null
 let patternLines: ISeriesApi<'Line'>[] = []
+let trendSeries: ISeriesApi<'Line'> | null = null
 let priceExtent = 1
 
 // ============================================================================
@@ -446,7 +457,38 @@ function formatLegend(d: CandlestickData, time: Time): string {
   const color = up ? '#e03131' : '#43BC7C'
   const item = (label: string, value: number) =>
     `<span class="lg-item"><span class="lg-label">${label}</span><span class="lg-value" style="color:${color}">${value}</span></span>`
-  return `<span class="lg-time">${formatTime(time)}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}`
+  const trend = trendBadgeHtml()
+  return `<span class="lg-time">${formatTime(time)}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}${trend}`
+}
+
+/** 当前周期 MA20 趋势方向徽标；无数据时不显示 */
+function trendBadgeHtml(): string {
+  if (!trendVisible.value) return ''
+  const dir = props.trendPoints?.length ? props.trendPoints[props.trendPoints.length - 1].direction : null
+  if (!dir) return ''
+  if (dir === 'up') {
+    return `<span class="lg-sep"></span><span class="lg-trend trend-up">MA20多</span>`
+  }
+  if (dir === 'down') {
+    return `<span class="lg-sep"></span><span class="lg-trend trend-down">MA20空</span>`
+  }
+  return `<span class="lg-sep"></span><span class="lg-trend trend-flat">MA20震荡</span>`
+}
+
+/** 把趋势点按时间落到当前周期每根K线，保证切换周期后仍有连续参考线 */
+function buildTrendData(): { time: Time; value: number }[] {
+  if (!props.trendPoints?.length) return []
+  const out: { time: Time; value: number }[] = []
+  let idx = 0
+  for (const row of props.rows) {
+    const rowTs = toTs(row.ts)
+    while (idx + 1 < props.trendPoints.length && toTs(props.trendPoints[idx + 1].ts) <= rowTs) {
+      idx += 1
+    }
+    if (idx >= props.trendPoints.length || toTs(props.trendPoints[idx].ts) > rowTs) continue
+    out.push({ time: rowTs as Time, value: props.trendPoints[idx].value })
+  }
+  return out
 }
 
 /** 当前K线收盘倒计时：显示在时间轴上方、最新K线正下方 */
@@ -679,6 +721,7 @@ function syncExtremes() {
 
 /** 可视区间变化时重算最高/最低点 */
 function onVisibleRangeChange() {
+  syncFocusFollowWithView()
   if (!props.showExtremes) return
   syncExtremes()
   markersApi?.setMarkers(buildMarkers())
@@ -728,6 +771,27 @@ function syncPatternLines() {
     line.setData(pts.map((p) => ({ time: toTs(p.ts) as Time, value: p.price })))
     patternLines.push(line)
   }
+}
+
+/** 重建当前周期 MA20 长期趋势线（独立 series，不混入 N 形态连线） */
+function syncTrendSeries() {
+  if (!chart) return
+  if (trendSeries) {
+    chart.removeSeries(trendSeries)
+    trendSeries = null
+  }
+  if (!trendVisible.value) return
+  const data = buildTrendData()
+  if (!data.length) return
+  trendSeries = chart.addSeries(LineSeries, {
+    color: 'rgba(37, 99, 235, 0.85)',
+    lineWidth: 1,
+    lineStyle: LineStyle.Solid,
+    lastValueVisible: true,
+    priceLineVisible: false,
+    crosshairMarkerVisible: false,
+  })
+  trendSeries.setData(data)
 }
 
 function applyDefaultView() {
@@ -865,6 +929,135 @@ function applySwitchView(span: number) {
   clampMinBarSpacing({ from, to })
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
   chart.priceScale('right').setAutoScale(true)
+}
+
+function focusRow(): KlineRow | null {
+  return focusIndex >= 0 && focusIndex < props.rows.length ? props.rows[focusIndex] : null
+}
+
+/** 图例显示当前焦点K线的开高低收 */
+function renderFocusLegend() {
+  if (!legend.value) return
+  const row = focusRow()
+  if (!row) {
+    legend.value.innerHTML = 'N趋势 K线'
+    return
+  }
+  const time = toTs(row.ts) as Time
+  legend.value.innerHTML = formatLegend(
+    { time, open: row.open, high: row.high, low: row.low, close: row.close },
+    time,
+  )
+}
+
+/** 更新焦点K线的十字光标与图例；数据尚未就绪时清除光标 */
+function syncFocus() {
+  if (!chart || !candleSeries) return
+  const row = focusRow()
+  if (!row) {
+    chart.clearCrosshairPosition()
+    renderFocusLegend()
+    return
+  }
+  chart.setCrosshairPosition(row.close, toTs(row.ts) as Time, candleSeries)
+  renderFocusLegend()
+}
+
+/** 焦点到可视区边缘时，让画面自动跟随一根，保持焦点K线可见 */
+function ensureFocusVisible() {
+  if (!chart) return
+  if (focusIndex < 0 || focusIndex >= props.rows.length) return
+  const ts = chart.timeScale()
+  const logical = ts.getVisibleLogicalRange()
+  if (!logical) return
+  const total = props.rows.length
+  const span = logical.to - logical.from
+  const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
+  let from = Number(logical.from)
+  let to = Number(logical.to)
+  if (focusIndex < logical.from) {
+    to = Math.min(maxTo, logical.to - (logical.from - focusIndex))
+    from = Math.max(-0.5, to - span)
+  } else if (focusIndex > logical.to) {
+    from = Math.min(maxTo - span, logical.from + (focusIndex - logical.to))
+    to = from + span
+  } else {
+    return
+  }
+  ts.setVisibleLogicalRange({ from, to })
+}
+
+/** 手动拖动/缩放离开最新K线后停止自动跟随；回到最新区域时再恢复跟随 */
+function syncFocusFollowWithView() {
+  if (!chart || props.rows.length === 0) return
+  if (focusIndex !== props.rows.length - 1) return
+  const logical = chart.timeScale().getVisibleLogicalRange()
+  if (!logical) return
+  focusFollowsLatest = Number(logical.to) >= props.rows.length - 1
+}
+
+/** 定位复盘形态：优先精确匹配，匹配不到时取时间上最接近的K线 */
+function nearestRowIndex(ts: string): number {
+  const target = toTs(ts)
+  let best = -1
+  let bestDiff = Number.POSITIVE_INFINITY
+  for (let i = 0; i < props.rows.length; i++) {
+    const diff = Math.abs(toTs(props.rows[i].ts) - target)
+    if (diff < bestDiff) {
+      bestDiff = diff
+      best = i
+    }
+  }
+  return best
+}
+
+/** 把目标K线放到可视区中央，保留当前缩放级别 */
+function centerFocusView(index: number) {
+  if (!chart || props.rows.length === 0) return
+  const ts = chart.timeScale()
+  const logical = ts.getVisibleLogicalRange()
+  const total = props.rows.length
+  const span = Math.max(1, Math.min(logical ? Number(logical.to - logical.from) : displayKNum.value, total))
+  const half = span / 2
+  const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
+  let from = Math.max(-0.5, index - half)
+  let to = Math.min(maxTo, index + half)
+  if (to - from < span - 1e-6) {
+    if (from <= -0.5 + 1e-6) to = from + span
+    else from = to - span
+  }
+  ts.setVisibleLogicalRange({ from, to })
+  clampMinBarSpacing({ from, to })
+  lastView = { from, to, totalAtCapture: total }
+}
+
+/** 复盘模式自动定位：数据未就绪时先记下，等K线到位后再聚焦 */
+function focusAtTs(ts: string | null) {
+  pendingFocusTs = ts || null
+  if (!pendingFocusTs || !chart || !rowsMatchRequest()) return
+  const idx = nearestRowIndex(pendingFocusTs)
+  if (idx < 0) return
+  pendingFocusTs = null
+  focusIndex = idx
+  focusFollowsLatest = false
+  focusPinnedByKeys = true
+  syncFocus()
+  centerFocusView(focusIndex)
+}
+
+/** 左右键切换焦点K线：dir=-1 上一根（更早），dir=1 下一根（更晚） */
+function stepCandles(dir: number) {
+  if (!chart) return
+  if (!candleSeries || candleSeries.data().length === 0) return
+  if (props.rows.length <= 0) return
+  if (focusIndex < 0 || focusIndex >= props.rows.length) focusIndex = props.rows.length - 1
+  const next = focusIndex + (dir < 0 ? -1 : 1)
+  if (next < 0 || next >= props.rows.length) return
+  focusIndex = next
+  focusFollowsLatest = false
+  focusPinnedByKeys = true
+  syncFocus()
+  ensureFocusVisible()
 }
 
 /** 相邻K线时间间隔超过该分钟数视为交易时段断裂（午休、日盘/夜盘切换、周末），
@@ -1138,6 +1331,28 @@ function renderData() {
   } else {
     restoreView()
   }
+  if (isSwitch) {
+    focusIndex = props.rows.length - 1
+    focusFollowsLatest = true
+  } else if (focusFollowsLatest) {
+    focusIndex = props.rows.length - 1
+  } else if (focusIndex < 0 || focusIndex >= props.rows.length) {
+    focusIndex = props.rows.length - 1
+  }
+  let focusNeedsCenter = false
+  if (pendingFocusTs) {
+    const idx = nearestRowIndex(pendingFocusTs)
+    if (idx >= 0) {
+      pendingFocusTs = null
+      focusIndex = idx
+      focusFollowsLatest = false
+      focusPinnedByKeys = true
+      focusNeedsCenter = true
+    }
+  }
+  syncFocus()
+  if (focusNeedsCenter) centerFocusView(focusIndex)
+  else if (focusFollowsLatest) ensureFocusVisible()
 }
 
 /** 只刷新形态标注与价位线，保留当前缩放/平移状态 */
@@ -1147,6 +1362,7 @@ function renderOverlays() {
   syncPriceLines()
   syncExtremes()
   syncPatternLines()
+  syncTrendSeries()
   syncEventLabels()
 }
 
@@ -1216,6 +1432,9 @@ onMounted(() => {
   lastDataCount = 0
   prevSymbol = null
   prevTimeframe = null
+  focusIndex = -1
+  focusFollowsLatest = true
+  focusPinnedByKeys = false
   chart = createChart(container.value, {
     layout: {
       background: { type: ColorType.Solid, color: '#ffffff' },
@@ -1274,12 +1493,18 @@ onMounted(() => {
   chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleRangeChange)
 
   chart.subscribeCrosshairMove((param) => {
-    if (!legend.value || !param.time || !candleSeries) return
-    const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
-    if (!d) {
-      legend.value.innerHTML = 'N趋势 K线'
+    if (!legend.value || !candleSeries) return
+    if (!param.time) {
+      if (focusPinnedByKeys) syncFocus()
+      else renderFocusLegend()
       return
     }
+    const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
+    if (!d) {
+      renderFocusLegend()
+      return
+    }
+    focusPinnedByKeys = false
     legend.value.innerHTML = formatLegend(d, param.time as Time)
   })
 
@@ -1340,10 +1565,29 @@ watch(
   { deep: true },
 )
 watch(
+  () => props.trendPoints,
+  () => {
+    if (!chart) return
+    syncTrendSeries()
+    renderFocusLegend()
+  },
+  { deep: true },
+)
+watch(trendVisible, () => {
+  if (!chart) return
+  syncTrendSeries()
+  renderFocusLegend()
+})
+watch(
   () => props.reviewExit,
   () => {
     if (chart) renderOverlays()
   },
+)
+watch(
+  () => props.focusTs,
+  (ts) => focusAtTs(ts ?? null),
+  { immediate: true },
 )
 watch(
   () => props.showExtremes,
@@ -1370,6 +1614,9 @@ onBeforeUnmount(() => {
     candleSeries.detachPrimitive(eventLabelPrimitive)
     eventLabelPrimitive = null
   }
+  focusIndex = -1
+  focusPinnedByKeys = false
+  pendingFocusTs = null
   chart?.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
   if (countdownTimer) {
     clearInterval(countdownTimer)
@@ -1381,12 +1628,18 @@ onBeforeUnmount(() => {
   extremeLines = []
   for (const line of patternLines) chart?.removeSeries(line)
   patternLines = []
+  if (trendSeries) {
+    chart?.removeSeries(trendSeries)
+    trendSeries = null
+  }
   chart?.remove()
   chart = null
   candleSeries = null
   volumeSeries = null
   priceLines = []
 })
+
+defineExpose({ stepCandles })
 </script>
 
 <template>
@@ -1402,12 +1655,20 @@ onBeforeUnmount(() => {
       <template v-for="(h, i) in dbg.history" :key="i">{{ h }}<br /></template>
     </div> -->
     <n-spin v-if="loading" class="spin-mask" />
+    <button
+      class="trend-toggle"
+      :class="{ active: trendVisible }"
+      type="button"
+      @click="trendVisible = !trendVisible"
+    >
+      MA20
+    </button>
     <div class="help-hint">
       <n-tooltip trigger="hover" placement="bottom-end">
         <template #trigger>
           <span class="help-icon">?</span>
         </template>
-        Ctrl+滚轮 缩放<br />滚轮 切换品种<br />拖拽 平移<br />双击价格轴 复位
+        ←/→ 切换焦点K线<br />Ctrl+滚轮 缩放<br />滚轮 切换品种<br />拖拽 平移<br />双击价格轴 复位
       </n-tooltip>
     </div>
   </div>
@@ -1467,6 +1728,24 @@ onBeforeUnmount(() => {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+.legend :deep(.lg-trend) {
+  font-weight: 600;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.legend :deep(.trend-up) {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+}
+.legend :deep(.trend-down) {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.1);
+}
+.legend :deep(.trend-flat) {
+  color: #64748b;
+  background: rgba(100, 116, 139, 0.12);
+}
 .time-left {
   position: absolute;
   z-index: 5;
@@ -1483,6 +1762,35 @@ onBeforeUnmount(() => {
   pointer-events: none;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.trend-toggle {
+  position: absolute;
+  top: 8px;
+  right: 40px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid rgba(100, 116, 139, 0.3);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #94a3b8;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.trend-toggle:hover {
+  border-color: rgba(37, 99, 235, 0.4);
+  color: #2563eb;
+}
+.trend-toggle.active {
+  border-color: rgba(37, 99, 235, 0.35);
+  background: rgba(37, 99, 235, 0.08);
+  color: #2563eb;
 }
 .help-hint {
   position: absolute;

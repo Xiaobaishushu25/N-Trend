@@ -21,6 +21,7 @@ import type {
   ScanResult,
   SchedulerStatus,
   SymbolRow,
+  TrendPointDto,
 } from '../types'
 
 export const api = {
@@ -62,6 +63,8 @@ export const api = {
 
   getKlines: (symbol: string, timeframe: string, limit?: number) =>
     invoke<KlineRow[]>('get_klines', { symbol, timeframe, limit }),
+  getTrendSeries: (symbol: string, timeframe: string, limit?: number) =>
+    invoke<TrendPointDto[]>('get_trend_series', { symbol, timeframe, limit }),
 
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
@@ -69,8 +72,20 @@ export const api = {
   rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),
 
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
-  getReviewStats: (dimension: string, scope: string, version?: string | null) =>
-    invoke<ReviewStats>('get_review_stats', { dimension, scope, version: version || null }),
+  getReviewStats: (
+    dimension: string,
+    scope: string,
+    version?: string | null,
+    scoreMin?: number | null,
+    scoreMax?: number | null,
+  ) =>
+    invoke<ReviewStats>('get_review_stats', {
+      dimension,
+      scope,
+      version: version || null,
+      scoreMin: scoreMin ?? null,
+      scoreMax: scoreMax ?? null,
+    }),
   getRecentOutcomes: (limit?: number, filters?: RecentOutcomeFilters) =>
     invoke<OutcomeDetail[]>('get_recent_outcomes', {
       limit,

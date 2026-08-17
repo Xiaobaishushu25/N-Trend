@@ -8,6 +8,7 @@ import {
   NDataTable,
   NEmpty,
   NInput,
+  NInputNumber,
   NSelect,
   NSpace,
   NTag,
@@ -33,8 +34,9 @@ const rebuilding = ref(false)
 const error = ref('')
 /** 品种筛选本地输入（防抖后再生效） */
 const symbolInput = ref('')
-/** 评分段筛选（映射为 scoreMin/scoreMax） */
-const scoreBand = ref<string | null>(null)
+/** 评分区间筛选：上下限为空表示不限制 */
+const scoreMinInput = ref<number | null>(null)
+const scoreMaxInput = ref<number | null>(null)
 
 const dirLabel = (d: string) => (d === 'up' ? '做多' : d === 'down' ? '做空' : d)
 const levelLabel = (l: string) =>
@@ -402,11 +404,6 @@ const gradeOptions = [
   { label: '回撤过浅', value: '回撤过浅' },
   { label: '回撤过深', value: '回撤过深' },
 ]
-const scoreOptions = [
-  { label: '<2.5', value: '<2.5' },
-  { label: '2.5-3.5', value: '2.5-3.5' },
-  { label: '3.5-5.0', value: '3.5-5.0' },
-]
 const outcomeOptions = [
   { label: '盈利', value: 'win' },
   { label: '亏损', value: 'loss' },
@@ -467,20 +464,18 @@ function onSymbolInput() {
   }, 400)
 }
 
-function applyScoreBand(v: string | null) {
-  if (!v) {
-    void review.setRecentFilter({ scoreMin: null, scoreMax: null })
-  } else if (v === '<2.5') {
-    void review.setRecentFilter({ scoreMin: null, scoreMax: 2.5 })
-  } else if (v === '2.5-3.5') {
-    void review.setRecentFilter({ scoreMin: 2.5, scoreMax: 3.5 })
-  } else {
-    void review.setRecentFilter({ scoreMin: 3.5, scoreMax: null })
-  }
+let scoreTimer: ReturnType<typeof setTimeout> | undefined
+function onScoreRangeInput() {
+  if (scoreTimer) clearTimeout(scoreTimer)
+  scoreTimer = setTimeout(() => {
+    void review.setScoreRange(scoreMinInput.value, scoreMaxInput.value)
+  }, 400)
 }
 
 async function resetFilters() {
-  scoreBand.value = ''
+  if (scoreTimer) clearTimeout(scoreTimer)
+  scoreMinInput.value = null
+  scoreMaxInput.value = null
   symbolInput.value = ''
   await review.resetRecentFilters()
 }
@@ -528,6 +523,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (symbolTimer) clearTimeout(symbolTimer)
+  if (scoreTimer) clearTimeout(scoreTimer)
   unlisten?.()
 })
 </script>
@@ -615,7 +611,40 @@ onBeforeUnmount(() => {
         </n-space>
       </n-card>
 
-      <n-card size="small" title="分组统计" class="groups-card">
+      <n-card size="small" class="groups-card">
+        <template #header>
+          <div class="groups-header">
+            <n-text strong>分组统计</n-text>
+            <n-space align="center" :size="6">
+              <n-text depth="3" style="font-size: 12px">评分</n-text>
+              <n-input-number
+                v-model:value="scoreMinInput"
+                size="small"
+                clearable
+                :show-button="false"
+                placeholder="下限"
+                style="width: 84px"
+                :min="0"
+                :max="5"
+                :step="0.1"
+                @update:value="onScoreRangeInput"
+              />
+              <n-text depth="3" style="font-size: 12px">~</n-text>
+              <n-input-number
+                v-model:value="scoreMaxInput"
+                size="small"
+                clearable
+                :show-button="false"
+                placeholder="上限"
+                style="width: 84px"
+                :min="0"
+                :max="5"
+                :step="0.1"
+                @update:value="onScoreRangeInput"
+              />
+            </n-space>
+          </div>
+        </template>
         <n-data-table
           :columns="groupColumns"
           :data="review.stats?.groups ?? []"
@@ -684,15 +713,6 @@ onBeforeUnmount(() => {
             @update:value="() => review.loadRecent()"
           />
           <n-select
-            v-model:value="scoreBand"
-            size="small"
-            clearable
-            placeholder="评分"
-            style="width: 110px"
-            :options="scoreOptions"
-            @update:value="applyScoreBand"
-          />
-          <n-select
             v-model:value="review.recentFilters.outcome"
             size="small"
             clearable
@@ -749,6 +769,13 @@ onBeforeUnmount(() => {
 }
 .groups-card {
   flex: none;
+}
+.groups-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
 }
 .details-card {
   flex: 1;

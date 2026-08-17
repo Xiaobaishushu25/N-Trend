@@ -179,13 +179,9 @@ pub enum GroupBy {
     OvershootBand,
     TpTier,
     GapCombo,
-    DimTrend,
     DimALeg,
     DimBLeg,
     DimWarning,
-    DimTrigger,
-    DimRr,
-    DimMomentum,
 }
 
 impl GroupBy {
@@ -212,13 +208,9 @@ impl GroupBy {
             "overshoot" => GroupBy::OvershootBand,
             "tp_tier" => GroupBy::TpTier,
             "gap_combo" => GroupBy::GapCombo,
-            "dim_trend" => GroupBy::DimTrend,
             "dim_a" => GroupBy::DimALeg,
             "dim_b" => GroupBy::DimBLeg,
             "dim_warning" => GroupBy::DimWarning,
-            "dim_trigger" => GroupBy::DimTrigger,
-            "dim_rr" => GroupBy::DimRr,
-            "dim_momentum" => GroupBy::DimMomentum,
             _ => GroupBy::ScoreBand,
         }
     }
@@ -311,7 +303,7 @@ pub struct StatRow {
     pub a_bars: Option<usize>,
     pub b_bars: Option<usize>,
     pub retracement: Option<f64>,
-    pub dims: Option<[f64; 6]>,
+    pub dims: Option<[f64; 3]>,
     pub net_r: Option<f64>,
     pub rollover_crossed: bool,
     pub gap_crossed_entry: bool,
@@ -862,13 +854,9 @@ fn bucket(group_by: GroupBy, r: &StatRow) -> String {
             (false, true) => "出场跳空".to_string(),
             (false, false) => "无跳空".to_string(),
         },
-        GroupBy::DimTrend => dim_band(r.dims.map(|d| d[0])),
-        GroupBy::DimALeg => dim_band(r.dims.map(|d| d[1])),
-        GroupBy::DimBLeg => dim_band(r.dims.map(|d| d[2])),
-        GroupBy::DimWarning => dim_band(r.dims.map(|d| d[3])),
-        GroupBy::DimTrigger => dim_band(r.dims.map(|d| d[3])),
-        GroupBy::DimRr => dim_band(r.dims.map(|d| d[4])),
-        GroupBy::DimMomentum => dim_band(r.dims.map(|d| d[5])),
+        GroupBy::DimALeg => dim_band(r.dims.map(|d| d[0])),
+        GroupBy::DimBLeg => dim_band(r.dims.map(|d| d[1])),
+        GroupBy::DimWarning => dim_band(r.dims.map(|d| d[2])),
     }
 }
 
@@ -1009,13 +997,7 @@ fn group_rank(group_by: GroupBy, key: &str) -> (u8, String) {
             "无跳空" => 3,
             _ => 9,
         },
-        GroupBy::DimTrend
-        | GroupBy::DimALeg
-        | GroupBy::DimBLeg
-        | GroupBy::DimWarning
-        | GroupBy::DimTrigger
-        | GroupBy::DimRr
-        | GroupBy::DimMomentum => match key {
+        GroupBy::DimALeg | GroupBy::DimBLeg | GroupBy::DimWarning => match key {
             "≥3.5" => 0,
             "2.0-3.5" => 1,
             "<2.0" => 2,
@@ -1793,18 +1775,15 @@ mod tests {
         );
 
         for (gb, idx) in [
-            (GroupBy::DimTrend, 0usize),
-            (GroupBy::DimALeg, 1),
-            (GroupBy::DimBLeg, 2),
-            (GroupBy::DimTrigger, 3),
-            (GroupBy::DimRr, 4),
-            (GroupBy::DimMomentum, 5),
+            (GroupBy::DimALeg, 0usize),
+            (GroupBy::DimBLeg, 1),
+            (GroupBy::DimWarning, 2),
         ] {
             let mut rows = (0..3)
                 .map(|i| mk_stat(i + 1, Some(Outcome::Win), Some(1.0)))
                 .collect::<Vec<_>>();
             for (row, v) in rows.iter_mut().zip([3.6, 2.5, 1.0]) {
-                let mut dims = [0.0; 6];
+                let mut dims = [0.0; 3];
                 dims[idx] = v;
                 row.dims = Some(dims);
             }

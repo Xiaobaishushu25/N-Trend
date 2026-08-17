@@ -35,6 +35,7 @@ import type {
   ReviewSignalDetail,
   SymbolRow,
   Timeframe,
+  TrendPointDto,
 } from '../types'
 
 const route = useRoute()
@@ -99,6 +100,16 @@ const reviewExit = computed<ReviewExitOverlay | null>(() => {
     outcome: o.outcome,
     r: o.r_multiple,
   }
+})
+const activeReviewRow = computed(() =>
+  reviewRows.value.find((r) => r.event_id === reviewSignalId.value) ?? null,
+)
+/** 复盘模式自动定位点：优先触发K线，未触发时用预警K线 */
+const reviewFocusTs = computed<string | null>(() => {
+  const row = activeReviewRow.value
+  if (row?.trigger_ts || row?.warning_ts) return row.trigger_ts || row.warning_ts
+  const ev = reviewOverlay.value?.event
+  return ev?.trigger_ts || ev?.warning_ts || null
 })
 
 let reviewOverlaySeq = 0
@@ -209,7 +220,16 @@ function exitReviewMode() {
 function onReviewKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape' && reviewMode.value) {
     exitReviewMode()
+    return
   }
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
+  const target = e.target as HTMLElement | null
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+    return
+  }
+  e.preventDefault()
+  chartRef.value?.stepCandles(e.key === 'ArrowLeft' ? -1 : 1)
 }
 
 /** 形态状态优先级：等待触发 > 已触发 > 已了结 > 已失效 */
@@ -248,7 +268,6 @@ function toChartSignal(e: PatternEvent): PatternDto {
     space: 0,
     rr: e.rr,
     score: e.entry_score,
-    dims: [0, 0, 0],
     warning_ts: e.warning_ts,
     trigger_ts: e.trigger_ts,
     vol_ratio: e.trigger_volume_ratio,
@@ -257,6 +276,44 @@ function toChartSignal(e: PatternEvent): PatternDto {
     box: null,
     note: '',
     active: true,
+  }
+}
+
+/** 把复盘/历史明细行转换成图表组件使用的形态结构 */
+function toChartSignalFromOutcome(row: OutcomeDetail): PatternDto {
+  const s0High = row.direction === 'down'
+  return {
+    number: row.event_id,
+    level: row.level,
+    logic_version: row.logic_version,
+    warning_kind: row.warning_kind,
+    direction: row.direction,
+    grade: row.grade,
+    s0: { index: 0, price: row.s0_price, is_high: s0High, ts: row.s0_ts },
+    s1: { index: 0, price: row.s1_price, is_high: !s0High, ts: row.s1_ts },
+    s2: { index: 0, price: row.s2_price, is_high: s0High, ts: row.s2_ts },
+    a_bars: row.a_bars ?? 0,
+    b_bars: row.b_bars ?? 0,
+    a_move: row.a_move ?? 0,
+    b_move: row.b_move ?? 0,
+    retracement: row.retracement ?? 0,
+    state: row.state,
+    category: '',
+    entry: row.entry,
+    stop: row.stop,
+    target: row.target,
+    risk: row.risk,
+    space: 0,
+    rr: row.rr,
+    score: row.entry_score,
+    warning_ts: row.warning_ts,
+    trigger_ts: row.trigger_ts,
+    vol_ratio: row.trigger_volume_ratio,
+    vol_confirmed: row.trigger_ts != null,
+    trigger_overshoot_r: row.overshoot_r,
+    box: null,
+    note: '',
+    active: false,
   }
 }
 
@@ -276,14 +333,66 @@ const signals = computed<PatternDto[]>(() => {
       if (rankA !== rankB) return rankA - rankB
       if (b.score !== a.score) return b.score - a.score
       return a.number - b.number
-  })
+    })
 })
+
+const recentSignals = ref<PatternDto[]>([])
+const recentLoading = ref(false)
+let recentSeq = 0
+
+/** 该品种最近的历史形态：排除仍在途的当前信号，按事件编号倒序保留 5 个。 */
+const recentHistorySignals = computed<PatternDto[]>(() => {
+  const activeNumbers = new Set(signals.value.map((s) => s.number))
+  return recentSignals.value.filter((s) => !activeNumbers.has(s.number)).slice(0, 5)
+})
+
+async function loadRecentPatterns() {
+  const sym = symbol.value
+  const seq = ++recentSeq
+  if (!sym) {
+    recentSignals.value = []
+    recentLoading.value = false
+    return
+  }
+  recentLoading.value = true
+  try {
+    const rows = await api.getRecentOutcomes(20, { symbol: sym })
+    if (seq !== recentSeq) return
+    recentSignals.value = rows.map(toChartSignalFromOutcome)
+  } catch {
+    if (seq === recentSeq) recentSignals.value = []
+  } finally {
+    if (seq === recentSeq) recentLoading.value = false
+  }
+}
 
 /** 被点击隐藏的形态编号（用于控制K线图上的展示） */
 const hiddenNumbers = ref<Set<number>>(new Set())
 
+/** 最近历史形态中用户主动点开绘制到K线图上的编号 */
+const shownRecentNumbers = ref<Set<number>>(new Set())
+
 /** 是否在K线图上标记当前视图的最高价/最低价 */
 const showExtremes = ref(true)
+
+/** 当前周期 MA20 长期趋势线（叠加在当前周期K线图上） */
+const trendPoints = ref<TrendPointDto[]>([])
+let trendSeq = 0
+async function loadTrendLine() {
+  const sym = symbol.value
+  const tf = timeframe.value
+  const seq = ++trendSeq
+  if (!sym) {
+    trendPoints.value = []
+    return
+  }
+  try {
+    const points = await api.getTrendSeries(sym, tf, chartLoadLimit.value)
+    if (seq === trendSeq) trendPoints.value = points
+  } catch {
+    if (seq === trendSeq) trendPoints.value = []
+  }
+}
 
 /** 记录“默认隐藏规则”是否已应用到当前 品种+周期+设置 */
 const hiddenApplied = ref('')
@@ -305,6 +414,7 @@ function applyDefaultHidden() {
 
 /** 左侧品种列表开关与行情快照 */
 const showList = ref(true)
+const chartRef = ref<{ stepCandles: (dir: number) => void } | null>(null)
 const snapshots = ref<Record<string, MarketSnapshot>>({})
 /** 品种行闪烁方向：up=上涨(红) / down=下跌(绿)，由实时行情跳动驱动 */
 const rowFlash = ref<Record<string, 'up' | 'down'>>({})
@@ -742,11 +852,27 @@ const visibleSignals = computed<PatternDto[]>(() => {
       : [toChartSignal(reviewOverlay.value.event)]
   }
   if (reviewMode.value) return []
-  return signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
+  const active = signals.value.filter((s) => !hiddenNumbers.value.has(s.number))
+  const recent = recentHistorySignals.value.filter((s) => shownRecentNumbers.value.has(s.number))
+  return [...active, ...recent]
 })
 
 function isHidden(num: number) {
   return hiddenNumbers.value.has(num)
+}
+
+function isRecentShown(num: number) {
+  return shownRecentNumbers.value.has(num)
+}
+
+function toggleRecentPattern(num: number) {
+  const next = new Set(shownRecentNumbers.value)
+  if (next.has(num)) {
+    next.delete(num)
+  } else {
+    next.add(num)
+  }
+  shownRecentNumbers.value = next
 }
 
 /** 普通滚轮在图表区域累积滚动量并切换上下品种（按住Ctrl时交给图表缩放） */
@@ -879,6 +1005,88 @@ function rvBarRatio(row: OutcomeDetail) {
     : (row.b_bars / row.a_bars).toFixed(2)
 }
 
+type RvDims = {
+  dimA: number | null
+  dimB: number | null
+  dimWarning: number | null
+}
+
+const rvDimsCache = new WeakMap<OutcomeDetail, RvDims>()
+
+function rvDims(row: OutcomeDetail): RvDims {
+  const cached = rvDimsCache.get(row)
+  if (cached) return cached
+  const dims: RvDims = { dimA: null, dimB: null, dimWarning: null }
+  try {
+    const v = JSON.parse(row.entry_score_dims) as Record<string, unknown>
+    if (typeof v.dim_a === 'number') dims.dimA = v.dim_a
+    if (typeof v.dim_b === 'number') dims.dimB = v.dim_b
+    if (typeof v.dim_warning === 'number') dims.dimWarning = v.dim_warning
+  } catch {
+    // 历史脏数据按缺失处理，显示为 —
+  }
+  rvDimsCache.set(row, dims)
+  return dims
+}
+
+function rvDimClass(v: number | null) {
+  if (v == null) return 'is-neutral'
+  if (v >= 3.5) return 'is-good'
+  if (v >= 3.0) return 'is-mid'
+  return 'is-weak'
+}
+
+function rvLegPerBar(move: number | null | undefined, bars: number | null | undefined) {
+  return move == null || bars == null || bars <= 0 ? '—' : `${(move / bars).toFixed(1)}点/根`
+}
+
+function rvQClass(v: number | null | undefined) {
+  if (v == null) return 'is-neutral'
+  if (v >= 0.5) return 'is-good'
+  if (v >= 0.35) return 'is-mid'
+  return 'is-weak'
+}
+
+function rvNetMove(row: OutcomeDetail) {
+  return row.a_net_move == null ? '—' : `${row.a_net_move.toFixed(1)}点`
+}
+
+function rvNetTitle(row: OutcomeDetail) {
+  if (row.a_move == null || row.a_net_move == null) return ''
+  const gap = row.a_gap_sum ?? 0
+  return gap > 0
+    ? `账面 ${row.a_move.toFixed(1)}点 - 大跳空 ${gap.toFixed(1)}点`
+    : `账面 ${row.a_move.toFixed(1)}点`
+}
+
+function rvGapDetail(row: OutcomeDetail) {
+  if (row.a_gap_count == null) return '—'
+  if (row.a_gap_count === 0) return '无'
+  return `${row.a_gap_count}根/${rvNum(row.a_gap_sum)}点`
+}
+
+function rvAtrRatio(row: OutcomeDetail) {
+  return row.a_net_move == null || row.a_atr == null || row.a_atr <= 0
+    ? '—'
+    : `${(row.a_net_move / row.a_atr).toFixed(2)}×`
+}
+
+function rvLegAtr(row: OutcomeDetail) {
+  return row.a_net_move == null ||
+    row.a_bars == null ||
+    row.a_atr == null ||
+    row.a_bars <= 0 ||
+    row.a_atr <= 0
+    ? '—'
+    : `${((row.a_net_move / row.a_bars) / row.a_atr).toFixed(2)}×`
+}
+
+function rvWeakening(row: OutcomeDetail) {
+  if (row.b_weakening == null) return '—'
+  if (!row.b_weakening) return '否'
+  return row.b_weakening_ratio == null ? '是' : `是(${row.b_weakening_ratio.toFixed(2)})`
+}
+
 function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 'error' {
   if (state === 'pending') return 'info'
   if (state === 'triggered') return 'success'
@@ -959,8 +1167,12 @@ watch([symbol, timeframe], async () => {
   hiddenApplied.value = ''
   applyDefaultHidden()
   liveBars.value = []
+  shownRecentNumbers.value = new Set()
+  trendPoints.value = []
+  loadRecentPatterns()
   if (symbol.value) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
+    await loadTrendLine()
     scansStore.refreshLatestSignals()
   }
 })
@@ -975,14 +1187,19 @@ onMounted(async () => {
       scansStore.ingest(result)
       loadSnapshots()
       scansStore.refreshLatestSignals()
+      loadRecentPatterns()
     }),
   )
   unlisteners.push(
     await onDataUpdated(() => {
       loadSnapshots()
       scansStore.refreshLatestSignals()
+      loadRecentPatterns()
       // 定时入库后静默重载完整K线，让刚收盘的实时桶转正为历史K线
-      if (symbol.value) klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+      if (symbol.value) {
+        klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+        loadTrendLine()
+      }
     }),
   )
   // 实时现价：合并进快照表，缺失品种保留旧值，避免盘口跳动时整表闪空
@@ -1020,7 +1237,9 @@ onMounted(async () => {
   }
   if (symbol.value) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
+    await loadTrendLine()
     scansStore.refreshLatestSignals()
+    loadRecentPatterns()
   }
 })
 
@@ -1214,12 +1433,15 @@ onBeforeUnmount(() => {
       <div class="chart-col" @wheel.prevent="handleChartWheel">
         <KLineChart
           v-if="symbol && klinesStore.rows.length"
+          ref="chartRef"
           :symbol="symbol"
           :timeframe="timeframe"
           :rows="displayRows"
           :signals="visibleSignals"
           :show-extremes="showExtremes"
           :review-exit="reviewExit"
+          :focus-ts="reviewFocusTs"
+          :trend-points="trendPoints"
           :loading="klinesStore.loading"
         />
         <n-empty
@@ -1388,6 +1610,63 @@ onBeforeUnmount(() => {
                     <span>净R</span>
                     <b :class="rvRClass(row.net_r)">{{ fmtR(row.net_r) }}</b>
                   </div>
+                  <div class="rv-section">ABC结构</div>
+                  <div class="rv-item">
+                    <span>A的q</span>
+                    <b :class="rvQClass(row.a_q)">{{ rvNum(row.a_q, 3) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A净幅度</span>
+                    <b :title="rvNetTitle(row)">{{ rvNetMove(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A跳空</span>
+                    <b>{{ rvGapDetail(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A幅度ATR</span>
+                    <b>{{ rvAtrRatio(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A速度</span>
+                    <b>{{ rvLegPerBar(row.a_net_move, row.a_bars) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A速度ATR</span>
+                    <b>{{ rvLegAtr(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>B速度</span>
+                    <b>{{ rvLegPerBar(row.b_move, row.b_bars) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A过长</span>
+                    <b>{{ rvBool(row.a_too_long) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>B过长</span>
+                    <b>{{ rvBool(row.b_too_long) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>B过快</span>
+                    <b>{{ rvBool(row.b_fast) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>B弱化</span>
+                    <b>{{ rvWeakening(row) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>A质量</span>
+                    <b :class="rvDimClass(rvDims(row).dimA)">{{ rvNum(rvDims(row).dimA) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>B质量</span>
+                    <b :class="rvDimClass(rvDims(row).dimB)">{{ rvNum(rvDims(row).dimB) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>预警质量</span>
+                    <b :class="rvDimClass(rvDims(row).dimWarning)">{{ rvNum(rvDims(row).dimWarning) }}</b>
+                  </div>
                   <div class="rv-item">
                     <span>A段</span>
                     <b>{{ row.a_move == null ? '—' : `${row.a_move.toFixed(1)}点/${row.a_bars ?? '?'}根` }}</b>
@@ -1511,6 +1790,85 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <div v-else class="patterns-empty">当前品种暂无识别出的信号</div>
+
+            <div class="patterns-title recent-title">最近 5 个形态（{{ recentHistorySignals.length }}）</div>
+            <div v-if="recentLoading" class="patterns-empty">正在加载历史形态...</div>
+            <div v-else-if="recentHistorySignals.length" class="patterns-list recent-list">
+              <div
+                v-for="r in recentHistorySignals"
+                :key="`recent-${r.number}`"
+                class="pattern-card is-recent"
+                :class="[
+                  r.direction === 'up' ? 'is-up' : 'is-down',
+                  { 'is-hidden': !isRecentShown(r.number) },
+                ]"
+                :title="
+                  isRecentShown(r.number)
+                    ? '点击在K线图上隐藏该形态'
+                    : '点击在K线图上显示该形态'
+                "
+                @click="toggleRecentPattern(r.number)"
+              >
+                <div class="pc-head">
+                  <div class="pc-badges">
+                    <span class="pc-num">#{{ r.number }}</span>
+                    <span class="pc-dir">{{ dirText(r.direction) }} {{ levelSuffix(r.level) }}</span>
+                    <span class="pc-grade">{{ r.grade }}</span>
+                    <span class="pc-warning">{{ warningKindText(r.warning_kind) }}</span>
+                  </div>
+                  <n-icon
+                    :component="isRecentShown(r.number) ? Eye : EyeOff"
+                    size="17"
+                    :color="isRecentShown(r.number) ? '#1677ff' : '#94a3b8'"
+                    style="margin-top: 2px"
+                  />
+                  <div class="pc-score">
+                    <span class="pc-score-num">{{ r.score.toFixed(2) }}</span>
+                    <span class="pc-score-label">评分</span>
+                  </div>
+                </div>
+
+                <div class="pc-state" :class="stateType(r.state)">
+                  <span class="dot"></span>{{ sigLabel(r.state) }}
+                  <span v-if="r.trigger_ts" class="pc-state-time">{{ fmtRecentTime(r.trigger_ts) }}</span>
+                </div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">预警</span>
+                  <span>{{ r.warning_ts ? fmtRecentTime(r.warning_ts) : '—' }}</span>
+                  <span v-if="r.trigger_ts" class="pc-history-label"> / 触发</span>
+                  <span v-if="r.trigger_ts">{{ fmtRecentTime(r.trigger_ts) }}</span>
+                </div>
+
+                <div class="pc-prices">
+                  <div class="pc-price">
+                    <span>入场</span>
+                    <b>{{ r.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>止损</span>
+                    <b>{{ r.stop.toFixed(1) }}</b>
+                    <em class="pc-delta is-stop">{{ fmtDelta(r.stop - r.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>目标</span>
+                    <b>{{ r.target.toFixed(1) }}</b>
+                    <em class="pc-delta is-target">{{ fmtDelta(r.target - r.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>RR</span>
+                    <b>{{ r.rr.toFixed(2) }}</b>
+                  </div>
+                </div>
+
+                <div class="pc-legs">
+                  <span>a段 {{ r.a_bars }}根 / {{ r.a_move.toFixed(1) }}点</span>
+                  <span>b段 {{ r.b_bars }}根 / {{ r.b_move.toFixed(1) }}点</span>
+                  <span>回撤 {{ (r.retracement * 100).toFixed(1) }}%</span>
+                </div>
+              </div>
+            </div>
+            <div v-else class="patterns-empty">该品种暂无历史形态</div>
           </n-scrollbar>
         </div>
       </div>
@@ -2039,6 +2397,11 @@ onBeforeUnmount(() => {
   color: #334155;
   margin-bottom: 8px;
 }
+.recent-title {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #f1f5f9;
+}
 .review-list {
   display: flex;
   flex-direction: column;
@@ -2194,6 +2557,16 @@ onBeforeUnmount(() => {
   padding-top: 7px;
   border-top: 1px dashed #eef0f3;
 }
+.rv-section {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding-top: 5px;
+  border-top: 1px solid #f1f5f9;
+  font-size: 10px;
+  font-weight: 800;
+  color: #7c5cff;
+  letter-spacing: 0;
+}
 .rv-item {
   display: flex;
   align-items: baseline;
@@ -2222,6 +2595,15 @@ onBeforeUnmount(() => {
 .rv-item b.is-neg {
   color: #0f9d58;
 }
+.rv-item b.is-good {
+  color: #0f766e;
+}
+.rv-item b.is-mid {
+  color: #2563eb;
+}
+.rv-item b.is-weak {
+  color: #94a3b8;
+}
 .rv-item b.is-neutral {
   color: #94a3b8;
 }
@@ -2230,6 +2612,9 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 10px;
   padding-right: 4px;
+}
+.recent-list {
+  gap: 8px;
 }
 .patterns-empty {
   padding: 24px 0;
@@ -2267,6 +2652,12 @@ onBeforeUnmount(() => {
 }
 .pattern-card.is-active {
   box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
+}
+.pattern-card.is-recent {
+  cursor: pointer;
+}
+.pattern-card.is-recent:hover {
+  box-shadow: 0 3px 12px rgba(15, 23, 42, 0.12);
 }
 .pc-head {
   display: flex;
@@ -2351,6 +2742,12 @@ onBeforeUnmount(() => {
   height: 8px;
   border-radius: 50%;
   background: currentColor;
+}
+.pc-state-time {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: #94a3b8;
 }
 .pc-state.success {
   color: #0f9d58;

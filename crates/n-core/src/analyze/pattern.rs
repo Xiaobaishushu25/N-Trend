@@ -19,10 +19,10 @@ const B_WEAKENING_RATIO_MAX: f64 = 0.75;
 // 视为“先大幅下跌再大幅拉回”的折返路径，而不是沿单一方向运动的健康回撤。
 const B_V_SHAPE_REVERSAL_RATIO: f64 = 0.5;
 
-/// a段内同向趋势K线根数，用于校验a段是否具备实际推动
+/// a段内同向趋势K线根数（含 S0），用于校验a段是否具备实际推动
 pub fn a_leg_strong_count(p: &NPattern, trend_k_relaxed: &[(bool, bool)]) -> usize {
     let mut count = 0;
-    for i in p.s0.index + 1..=p.s1.index {
+    for i in p.s0.index..=p.s1.index {
         if p.dir == Dir::Down && trend_k_relaxed[i].1 {
             count += 1;
         }
@@ -45,7 +45,12 @@ pub fn is_small_n(p: &NPattern, atr20: &[Option<f64>]) -> bool {
 
 /// b段反向K线实体是否整体衰减。
 /// 反向K线指与主趋势方向相反的回调K线：做多看阴线实体、做空看阳线实体。
-fn b_leg_weakening(bars: &[Bar], start: usize, end: usize, dir: Dir) -> (bool, Option<f64>) {
+pub(crate) fn b_leg_weakening(
+    bars: &[Bar],
+    start: usize,
+    end: usize,
+    dir: Dir,
+) -> (bool, Option<f64>) {
     let mut bodies = Vec::new();
     for i in start + 1..=end {
         let body = match dir {
@@ -108,9 +113,10 @@ pub fn make_pattern(
     bars: &[Bar],
     trend_k: &[(bool, bool)],
 ) -> Option<NPattern> {
-    let a_bars = s1.index.saturating_sub(s0.index);
+    // A段K线根数含 S0 本身：S0 是转折极值K，同时也是新腿的第一根K。
+    let a_bars = s1.index.saturating_sub(s0.index) + 1;
     let b_bars = s2.index.saturating_sub(s1.index);
-    if a_bars < 2 || b_bars < 2 {
+    if a_bars < 3 || b_bars < 2 {
         return None;
     }
 
@@ -163,7 +169,7 @@ pub fn make_pattern(
     };
 
     let mut a_strong_trend = 0;
-    for i in s0.index + 1..=s1.index {
+    for i in s0.index..=s1.index {
         if dir == Dir::Down && trend_k[i].1 {
             a_strong_trend += 1;
         }
@@ -234,7 +240,7 @@ pub fn make_pattern(
         retracement,
         grade,
         hard_failure,
-        a_too_long: a_bars > 6,
+        a_too_long: a_bars > 7,
         b_too_long: b_bars > 8,
         b_fast: b_speed > 0.8 * a_speed,
         b_weakening,

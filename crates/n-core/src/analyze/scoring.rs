@@ -11,46 +11,94 @@ const ENTRY_BLOCK_WICK_ATR_MIN: f64 = 0.25;
 const ENTRY_BLOCK_WICK_RANGE_MIN: f64 = 0.50;
 const OPPOSING_PREV_RANGE_ATR_MIN: f64 = 0.80;
 const OPPOSING_PREV_BODY_ATR_MIN: f64 = 0.50;
-const ENTRY_BLOCK_TRIGGER_PENALTY: f64 = 0.70;
-const ENTRY_BLOCK_MOMENTUM_PENALTY: f64 = 0.35;
-const TRIGGER_OPPOSITION_PENALTY_MAX: f64 = 2.00;
 // ===== a段质量分标定参数 =====
-// 幅度满档：a_move 达到 8 倍 ATR 即得满分。
-// 幅度不足的短腿自然低分，不另设“最少根数”之类的硬门槛，避免针对个案。
-const A_LEG_AMPLITUDE_ATR_FULL: f64 = 8.0;
-// 推动分权重：幅度、强K密度、推进速度三项相乘，全部满档时推动分 3.6。
-const A_LEG_CORE_SCORE_WEIGHT: f64 = 3.6;
-// 推进速度（每根K线平均推进的 ATR 数）满档：0.50 倍 ATR/根。
-// 从 0.15 倍（与 v2 最低速度门槛一致）线性升至满档，慢腿按比例压推动分。
+// dim_a = 0.5 + 4.5 × 幅度因子 × 速度因子 × 干净因子 - 跳空扣分。
+// 三个因子分别设甜区，乘法短板结构：任何一个不合格都会按比例压分。
+// 长度不再单独扣分，长腿由速度因子和干净因子共同把关。
+const A_LEG_CORE_SCORE_WEIGHT: f64 = 4.5;
+// 推进速度甜区：0.25~0.55 ATR/根满档；0.15~0.25 线性升温；
+// 0.55~0.90 过快段线性降权，超过 0.90 保留 0.6 下限。
 const A_LEG_SPEED_ATR_MIN: f64 = 0.15;
-const A_LEG_SPEED_ATR_FULL: f64 = 0.50;
-// 超大A段扣分：a_move 超过 8 倍 ATR 后每多 1 ATR 扣 0.1，封顶 0.3。
-// 再往上就是小时级 N 形的尺度，15m 信号不再给更多幅度分，只做轻压。
-const A_LEG_AMPLITUDE_OVERSIZE_ATR_MIN: f64 = 8.0;
-const A_LEG_AMPLITUDE_OVERSIZE_PER_ATR: f64 = 0.1;
-const A_LEG_AMPLITUDE_OVERSIZE_MAX: f64 = 0.3;
-// A段跳空扣分：向上、向下跳空都统计，单根缺口达到 1 倍 ATR 才开始扣；
-// 扣分 = min(0.4 × 缺口合计 / A段幅度, 0.25)，小跳空不计。
+const A_LEG_SPEED_ATR_RAMP_FULL: f64 = 0.25;
+const A_LEG_SPEED_ATR_FULL: f64 = 0.55;
+const A_LEG_SPEED_ATR_FAST_START: f64 = 0.90;
+const A_LEG_SPEED_FAST_PENALTY_MAX: f64 = 0.4;
+const A_LEG_SPEED_FLOOR: f64 = 0.6;
+/// A段单根K线在干净度中的归类，所有K都参与加权。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ALegBarKind {
+    Clean,
+    PlainSame,
+    BigSame,
+    Wick,
+    ReverseWick,
+    Doji,
+    FavWick,
+    SmallReverse,
+    Reverse,
+    BigReverse,
+    Neutral,
+}
+// A段逐根K线质量分（ATR 加权）：整条腿所有K都参与，不再只挑“显著K”平均。
+// 同色小K给轻分，速度因子负责惩罚“全是小K”的慢腿；
+// 大K、逆势长影、普通/大反向K直接扣分。
+const A_LEG_BAR_CLEAN: f64 = 1.0;
+const A_LEG_BAR_PLAIN_SAME: f64 = 0.6;
+const A_LEG_BAR_BIG_SAME: f64 = -0.6;
+const A_LEG_BAR_WICK: f64 = -0.5;
+const A_LEG_BAR_REVERSE_WICK: f64 = -0.9;
+const A_LEG_BAR_DOJI: f64 = -0.1;
+const A_LEG_BAR_FAVORABLE_WICK: f64 = 0.2;
+const A_LEG_BAR_SMALL_REVERSE: f64 = -0.4;
+const A_LEG_BAR_REVERSE: f64 = -1.2;
+const A_LEG_BAR_BIG_REVERSE: f64 = -1.8;
+// 干净因子归一：加权平均 -2~+1 映射到 0~1。
+const A_LEG_CLEAN_SCORE_SHIFT: f64 = 2.0;
+const A_LEG_CLEAN_SCORE_SCALE: f64 = 3.0;
+// 长影线门槛：逆势影达到 0.4 ATR 且超过实体即判长影，先于 Doji 和小反向，
+// 小实体长影不会再被实体大小分类吞掉。顺向影达到 2 倍实体且收盘有利才奖励。
+const A_LEG_WICK_ATR_MIN: f64 = 0.4;
+const A_LEG_WICK_BODY_RATIO: f64 = 1.0;
+const A_LEG_FAV_WICK_BODY_RATIO: f64 = 2.0;
+const A_LEG_DOJI_BODY_RATIO_MAX: f64 = 0.15;
+// 大K门槛：同色振幅超过 2.5 ATR 判大同色K；反向实体 0.8 ATR
+// 或振幅 1.5 ATR 判大反向K。
+const A_LEG_BAR_BIG_SAME_ATR_MIN: f64 = 2.5;
+const A_LEG_BAR_BIG_REVERSE_BODY_ATR_MIN: f64 = 0.8;
+const A_LEG_BAR_BIG_REVERSE_RANGE_ATR_MIN: f64 = 1.5;
+const A_LEG_BAR_REVERSE_BODY_ATR_MIN: f64 = 0.25;
+const A_LEG_BAR_REVERSE_RANGE_ATR_MIN: f64 = 0.8;
+// 干净同色K：实体占比≥0.55、逆势影≤0.4 实体、振幅 0.4~2.0 ATR。
+const A_LEG_CLEAN_BODY_RATIO_MIN: f64 = 0.55;
+const A_LEG_CLEAN_WICK_BODY_RATIO_MAX: f64 = 0.4;
+const A_LEG_CLEAN_RANGE_ATR_MIN: f64 = 0.4;
+const A_LEG_CLEAN_RANGE_ATR_MAX: f64 = 2.0;
+// 逐根权重：振幅/ATR 夹在 0.25~2.0，S1 固定 1。
+const A_LEG_BAR_WEIGHT_MIN_ATR: f64 = 0.25;
+const A_LEG_BAR_WEIGHT_MAX_ATR: f64 = 2.0;
+// 幅度甜区：1.5 ATR 以下线性升温，2.5 ATR 起满档；
+// 上限随形态尺度浮动：8 + max(0, N_ATR - 12) × 0.5 ATR，
+// 超过上限后 4 ATR 内线性降到 0.6，避免大形态被同尺度误伤。
+const A_LEG_AMPLITUDE_ATR_RAMP_MIN: f64 = 1.5;
+const A_LEG_AMPLITUDE_ATR_FULL_MIN: f64 = 2.5;
+const A_LEG_AMPLITUDE_CAP_BASE_ATR: f64 = 8.0;
+const A_LEG_AMPLITUDE_CAP_N_BASE_ATR: f64 = 12.0;
+const A_LEG_AMPLITUDE_CAP_PER_N_ATR: f64 = 0.5;
+const A_LEG_AMPLITUDE_CAP_DECAY_ATR: f64 = 4.0;
+const A_LEG_AMPLITUDE_CAP_DECAY_MAX: f64 = 0.4;
+const A_LEG_AMPLITUDE_FLOOR: f64 = 0.6;
+// A段跳空处理：向上、向下跳空都统计，单根缺口达到 1 倍 ATR 才算大跳空。
+// 大跳空先剔除出 a_move，不再贡献幅度和推进速度；再按
+// “每根 0.15 + 超出 1 倍 ATR 部分每 ATR 0.20”计惩罚，封顶 0.5。
 // 跨合约换月的 rollover bar 不构成真实跳空，不参与统计。
 const A_LEG_GAP_MIN_ATR: f64 = 1.0;
-const A_LEG_GAP_PENALTY_RATIO: f64 = 0.4;
-const A_LEG_GAP_PENALTY_MAX: f64 = 0.25;
-// 强趋势K密度基准：长腿按 35% 密度折算；短腿保底 2 根。
-// 这样“长而干净”（大量光头阳线/光脚阴线）的腿仍能得高分，
-// 只有强K密度低的震荡/重叠腿被压低。
-const A_LEG_STRONG_DENSITY_BASE: f64 = 0.35;
-const A_LEG_STRONG_MIN_COUNT: f64 = 2.0;
-// 长度扣分：a 段过长消耗动能，分两档轻扣；只扣“动能”，不与质量混为一谈。
-// 常量保持正数，公式统一用减号，避免“负数再加”造成视觉歧义。
-const A_LEG_LONG_PENALTY_MIN_BARS: usize = 24;
-const A_LEG_LONG_PENALTY_LEVEL1: f64 = 0.4;
-const A_LEG_LONG_PENALTY_MAX_BARS: usize = 32;
-const A_LEG_LONG_PENALTY_LEVEL2: f64 = 0.8;
-// b段终点确认：当反转段前一根K线是强b向趋势K时，单根弱反向K线不能确认b段结束
-const WEAK_CONFIRM_TRIGGER_PENALTY: f64 = 1.0;
-const WEAK_CONFIRM_MOMENTUM_PENALTY: f64 = 1.0;
-// 弱确认信号总分上限：只允许小仓试错，不进入标准仓区间
-const WEAK_CONFIRM_TOTAL_MAX: f64 = 3.49;
+const A_LEG_GAP_PENALTY_PER_GAP: f64 = 0.15;
+const A_LEG_GAP_PENALTY_PER_EXCESS_ATR: f64 = 0.20;
+const A_LEG_GAP_PENALTY_MAX: f64 = 0.5;
+// 多K累积覆盖的入场分上限：只允许小仓试错，不进入标准仓区间
+const CUMULATIVE_ENTRY_SCORE_MAX: f64 = 3.49;
+// 长影线预警的入场分上限：全分档胜率都弱，不允许进入 3.5+ 标准仓区间。
+pub(crate) const WICK_ENTRY_SCORE_MAX: f64 = 3.0;
 // 预警K线长影线硬门槛（2026-08-15），七条同时满足才识别：
 // 实体 > 0；主影线 ≥ 3 倍实体；主影线 ≥ 60% 振幅且 ≥ 0.5 倍 ATR20；
 // 收盘位于反向一端 25% 振幅内；反向影线 ≤ 10% 振幅；
@@ -71,13 +119,12 @@ const STRONG_ENGULF_BODY_ATR_MIN: f64 = 0.25;
 /// 长影线收盘方向微调：做多长下影收阴、做空长上影收阳时，预警K线质量略扣 0.1 分。
 /// 只影响评分，不改变七条识别门槛。
 const WICK_DIRECTION_PENALTY: f64 = 0.1;
-// 预警K线透支空间扣分：反转K线实体已经覆盖大部分到 S1 的剩余空间时，
-// 突破入场后的空间不足、止损与目标盈亏比差，预警质量应下降而不是继续按标准强预警计。
-// 从实体覆盖剩余空间 50% 起线性扣分，覆盖 150% 时扣满 1.0 分。
-// 只降质量分，不取消识别，避免把“大K预警”整体丢弃。
-const WARNING_SPACE_OVERRUN_START: f64 = 0.5;
-const WARNING_SPACE_OVERRUN_FULL: f64 = 1.5;
-const WARNING_SPACE_OVERRUN_PENALTY_MAX: f64 = 1.0;
+// 预警K线体量扣分：振幅达到 2 倍 ATR20 的预警K线视为“特别巨大”，
+// 会消耗较多动能并拉大止损空间，预警质量按比例下降。
+// 是否覆盖到 S1 目标空间不作为扣分依据，破位预期下覆盖目标空间是正常现象。
+const WARNING_SIZE_ATR_START: f64 = 2.0;
+const WARNING_SIZE_ATR_FULL: f64 = 3.5;
+const WARNING_SIZE_PENALTY_MAX: f64 = 1.0;
 
 fn clamp(v: f64) -> f64 {
     v.clamp(0.0, 5.0)
@@ -87,72 +134,205 @@ pub(crate) fn atr_at(atr20: &[Option<f64>], index: usize) -> f64 {
     atr20.get(index).and_then(|x| *x).unwrap_or(1.0)
 }
 
-fn score_60m(trend: &Trend60, dir: Dir) -> f64 {
-    if trend.aligned_with(dir) {
-        if trend.strong() {
-            4.5
-        } else {
-            3.0
-        }
-    } else if trend.opposite_to(dir) {
-        if trend.strong() {
-            0.5
-        } else {
-            1.0
-        }
-    } else {
-        2.0
+/// A段逐K质量与净推进结构明细，供复盘卡片直接展示。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ALegDetail {
+    pub q: f64,
+    pub gap_sum: f64,
+    pub gap_count: usize,
+    pub gap_penalty: f64,
+    pub net_move: f64,
+    pub atr: f64,
+}
+
+pub(crate) fn a_leg_detail(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> ALegDetail {
+    let atr = atr_at(atr20, p.s1.index);
+    let q = a_leg_clean_fit(bars, atr20, p);
+    let (gap_sum, gap_count, gap_penalty) = a_leg_gap_info(bars, p, atr);
+    ALegDetail {
+        q,
+        gap_sum,
+        gap_count,
+        gap_penalty,
+        net_move: (p.a_move - gap_sum).max(0.0),
+        atr,
     }
 }
 
 /// a段质量分：衡量“推动腿”的幅度与K线质量，采用乘法短板结构。
 ///
 /// 公式：
-///   dim_a = 0.5 + 3.6 × min(1, a_move/(8·ATR)) × min(1, 强趋势K/密度基准)
-///                  × clamp((推进速度/ATR - 0.15)/(0.50 - 0.15), 0, 1)
-///           - 超大A段扣分 - 跳空扣分 - 长度扣分
+///   dim_a = 0.5 + 4.5 × 幅度因子 × 速度因子 × 干净因子 - 跳空扣分
 ///
 /// 设计要点（避免“各项中等、凑满高分”的加法漏洞）：
-/// 1. 幅度、强K密度、推进速度三项相乘，任何一项弱都会按比例压低总分；
-/// 2. 推进速度 = (a_move/a_bars)/ATR，最能体现动能；低于 0.15 不给推动分，
-///    0.50 倍 ATR/根及以上按满动能计；
-/// 3. 强趋势K按密度折算：长腿按 35% 基准放宽，短腿保底 2 根——
-///    长而干净的腿（大量光头阳线/光脚阴线）仍得高分，震荡/重叠腿被压低；
-/// 4. 长度单独作为“动能消耗”轻扣，不与质量混为一谈；
-/// 5. 8 倍 ATR 幅度满档，但幅度权重不抬高；超过 8 倍后再轻扣；
-/// 6. A段内部大跳空按占比单独扣分（单根 ≥ 1 倍 ATR 才计），
-///    向上、向下都统计，不影响质量和幅度权重。
+/// 1. 幅度、速度、干净度三项相乘，任何一项弱都会按比例压低总分；
+/// 2. 推进速度 = (净推进/根数)/ATR：0.25~0.55 满档，0.15 以下零分，
+///    0.55 以上过快段降权，0.90 以上保留 0.6 下限；
+/// 3. 干净因子由整条腿所有K参与，逐根按 K 线方向、实体大小、影线打分，
+///    大反向K、逆势长影、大同色K直接扣分；普通小K给轻分，速度因子惩罚小K慢腿；
+///    S1 最后一根固定权重 1，其余权重 = clamp(振幅/ATR, 0.25, 2.0)；
+/// 4. 幅度因子带甜区：1.5~2.5 ATR 过渡，2.5 ATR 起满档，上限随
+///    N_ATR（A+B 净幅度）浮动到 8+（N-12）×0.5，超过上限线性降到 0.6；
+/// 5. A段内部大跳空按次数和超出 1 倍 ATR 的部分单独扣分，
+///    向上、向下都统计，且不再参与幅度和速度收益。
 pub(crate) fn score_a(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
-    let atr = atr_at(atr20, p.s1.index);
-    let strong = a_leg_relaxed_strong(bars, atr20, p);
-    let gap_penalty = a_leg_gap_penalty(bars, p, atr);
-    a_leg_score_formula(p.a_move, p.a_bars, strong, atr, gap_penalty)
-}
-
-/// a段内“形态方向强趋势K”的数量（宽松口径，与识别阶段的 a_leg_strong_count 一致）。
-///
-/// 注意：不能直接使用 NPattern.a_strong_trend——那是 make_pattern 里按严格趋势K
-/// 统计的，会把大量“光头阳线/光脚阴线”级别的干净推进漏掉，导致长而干净的腿被低估。
-fn a_leg_relaxed_strong(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> usize {
-    let flags = indicators::trend_flags_relaxed(bars, atr20);
-    let mut count = 0;
-    for i in p.s0.index + 1..=p.s1.index {
-        match p.dir {
-            Dir::Down if flags.get(i).is_some_and(|f| f.1) => count += 1,
-            Dir::Up if flags.get(i).is_some_and(|f| f.0) => count += 1,
-            _ => {}
-        }
-    }
-    count
-}
-
-/// A段内部大跳空的合计占比扣分：向上、向下跳空都统计，
-/// 单根缺口低于 1 倍 ATR 视为可接受的正常波动，不参与扣分。
-fn a_leg_gap_penalty(bars: &[Bar], p: &NPattern, atr: f64) -> f64 {
-    if atr <= 0.0 || p.a_move <= 0.0 {
+    let d = a_leg_detail(bars, atr20, p);
+    if d.atr <= 0.0 {
         return 0.0;
     }
+    let leg_atr = d.net_move / d.atr;
+    let n_atr = (d.net_move + p.b_move) / d.atr;
+    let amplitude = a_leg_amplitude_factor(leg_atr, n_atr);
+    let speed_atr = d.net_move / p.a_bars.max(1) as f64 / d.atr;
+    let speed = a_leg_speed_factor(speed_atr);
+    a_leg_score_formula(amplitude, speed, d.q, d.gap_penalty)
+}
+
+/// A段干净因子（ATR 加权）：整条腿所有K都参与，逐根打质量分后做
+/// “S1 权重 1、其余权重 = clamp(振幅/ATR, 0.25, 2.0)”加权平均。
+/// 加权平均 -2~+1 映射到 0..1；没有有效K线时返回 0。
+fn a_leg_clean_fit(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
+    let mut weight_sum = 0.0;
+    let mut total_sum = 0.0;
+    for i in p.s0.index..=p.s1.index {
+        let Some(bar) = bars.get(i) else {
+            continue;
+        };
+        let atr = atr20.get(i).copied().flatten();
+        let (score, _) = a_leg_bar_score_detail(bar, atr, p.dir);
+        let weight = if i == p.s1.index {
+            1.0
+        } else {
+            match atr {
+                Some(a) if a > 0.0 => ((bar.high - bar.low) / a)
+                    .clamp(A_LEG_BAR_WEIGHT_MIN_ATR, A_LEG_BAR_WEIGHT_MAX_ATR),
+                _ => 1.0,
+            }
+        };
+        weight_sum += weight;
+        total_sum += score * weight;
+    }
+    if weight_sum > 0.0 {
+        ((total_sum / weight_sum + A_LEG_CLEAN_SCORE_SHIFT) / A_LEG_CLEAN_SCORE_SCALE)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// 单根K线在 A 段方向上的质量分（干净度用）。
+/// 同色：干净 +1.0、普通同色 +0.6、大同色 -0.6、逆势长影 -0.5；
+/// 反向：顺向长影 +0.2、小反向 -0.4、普通反向 -1.2、大反向 -1.8、
+/// 逆势长影 -0.9；十字星 -0.1；无效K记 0。
+#[cfg(test)]
+fn a_leg_bar_score(bar: &Bar, atr: Option<f64>, dir: Dir) -> f64 {
+    a_leg_bar_score_detail(bar, atr, dir).0
+}
+
+/// 单根K线质量分，同时返回干净度归类。
+fn a_leg_bar_score_detail(bar: &Bar, atr: Option<f64>, dir: Dir) -> (f64, ALegBarKind) {
+    let Some(atr) = atr else {
+        return (0.0, ALegBarKind::Neutral);
+    };
+    if atr <= 0.0 {
+        return (0.0, ALegBarKind::Neutral);
+    }
+    let range = bar.high - bar.low;
+    if range <= 0.0 {
+        return (0.0, ALegBarKind::Neutral);
+    }
+    let body = (bar.close - bar.open).abs();
+    let upper = bar.high - bar.open.max(bar.close);
+    let lower = bar.open.min(bar.close) - bar.low;
+    let body_ratio = body / range;
+    let pos = match dir {
+        Dir::Up => (bar.close - bar.low) / range,
+        Dir::Down => (bar.high - bar.close) / range,
+    };
+    let same = match dir {
+        Dir::Up => bar.close > bar.open,
+        Dir::Down => bar.close < bar.open,
+    };
+    let oppose_wick = match dir {
+        Dir::Up => upper,
+        Dir::Down => lower,
+    };
+    let favor_wick = match dir {
+        Dir::Up => lower,
+        Dir::Down => upper,
+    };
+    let favorable_close = match dir {
+        Dir::Up => pos <= 0.30,
+        Dir::Down => pos >= 0.70,
+    };
+
+    // 反向K带顺向长影（做多下影/做空上影）且收盘有利：拒绝/供应信号，给温和正分。
+    // 这类K先于反向大小实体判断，避免把“好影线”误伤成大反向。
+    if !same
+        && range >= A_LEG_BAR_REVERSE_RANGE_ATR_MIN * atr
+        && favor_wick >= A_LEG_FAV_WICK_BODY_RATIO * body
+        && favorable_close
+    {
+        return (A_LEG_BAR_FAVORABLE_WICK, ALegBarKind::FavWick);
+    }
+
+    // 逆势长影优先于 Doji、小反向和大实体分类：小实体长影不会再被吞掉。
+    if oppose_wick >= A_LEG_WICK_ATR_MIN * atr && oppose_wick >= A_LEG_WICK_BODY_RATIO * body {
+        if !same
+            && (body >= A_LEG_BAR_BIG_REVERSE_BODY_ATR_MIN * atr
+                || range >= A_LEG_BAR_BIG_REVERSE_RANGE_ATR_MIN * atr)
+        {
+            return (A_LEG_BAR_BIG_REVERSE, ALegBarKind::BigReverse);
+        }
+        if same && range > A_LEG_BAR_BIG_SAME_ATR_MIN * atr {
+            return (A_LEG_BAR_BIG_SAME, ALegBarKind::BigSame);
+        }
+        if same {
+            return (A_LEG_BAR_WICK, ALegBarKind::Wick);
+        }
+        return (A_LEG_BAR_REVERSE_WICK, ALegBarKind::ReverseWick);
+    }
+
+    if body <= 0.0 || body_ratio < A_LEG_DOJI_BODY_RATIO_MAX {
+        return (A_LEG_BAR_DOJI, ALegBarKind::Doji);
+    }
+
+    if same {
+        if range > A_LEG_BAR_BIG_SAME_ATR_MIN * atr {
+            return (A_LEG_BAR_BIG_SAME, ALegBarKind::BigSame);
+        }
+        if body_ratio >= A_LEG_CLEAN_BODY_RATIO_MIN
+            && oppose_wick <= A_LEG_CLEAN_WICK_BODY_RATIO_MAX * body
+            && range >= A_LEG_CLEAN_RANGE_ATR_MIN * atr
+            && range <= A_LEG_CLEAN_RANGE_ATR_MAX * atr
+        {
+            return (A_LEG_BAR_CLEAN, ALegBarKind::Clean);
+        }
+        return (A_LEG_BAR_PLAIN_SAME, ALegBarKind::PlainSame);
+    }
+
+    if body >= A_LEG_BAR_BIG_REVERSE_BODY_ATR_MIN * atr
+        || range >= A_LEG_BAR_BIG_REVERSE_RANGE_ATR_MIN * atr
+    {
+        return (A_LEG_BAR_BIG_REVERSE, ALegBarKind::BigReverse);
+    }
+    if body >= A_LEG_BAR_REVERSE_BODY_ATR_MIN * atr
+        || range >= A_LEG_BAR_REVERSE_RANGE_ATR_MIN * atr
+    {
+        return (A_LEG_BAR_REVERSE, ALegBarKind::Reverse);
+    }
+    (A_LEG_BAR_SMALL_REVERSE, ALegBarKind::SmallReverse)
+}
+
+/// A段大跳空信息：返回（缺口合计、跳空根数、扣分）。
+/// 单根缺口低于 1 倍 ATR 视为可接受的正常波动，不参与扣分。
+fn a_leg_gap_info(bars: &[Bar], p: &NPattern, atr: f64) -> (f64, usize, f64) {
+    if atr <= 0.0 || p.a_move <= 0.0 {
+        return (0.0, 0, 0.0);
+    }
     let mut gap_sum = 0.0;
+    let mut gap_count = 0usize;
+    let mut excess_atr = 0.0;
     for i in p.s0.index + 1..=p.s1.index {
         let Some(prev) = bars.get(i.saturating_sub(1)) else {
             continue;
@@ -168,52 +348,61 @@ fn a_leg_gap_penalty(bars: &[Bar], p: &NPattern, atr: f64) -> f64 {
         let gap = gap_up.max(gap_down);
         if gap >= A_LEG_GAP_MIN_ATR * atr {
             gap_sum += gap;
+            gap_count += 1;
+            excess_atr += (gap / atr - A_LEG_GAP_MIN_ATR).max(0.0);
         }
     }
-    let ratio = (gap_sum / p.a_move).min(1.0);
-    (ratio * A_LEG_GAP_PENALTY_RATIO).min(A_LEG_GAP_PENALTY_MAX)
+    let penalty = (gap_count as f64 * A_LEG_GAP_PENALTY_PER_GAP
+        + excess_atr * A_LEG_GAP_PENALTY_PER_EXCESS_ATR)
+        .min(A_LEG_GAP_PENALTY_MAX);
+    (gap_sum, gap_count, penalty)
 }
 
-/// a段质量分的纯公式（抽出便于单测与标定）。
-fn a_leg_score_formula(
-    a_move: f64,
-    a_bars: usize,
-    strong: usize,
-    atr: f64,
-    gap_penalty: f64,
-) -> f64 {
-    if atr <= 0.0 {
+/// a段质量分的纯公式（抽出便于单测与标定）：三个因子相乘后扣跳空。
+fn a_leg_score_formula(amplitude: f64, speed: f64, clean: f64, gap_penalty: f64) -> f64 {
+    clamp(0.5 + A_LEG_CORE_SCORE_WEIGHT * amplitude * speed * clean - gap_penalty)
+}
+
+/// 幅度因子：1.5 ATR 以下线性升温，2.5 ATR 起满档；
+/// 上限随形态尺度 N_ATR 浮动，超过上限后线性衰减到 0.6。
+fn a_leg_amplitude_factor(leg_atr: f64, n_atr: f64) -> f64 {
+    if leg_atr < A_LEG_AMPLITUDE_ATR_RAMP_MIN {
+        return leg_atr / A_LEG_AMPLITUDE_ATR_RAMP_MIN;
+    }
+    if leg_atr < A_LEG_AMPLITUDE_ATR_FULL_MIN {
+        return 0.5 + 0.5 * (leg_atr - A_LEG_AMPLITUDE_ATR_RAMP_MIN)
+            / (A_LEG_AMPLITUDE_ATR_FULL_MIN - A_LEG_AMPLITUDE_ATR_RAMP_MIN);
+    }
+    let cap = A_LEG_AMPLITUDE_CAP_BASE_ATR
+        + (n_atr - A_LEG_AMPLITUDE_CAP_N_BASE_ATR).max(0.0) * A_LEG_AMPLITUDE_CAP_PER_N_ATR;
+    if leg_atr <= cap {
+        return 1.0;
+    }
+    if leg_atr <= cap + A_LEG_AMPLITUDE_CAP_DECAY_ATR {
+        return 1.0 - (leg_atr - cap) / A_LEG_AMPLITUDE_CAP_DECAY_ATR * A_LEG_AMPLITUDE_CAP_DECAY_MAX;
+    }
+    A_LEG_AMPLITUDE_FLOOR
+}
+
+/// 速度因子：0.15 以下零分，0.25~0.55 满档，
+/// 0.55~0.90 过快段线性降权，0.90 以上保留 0.6。
+fn a_leg_speed_factor(speed_atr: f64) -> f64 {
+    if speed_atr < A_LEG_SPEED_ATR_MIN {
         return 0.0;
     }
-    // 幅度分：a_move 达到 8 倍 ATR 视为满档（1.0）。
-    let amplitude = (a_move / (A_LEG_AMPLITUDE_ATR_FULL * atr)).min(1.0);
-    // 强趋势K密度分：短腿保底 2 根，长腿按 35% 密度折算。
-    let density_floor = (A_LEG_STRONG_DENSITY_BASE * a_bars as f64).max(A_LEG_STRONG_MIN_COUNT);
-    let quality = (strong as f64 / density_floor).min(1.0);
-    // 推进速度：每根K线平均推进的 ATR 数，最能体现动能。
-    // 低于 0.15 不给推动分，0.50 及以上按满动能计。
-    let speed_atr = a_move / a_bars.max(1) as f64 / atr;
-    let speed_factor = ((speed_atr - A_LEG_SPEED_ATR_MIN)
-        / (A_LEG_SPEED_ATR_FULL - A_LEG_SPEED_ATR_MIN))
-        .clamp(0.0, 1.0);
-    // 超大A段扣分：独立轻扣，不再随质量缩放。
-    let oversize_excess = (a_move / atr - A_LEG_AMPLITUDE_OVERSIZE_ATR_MIN).max(0.0);
-    let oversize_penalty =
-        (oversize_excess * A_LEG_AMPLITUDE_OVERSIZE_PER_ATR).min(A_LEG_AMPLITUDE_OVERSIZE_MAX);
-    // 长度扣分：a 段过长消耗动能，分两档轻扣。
-    let length_penalty = if a_bars > A_LEG_LONG_PENALTY_MAX_BARS {
-        A_LEG_LONG_PENALTY_LEVEL2
-    } else if a_bars > A_LEG_LONG_PENALTY_MIN_BARS {
-        A_LEG_LONG_PENALTY_LEVEL1
-    } else {
-        0.0
-    };
-    clamp(
-        0.5 + A_LEG_CORE_SCORE_WEIGHT * amplitude * quality * speed_factor
-            - oversize_penalty
-            - length_penalty
-            - gap_penalty,
-    )
+    if speed_atr < A_LEG_SPEED_ATR_RAMP_FULL {
+        return (speed_atr - A_LEG_SPEED_ATR_MIN)
+            / (A_LEG_SPEED_ATR_RAMP_FULL - A_LEG_SPEED_ATR_MIN);
+    }
+    if speed_atr <= A_LEG_SPEED_ATR_FULL {
+        return 1.0;
+    }
+    if speed_atr <= A_LEG_SPEED_ATR_FAST_START {
+        return 1.0 - (speed_atr - A_LEG_SPEED_ATR_FULL)
+            / (A_LEG_SPEED_ATR_FAST_START - A_LEG_SPEED_ATR_FULL)
+            * A_LEG_SPEED_FAST_PENALTY_MAX;
+    }
+    A_LEG_SPEED_FLOOR
 }
 
 pub(crate) fn score_b(p: &NPattern) -> f64 {
@@ -232,75 +421,6 @@ pub(crate) fn score_b(p: &NPattern) -> f64 {
     // 反向强K扣分：健康回撤里第一根反向强K是正常的，不惩罚；
     // 从第 2 根起每根扣 0.3（至多按 2 根计），避免把正常回撤误判为弱结构。
     s -= (p.b_strong_reverse.saturating_sub(1).min(2) as f64) * 0.3;
-    clamp(s)
-}
-
-fn score_trigger(
-    bars: &[Bar],
-    atr20: &[Option<f64>],
-    warning: Option<usize>,
-    trigger: Option<usize>,
-    p: &NPattern,
-    local_block_count: u8,
-) -> f64 {
-    match (warning, trigger) {
-        (None, _) => 0.0,
-        (Some(_), None) => 1.0,
-        (Some(w), Some(t)) => {
-            let mut s = 3.0;
-            let delay = t.saturating_sub(w);
-            if delay <= 1 {
-                s += 1.0;
-            } else if delay <= 3 {
-                s += 0.5;
-            } else {
-                s -= 0.5;
-            }
-            if p.grade == Grade::A {
-                s += 0.2;
-            }
-            if p.c_extended {
-                s -= 0.5;
-            }
-            s -= ENTRY_BLOCK_TRIGGER_PENALTY * local_block_count as f64;
-            s -= trigger_opposition_penalty(bars, atr20, p.dir, p.s2.index, t);
-            clamp(s)
-        }
-    }
-}
-
-fn score_rr(rr: f64, momentum: f64, c_extended: bool) -> f64 {
-    let base = if rr <= 0.0 { 0.0 } else { (rr * 2.5).min(5.0) };
-    if !c_extended && momentum >= 3.5 {
-        base.max(2.0)
-    } else {
-        base
-    }
-}
-
-fn score_momentum(
-    p: &NPattern,
-    trend: &Trend60,
-    atr20: &[Option<f64>],
-    entry_block_count: u8,
-) -> f64 {
-    let atr = atr_at(atr20, p.s2.index);
-    let mut s = 2.5;
-    if p.c_extended {
-        s -= 1.0;
-    } else {
-        s += 0.5;
-    }
-    if trend.aligned_with(p.dir) && trend.strong() {
-        s += 0.5;
-    }
-    if p.a_move >= 1.5 * atr {
-        s += 0.3;
-    }
-    if p.b_strong_reverse == 0 {
-        s += 0.2;
-    }
-    s -= ENTRY_BLOCK_MOMENTUM_PENALTY * entry_block_count as f64;
     clamp(s)
 }
 
@@ -377,27 +497,6 @@ fn entry_block_flags(
         trigger > 0 && strong_opposite_body_at(bars, atr20, dir, trigger - 1).is_some();
 
     (wick_block, prev_block)
-}
-
-fn trigger_opposition_penalty(
-    bars: &[Bar],
-    atr20: &[Option<f64>],
-    dir: Dir,
-    b_end: usize,
-    trigger: usize,
-) -> f64 {
-    let Some(opposing_body) = strong_opposite_body_at(bars, atr20, dir, b_end) else {
-        return 0.0;
-    };
-    let Some(trigger_bar) = bars.get(trigger) else {
-        return 0.0;
-    };
-    let trigger_body = (trigger_bar.close - trigger_bar.open).abs();
-    if trigger_body <= 0.0 {
-        return TRIGGER_OPPOSITION_PENALTY_MAX;
-    }
-    let ratio = opposing_body / trigger_body;
-    (ratio - 1.0).clamp(0.0, 3.0) * (TRIGGER_OPPOSITION_PENALTY_MAX / 3.0)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -484,31 +583,71 @@ pub(crate) fn wick_direction_penalty(bar: &Bar, dir: Dir) -> f64 {
     }
 }
 
-/// 预警K线透支空间扣分：做多按预警K线实体覆盖 `S1 - 高点` 的剩余空间比例，
-/// 做空按实体覆盖 `低点 - S1` 的剩余空间比例，方向对称。
-pub(crate) fn warning_space_overrun_penalty(bars: &[Bar], p: &NPattern, w: usize) -> f64 {
+/// 预警K线体量扣分：按振幅相对 ATR20 的倍数衡量是否“特别巨大”，方向无关。
+pub(crate) fn warning_size_penalty(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    w: usize,
+) -> f64 {
     let Some(bar) = bars.get(w) else {
         return 0.0;
     };
-    let body = (bar.close - bar.open).abs();
-    if body <= 0.0 {
+    let atr = atr_at(atr20, w);
+    if atr <= 0.0 {
         return 0.0;
     }
-    let space = match p.dir {
-        Dir::Up => p.s1.price - bar.high,
-        Dir::Down => bar.low - p.s1.price,
-    };
-    if space <= 0.0 {
+    let ratio = (bar.high - bar.low) / atr;
+    if ratio <= WARNING_SIZE_ATR_START {
         return 0.0;
     }
-    let ratio = body / space;
-    if ratio <= WARNING_SPACE_OVERRUN_START {
-        return 0.0;
-    }
-    let t = ((ratio - WARNING_SPACE_OVERRUN_START)
-        / (WARNING_SPACE_OVERRUN_FULL - WARNING_SPACE_OVERRUN_START))
+    let t = ((ratio - WARNING_SIZE_ATR_START)
+        / (WARNING_SIZE_ATR_FULL - WARNING_SIZE_ATR_START))
         .clamp(0.0, 1.0);
-    WARNING_SPACE_OVERRUN_PENALTY_MAX * t
+    WARNING_SIZE_PENALTY_MAX * t
+}
+
+fn warning_base(kind: &str) -> f64 {
+    match kind {
+        // engulf 仅保留给历史落盘记录，新识别统一为 strong。
+        "strong" | "engulf" | "wick" => 3.5,
+        _ => 2.0,
+    }
+}
+
+/// 预警K线质量分：强反转/长影线基准 3.5，多K累积覆盖基准 2.0，
+/// 再扣除长影线收盘方向与预警K线体量扣分。
+pub(crate) fn dim_warning(
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    w: usize,
+    kind: &str,
+    dir: Dir,
+) -> f64 {
+    let direction_penalty = if kind == "wick" {
+        bars.get(w)
+            .map(|bar| wick_direction_penalty(bar, dir))
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    clamp(warning_base(kind) - direction_penalty - warning_size_penalty(bars, atr20, w))
+}
+
+/// 入场分 = 0.60×A段 + 0.20×B段 + 0.20×预警K线。
+/// 多K累积覆盖总分封顶 3.49，只允许小仓试错；
+/// 长影线预警总分封顶 3.0，历史分档胜率全面偏弱，不进 3.5+ 标准仓区间。
+pub(crate) fn entry_score(
+    dim_a: f64,
+    dim_b: f64,
+    dim_warning: f64,
+    kind: &str,
+) -> f64 {
+    let score = 0.60 * dim_a + 0.20 * dim_b + 0.20 * dim_warning;
+    match kind {
+        "cumulative" => score.min(CUMULATIVE_ENTRY_SCORE_MAX),
+        "wick" => score.min(WICK_ENTRY_SCORE_MAX),
+        _ => score,
+    }
 }
 
 /// 单根K线构成的反转形态：只有干净吞没判为强反转，反向长影线单独识别。
@@ -597,6 +736,20 @@ fn weak_confirm_prefix(weak: bool) -> &'static str {
     }
 }
 
+fn apply_entry_score(
+    sc: &mut SignalCheck,
+    bars: &[Bar],
+    atr20: &[Option<f64>],
+    p: &NPattern,
+    w: usize,
+) {
+    sc.dim_a = score_a(bars, atr20, p);
+    sc.dim_b = score_b(p);
+    sc.dim_warning = dim_warning(bars, atr20, w, sc.warning_kind, p.dir);
+    sc.total = entry_score(sc.dim_a, sc.dim_b, sc.dim_warning, sc.warning_kind);
+    sc.category = score_category(sc.total);
+}
+
 fn score_category(total: f64) -> &'static str {
     if total >= 4.5 {
         "标准仓，可分批加仓候选"
@@ -633,58 +786,6 @@ fn build_note(p: &NPattern, rr: f64) -> String {
     }
     parts.push("前低/前高为决策点，不必然止盈".to_string());
     parts.join("；")
-}
-
-fn compute_scores(
-    bars: &[Bar],
-    atr20: &[Option<f64>],
-    p: &NPattern,
-    trend: &Trend60,
-    rr: f64,
-    warning_kind: &str,
-    warning: Option<usize>,
-    trigger: Option<usize>,
-    local_block_count: u8,
-    entry_block_count: u8,
-    weak_confirm: bool,
-) -> ([f64; 6], f64) {
-    let dim_trend = score_60m(trend, p.dir);
-    let dim_a = score_a(bars, atr20, p);
-    let dim_b = score_b(p);
-    let mut dim_trigger = score_trigger(bars, atr20, warning, trigger, p, local_block_count);
-    let mut dim_momentum = score_momentum(p, trend, atr20, entry_block_count);
-    if weak_confirm {
-        dim_trigger = (dim_trigger - WEAK_CONFIRM_TRIGGER_PENALTY).max(0.0);
-        dim_momentum = (dim_momentum - WEAK_CONFIRM_MOMENTUM_PENALTY).max(0.0);
-    }
-    let dim_rr = score_rr(rr, dim_momentum, p.c_extended);
-
-    // 2026-08-16：预警K线质量分直接计入综合评分。
-    // 强反转（干净吞没）/长影线 +0.3，累计覆盖/无预警 +0，
-    // 不新增 dims 维度，避免改变旧记录的 dims 结构与去重/统计口径。
-    let mut total = 0.10 * dim_trend
-        + 0.40 * dim_a
-        + 0.20 * dim_b
-        + 0.15 * dim_trigger
-        + 0.05 * dim_rr
-        + 0.10 * dim_momentum
-        + SignalCheck::warning_quality_points_for(warning_kind);
-    if warning_kind == "wick" {
-        if let Some(w) = warning {
-            total -= wick_direction_penalty(&bars[w], p.dir);
-        }
-    }
-    if let Some(w) = warning {
-        total -= warning_space_overrun_penalty(bars, p, w);
-    }
-    if weak_confirm {
-        total = total.min(WEAK_CONFIRM_TOTAL_MAX);
-    }
-
-    (
-        [dim_trend, dim_a, dim_b, dim_trigger, dim_rr, dim_momentum],
-        total,
-    )
 }
 
 /// 使用默认 tick（1.0）评估信号（测试与旧路径共用）。
@@ -724,7 +825,7 @@ fn evaluate_signal_inner(
     bars: &[Bar],
     atr20: &[Option<f64>],
     p: &NPattern,
-    trend: &Trend60,
+    _trend: &Trend60,
     tick: f64,
     v2_strict: bool,
 ) -> SignalCheck {
@@ -908,22 +1009,7 @@ fn evaluate_signal_inner(
         }
 
         sc.state = "即将触发";
-        let (dims, total) = compute_scores(
-            bars,
-            atr20,
-            p,
-            trend,
-            sc.rr,
-            sc.warning_kind,
-            Some(w),
-            None,
-            0,
-            0,
-            weak_confirm,
-        );
-        sc.dims = dims;
-        sc.total = total;
-        sc.category = score_category(total);
+        apply_entry_score(&mut sc, bars, atr20, p, w);
 
         // 未触发信号的时效检查：触发位距现价过远，或预警后等待过久
         let last_close = bars.last().map(|b| b.close).unwrap_or(0.0);
@@ -954,8 +1040,7 @@ fn evaluate_signal_inner(
     sc.trigger = Some(t);
     let (wick_block, prev_block) = entry_block_flags(bars, atr20, p.dir, t);
     let b_end_block = strong_opposite_body_at(bars, atr20, p.dir, p.s2.index).is_some();
-    let local_block_count = wick_block as u8 + prev_block as u8;
-    let entry_block_count = local_block_count + b_end_block as u8;
+    let entry_block_count = wick_block as u8 + prev_block as u8 + b_end_block as u8;
     if entry_block_count > 0 {
         sc.entry_block_count = entry_block_count;
         let mut flags = Vec::new();
@@ -1014,20 +1099,7 @@ fn evaluate_signal_inner(
     } else {
         0.0
     };
-    let (dims, total) = compute_scores(
-        bars,
-        atr20,
-        p,
-        trend,
-        sc.rr,
-        sc.warning_kind,
-        Some(w),
-        Some(t),
-        local_block_count,
-        entry_block_count,
-        weak_confirm,
-    );
-    sc.dims = dims;
+    apply_entry_score(&mut sc, bars, atr20, p, w);
 
     if p.hard_failure || p.grade == Grade::Invalid {
         sc.total = 0.0;
@@ -1051,8 +1123,6 @@ fn evaluate_signal_inner(
         sc.state = "已过时，仅复盘";
     }
 
-    sc.total = total;
-    sc.category = score_category(total);
     sc.note = format!(
         "{}{}",
         weak_confirm_prefix(weak_confirm),
@@ -1199,46 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_block_lowers_trigger_and_momentum_scores() {
-        let p = pattern();
-        let trend = trend60();
-        let atr = vec![Some(10.0), Some(10.0), Some(10.0)];
-        let bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.6, 1.0, 0.5, 0.7),
-        ];
-
-        let clean_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 0);
-        let blocked_trigger = score_trigger(&bars, &atr, Some(1), Some(2), &p, 2);
-        assert!((blocked_trigger - clean_trigger + 1.4).abs() < 1e-9);
-
-        let clean_momentum = score_momentum(&p, &trend, &atr, 0);
-        let blocked_momentum = score_momentum(&p, &trend, &atr, 2);
-        assert!((blocked_momentum - clean_momentum + 0.7).abs() < 1e-9);
-    }
-
-    #[test]
-    fn b_end_opposition_heavily_lowers_trigger_quality() {
-        let atr = vec![Some(29.6), Some(29.6)];
-
-        let bars_long = vec![
-            bar(4565.6, 4568.2, 4542.4, 4543.2),
-            bar(4558.4, 4577.0, 4557.4, 4562.4),
-        ];
-        assert!(strong_opposite_body_at(&bars_long, &atr, Dir::Up, 0).is_some());
-        assert!(trigger_opposition_penalty(&bars_long, &atr, Dir::Up, 0, 1) > 1.5);
-
-        let bars_short = vec![
-            bar(4518.0, 4542.0, 4517.0, 4537.0),
-            bar(4537.0, 4538.0, 4520.0, 4533.0),
-        ];
-        assert!(strong_opposite_body_at(&bars_short, &atr, Dir::Down, 0).is_some());
-        assert!(trigger_opposition_penalty(&bars_short, &atr, Dir::Down, 0, 1) > 1.5);
-    }
-
-    #[test]
-    fn pending_signal_uses_default_trigger_score() {
+    fn pending_signal_fills_entry_score_components() {
         let mut p = pattern();
         // 入场价偏移一档后，决策点需高于预警K线极值，这里把价格平移到正常量级
         p.s0.price = 4500.0;
@@ -1258,57 +1289,157 @@ mod tests {
         let sc = evaluate_signal(&bars, &atr, &p, &trend);
         assert_eq!(sc.state, "即将触发");
         assert_eq!(sc.trigger, None);
-        assert!((sc.dims[3] - 1.0).abs() < 1e-9);
-        assert!(sc.total > 0.0);
+        assert_eq!(sc.warning_kind, "strong");
+        assert_eq!(
+            sc.total,
+            entry_score(sc.dim_a, sc.dim_b, sc.dim_warning, sc.warning_kind)
+        );
         assert!(sc.note.contains("继续等待"));
     }
 
     #[test]
-    fn a_leg_score_uses_amplitude_quality_speed_and_length() {
-        // a段质量分=乘法短板：幅度×强K密度×推进速度，长度单独轻扣（纯公式单测）。
-        // 幅度：8倍ATR满档；5倍ATR只有 5/8。
-        // 8倍ATR满档分与旧公式8倍ATR持平，不因满档前移而加分。
-        assert!((a_leg_score_formula(80.0, 8, 5, 10.0, 0.0) - 4.1).abs() < 1e-9);
-        assert!((a_leg_score_formula(50.0, 8, 5, 10.0, 0.0) - 2.75).abs() < 1e-9);
-        // 强K密度：0根只有地板分；用8倍ATR避免叠加超大扣分。
-        assert!((a_leg_score_formula(80.0, 8, 0, 10.0, 0.0) - 0.5).abs() < 1e-9);
-        // 33根慢腿：速度约0.303 ATR/根，推动分只剩约0.44，超长扣0.8、超大扣0.2。
-        assert!((a_leg_score_formula(100.0, 33, 12, 10.0, 0.0) - 1.074025974).abs() < 1e-9);
-        // 短腿保底2根：3根腿只有1根强K → 质量0.5，10倍ATR轻扣0.2。
-        assert!((a_leg_score_formula(100.0, 3, 1, 10.0, 0.0) - 2.1).abs() < 1e-9);
+    fn a_leg_score_uses_amplitude_speed_clean_and_gap_penalty() {
+        // 三因子乘法：全部满档时 5.0，任一折半都按比例压分。
+        assert!((a_leg_score_formula(1.0, 1.0, 1.0, 0.0) - 5.0).abs() < 1e-9);
+        assert!((a_leg_score_formula(0.5, 1.0, 1.0, 0.0) - 2.75).abs() < 1e-9);
+        assert!((a_leg_score_formula(1.0, 0.5, 1.0, 0.0) - 2.75).abs() < 1e-9);
+        assert!((a_leg_score_formula(1.0, 1.0, 0.5, 0.0) - 2.75).abs() < 1e-9);
+        // 跳空扣分直接作用于总分，0.5 上限时总分至少降 0.5。
+        assert!((a_leg_score_formula(1.0, 1.0, 1.0, 0.5) - 4.5).abs() < 1e-9);
+        // 速度为零时只剩地板分。
+        assert!((a_leg_score_formula(1.0, 0.0, 1.0, 0.0) - 0.5).abs() < 1e-9);
     }
 
     #[test]
-    fn a_leg_speed_is_the_third_short_board_factor() {
-        // 同样的幅度和强K密度：8根（0.5 ATR/根）拿满速度分；
-        // 16根（0.25 ATR/根）只剩约28.6%，速度短板直接压低A段分。
-        assert!((a_leg_score_formula(40.0, 8, 3, 10.0, 0.0) - 2.3).abs() < 1e-9);
-        assert!((a_leg_score_formula(40.0, 16, 6, 10.0, 0.0) - 1.014285714).abs() < 1e-9);
-        // 速度低到 v2 门槛 0.15 以下时，推动分为 0，只剩地板分。
-        assert!((a_leg_score_formula(10.0, 10, 5, 10.0, 0.0) - 0.5).abs() < 1e-9);
+    fn a_leg_speed_factor_has_sweet_spot_and_fast_penalty() {
+        assert_eq!(a_leg_speed_factor(0.10), 0.0);
+        assert!((a_leg_speed_factor(0.20) - 0.5).abs() < 1e-9);
+        assert_eq!(a_leg_speed_factor(0.30), 1.0);
+        assert_eq!(a_leg_speed_factor(0.55), 1.0);
+        // 过快段线性降权，0.90 及以上保留 0.6。
+        assert!((a_leg_speed_factor(0.70) - 0.828571428571).abs() < 1e-9);
+        assert_eq!(a_leg_speed_factor(0.90), 0.6);
+        assert_eq!(a_leg_speed_factor(1.20), 0.6);
     }
 
     #[test]
-    fn a_leg_slow_short_leg_loses_momentum_points() {
-        // C0 1261 复盘：10根K线只推进8点（约0.31 ATR/根），
-        // 即使幅度和强K密度都不差，速度短板也会把A段分明显压下来。
-        assert!((a_leg_score_formula(8.0, 10, 5, 2.6, 0.0) - 1.123837701).abs() < 1e-6);
+    fn a_leg_amplitude_factor_ramps_and_tracks_scale() {
+        // 1.5 ATR 以下线性升温。
+        assert!((a_leg_amplitude_factor(1.0, 10.0) - 1.0 / 1.5).abs() < 1e-9);
+        // 2 ATR 在过渡带中点：0.5 + 0.5×(0.5/1)。
+        assert!((a_leg_amplitude_factor(2.0, 10.0) - 0.75).abs() < 1e-9);
+        // 2.5 ATR 起满档，基础上限 8 ATR。
+        assert_eq!(a_leg_amplitude_factor(3.0, 10.0), 1.0);
+        assert!((a_leg_amplitude_factor(9.0, 10.0) - 0.9).abs() < 1e-9);
+        assert_eq!(a_leg_amplitude_factor(12.0, 10.0), 0.6);
+        // 大形态浮动上限：N=16 时上限升到 10 ATR。
+        assert_eq!(a_leg_amplitude_factor(10.0, 16.0), 1.0);
     }
 
     #[test]
-    fn a_leg_oversize_penalty_is_mild_and_not_quality_scaled() {
-        // 8倍ATR不扣分：质量1 → 0.5 + 3.6 = 4.1。
-        assert!((a_leg_score_formula(80.0, 8, 5, 10.0, 0.0) - 4.1).abs() < 1e-9);
-        // 9倍ATR轻扣0.1，10倍ATR扣0.2，12倍ATR封顶0.3。
-        assert!((a_leg_score_formula(90.0, 8, 5, 10.0, 0.0) - 4.0).abs() < 1e-9);
-        assert!((a_leg_score_formula(100.0, 8, 5, 10.0, 0.0) - 3.9).abs() < 1e-9);
-        assert!((a_leg_score_formula(120.0, 8, 5, 10.0, 0.0) - 3.8).abs() < 1e-9);
-        // 扣分不随质量缩放：质量0.5时同样扣0.1，不因质量低而少扣。
-        assert!((a_leg_score_formula(90.0, 3, 1, 10.0, 0.0) - 2.2).abs() < 1e-9);
+    fn a_leg_bar_score_ranks_same_direction_candles() {
+        // 干净同色：实体占比≥0.55、逆势影≤0.4 实体、振幅 0.4~2.0 ATR。
+        assert!((a_leg_bar_score(&bar(100.0, 113.0, 98.0, 112.0), Some(10.0), Dir::Up) - 1.0).abs() < 1e-9);
+        // 普通同色：实体占比不足，给轻分。
+        assert!((a_leg_bar_score(&bar(100.0, 104.0, 97.0, 102.0), Some(10.0), Dir::Up) - 0.6).abs() < 1e-9);
+        // 大同色：振幅超过 2.5 ATR 直接扣分。
+        assert!((a_leg_bar_score(&bar(100.0, 130.0, 98.0, 128.0), Some(10.0), Dir::Up) - -0.6).abs() < 1e-9);
+        // 无长影的十字星只轻扣。
+        assert!((a_leg_bar_score(&bar(100.0, 101.5, 98.5, 100.1), Some(10.0), Dir::Up) - -0.1).abs() < 1e-9);
     }
 
     #[test]
-    fn a_leg_gap_penalty_counts_both_directions_and_ignores_small_gaps() {
+    fn a_leg_bar_score_handles_wicks_and_reverse_candles() {
+        // 顺向长影：做空A段小阳线带长上影（14:30 场景）应给正分，不再当小反向。
+        assert!((a_leg_bar_score(&bar(90.0, 110.0, 89.0, 92.0), Some(10.0), Dir::Down) - 0.2).abs() < 1e-9);
+        // 顺向长影：做多A段阴线带长下影，同样给正分。
+        assert!((a_leg_bar_score(&bar(93.0, 102.0, 90.0, 92.0), Some(10.0), Dir::Up) - 0.2).abs() < 1e-9);
+        // 同色小实体长上影（向上腿）判逆势长影，不再被 Doji 吞掉。
+        assert!((a_leg_bar_score(&bar(95.0, 110.0, 94.0, 100.0), Some(10.0), Dir::Up) - -0.5).abs() < 1e-9);
+        // 同色小实体长下影（向下腿）镜像扣分。
+        assert!((a_leg_bar_score(&bar(95.0, 98.0, 80.0, 90.0), Some(10.0), Dir::Down) - -0.5).abs() < 1e-9);
+        // 反向小K带逆势长影：重扣但不到大反向档。
+        // 注意收盘要落在反向不利位置，否则会先被“顺向长影+收盘有利”救成 FavWick。
+        assert!((a_leg_bar_score(&bar(100.0, 105.0, 92.0, 97.0), Some(10.0), Dir::Up) - -0.9).abs() < 1e-9);
+        // 小反向、普通反向、大反向逐级加重。
+        assert!((a_leg_bar_score(&bar(100.0, 101.0, 96.0, 98.0), Some(10.0), Dir::Up) - -0.4).abs() < 1e-9);
+        assert!((a_leg_bar_score(&bar(100.0, 102.0, 93.0, 96.0), Some(10.0), Dir::Up) - -1.2).abs() < 1e-9);
+        assert!((a_leg_bar_score(&bar(100.0, 102.0, 88.0, 90.0), Some(10.0), Dir::Up) - -1.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_clean_fit_uses_all_bars_weighted() {
+        let atr = atrs(2, 10.0);
+        let bars = vec![
+            bar(100.0, 113.0, 98.0, 112.0), // Clean，权重 1.5
+            bar(100.0, 113.0, 98.0, 112.0), // S1 Clean，固定权重 1
+        ];
+        let p = NPattern {
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 1,
+                price: 112.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        assert!((a_leg_clean_fit(&bars, &atr, &p) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_clean_fit_penalizes_dirty_leg() {
+        let atr = atrs(2, 10.0);
+        let bars = vec![
+            bar(100.0, 113.0, 98.0, 112.0), // Clean，权重 1.5，得分 1
+            bar(100.0, 102.0, 88.0, 90.0),  // S1 大反向，固定权重 1，得分 -1.8
+        ];
+        let p = NPattern {
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 1,
+                price: 90.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        // avg=(1×1.5-1.8×1)/2.5=-0.12，fit=(-0.12+2)/3。
+        assert!((a_leg_clean_fit(&bars, &atr, &p) - 0.6266666667).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_clean_fit_floor_with_single_reverse() {
+        let atr = atrs(1, 10.0);
+        let bars = vec![bar(100.0, 102.0, 93.0, 96.0)];
+        let p = NPattern {
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 0,
+                price: 96.0,
+                is_high: true,
+            },
+            ..pattern()
+        };
+        // 普通反向 -1.2，fit=(-1.2+2)/3。
+        assert!((a_leg_clean_fit(&bars, &atr, &p) - 0.2666666667).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_leg_gap_info_counts_both_directions_and_ignores_small_gaps() {
         let p = NPattern {
             s0: Swing {
                 index: 0,
@@ -1325,13 +1456,16 @@ mod tests {
             ..pattern()
         };
         // 向上跳空12点、向下跳空12点，都达到 1 倍 ATR（10）门槛，
-        // 合计 24 / a_move 100 = 24%，扣 24% × 0.4 = 0.096。
+        // 缺口合计 24，扣 2×0.15 + 0.4×0.20 = 0.38。
         let both = vec![
             bar(0.0, 100.0, 100.0, 100.0),
             bar(110.0, 112.0, 112.0, 112.0),
             bar(90.0, 100.0, 90.0, 90.0),
         ];
-        assert!((a_leg_gap_penalty(&both, &p, 10.0) - 0.096).abs() < 1e-9);
+        let (gap_sum, gap_count, penalty) = a_leg_gap_info(&both, &p, 10.0);
+        assert!((gap_sum - 24.0).abs() < 1e-9);
+        assert_eq!(gap_count, 2);
+        assert!((penalty - 0.38).abs() < 1e-9);
 
         // 单根缺口 8 点小于 1 倍 ATR（10），小跳空不扣分。
         let small = vec![
@@ -1339,12 +1473,57 @@ mod tests {
             bar(106.0, 108.0, 108.0, 108.0),
             bar(90.0, 100.0, 90.0, 90.0),
         ];
-        assert_eq!(a_leg_gap_penalty(&small, &p, 10.0), 0.0);
+        assert_eq!(a_leg_gap_info(&small, &p, 10.0), (0.0, 0, 0.0));
 
         // rollover bar 的跨合约跳空不参与统计。
         let mut rollover_gap = both.clone();
         rollover_gap[1].rollover = true;
-        assert_eq!(a_leg_gap_penalty(&rollover_gap, &p, 10.0), 0.0);
+        assert_eq!(a_leg_gap_info(&rollover_gap, &p, 10.0), (0.0, 0, 0.0));
+
+        // 单根缺口 3 倍 ATR：0.15 + 2×0.20 = 0.55，封顶 0.5。
+        let huge = vec![
+            bar(0.0, 100.0, 100.0, 100.0),
+            bar(130.0, 140.0, 130.0, 138.0),
+            bar(138.0, 160.0, 138.0, 158.0),
+        ];
+        let (huge_sum, huge_count, huge_penalty) = a_leg_gap_info(&huge, &p, 10.0);
+        assert!((huge_sum - 30.0).abs() < 1e-9);
+        assert_eq!(huge_count, 1);
+        assert!((huge_penalty - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_a_excludes_big_gaps_from_move_and_applies_penalty() {
+        // a_move 账面 50，其中第一根K带着 1 倍 ATR 大跳空 10；
+        // 净推进只有 40，幅度按 4/4.5 折算，速度仍满档，另扣 0.15；
+        // S1 用一般同色K把 q 压到 23/30，避免总分封顶后看不出跳空扣分。
+        let atr = atrs(3, 10.0);
+        let bars = vec![
+            bar(100.0, 100.0, 100.0, 100.0), // S0 十字星，不计质量
+            bar(110.0, 130.0, 110.0, 128.0), // 跳空 + 完美阳线
+            bar(130.0, 142.0, 130.0, 139.0), // S1 一般同色
+        ];
+        let p = NPattern {
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 100.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 2,
+                price: 139.0,
+                is_high: true,
+            },
+            a_bars: 2,
+            a_move: 50.0,
+            ..pattern()
+        };
+        // S0 是平盘K：干净因子里记 0 分、权重 0.25；
+        // 两根干净同色K权重 2 和 1，avg=(1×2+1×1+0×0.25)/3.25=12/13，
+        // clean=(12/13+2)/3=38/39；速度 2.0 ATR/根已进入过快降权 0.6；
+        // dim_a=0.5+4.5×1×0.6×(38/39)-0.15=2.980769231。
+        assert!((score_a(&bars, &atr, &p) - 2.980769231).abs() < 1e-9);
     }
 
     #[test]
@@ -1372,49 +1551,6 @@ mod tests {
             ..pattern()
         };
         assert!((score_b(&long_weakening) - 3.3).abs() < 1e-9);
-    }
-
-    #[test]
-    fn a_leg_relaxed_strong_counts_direction_candles() {
-        // 宽松强趋势K计数：实体占比、收盘位置、振幅、影线四条件全过才算。
-        let atr = vec![Some(10.0); 8];
-        let bars = vec![
-            bar(100.0, 108.0, 99.0, 106.0),  // 强阳：实体67%、收盘位0.78、上影小 ✓
-            bar(100.0, 104.0, 95.0, 96.0),   // 弱阳：实体44% ✗
-            bar(96.0, 104.0, 96.0, 102.0),   // 强阳：实体75%、收盘位0.75 ✓
-            bar(102.0, 108.0, 101.0, 107.0), // 强阳：实体71%、收盘位0.86 ✓
-        ];
-        let p = NPattern {
-            dir: Dir::Up,
-            s0: Swing {
-                index: 0,
-                price: 100.0,
-                is_high: false,
-            },
-            s1: Swing {
-                index: 3,
-                price: 102.0,
-                is_high: true,
-            },
-            ..pattern()
-        };
-        assert_eq!(a_leg_relaxed_strong(&bars, &atr, &p), 2);
-    }
-
-    #[test]
-    fn weak_trends_are_scored_by_direction() {
-        let weak_up = Trend60 {
-            direction: "WEAK_UP".to_string(),
-            ..trend60()
-        };
-        let weak_down = Trend60 {
-            direction: "WEAK_DOWN".to_string(),
-            ..trend60()
-        };
-        assert_eq!(score_60m(&weak_up, Dir::Up), 3.0);
-        assert_eq!(score_60m(&weak_up, Dir::Down), 1.0);
-        assert_eq!(score_60m(&weak_down, Dir::Down), 3.0);
-        assert_eq!(score_60m(&weak_down, Dir::Up), 1.0);
     }
 
     #[test]
@@ -1711,7 +1847,11 @@ mod tests {
         assert_eq!(sc.trigger, Some(3));
         assert_eq!(sc.entry, 4019.0);
         assert_eq!(sc.state, "当前已触发");
-        assert!((sc.dims[3] - 4.2).abs() < 1e-9);
+        assert_eq!(sc.warning_kind, "wick");
+        assert_eq!(
+            sc.total,
+            entry_score(sc.dim_a, sc.dim_b, sc.dim_warning, sc.warning_kind)
+        );
         assert!(!sc.note.contains("累积确认"));
     }
 
@@ -1812,10 +1952,9 @@ mod tests {
     }
 
     #[test]
-    fn compute_scores_applies_wick_direction_penalty_once() {
+    fn dim_warning_applies_wick_direction_penalty_once() {
         let atr = atrs(4, 15.0);
         let p = pattern();
-        let trend = trend60();
         let clean_bars = vec![
             bar(0.0, 1.0, 0.0, 0.5),
             bar(0.5, 1.0, 0.4, 0.6),
@@ -1829,81 +1968,30 @@ mod tests {
             bar(101.0, 102.0, 100.0, 101.5),
         ];
 
-        let (_, clean) = compute_scores(
-            &clean_bars,
-            &atr,
-            &p,
-            &trend,
-            2.0,
-            "wick",
-            Some(2),
-            Some(3),
-            0,
-            0,
-            false,
-        );
-        let (_, penalized) = compute_scores(
-            &penalized_bars,
-            &atr,
-            &p,
-            &trend,
-            2.0,
-            "wick",
-            Some(2),
-            Some(3),
-            0,
-            0,
-            false,
-        );
+        let clean = dim_warning(&clean_bars, &atr, 2, "wick", p.dir);
+        let penalized = dim_warning(&penalized_bars, &atr, 2, "wick", p.dir);
         assert!((clean - penalized - 0.1).abs() < 1e-9);
         assert_eq!(wick_direction_penalty(&penalized_bars[2], p.dir), 0.1);
     }
 
     #[test]
-    fn warning_space_overrun_penalty_is_linear_and_symmetric() {
-        let up = pattern();
-        let up_bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.8, 0.9, 0.79, 0.9),
-            bar(0.9, 1.0, 0.8, 0.95),
+    fn warning_size_penalty_uses_atr_relative_range() {
+        let atr20 = atrs(3, 10.0);
+        let bars = vec![
+            bar(0.0, 10.0, 0.0, 5.0),
+            bar(0.0, 10.0, 0.0, 5.0),
+            bar(0.0, 10.0, 0.0, 5.0),
         ];
-        // 实体覆盖剩余空间 50%：不扣；100%：线性扣 0.5；150%：扣满 1.0。
-        let mut bars_50 = up_bars.clone();
-        bars_50[2] = bar(0.85, 0.9, 0.84, 0.9);
-        let mut bars_100 = up_bars.clone();
-        bars_100[2] = bar(0.8, 0.9, 0.79, 0.9);
-        let mut bars_150 = up_bars.clone();
-        bars_150[2] = bar(0.75, 0.9, 0.74, 0.9);
-        assert!((warning_space_overrun_penalty(&bars_50, &up, 2) - 0.0).abs() < 1e-9);
-        assert!((warning_space_overrun_penalty(&bars_100, &up, 2) - 0.5).abs() < 1e-9);
-        assert!((warning_space_overrun_penalty(&bars_150, &up, 2) - 1.0).abs() < 1e-9);
-
-        // 做空镜像：S1=1，预警K线低点1.1，实体按相同比例覆盖剩余空间。
-        let down = NPattern {
-            dir: Dir::Down,
-            s1: Swing {
-                index: 1,
-                price: 1.0,
-                is_high: false,
-            },
-            ..pattern()
-        };
-        let down_bars = vec![
-            bar(1.0, 1.0, 0.9, 0.95),
-            bar(1.1, 1.2, 1.0, 1.1),
-            bar(1.2, 1.3, 1.1, 1.1),
-            bar(1.1, 1.2, 1.0, 1.1),
-        ];
-        let mut down_50 = down_bars.clone();
-        down_50[2] = bar(1.15, 1.3, 1.1, 1.1);
-        let mut down_100 = down_bars.clone();
-        down_100[2] = bar(1.2, 1.3, 1.1, 1.1);
-        let mut down_150 = down_bars.clone();
-        down_150[2] = bar(1.25, 1.35, 1.1, 1.1);
-        assert!((warning_space_overrun_penalty(&down_50, &down, 2) - 0.0).abs() < 1e-9);
-        assert!((warning_space_overrun_penalty(&down_100, &down, 2) - 0.5).abs() < 1e-9);
-        assert!((warning_space_overrun_penalty(&down_150, &down, 2) - 1.0).abs() < 1e-9);
+        let mut start = bars.clone();
+        start[2] = bar(0.0, 20.0, 0.0, 10.0);
+        let mut half = bars.clone();
+        half[2] = bar(0.0, 27.5, 0.0, 10.0);
+        let mut full = bars.clone();
+        full[2] = bar(0.0, 35.0, 0.0, 10.0);
+        assert!((warning_size_penalty(&bars, &atr20, 2) - 0.0).abs() < 1e-9);
+        assert!((warning_size_penalty(&start, &atr20, 2) - 0.0).abs() < 1e-9);
+        assert!((warning_size_penalty(&half, &atr20, 2) - 0.5).abs() < 1e-9);
+        assert!((warning_size_penalty(&full, &atr20, 2) - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2310,45 +2398,20 @@ mod tests {
     }
 
     #[test]
-    fn strong_warning_kinds_beat_cumulative_by_three_tenths() {
-        let atr = atrs(4, 10.0);
-        let p = pattern();
-        let trend = trend60();
-        let bars = vec![
-            bar(0.0, 1.0, 0.0, 0.5),
-            bar(0.5, 1.0, 0.4, 0.6),
-            bar(0.6, 1.0, 0.5, 0.7),
-            bar(0.7, 1.1, 0.6, 0.9),
-        ];
-        let cumulative = compute_scores(
-            &bars,
-            &atr,
-            &p,
-            &trend,
-            2.0,
-            "cumulative",
-            Some(2),
-            Some(3),
-            0,
-            0,
-            false,
-        );
-        for kind in ["strong", "wick"] {
-            let strong = compute_scores(
-                &bars,
-                &atr,
-                &p,
-                &trend,
-                2.0,
-                kind,
-                Some(2),
-                Some(3),
-                0,
-                0,
-                false,
-            );
-            assert!((strong.1 - cumulative.1 - 0.3).abs() < 1e-9, "kind={kind}");
-        }
+    fn entry_score_uses_60_20_20_and_caps_cumulative() {
+        let base = entry_score(4.0, 4.0, 2.0, "cumulative");
+        assert!((base - CUMULATIVE_ENTRY_SCORE_MAX).abs() < 1e-9);
+
+        let strong = entry_score(4.0, 4.0, 3.5, "strong");
+        assert!((strong - 3.9).abs() < 1e-9);
+
+        // 长影线预警总分封顶 3.0，不进 3.5+ 标准仓区间。
+        let wick = entry_score(4.0, 4.0, 3.5, "wick");
+        assert!((wick - WICK_ENTRY_SCORE_MAX).abs() < 1e-9);
+
+        // 强反转按原权重计算，不额外封顶。
+        let weighted = entry_score(3.0, 4.0, 3.0, "strong");
+        assert!((weighted - 3.2).abs() < 1e-9);
     }
 
     #[test]

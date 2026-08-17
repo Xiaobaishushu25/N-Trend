@@ -268,14 +268,6 @@ fn build_box_check(
         0.0
     };
     let rr_score = if sc.rr >= 1.2 { BOX_RR_SCORE } else { 0.0 };
-    sc.dims = [
-        trend_score,
-        touch_score,
-        rr_score,
-        if sc.trigger.is_some() { 1.0 } else { 0.0 },
-        0.0,
-        0.0,
-    ];
     // 2026-08-14：箱体与N字共用同一套预警K线质量分，
     // 干净吞没/长影线预警同样计入综合评分（+0.3）。
     sc.total =

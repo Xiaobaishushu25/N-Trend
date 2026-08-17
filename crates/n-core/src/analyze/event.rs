@@ -28,27 +28,6 @@ pub struct WarningCandidate {
     pub rr: f64,
 }
 
-fn clamp_score(v: f64) -> f64 {
-    v.clamp(0.0, 5.0)
-}
-
-// A 腿是形态的推动主力，权重最高；B 腿满分不应掩盖过弱的 A 腿。
-fn composite_entry_score(dim_a: f64, dim_b: f64, dim_warning: f64, kind: &str) -> f64 {
-    let mut score = 0.60 * dim_a + 0.20 * dim_b + 0.20 * dim_warning;
-    if kind == "cumulative" {
-        score = score.min(3.49);
-    }
-    score
-}
-
-fn warning_base(kind: &str) -> f64 {
-    match kind {
-        // engulf 仅保留给历史落盘记录，新识别统一为 strong。
-        "strong" | "engulf" | "wick" => 3.5,
-        _ => 2.0,
-    }
-}
-
 fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
     match dir {
         Dir::Up => bar.close > bar.open,
@@ -145,14 +124,8 @@ fn candidate_for(
 
     let dim_a = scoring::score_a(bars, atr20, p);
     let dim_b = scoring::score_b(p);
-    let dim_warning = warning_base(kind)
-        - if kind == "wick" {
-            scoring::wick_direction_penalty(&bars[w], p.dir)
-        } else {
-            0.0
-        }
-        - scoring::warning_space_overrun_penalty(bars, p, w);
-    let entry_score = composite_entry_score(dim_a, dim_b, dim_warning, kind);
+    let dim_warning = scoring::dim_warning(bars, atr20, w, kind, p.dir);
+    let entry_score = scoring::entry_score(dim_a, dim_b, dim_warning, kind);
 
     let buffer = (0.1 * scoring::atr_at(atr20, w)).max(1.0);
     let (entry, stop) = match p.dir {
@@ -183,7 +156,7 @@ fn candidate_for(
         retracement: p.retracement,
         warning_index: w,
         warning_kind: kind,
-        entry_score: clamp_score(entry_score),
+        entry_score,
         dim_a,
         dim_b,
         dim_warning,
@@ -298,6 +271,7 @@ pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCand
 mod tests {
     use super::*;
     use crate::analyze::model::DT;
+    use crate::analyze::scoring::WICK_ENTRY_SCORE_MAX;
 
     fn bar(dt: DT, o: f64, h: f64, l: f64, c: f64) -> Bar {
         Bar {
@@ -546,15 +520,15 @@ mod tests {
         assert_eq!(ev.direction, Dir::Up);
         assert_eq!(ev.warning_kind, "wick");
         assert!((ev.dim_warning - 3.4).abs() < 1e-9);
-        // 收盘改阴让b段出现“大阴+小阴”，新判定的b段动能衰减使 dim_b +0.3，
-        // 部分抵消预警方向微调的 -0.1（dim_warning权重0.2、dim_b权重0.2）。
-        assert!((bullish.entry_score - ev.entry_score + 0.04).abs() < 1e-9);
+        // wick 总分已封顶 3.0，方向微调不再体现到总分，但 dim_warning 本身仍保留 3.4。
+        assert!((bullish.entry_score - WICK_ENTRY_SCORE_MAX).abs() < 1e-9);
+        assert!((ev.entry_score - WICK_ENTRY_SCORE_MAX).abs() < 1e-9);
     }
 
     #[test]
     fn low_a_full_b_stays_below_2_5() {
         // C0 1251 对照：A 腿 1.207、B 腿满分 5.0、弱预警 2.5。
-        let score = composite_entry_score(1.207, 5.0, 2.5, "weak");
+        let score = scoring::entry_score(1.207, 5.0, 2.5, "weak");
         assert!((score - 2.2243).abs() < 1e-4);
         assert!(score < 2.5);
     }
@@ -588,18 +562,18 @@ mod tests {
     }
 
     #[test]
-    fn oversized_warning_body_lowers_realtime_dim_warning_for_both_directions() {
+    fn oversized_warning_k_lowers_realtime_dim_warning_for_both_directions() {
         let atr20 = vec![Some(10.0), Some(10.0), Some(10.0)];
         let t = dt(2026, 8, 7, 21, 15);
 
-        // 做多镜像：S1=150，前一根阴线 O141 C140，预警K线干净吞没，
-        // 大实体高点148、实体覆盖剩余空间3.5倍，小实体K线不触发透支扣分。
+        // 做多镜像：S1=150，前一根阴线 O141 C140，预警K线干净吞没。
+        // 大振幅K线振幅 3.5 倍 ATR 扣满，小振幅K线不触发体量扣分。
         let up_trend = vec![(false, false), (false, false), (true, false)];
         let up_relaxed = vec![(false, false), (true, false), (false, false)];
         let up_bars = vec![
             bar(t, 100.0, 100.0, 100.0, 100.0),
             bar(t, 141.0, 150.0, 109.0, 140.0),
-            bar(t, 140.0, 148.0, 138.0, 147.0),
+            bar(t, 140.0, 148.0, 113.0, 147.0),
         ];
         let up_small_bars = vec![
             bar(t, 100.0, 100.0, 100.0, 100.0),
@@ -625,13 +599,13 @@ mod tests {
         assert!((small_up.entry_score - big_up.entry_score - 0.2).abs() < 1e-9);
 
         // 做空镜像：S1=100，前一根阳线 O108 C107，预警K线干净吞没，
-        // 大实体低点102、实体覆盖剩余空间2倍，小实体K线不触发透支扣分。
+        // 大振幅K线振幅 3.5 倍 ATR 扣满，小振幅K线不触发体量扣分。
         let down_trend = vec![(false, false), (false, false), (false, true)];
         let down_relaxed = vec![(false, false), (false, true), (false, false)];
         let down_bars = vec![
             bar(t, 150.0, 150.0, 149.0, 149.0),
             bar(t, 106.0, 110.0, 100.0, 107.0),
-            bar(t, 108.0, 112.0, 102.0, 103.0),
+            bar(t, 108.0, 137.0, 102.0, 103.0),
         ];
         let down_small_bars = vec![
             bar(t, 150.0, 150.0, 149.0, 149.0),

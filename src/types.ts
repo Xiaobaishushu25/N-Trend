@@ -44,6 +44,13 @@ export interface KlineRow {
   rollover: boolean
 }
 
+/** 当前周期 MA20 长期趋势线的一个数据点 */
+export interface TrendPointDto {
+  ts: string
+  value: number
+  direction: string
+}
+
 export interface SwingDto {
   index: number
   price: number
@@ -87,7 +94,6 @@ export interface PatternDto {
   space: number
   rr: number
   score: number
-  dims: number[]
   warning_ts: string | null
   trigger_ts: string | null
   /** 触发bar量能：成交量 / 前20根15m均量 */
@@ -354,6 +360,12 @@ export interface OutcomeDetail {
   grade: string
   entry_score: number
   entry_score_dims: string
+  s0_ts: string
+  s0_price: number
+  s1_ts: string
+  s1_price: number
+  s2_ts: string
+  s2_price: number
   entry: number
   stop: number
   target: number
@@ -381,6 +393,16 @@ export interface OutcomeDetail {
   a_bars: number | null
   b_bars: number | null
   retracement: number | null
+  a_q: number | null
+  a_net_move: number | null
+  a_gap_sum: number | null
+  a_gap_count: number | null
+  a_atr: number | null
+  a_too_long: boolean | null
+  b_too_long: boolean | null
+  b_fast: boolean | null
+  b_weakening: boolean | null
+  b_weakening_ratio: number | null
   net_r: number | null
   rollover_crossed: boolean
   gap_crossed_entry: boolean

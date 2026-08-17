@@ -63,6 +63,8 @@ export const useReviewStore = defineStore('review', {
             this.dimension,
             this.statsScope,
             this.recentFilters.version,
+            this.recentFilters.scoreMin,
+            this.recentFilters.scoreMax,
           ),
           this.loadRecent(),
         ])
@@ -84,6 +86,11 @@ export const useReviewStore = defineStore('review', {
     async setRecentFilter(patch: Partial<RecentOutcomeFilters>) {
       this.recentFilters = { ...this.recentFilters, ...patch }
       await this.loadRecent()
+    },
+    /** 设置自定义评分区间并同时刷新分组统计与明细 */
+    async setScoreRange(min: number | null, max: number | null) {
+      this.recentFilters = { ...this.recentFilters, scoreMin: min, scoreMax: max }
+      await this.load()
     },
     /** 清空明细筛选 */
     async resetRecentFilters() {

@@ -29,6 +29,26 @@ pub fn atr(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
     out
 }
 
+/// 简单移动平均序列；不足 period 根的位置为 None。
+pub fn ma_series(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
+    let n = bars.len();
+    let mut out = vec![None; n];
+    if period == 0 {
+        return out;
+    }
+    let mut sum = 0.0;
+    for i in 0..n {
+        sum += bars[i].close;
+        if i >= period {
+            sum -= bars[i - period].close;
+        }
+        if i + 1 >= period {
+            out[i] = Some(sum / period as f64);
+        }
+    }
+    out
+}
+
 pub fn trend_flags(bars: &[Bar], atr20: &[Option<f64>]) -> Vec<(bool, bool)> {
     let mut out = Vec::with_capacity(bars.len());
     for i in 0..bars.len() {
@@ -297,5 +317,19 @@ mod tests {
         assert!(!trend_flags(&bars, &atr)[1].1);
         assert!(!trend_flags_relaxed(&bars, &atr)[1].0);
         assert!(!trend_flags_relaxed(&bars, &atr)[1].1);
+    }
+
+    #[test]
+    fn ma_series_starts_after_period() {
+        let bars: Vec<Bar> = (1..=25)
+            .map(|i| {
+                let c = i as f64;
+                bar(c, c, c, c)
+            })
+            .collect();
+        let ma = ma_series(&bars, 20);
+        assert!(ma[18].is_none());
+        assert_eq!(ma[19], Some(10.5));
+        assert_eq!(ma[20], Some(11.5));
     }
 }

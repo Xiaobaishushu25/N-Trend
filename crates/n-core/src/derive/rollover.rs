@@ -4,7 +4,8 @@
 //! 1. 在本地连续 5m 序列上找出所有会话断裂点，跳空/持仓只作为候选信息，
 //!    不再按阈值过滤，避免漏掉小跳空换月；
 //! 2. 对候选点用月合约确认：断点前旧合约、断点后新合约的价格要贴合连续序列，
-//!    并且新合约的持仓或成交量要超过旧合约（主力已切换）。
+//!    并确认断点后的连续序列已经切到更晚的月份。持仓/成交不再作为一票否决，
+//!    避免新浪已提前切换但新合约持仓尚未反超时漏标。
 
 use anyhow::Result;
 use chrono::NaiveDateTime;
@@ -163,87 +164,71 @@ pub fn confirm_candidate(
         return Ok(ConfirmResult::NotRollover);
     }
 
-    // 断点前的旧合约必须是当时的主力（持仓/成交接近所有旧侧合约的最高值），
-    // 否则换月之后每个普通断裂点都可能拿一个已经衰落的旧月份去“确认”，造成误报。
-    let old_peak_hold = month_bars
-        .values()
-        .filter_map(|rows| point_before(rows, before_ts).map(|p| p.hold))
-        .fold(f64::MIN, f64::max);
-    let new_peak_hold = month_bars
-        .values()
-        .filter_map(|rows| point_after(rows, after_ts).map(|p| p.hold))
-        .fold(f64::MIN, f64::max);
-    let new_peak_volume = month_bars
-        .values()
-        .filter_map(|rows| point_after(rows, after_ts).map(|p| p.volume))
-        .fold(f64::MIN, f64::max);
-
-    let mut scored: Vec<(f64, String, String)> = Vec::new();
-
-    for (old_code, old_rows) in month_bars {
-        let Some(old) = point_before(old_rows, before_ts) else {
-            continue;
-        };
-        if old_peak_hold > 0.0 && old.hold < old_peak_hold * 0.9 {
-            continue;
+    let mut before: Vec<(f64, String, BarPoint)> = Vec::new();
+    let mut after: Vec<(f64, String, BarPoint)> = Vec::new();
+    for (code, rows) in month_bars {
+        if let Some(old) = point_before(rows, before_ts) {
+            if hold_close(old.hold, candidate.before.hold)
+                && price_ratio(old.price, candidate.before.close) <= PRICE_TOLERANCE
+            {
+                before.push((
+                    price_ratio(old.price, candidate.before.close),
+                    code.clone(),
+                    old,
+                ));
+            }
         }
-        if !hold_close(old.hold, candidate.before.hold) {
-            continue;
-        }
-        let old_close_ratio = price_ratio(old.price, candidate.before.close);
-        for (new_code, new_rows) in month_bars {
-            if new_code == old_code {
-                continue;
+        if let Some(new) = point_after(rows, after_ts) {
+            if hold_close(new.hold, candidate.after.hold)
+                && price_ratio(new.price, candidate.after.open) <= PRICE_TOLERANCE
+            {
+                after.push((
+                    price_ratio(new.price, candidate.after.open),
+                    code.clone(),
+                    new,
+                ));
             }
-            if contract_month(new_code) <= contract_month(old_code) {
-                continue;
-            }
-            let Some(new) = point_after(new_rows, after_ts) else {
-                continue;
-            };
-            if !is_peak(&new, new_peak_hold, new_peak_volume) {
-                continue;
-            }
-            if !hold_close(new.hold, candidate.after.hold) {
-                continue;
-            }
-            let new_open_ratio = price_ratio(new.price, candidate.after.open);
-            let old_ok = old_close_ratio <= PRICE_TOLERANCE;
-            let new_ok = new_open_ratio <= PRICE_TOLERANCE;
-            if !old_ok || !new_ok {
-                continue;
-            }
-            // 主力已切换到新合约：持仓或成交量任一超过断点前旧合约即可。
-            if new.hold <= old.hold && new.volume <= old.volume {
-                continue;
-            }
-            let cross_ratio = price_ratio(new.price, old.price);
-            let score = old_close_ratio + new_open_ratio + cross_ratio;
-            scored.push((score, old_code.clone(), new_code.clone()));
         }
     }
 
-    if scored.is_empty() {
+    if before.is_empty() || after.is_empty() {
         return Ok(ConfirmResult::NotRollover);
     }
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let (_, from, to) = scored.remove(0);
-    Ok(ConfirmResult::Confirmed(from, to))
+
+    before.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then(b.2.hold.total_cmp(&a.2.hold))
+            .then(a.1.cmp(&b.1))
+    });
+    after.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then(b.2.hold.total_cmp(&a.2.hold))
+            .then(a.1.cmp(&b.1))
+    });
+
+    let (_, old_code, _) = &before[0];
+    let (new_ratio, new_code, _) = &after[0];
+    if new_code == old_code || contract_month(new_code) <= contract_month(old_code) {
+        return Ok(ConfirmResult::NotRollover);
+    }
+
+    // 普通周末断点里连续序列仍贴着旧合约；只有断点后明显切到更晚月份才确认。
+    if let Some(old_rows) = month_bars.get(old_code) {
+        if let Some(old_after) = point_after(old_rows, after_ts) {
+            let old_after_ratio = price_ratio(old_after.price, candidate.after.open);
+            if old_after_ratio < *new_ratio {
+                return Ok(ConfirmResult::NotRollover);
+            }
+        }
+    }
+
+    Ok(ConfirmResult::Confirmed(old_code.clone(), new_code.clone()))
 }
 
+#[derive(Debug, Clone)]
 struct BarPoint {
     price: f64,
     hold: f64,
-    volume: f64,
-}
-
-/// 主力判定：持仓量优先，持仓全为 0 时退化为成交量峰值。
-fn is_peak(point: &BarPoint, peak_hold: f64, peak_volume: f64) -> bool {
-    if peak_hold > 0.0 {
-        point.hold >= peak_hold
-    } else {
-        point.volume >= peak_volume
-    }
 }
 
 /// 月份合约持仓必须和连续序列同一量级：连续序列的持仓就是当时主力合约的持仓。
@@ -265,7 +250,6 @@ fn point_before(rows: &[Kline], ts: NaiveDateTime) -> Option<BarPoint> {
         .map(|(_, k)| BarPoint {
             price: k.close,
             hold: k.hold,
-            volume: k.volume,
         })
 }
 
@@ -278,7 +262,6 @@ fn point_after(rows: &[Kline], ts: NaiveDateTime) -> Option<BarPoint> {
         .map(|(_, k)| BarPoint {
             price: k.open,
             hold: k.hold,
-            volume: k.volume,
         })
 }
 
@@ -558,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn non_peak_old_contract_cannot_confirm_rollover() {
+    fn source_switch_confirms_even_if_old_side_peak_contract_price_does_not_match() {
         let mut bars = session("2026-08-05", 100.0, 100.0, 10000.0);
         bars.push(bar("2026-08-05 15:00:00", 100.0, 100.0, 11000.0));
         bars.push(bar("2026-08-05 21:05:00", 100.0, 100.0, 12000.0));
@@ -566,8 +549,8 @@ mod tests {
         assert_eq!(cands.len(), 1);
 
         let mut month_bars = std::collections::HashMap::new();
-        // BU2609 持仓不小（接近峰值），但断点前真正的峰值是 BU2610，
-        // 而 BU2610 的价格和连续序列对不上，说明这不是主力换月。
+        // 断点前真正的持仓峰值 BU2610 价格和连续序列对不上，
+        // 但连续序列断点前贴 BU2609、断点后贴 BU2611，按数据源切换确认。
         let mut old_2609 = session("2026-08-05", 100.0, 100.0, 20000.0);
         old_2609.push(bar("2026-08-05 15:00:00", 100.0, 100.0, 22000.0));
         month_bars.insert("BU2609".to_string(), old_2609);
@@ -581,6 +564,58 @@ mod tests {
         month_bars.insert(
             "BU2611".to_string(),
             vec![bar("2026-08-05 21:05:00", 100.0, 100.0, 30000.0)],
+        );
+
+        let result = confirm_candidate(&cands[0], &month_bars).unwrap();
+        assert_eq!(
+            result,
+            ConfirmResult::Confirmed("BU2609".to_string(), "BU2611".to_string())
+        );
+    }
+
+    #[test]
+    fn ur0_early_switch_confirms_without_new_hold_peak() {
+        // UR0 8/17 实测形态：UR2609 仍是持仓峰值，但连续合约已切到 UR2611。
+        let mut bars = session("2026-08-14", 1687.0, 1687.0, 143833.0);
+        bars.push(bar("2026-08-14 15:00:00", 1686.0, 1687.0, 143833.0));
+        bars.push(bar("2026-08-17 09:05:00", 1733.0, 1730.0, 167680.0));
+        let cands = detect_candidates("UR0", &bars);
+        assert_eq!(cands.len(), 1);
+
+        let mut month_bars = std::collections::HashMap::new();
+        let mut old_2609 = session("2026-08-14", 1687.0, 1687.0, 143833.0);
+        old_2609.push(bar("2026-08-14 15:00:00", 1686.0, 1687.0, 143833.0));
+        old_2609.push(bar("2026-08-17 09:05:00", 1694.0, 1694.0, 125507.0));
+        month_bars.insert("UR2609".to_string(), old_2609);
+        month_bars.insert(
+            "UR2611".to_string(),
+            vec![bar("2026-08-17 09:05:00", 1736.0, 1730.0, 93323.0)],
+        );
+
+        let result = confirm_candidate(&cands[0], &month_bars).unwrap();
+        assert_eq!(
+            result,
+            ConfirmResult::Confirmed("UR2609".to_string(), "UR2611".to_string())
+        );
+    }
+
+    #[test]
+    fn normal_session_break_stays_on_same_contract() {
+        // 普通周末断点：连续序列前后仍贴旧合约，即使更晚月份价格接近也不能确认。
+        let mut bars = session("2026-08-14", 100.0, 100.0, 10000.0);
+        bars.push(bar("2026-08-14 15:00:00", 100.0, 100.0, 10000.0));
+        bars.push(bar("2026-08-17 09:05:00", 100.5, 100.5, 10500.0));
+        let cands = detect_candidates("BU0", &bars);
+        assert_eq!(cands.len(), 1);
+
+        let mut month_bars = std::collections::HashMap::new();
+        let mut old = session("2026-08-14", 100.0, 100.0, 20000.0);
+        old.push(bar("2026-08-14 15:00:00", 100.0, 100.0, 20000.0));
+        old.push(bar("2026-08-17 09:05:00", 100.5, 100.5, 20000.0));
+        month_bars.insert("BU2609".to_string(), old);
+        month_bars.insert(
+            "BU2610".to_string(),
+            vec![bar("2026-08-17 09:05:00", 100.7, 100.7, 21000.0)],
         );
 
         let result = confirm_candidate(&cands[0], &month_bars).unwrap();

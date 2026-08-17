@@ -4,7 +4,7 @@ use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
     KlineDto, MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail,
-    ScanResult,
+    ScanResult, TrendPointDto,
 };
 use n_core::storage::entities::{groups, symbols};
 use serde::Serialize;
@@ -266,6 +266,20 @@ pub async fn get_klines(
 }
 
 #[tauri::command]
+pub async fn get_trend_series(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+    timeframe: String,
+    limit: Option<usize>,
+) -> Result<Vec<TrendPointDto>, String> {
+    state
+        .services
+        .trend_series(&symbol, &timeframe, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_market_snapshot(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MarketSnapshot>, String> {
@@ -342,11 +356,19 @@ pub async fn get_review_stats(
     dimension: String,
     scope: Option<String>,
     version: Option<String>,
+    score_min: Option<f64>,
+    score_max: Option<f64>,
 ) -> Result<ReviewStats, String> {
     let scope = scope.unwrap_or_default();
     state
         .services
-        .review_stats(&dimension, &scope, version.as_deref())
+        .review_stats(
+            &dimension,
+            &scope,
+            version.as_deref(),
+            score_min,
+            score_max,
+        )
         .await
         .map_err(|e| e.to_string())
 }

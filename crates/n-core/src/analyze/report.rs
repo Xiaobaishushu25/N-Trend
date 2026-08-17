@@ -133,19 +133,11 @@ fn write_signal_body(
             sc.entry_block_detail, sc.entry_block_count
         )?;
     }
-    if show_dims {
-        let names = [
-            "60分钟方向",
-            "a段质量",
-            "b段质量",
-            "触发质量",
-            "空间与RR",
-            "动能与破位预期",
-        ];
-        writeln!(out, "六项评分:")?;
-        for (i, name) in names.iter().enumerate() {
-            writeln!(out, "  {}: {:.1}", name, sc.dims[i])?;
-        }
+    if show_dims && sc.category != "BOX" {
+        writeln!(out, "入场评分构成:")?;
+        writeln!(out, "  A段质量: {:.1}", sc.dim_a)?;
+        writeln!(out, "  B段质量: {:.1}", sc.dim_b)?;
+        writeln!(out, "  预警K线质量: {:.1}", sc.dim_warning)?;
     }
     if spacing {
         writeln!(out)?;

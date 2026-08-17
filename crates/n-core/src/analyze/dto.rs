@@ -54,7 +54,6 @@ pub struct PatternDto {
     pub space: f64,
     pub rr: f64,
     pub score: f64,
-    pub dims: [f64; 6],
     pub warning_ts: Option<String>,
     pub trigger_ts: Option<String>,
     #[serde(default)]
@@ -144,7 +143,6 @@ impl PatternDto {
             space: sc.space,
             rr: sc.rr,
             score: sc.total,
-            dims: sc.dims,
             warning_ts: sc.warning.map(ts),
             trigger_ts: sc.trigger.map(ts),
             vol_ratio,
