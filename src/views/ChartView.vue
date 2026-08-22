@@ -956,6 +956,33 @@ function levelSuffix(l: string) {
   return `${levelText(l)}${l === 'box' ? '' : 'N'}`
 }
 
+function trendText(state?: string) {
+  switch (state) {
+    case 'STRONG_UP': return '强多'
+    case 'WEAK_UP': return '弱多'
+    case 'STRONG_DOWN': return '强空'
+    case 'WEAK_DOWN': return '弱空'
+    case 'RANGE':
+    case 'NEUTRAL': return '震荡'
+    default: return state || '—'
+  }
+}
+function trendClass(state?: string) {
+  switch (state) {
+    case 'STRONG_UP': return 'trend-strong-up'
+    case 'WEAK_UP': return 'trend-weak-up'
+    case 'STRONG_DOWN': return 'trend-strong-down'
+    case 'WEAK_DOWN': return 'trend-weak-down'
+    case 'RANGE':
+    case 'NEUTRAL': return 'trend-range'
+    default: return 'trend-unknown'
+  }
+}
+function trendBonusText(s: PatternDto) {
+  if (!s.trend_bonus || s.trend_bonus === 0) return ''
+  return `+${s.trend_bonus.toFixed(1)}`
+}
+
 // 2026-08-14：预警质量分已计入 score，这里只显示类型标签，不再叠加显示加分。
 function warningKindText(kind?: string) {
   switch (kind) {
@@ -1806,6 +1833,7 @@ onBeforeUnmount(() => {
                     <span class="pc-dir">{{ dirText(s.direction) }} {{ levelSuffix(s.level) }}</span>
                     <span class="pc-grade">{{ s.grade }}</span>
                     <span class="pc-warning">{{ warningKindText(s.warning_kind) }}</span>
+                    <span class="pc-trend" :class="trendClass(s.trend_state)" :title="s.trend_state || ''">{{ trendText(s.trend_state) }}<em v-if="s.trend_bonus"> {{ trendBonusText(s) }}</em></span>
                   </div>
                   <n-icon
                   :component="isHidden(s.number) ? EyeOff : Eye"
@@ -1899,6 +1927,7 @@ onBeforeUnmount(() => {
                     <span class="pc-dir">{{ dirText(r.direction) }} {{ levelSuffix(r.level) }}</span>
                     <span class="pc-grade">{{ r.grade }}</span>
                     <span class="pc-warning">{{ warningKindText(r.warning_kind) }}</span>
+                    <span class="pc-trend" :class="trendClass(r.trend_state)" :title="r.trend_state || ''">{{ trendText(r.trend_state) }}<em v-if="r.trend_bonus"> {{ trendBonusText(r) }}</em></span>
                   </div>
                   <n-icon
                     :component="isRecentShown(r.number) ? Eye : EyeOff"
@@ -2906,6 +2935,13 @@ onBeforeUnmount(() => {
   padding: 2px 7px;
   border-radius: 999px;
 }
+.pc-trend { font-size: 11px; padding: 2px 6px; border-radius: 999px; font-weight: 600; border: 1px solid transparent; }
+.pc-trend.trend-strong-up { background:#fee2e2; color:#dc2626; border-color:#fecaca; }
+.pc-trend.trend-weak-up { background:#ffedd5; color:#ea580c; border-color:#fed7aa; }
+.pc-trend.trend-range { background:#f1f5f9; color:#64748b; border-color:#e2e8f0; }
+.pc-trend.trend-weak-down { background:#e0f2fe; color:#0284c7; border-color:#bae6fd; }
+.pc-trend.trend-strong-down { background:#dbeafe; color:#1d4ed8; border-color:#bfdbfe; }
+.pc-trend em { font-style:normal; margin-left:2px; font-weight:700; }
 .pc-warning {
   font-size: 10px;
   font-weight: 700;

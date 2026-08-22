@@ -826,11 +826,13 @@ fn evaluate_signal_inner(
     bars: &[Bar],
     atr20: &[Option<f64>],
     p: &NPattern,
-    _trend: &Trend60,
+    trend: &Trend60,
     tick: f64,
     v2_strict: bool,
 ) -> SignalCheck {
     let mut sc = SignalCheck::new();
+    sc.trend_state = trend.direction.clone();
+    sc.trend_bonus = 0.0; // 回撤：仅展示趋势标签，不计入触发分，保持分数区分度
 
     let end = bars.len().min(p.s2.index + 6);
     if p.s2.index + 1 >= end {

@@ -143,11 +143,11 @@ pub struct Trend60 {
 
 impl Trend60 {
     pub fn is_up(&self) -> bool {
-        self.direction == "UP" || self.direction == "WEAK_UP"
+        matches!(self.direction.as_str(), "UP" | "WEAK_UP" | "STRONG_UP")
     }
 
     pub fn is_down(&self) -> bool {
-        self.direction == "DOWN" || self.direction == "WEAK_DOWN"
+        matches!(self.direction.as_str(), "DOWN" | "WEAK_DOWN" | "STRONG_DOWN")
     }
 
     pub fn aligned_with(&self, dir: Dir) -> bool {
@@ -159,8 +159,14 @@ impl Trend60 {
     }
 
     pub fn strong(&self) -> bool {
-        self.direction == "UP" || self.direction == "DOWN"
+        matches!(self.direction.as_str(), "UP" | "DOWN" | "STRONG_UP" | "STRONG_DOWN")
     }
+
+    pub fn is_weak_up(&self) -> bool { self.direction == "WEAK_UP" }
+    pub fn is_weak_down(&self) -> bool { self.direction == "WEAK_DOWN" }
+    pub fn is_strong_up(&self) -> bool { self.direction == "STRONG_UP" }
+    pub fn is_strong_down(&self) -> bool { self.direction == "STRONG_DOWN" }
+    pub fn is_range(&self) -> bool { self.direction == "RANGE" || self.direction == "NEUTRAL" }
 }
 
 #[derive(Clone)]
@@ -184,6 +190,8 @@ pub struct SignalCheck {
     pub total: f64,
     pub category: &'static str,
     pub note: String,
+    pub trend_bonus: f64,
+    pub trend_state: String,
 }
 
 impl SignalCheck {
@@ -208,6 +216,8 @@ impl SignalCheck {
             total: 0.0,
             category: "",
             note: String::new(),
+            trend_bonus: 0.0,
+            trend_state: String::new(),
         }
     }
 

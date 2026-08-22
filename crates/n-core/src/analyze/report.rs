@@ -21,10 +21,13 @@ pub fn level_label(level: &str) -> &'static str {
 
 pub fn direction_label(direction: &str) -> &'static str {
     match direction {
+        "STRONG_UP" => "强多",
+        "STRONG_DOWN" => "强空",
+        "WEAK_UP" => "弱多",
+        "WEAK_DOWN" => "弱空",
+        "RANGE" | "NEUTRAL" => "震荡",
         "UP" => "上涨",
         "DOWN" => "下跌",
-        "WEAK_UP" => "弱上涨",
-        "WEAK_DOWN" => "弱下跌",
         _ => "震荡",
     }
 }

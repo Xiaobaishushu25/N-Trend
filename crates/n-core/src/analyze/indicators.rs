@@ -208,43 +208,143 @@ pub fn find_swings(
     merged
 }
 
+// 5档60m趋势：收紧版阈值 2.0ATR + ADX25/18 + 20根不触EMA20(0.3ATR)
+// 对齐实盘体感：FG0->RANGE, PB0->WEAK_UP, AU0->STRONG_UP
+const TREND_EMA_FAST: usize = 20;
+const TREND_EMA_SLOW: usize = 60;
+const TREND_ATR_PERIOD: usize = 20;
+const TREND_ADX_PERIOD: usize = 14;
+const TREND_STRONG_ATR: f64 = 2.0;
+const TREND_ADX_STRONG: f64 = 25.0;
+const TREND_ADX_WEAK: f64 = 18.0;
+const TREND_TOUCH_WINDOW: usize = 20;
+const TREND_TOUCH_THRESH: f64 = 0.3;
+
+fn ema_series(values: &[f64], period: usize) -> Vec<Option<f64>> {
+    let n = values.len();
+    let mut out = vec![None; n];
+    if n < period || period == 0 { return out; }
+    let k = 2.0 / (period as f64 + 1.0);
+    let mut sma = 0.0;
+    for i in 0..period { sma += values[i]; }
+    sma /= period as f64;
+    out[period-1] = Some(sma);
+    let mut prev = sma;
+    for i in period..n {
+        prev = values[i]*k + prev*(1.0-k);
+        out[i] = Some(prev);
+    }
+    out
+}
+
+fn adx_wilder(bars: &[Bar], period: usize) -> (Vec<Option<f64>>, Vec<f64>, Vec<f64>) {
+    let n = bars.len();
+    let mut adx = vec![None; n];
+    let mut pdi = vec![0.0; n];
+    let mut mdi = vec![0.0; n];
+    if n < period+1 { return (adx,pdi,mdi); }
+    let mut tr = vec![0.0; n];
+    let mut plus_dm = vec![0.0; n];
+    let mut minus_dm = vec![0.0; n];
+    for i in 1..n {
+        let h = bars[i].high; let l = bars[i].low;
+        let ph = bars[i-1].high; let pl = bars[i-1].low; let pc = bars[i-1].close;
+        tr[i] = (h - l).max((h - pc).abs()).max((l - pc).abs());
+        let up = h - ph; let dn = pl - l;
+        if up > dn && up > 0.0 { plus_dm[i] = up; }
+        if dn > up && dn > 0.0 { minus_dm[i] = dn; }
+    }
+    let mut atr_w = 0.0; let mut p_dm_w = 0.0; let mut m_dm_w = 0.0;
+    for i in 1..=period { atr_w += tr[i]; p_dm_w += plus_dm[i]; m_dm_w += minus_dm[i]; }
+    let mut dx = vec![0.0; n];
+    // first dx at period
+    if atr_w != 0.0 {
+        pdi[period] = 100.0 * p_dm_w / atr_w;
+        mdi[period] = 100.0 * m_dm_w / atr_w;
+        let s = pdi[period] + mdi[period];
+        if s != 0.0 { dx[period] = 100.0 * (pdi[period]-mdi[period]).abs() / s; }
+    }
+    for i in period+1..n {
+        atr_w = atr_w - atr_w/period as f64 + tr[i];
+        p_dm_w = p_dm_w - p_dm_w/period as f64 + plus_dm[i];
+        m_dm_w = m_dm_w - m_dm_w/period as f64 + minus_dm[i];
+        if atr_w != 0.0 {
+            pdi[i] = 100.0 * p_dm_w / atr_w;
+            mdi[i] = 100.0 * m_dm_w / atr_w;
+            let s = pdi[i] + mdi[i];
+            if s != 0.0 { dx[i] = 100.0 * (pdi[i]-mdi[i]).abs() / s; }
+        }
+    }
+    if n >= period*2 {
+        let mut sum_dx = 0.0;
+        for i in period..period+period { sum_dx += dx[i]; }
+        adx[period*2 -1] = Some(sum_dx / period as f64);
+        for i in period*2..n {
+            let prev = adx[i-1].unwrap_or(0.0);
+            adx[i] = Some((prev*(period as f64 -1.0) + dx[i]) / period as f64);
+        }
+    }
+    (adx,pdi,mdi)
+}
+
 pub fn analyze_60m(bars: &[Bar]) -> Trend60 {
     let n = bars.len();
+    if n < ATR_PERIOD {
+        return Trend60 { direction: "RANGE".to_string(), ma20: bars.last().map(|b| b.close).unwrap_or(0.0), slope: 0.0, price_vs_ma: 0.0, higher_highs: false, higher_lows: false, lower_highs: false, lower_lows: false };
+    }
+    let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
+    let e20 = ema_series(&closes, TREND_EMA_FAST);
+    let e60 = ema_series(&closes, TREND_EMA_SLOW);
+    let a20 = atr(bars, TREND_ATR_PERIOD);
+    let (adx, pdi, mdi) = adx_wilder(bars, TREND_ADX_PERIOD);
+    // fallback simple ma20/slope for display
     let mut sum = 0.0;
-    for i in n - ATR_PERIOD..n {
-        sum += bars[i].close;
-    }
-    let ma20 = sum / ATR_PERIOD as f64;
-
-    let mut prev_sum = 0.0;
-    for i in n - ATR_PERIOD - 1..n - 1 {
-        prev_sum += bars[i].close;
-    }
-    let prev_ma = prev_sum / ATR_PERIOD as f64;
+    for i in n-ATR_PERIOD..n { sum += bars[i].close; }
+    let ma20 = sum/ATR_PERIOD as f64;
+    let mut prev_sum=0.0;
+    if n >= ATR_PERIOD+1 {
+        for i in n-ATR_PERIOD-1..n-1 { prev_sum+= bars[i].close; }
+    } else { prev_sum = sum; }
+    let prev_ma = prev_sum/ATR_PERIOD as f64;
     let slope = ma20 - prev_ma;
-    let close = bars[n - 1].close;
-
+    let close = bars[n-1].close;
     let atr20 = atr(bars, ATR_PERIOD);
     let swings = find_swings(bars, &atr20, 3, 8);
     let highs: Vec<&Swing> = swings.iter().filter(|s| s.is_high).collect();
     let lows: Vec<&Swing> = swings.iter().filter(|s| !s.is_high).collect();
-    let higher_highs =
-        highs.len() >= 2 && highs[highs.len() - 1].price > highs[highs.len() - 2].price;
-    let higher_lows = lows.len() >= 2 && lows[lows.len() - 1].price > lows[lows.len() - 2].price;
-    let lower_highs =
-        highs.len() >= 2 && highs[highs.len() - 1].price < highs[highs.len() - 2].price;
-    let lower_lows = lows.len() >= 2 && lows[lows.len() - 1].price < lows[lows.len() - 2].price;
+    let higher_highs = highs.len()>=2 && highs[highs.len()-1].price > highs[highs.len()-2].price;
+    let higher_lows = lows.len()>=2 && lows[lows.len()-1].price > lows[lows.len()-2].price;
+    let lower_highs = highs.len()>=2 && highs[highs.len()-1].price < highs[highs.len()-2].price;
+    let lower_lows = lows.len()>=2 && lows[lows.len()-1].price < lows[lows.len()-2].price;
 
-    let direction = if close > ma20 && slope > 0.0 && higher_highs && higher_lows {
-        "UP"
-    } else if close < ma20 && slope < 0.0 && !higher_highs && !higher_lows {
-        "DOWN"
-    } else if close > ma20 && slope > 0.0 {
-        "WEAK_UP"
-    } else if close < ma20 && slope < 0.0 {
-        "WEAK_DOWN"
+    // determine 5-tier direction if enough data, else fallback to old weak logic
+    let direction = if n >= TREND_EMA_SLOW + TREND_ADX_PERIOD*2 {
+        let idx=n-1;
+        let e20v = e20[idx]; let e60v = e60[idx]; let atrv = a20[idx]; let adxv = adx[idx];
+        if let (Some(ev20), Some(ev60), Some(av), Some(ax)) = (e20v, e60v, atrv, adxv) {
+            let pdiv=pdi[idx]; let mdiv=mdi[idx];
+            let mut touched=false;
+            let start=idx.saturating_sub(TREND_TOUCH_WINDOW-1);
+            for j in start..=idx {
+                if let (Some(e), Some(a)) = (e20[j], a20[j]) {
+                    if (bars[j].close - e).abs() < TREND_TOUCH_THRESH * a { touched=true; break; }
+                }
+            }
+            if close > ev60 + TREND_STRONG_ATR*av && ev20 > ev60 && ax >= TREND_ADX_STRONG && !touched && pdiv > mdiv {
+                "STRONG_UP"
+            } else if close < ev60 - TREND_STRONG_ATR*av && ev20 < ev60 && ax >= TREND_ADX_STRONG && !touched && mdiv > pdiv {
+                "STRONG_DOWN"
+            } else if close > ev60 && ev20 > ev60 && ax >= TREND_ADX_WEAK && pdiv > mdiv {
+                "WEAK_UP"
+            } else if close < ev60 && ev20 < ev60 && ax >= TREND_ADX_WEAK && mdiv > pdiv {
+                "WEAK_DOWN"
+            } else {
+                "RANGE"
+            }
+        } else { "RANGE" }
     } else {
-        "NEUTRAL"
+        // not enough for 5-tier, use simple range
+        "RANGE"
     };
 
     Trend60 {

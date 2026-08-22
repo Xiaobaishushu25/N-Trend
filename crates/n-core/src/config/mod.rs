@@ -302,6 +302,9 @@ pub struct UiConfig {
     pub timeframes: Vec<String>,
     /// 上次打开的分组表格（null=全部品种），应用启动后恢复
     pub last_group_id: Option<i64>,
+    /// 复盘聚焦时是否将预警K线置于最右侧（避免看到未来走势，默认居中）
+    #[serde(default)]
+    pub chart_review_focus_right: bool,
 }
 
 impl Default for UiConfig {
@@ -316,6 +319,7 @@ impl Default for UiConfig {
             score_pill_full_score: 3.5,
             timeframes: DEFAULT_TIMEFRAMES.iter().map(|s| s.to_string()).collect(),
             last_group_id: None,
+            chart_review_focus_right: false,
         }
     }
 }

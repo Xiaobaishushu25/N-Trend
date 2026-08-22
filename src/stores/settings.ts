@@ -51,6 +51,7 @@ const defaultConfig = (): Config => ({
     score_pill_full_score: 3.5,
     timeframes: ['5m', '15m', '30m', '60m', '120m', '240m', '1d'],
     last_group_id: null,
+    chart_review_focus_right: false,
   },
 })
 

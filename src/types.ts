@@ -1,4 +1,4 @@
-﻿// 与 Rust 侧 DTO/实体一一对应的类型定义
+// 与 Rust 侧 DTO/实体一一对应的类型定义
 
 export interface SymbolRow {
   code: string
@@ -106,6 +106,9 @@ export interface PatternDto {
   box?: BoxDto | null
   note: string
   active: boolean
+  trend_state: string
+  trend_bonus: number
+  trend_label: string
 }
 
 export interface TrendDto {
@@ -262,6 +265,7 @@ export interface UiConfig {
   timeframes: string[]
   /** 上次打开的分组表格（null=全部品种），应用启动后恢复 */
   last_group_id: number | null
+  chart_review_focus_right: boolean
 }
 
 export interface Config {

@@ -362,6 +362,13 @@ onMounted(async () => {
             </div>
             <div class="setting-card-row">
               <div class="row-label">
+                复盘聚焦时将预警K线置于最右侧
+                <Tip text="开启后，复盘统计页点击明细或切换历史信号时，预警K线会贴到K线图最右侧，不显示后续走势，避免后视镜判断；关闭时居中显示。" />
+              </div>
+              <n-switch v-model:value="form.ui.chart_review_focus_right" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
                 状态胶囊完整显示评分门槛
                 <Tip text="达到该评分的形态在列表页和表格中按完整大小与不透明度显示；每低 0.2 分缩小变浅一档，共 5 档。" />
               </div>

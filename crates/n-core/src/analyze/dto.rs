@@ -69,6 +69,12 @@ pub struct PatternDto {
     pub r#box: Option<BoxDto>,
     pub note: String,
     pub active: bool,
+    #[serde(default)]
+    pub trend_state: String,
+    #[serde(default)]
+    pub trend_bonus: f64,
+    #[serde(default)]
+    pub trend_label: String,
 }
 
 impl PatternDto {
@@ -151,6 +157,9 @@ impl PatternDto {
             r#box: box_meta,
             note: sc.note.clone(),
             active: report::is_active_signal_with_min(sc, min_total),
+            trend_state: sc.trend_state.clone(),
+            trend_bonus: sc.trend_bonus,
+            trend_label: report::direction_label(&sc.trend_state).to_string(),
         }
     }
 }

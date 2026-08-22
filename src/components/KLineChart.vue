@@ -1014,20 +1014,36 @@ function nearestRowIndex(ts: string): number {
   return best
 }
 
-/** 把目标K线放到可视区中央，保留当前缩放级别 */
+/** 把目标K线放到可视区中央，保留当前缩放级别；开启“右侧聚焦”时则将目标置于最右侧（无后视） */
 function centerFocusView(index: number) {
   if (!chart || props.rows.length === 0) return
   const ts = chart.timeScale()
   const logical = ts.getVisibleLogicalRange()
   const total = props.rows.length
   const span = Math.max(1, Math.min(logical ? Number(logical.to - logical.from) : displayKNum.value, total))
-  const half = span / 2
   const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
-  let from = Math.max(-0.5, index - half)
-  let to = Math.min(maxTo, index + half)
-  if (to - from < span - 1e-6) {
-    if (from <= -0.5 + 1e-6) to = from + span
-    else from = to - span
+  let from: number
+  let to: number
+  if (settingsStore.settings.ui.chart_review_focus_right) {
+    const gap = rightGapBars(Math.min(span, total))
+    to = index + 0.5 + gap
+    from = to - span
+    if (from < -0.5) {
+      from = -0.5
+      to = from + span
+    }
+    if (to > maxTo) {
+      to = maxTo
+      from = Math.max(-0.5, to - span)
+    }
+  } else {
+    const half = span / 2
+    from = Math.max(-0.5, index - half)
+    to = Math.min(maxTo, index + half)
+    if (to - from < span - 1e-6) {
+      if (from <= -0.5 + 1e-6) to = from + span
+      else from = to - span
+    }
   }
   ts.setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
