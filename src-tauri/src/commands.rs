@@ -4,7 +4,7 @@ use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
     KlineDto, MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats, ReviewSignalDetail,
-    ScanResult, TrendPointDto,
+    ScanResult, SignalAnnotationDto, SignalDecisionDto, SignalUserData, TrendPointDto,
 };
 use n_core::storage::entities::{groups, symbols};
 use serde::Serialize;
@@ -336,7 +336,6 @@ pub async fn rebuild_events_now(
     Ok(result)
 }
 
-
 /// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
 #[tauri::command]
 pub async fn refresh_outcomes_now(
@@ -362,13 +361,7 @@ pub async fn get_review_stats(
     let scope = scope.unwrap_or_default();
     state
         .services
-        .review_stats(
-            &dimension,
-            &scope,
-            version.as_deref(),
-            score_min,
-            score_max,
-        )
+        .review_stats(&dimension, &scope, version.as_deref(), score_min, score_max)
         .await
         .map_err(|e| e.to_string())
 }
@@ -413,6 +406,60 @@ pub async fn get_review_signal(
     state
         .services
         .review_signal(event_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// K线右侧卡片：读取某个信号的批注与开仓记录。
+#[tauri::command]
+pub async fn get_signal_user_data(
+    state: State<'_, Arc<AppState>>,
+    event_id: i64,
+) -> Result<SignalUserData, String> {
+    state
+        .services
+        .signal_user_data(event_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 给某个信号追加一条批注。
+#[tauri::command]
+pub async fn add_signal_annotation(
+    state: State<'_, Arc<AppState>>,
+    event_id: i64,
+    content: String,
+) -> Result<SignalAnnotationDto, String> {
+    state
+        .services
+        .add_signal_annotation(event_id, &content)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 删除一条批注。
+#[tauri::command]
+pub async fn delete_signal_annotation(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<(), String> {
+    state
+        .services
+        .delete_signal_annotation(id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 记录/修改某个信号是否按建议开仓。
+#[tauri::command]
+pub async fn set_signal_decision(
+    state: State<'_, Arc<AppState>>,
+    event_id: i64,
+    opened: bool,
+) -> Result<SignalDecisionDto, String> {
+    state
+        .services
+        .set_signal_decision(event_id, opened)
         .await
         .map_err(|e| e.to_string())
 }

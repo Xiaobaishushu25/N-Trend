@@ -265,6 +265,79 @@ const recentColumns: DataTableColumns<OutcomeDetail> = [
   },
   { title: '预警K线', key: 'warning_ts', width: 150, render: (r) => r.warning_ts },
   { title: '状态', key: 'state', width: 80, render: (r) => stateLabel(r.state) },
+  {
+    title: '开仓',
+    key: 'opened',
+    width: 80,
+    render: (r) => {
+      if (r.opened == null) {
+        return h('span', { style: 'color:#9aa3b2' }, '未记录')
+      }
+      return h(
+        'span',
+        { style: `color:${r.opened ? '#e03131' : '#64748b'};font-weight:600` },
+        r.opened ? '已开仓' : '未开仓',
+      )
+    },
+  },
+  // {
+  //   title: '批注',
+  //   key: 'annotations',
+  //   width: 240,
+  //
+  //   render: (r) => {
+  //     if (!r.annotations?.length) {
+  //       return h(
+  //           'span',
+  //           {
+  //             style: 'color:#b6bfcb',
+  //           },
+  //           '—'
+  //       )
+  //     }
+  //
+  //     return h(
+  //         'div',
+  //         {
+  //           style: `
+  //         color:#334155;
+  //         font-size:12px;
+  //         line-height:1.5;
+  //         white-space:normal;
+  //         word-break:break-word;
+  //       `,
+  //         },
+  //         r.annotations.map((item, index) =>
+  //             h(
+  //                 'div',
+  //                 {
+  //                   style: `
+  //             margin-bottom:${index === r.annotations.length - 1 ? '0' : '6px'};
+  //           `,
+  //                 },
+  //                 `${index + 1}. ${item.content}`
+  //             )
+  //         )
+  //     )
+  //   },
+  // },
+  // {
+  //   title: '批注',
+  //   key: 'annotations',
+  //   width: 240,
+  //   ellipsis: { tooltip: true },
+  //   render: (r) => {
+  //     if (!r.annotations.length) {
+  //       return h('span', { style: 'color:#b6bfcb' }, '—')
+  //     }
+  //     const last = r.annotations[r.annotations.length - 1]
+  //     const label =
+  //       r.annotations.length > 1
+  //         ? `[${r.annotations.length}条] ${last.content}`
+  //         : last.content
+  //     return h('span', { style: 'color:#334155;font-size:12px' }, label)
+  //   },
+  // },
   { title: '入场', key: 'entry', width: 90, align: 'right', render: (r) => r.entry.toFixed(1) },
   { title: '止损', key: 'stop', width: 90, align: 'right', render: (r) => r.stop.toFixed(1) },
   { title: '目标位(参考)', key: 'target', width: 100, align: 'right', render: (r) => r.target.toFixed(1) },

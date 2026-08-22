@@ -360,6 +360,19 @@ onMounted(async () => {
               </div>
               <n-switch v-model:value="form.ui.chart_show_first_signal" />
             </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                状态胶囊完整显示评分门槛
+                <Tip text="达到该评分的形态在列表页和表格中按完整大小与不透明度显示；每低 0.2 分缩小变浅一档，共 5 档。" />
+              </div>
+              <n-input-number
+                v-model:value="form.ui.score_pill_full_score"
+                :min="0.5"
+                :max="5"
+                :step="0.1"
+                style="width: 200px"
+              />
+            </div>
           </div>
         </div>
       </n-tab-pane>

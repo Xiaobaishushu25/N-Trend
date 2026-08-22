@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 // reactive 仅被下方被注释的调试面板使用；如取消注释调试面板，需把 reactive 加回 import
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin, NTooltip } from 'naive-ui'
@@ -323,6 +323,9 @@ let focusFollowsLatest = true
 /** 键盘或复盘定位后，鼠标移出图表时仍把十字光标留在焦点K线上 */
 let focusPinnedByKeys = false
 let pendingFocusTs: string | null = null
+/** 鼠标悬停在历史K线时，实时行情刷新不应把焦点拉回最新K线 */
+let hoveredTime: Time | null = null
+let isHovering = false
 let patternLines: ISeriesApi<'Line'>[] = []
 let trendSeries: ISeriesApi<'Line'> | null = null
 let priceExtent = 1
@@ -1435,6 +1438,8 @@ onMounted(() => {
   focusIndex = -1
   focusFollowsLatest = true
   focusPinnedByKeys = false
+  hoveredTime = null
+  isHovering = false
   chart = createChart(container.value, {
     layout: {
       background: { type: ColorType.Solid, color: '#ffffff' },
@@ -1617,6 +1622,8 @@ onBeforeUnmount(() => {
   focusIndex = -1
   focusPinnedByKeys = false
   pendingFocusTs = null
+  hoveredTime = null
+  isHovering = false
   chart?.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
   if (countdownTimer) {
     clearInterval(countdownTimer)
@@ -1845,7 +1852,6 @@ defineExpose({ stepCandles })
   font-family: Consolas, monospace;
 } */
 </style>
-
 
 
 

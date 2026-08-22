@@ -13,7 +13,7 @@ use crate::analyze::model::{Bar, Dir, Grade, NPattern, Swing, ATR_PERIOD, DT};
 use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
-use crate::fetch::kline::Kline;
+use crate::fetch::kline::{Kline, MINUTE_BAR_SETTLE_SECS};
 use crate::fetch::SinaClient;
 use crate::scheduler::SchedulerConfig;
 use crate::storage::entities::{klines, pattern_events, symbols};
@@ -131,6 +131,10 @@ pub struct OutcomeDetail {
     pub rollover_crossed: bool,
     pub gap_crossed_entry: bool,
     pub gap_crossed_exit: bool,
+    /// 用户批注（按创建时间正序）
+    pub annotations: Vec<SignalAnnotationDto>,
+    /// 用户是否按建议开仓；未记录时为 None
+    pub opened: Option<bool>,
 }
 
 /// 复盘明细跳转K线图所需：完整事件 + 结局。
@@ -138,6 +142,32 @@ pub struct OutcomeDetail {
 pub struct ReviewSignalDetail {
     pub event: pattern_events::Model,
     pub outcome: Option<OutcomeDetail>,
+    pub annotations: Vec<SignalAnnotationDto>,
+    pub opened: Option<bool>,
+}
+
+/// 用户给信号写的批注。
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalAnnotationDto {
+    pub id: i64,
+    pub event_id: i64,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// 用户是否按建议开仓的记录。
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalDecisionDto {
+    pub event_id: i64,
+    pub opened: bool,
+    pub updated_at: String,
+}
+
+/// 单个信号的用户记录聚合（K线右侧卡片用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SignalUserData {
+    pub annotations: Vec<SignalAnnotationDto>,
+    pub opened: Option<bool>,
 }
 
 /// 最近信号明细的筛选条件（均为可选，空值不过滤）。
@@ -155,11 +185,11 @@ pub struct OutcomeFilter {
     pub score_max: Option<f64>,
     /// win / loss / no_trigger / open / insufficient_data / rollover
     pub outcome: Option<String>,
-    /// 4，缺省不过滤
+    /// 5，缺省不过滤
     pub version: Option<String>,
 }
 
-const EVENT_LOGIC_VERSION: &str = "4";
+const EVENT_LOGIC_VERSION: &str = "5";
 
 fn pattern_endpoint_prices(bars: &[Bar], candidate: &event::WarningCandidate) -> (f64, f64, f64) {
     if candidate.direction == Dir::Up {
@@ -563,6 +593,8 @@ fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeD
         rollover_crossed: e.outcome.as_deref() == Some("rollover"),
         gap_crossed_entry: false,
         gap_crossed_exit: false,
+        annotations: Vec::new(),
+        opened: None,
     }
 }
 
@@ -588,12 +620,20 @@ fn fill_leg_detail(
     } else {
         Dir::Up
     };
-    let a_bars = row.a_bars.unwrap_or_else(|| s1_index.saturating_sub(s0_index) + 1);
-    let b_bars = row.b_bars.unwrap_or_else(|| s2_index.saturating_sub(s1_index));
+    let a_bars = row
+        .a_bars
+        .unwrap_or_else(|| s1_index.saturating_sub(s0_index) + 1);
+    let b_bars = row
+        .b_bars
+        .unwrap_or_else(|| s2_index.saturating_sub(s1_index));
     let a_speed = row.a_move.unwrap_or(0.0) / a_bars.max(1) as f64;
     let b_speed = row.b_move.unwrap_or(0.0) / b_bars.max(1) as f64;
     let p = NPattern {
-        level: if row.level == "large" { "large" } else { "fine" },
+        level: if row.level == "large" {
+            "large"
+        } else {
+            "fine"
+        },
         dir,
         s0: Swing {
             index: s0_index,
@@ -638,7 +678,8 @@ fn fill_leg_detail(
     row.a_too_long = Some(p.a_too_long);
     row.b_too_long = Some(p.b_too_long);
     row.b_fast = Some(p.b_fast);
-    let (weakening, ratio) = crate::analyze::pattern::b_leg_weakening(bars, s1_index, s2_index, dir);
+    let (weakening, ratio) =
+        crate::analyze::pattern::b_leg_weakening(bars, s1_index, s2_index, dir);
     row.b_weakening = Some(weakening);
     row.b_weakening_ratio = ratio;
 }
@@ -652,6 +693,29 @@ fn bar_ts(bar: &Bar) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:00",
         bar.dt.year, bar.dt.month, bar.dt.day, bar.dt.hour, bar.dt.minute
     )
+}
+
+/// 形态扫描与事件推进只使用已过确认余量的 15m bar，
+/// 避免把最后一根仍在确认期的成分K线当成最终值。
+fn settled_scan_bars_at(bars: Vec<Bar>, now: chrono::NaiveDateTime) -> Vec<Bar> {
+    bars.into_iter()
+        .filter(|b| {
+            let Some(ts) = chrono::NaiveDate::from_ymd_opt(
+                b.dt.year,
+                b.dt.month as u32,
+                b.dt.day as u32,
+            )
+            .and_then(|d| d.and_hms_opt(b.dt.hour as u32, b.dt.minute as u32, 0))
+            else {
+                return false;
+            };
+            now.signed_duration_since(ts).num_seconds() >= MINUTE_BAR_SETTLE_SECS
+        })
+        .collect()
+}
+
+fn settled_scan_bars(bars: Vec<Bar>) -> Vec<Bar> {
+    settled_scan_bars_at(bars, chrono::Local::now().naive_local())
 }
 
 fn event_dir(e: &pattern_events::Model) -> Dir {
@@ -1903,7 +1967,7 @@ impl Services {
         let mut scanned = 0i64;
 
         for sym in symbols {
-            let bars15 = self.bars_for(&sym.code, "15m").await?;
+            let bars15 = settled_scan_bars(self.bars_for(&sym.code, "15m").await?);
             if bars15.len() < ATR_PERIOD + 2 {
                 failed.push(SymbolFailure {
                     symbol: sym.code,
@@ -2005,12 +2069,32 @@ impl Services {
     /// 再把每个事件推进到现在的真实状态（触发/失效/已了结）。
     pub async fn rebuild_events(&self) -> Result<usize> {
         let _scan_guard = self.scan_lock.lock().await;
+        let old_events = repo::all_pattern_events(&self.db).await?;
+        let old_keys: HashMap<i64, (String, String, String, String, String, String)> = old_events
+            .iter()
+            .map(|e| {
+                (
+                    e.id,
+                    (
+                        e.symbol.clone(),
+                        e.direction.clone(),
+                        e.s0_ts.clone(),
+                        e.s1_ts.clone(),
+                        e.s2_ts.clone(),
+                        e.warning_ts.clone(),
+                    ),
+                )
+            })
+            .collect();
+        let annotations = repo::all_signal_annotations(&self.db).await?;
+        let decisions = repo::all_signal_decisions(&self.db).await?;
         repo::clear_pattern_events(&self.db).await?;
+        repo::clear_signal_user_data(&self.db).await?;
         self.entry_notified.write().await.clear();
         let symbols = repo::list_symbols(&self.db, true).await?;
         let mut inserted = 0usize;
         for sym in symbols {
-            let bars15 = self.bars_for(&sym.code, "15m").await?;
+            let bars15 = settled_scan_bars(self.bars_for(&sym.code, "15m").await?);
             if bars15.len() < ATR_PERIOD + 2 {
                 continue;
             }
@@ -2040,6 +2124,83 @@ impl Services {
             }
         }
         self.cleanup_duplicate_events().await?;
+        let new_events = repo::all_pattern_events(&self.db).await?;
+        let mut new_keys_by_structure: HashMap<(String, String, String, String, String), i64> =
+            HashMap::new();
+        let mut new_keys_by_warning: HashMap<(String, String, String), i64> = HashMap::new();
+        for e in &new_events {
+            new_keys_by_structure
+                .entry((
+                    e.symbol.clone(),
+                    e.direction.clone(),
+                    e.s0_ts.clone(),
+                    e.s1_ts.clone(),
+                    e.s2_ts.clone(),
+                ))
+                .or_insert(e.id);
+            new_keys_by_warning
+                .entry((e.symbol.clone(), e.direction.clone(), e.warning_ts.clone()))
+                .or_insert(e.id);
+        }
+        for ann in annotations {
+            let Some((symbol, direction, s0_ts, s1_ts, s2_ts, warning_ts)) =
+                old_keys.get(&ann.event_id)
+            else {
+                continue;
+            };
+            let structure_key = (
+                symbol.clone(),
+                direction.clone(),
+                s0_ts.clone(),
+                s1_ts.clone(),
+                s2_ts.clone(),
+            );
+            let new_id = new_keys_by_structure
+                .get(&structure_key)
+                .copied()
+                .or_else(|| {
+                    new_keys_by_warning
+                        .get(&(symbol.clone(), direction.clone(), warning_ts.clone()))
+                        .copied()
+                });
+            let Some(new_id) = new_id else {
+                continue;
+            };
+            repo::insert_signal_annotation_with_ts(&self.db, new_id, &ann.content, &ann.created_at)
+                .await?;
+        }
+        for decision in decisions {
+            let Some((symbol, direction, s0_ts, s1_ts, s2_ts, warning_ts)) =
+                old_keys.get(&decision.event_id)
+            else {
+                continue;
+            };
+            let structure_key = (
+                symbol.clone(),
+                direction.clone(),
+                s0_ts.clone(),
+                s1_ts.clone(),
+                s2_ts.clone(),
+            );
+            let new_id = new_keys_by_structure
+                .get(&structure_key)
+                .copied()
+                .or_else(|| {
+                    new_keys_by_warning
+                        .get(&(symbol.clone(), direction.clone(), warning_ts.clone()))
+                        .copied()
+                });
+            let Some(new_id) = new_id else {
+                continue;
+            };
+            repo::insert_signal_decision_with_ts(
+                &self.db,
+                new_id,
+                decision.opened,
+                &decision.updated_at,
+            )
+            .await?;
+        }
         Ok(inserted)
     }
 
@@ -2056,7 +2217,7 @@ impl Services {
         }
         let mut updated = 0usize;
         for (symbol, list) in by_symbol {
-            let bars15 = self.bars_for(&symbol, "15m").await?;
+            let bars15 = settled_scan_bars(self.bars_for(&symbol, "15m").await?);
             for mut e in list {
                 if advance_event_model(&mut e, &bars15) {
                     repo::update_pattern_event(&self.db, e).await?;
@@ -2118,7 +2279,7 @@ impl Services {
         ))
     }
 
-    /// 最近信号明细（复盘页明细表）：真实事件，按 event_id 倒序。
+    /// 最近信号明细（复盘页明细表）：真实事件，按预警时间倒序（同时间按 event_id 倒序）。
     pub async fn recent_outcomes(
         &self,
         limit: usize,
@@ -2145,8 +2306,31 @@ impl Services {
                 ))
             })
             .collect();
-        rows.sort_by(|a, b| b.event_id.cmp(&a.event_id));
+        rows.sort_by(|a, b| b.warning_ts.cmp(&a.warning_ts).then_with(|| b.event_id.cmp(&a.event_id)));
         rows.truncate(limit);
+        let mut annotations_by_event: HashMap<i64, Vec<SignalAnnotationDto>> = HashMap::new();
+        for ann in repo::all_signal_annotations(&self.db).await? {
+            annotations_by_event
+                .entry(ann.event_id)
+                .or_default()
+                .push(SignalAnnotationDto {
+                    id: ann.id,
+                    event_id: ann.event_id,
+                    content: ann.content,
+                    created_at: ann.created_at,
+                });
+        }
+        let opened_by_event: HashMap<i64, bool> = repo::all_signal_decisions(&self.db)
+            .await?
+            .into_iter()
+            .map(|d| (d.event_id, d.opened))
+            .collect();
+        for row in rows.iter_mut() {
+            row.annotations = annotations_by_event
+                .remove(&row.event_id)
+                .unwrap_or_default();
+            row.opened = opened_by_event.get(&row.event_id).copied();
+        }
         let symbols_with_rows: HashSet<String> = rows.iter().map(|r| r.symbol.clone()).collect();
         for code in symbols_with_rows {
             let bars = self.bars_for(&code, "15m").await?;
@@ -2183,10 +2367,81 @@ impl Services {
             .collect();
         fill_leg_detail(&mut outcome, &bars, &atr20, &index_by_ts);
         let outcome = Some(outcome);
+        let annotations = repo::signal_annotations_for_event(&self.db, event_id)
+            .await?
+            .into_iter()
+            .map(|a| SignalAnnotationDto {
+                id: a.id,
+                event_id: a.event_id,
+                content: a.content,
+                created_at: a.created_at,
+            })
+            .collect();
+        let opened = repo::signal_decision(&self.db, event_id)
+            .await?
+            .map(|d| d.opened);
         Ok(Some(ReviewSignalDetail {
             event: row,
             outcome,
+            annotations,
+            opened,
         }))
+    }
+
+    /// K线右侧卡片：读取单个信号的批注与开仓记录。
+    pub async fn signal_user_data(&self, event_id: i64) -> Result<SignalUserData> {
+        let annotations = repo::signal_annotations_for_event(&self.db, event_id)
+            .await?
+            .into_iter()
+            .map(|a| SignalAnnotationDto {
+                id: a.id,
+                event_id: a.event_id,
+                content: a.content,
+                created_at: a.created_at,
+            })
+            .collect();
+        let opened = repo::signal_decision(&self.db, event_id)
+            .await?
+            .map(|d| d.opened);
+        Ok(SignalUserData {
+            annotations,
+            opened,
+        })
+    }
+
+    pub async fn add_signal_annotation(
+        &self,
+        event_id: i64,
+        content: &str,
+    ) -> Result<SignalAnnotationDto> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(anyhow!("批注内容不能为空"));
+        }
+        let row = repo::add_signal_annotation(&self.db, event_id, content).await?;
+        Ok(SignalAnnotationDto {
+            id: row.id,
+            event_id: row.event_id,
+            content: row.content,
+            created_at: row.created_at,
+        })
+    }
+
+    pub async fn delete_signal_annotation(&self, id: i64) -> Result<()> {
+        repo::delete_signal_annotation(&self.db, id).await
+    }
+
+    pub async fn set_signal_decision(
+        &self,
+        event_id: i64,
+        opened: bool,
+    ) -> Result<SignalDecisionDto> {
+        let row = repo::set_signal_decision(&self.db, event_id, opened).await?;
+        Ok(SignalDecisionDto {
+            event_id: row.event_id,
+            opened: row.opened,
+            updated_at: row.updated_at,
+        })
     }
 }
 
@@ -2796,6 +3051,31 @@ mod tests {
             ts_gap_minutes("2026-08-03 10:00:00", "2026-08-03 08:00:00"),
             Some(120)
         );
+    }
+
+    #[test]
+    fn settled_scan_bars_waits_for_settle_grace() {
+        let bars = vec![
+            bar_model("2026-08-19 14:00:00", 0.0, 0.0, 0.0, 0.0),
+            bar_model("2026-08-19 14:15:00", 0.0, 0.0, 0.0, 0.0),
+        ];
+        let not_yet = chrono::NaiveDateTime::parse_from_str(
+            "2026-08-19 14:15:29",
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .unwrap();
+        let settled = chrono::NaiveDateTime::parse_from_str(
+            "2026-08-19 14:15:30",
+            "%Y-%m-%d %H:%M:%S",
+        )
+        .unwrap();
+
+        let pending = settled_scan_bars_at(bars.clone(), not_yet);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].dt.minute, 0);
+
+        let ready = settled_scan_bars_at(bars, settled);
+        assert_eq!(ready.len(), 2);
     }
 
     #[test]

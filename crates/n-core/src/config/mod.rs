@@ -295,6 +295,9 @@ pub struct UiConfig {
     /// 进入K线图时默认显示排序最靠前的信号形态
     #[serde(default = "default_chart_show_first_signal")]
     pub chart_show_first_signal: bool,
+    /// 列表页/表格状态胶囊完整显示的最低评分；每低 0.2 分缩小变浅一档
+    #[serde(default = "default_score_pill_full_score")]
+    pub score_pill_full_score: f64,
     /// 启用的K线周期（空时按全部处理）
     pub timeframes: Vec<String>,
     /// 上次打开的分组表格（null=全部品种），应用启动后恢复
@@ -310,6 +313,7 @@ impl Default for UiConfig {
             chart_display_bars: 140,
             chart_right_gap: 10,
             chart_show_first_signal: true,
+            score_pill_full_score: 3.5,
             timeframes: DEFAULT_TIMEFRAMES.iter().map(|s| s.to_string()).collect(),
             last_group_id: None,
         }
@@ -419,6 +423,10 @@ fn default_chart_show_first_signal() -> bool {
     true
 }
 
+fn default_score_pill_full_score() -> f64 {
+    3.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +459,7 @@ mod tests {
         assert_eq!(back.ui.chart_display_bars, 140);
         assert_eq!(back.ui.chart_right_gap, 10);
         assert_eq!(back.ui.chart_show_first_signal, true);
+        assert_eq!(back.ui.score_pill_full_score, 3.5);
         assert_eq!(
             back.ui.timeframes,
             DEFAULT_TIMEFRAMES
@@ -470,6 +479,7 @@ mod tests {
         assert_eq!(config.quote.poll_interval_ms, 3000);
         assert_eq!(config.log.level, "info");
         assert_eq!(config.notify.new_pattern_min_score, 0.0);
+        assert_eq!(config.ui.score_pill_full_score, 3.5);
     }
 
     #[test]
@@ -540,6 +550,7 @@ mod tests {
         assert_eq!(config.email.to, "a@b.com");
         assert_eq!(config.email.smtp_password, "secret");
         assert_eq!(config.quote.poll_interval_ms, 3000);
+        assert_eq!(config.ui.score_pill_full_score, 3.5);
 
         // 配置键已删除，运行时键保留
         let rest = repo::all_settings(&db).await.unwrap();

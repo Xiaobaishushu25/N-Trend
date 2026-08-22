@@ -9,7 +9,8 @@ use sea_orm::{
 };
 
 use crate::storage::entities::{
-    groups, klines, pattern_events, rollovers, settings, symbol_groups, symbols,
+    groups, klines, pattern_events, rollovers, settings, signal_annotations, signal_decisions,
+    symbol_groups, symbols,
 };
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
@@ -699,6 +700,18 @@ pub async fn clear_pattern_events(db: &DatabaseConnection) -> Result<()> {
 
 /// 删除历史上落盘的快速路径预警记录（2026-08-16 起不再生成该类型）。
 pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> {
+    db.execute_unprepared(
+        "DELETE FROM signal_annotations WHERE event_id IN \
+         (SELECT id FROM pattern_events WHERE warning_kind = 'fast')",
+    )
+    .await
+    .context("清理快速路径信号批注失败")?;
+    db.execute_unprepared(
+        "DELETE FROM signal_decisions WHERE event_id IN \
+         (SELECT id FROM pattern_events WHERE warning_kind = 'fast')",
+    )
+    .await
+    .context("清理快速路径信号开仓记录失败")?;
     let res = pattern_events::Entity::delete_many()
         .filter(pattern_events::Column::WarningKind.eq("fast"))
         .exec(db)
@@ -709,6 +722,15 @@ pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> 
 
 /// 按 id 删除单条信号事件（重复信号清理用）。
 pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()> {
+    signal_annotations::Entity::delete_many()
+        .filter(signal_annotations::Column::EventId.eq(id))
+        .exec(db)
+        .await
+        .context("删除信号批注失败")?;
+    signal_decisions::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("删除信号开仓记录失败")?;
     let res = pattern_events::Entity::delete_by_id(id)
         .exec(db)
         .await
@@ -749,6 +771,179 @@ pub async fn pending_pattern_events_by_symbol_direction(
         .all(db)
         .await
         .context("查询待触发信号事件失败")?)
+}
+
+fn db_now() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub async fn signal_annotations_for_event(
+    db: &DatabaseConnection,
+    event_id: i64,
+) -> Result<Vec<signal_annotations::Model>> {
+    Ok(signal_annotations::Entity::find()
+        .filter(signal_annotations::Column::EventId.eq(event_id))
+        .order_by_asc(signal_annotations::Column::Id)
+        .all(db)
+        .await
+        .context("查询信号批注失败")?)
+}
+
+pub async fn all_signal_annotations(
+    db: &DatabaseConnection,
+) -> Result<Vec<signal_annotations::Model>> {
+    Ok(signal_annotations::Entity::find()
+        .order_by_asc(signal_annotations::Column::Id)
+        .all(db)
+        .await
+        .context("查询全部信号批注失败")?)
+}
+
+pub async fn add_signal_annotation(
+    db: &DatabaseConnection,
+    event_id: i64,
+    content: &str,
+) -> Result<signal_annotations::Model> {
+    let row = signal_annotations::ActiveModel {
+        id: sea_orm::NotSet,
+        event_id: Set(event_id),
+        content: Set(content.to_string()),
+        created_at: Set(db_now()),
+    };
+    let res = signal_annotations::Entity::insert(row)
+        .exec(db)
+        .await
+        .context("写入信号批注失败")?;
+    signal_annotations_for_event(db, event_id)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .find(|r| r.id == res.last_insert_id)
+                .ok_or_else(|| anyhow!("批注写入后读取失败"))
+        })?
+}
+
+/// 重建后按原时间戳回填批注，保留用户记录的创建时间。
+pub(crate) async fn insert_signal_annotation_with_ts(
+    db: &DatabaseConnection,
+    event_id: i64,
+    content: &str,
+    created_at: &str,
+) -> Result<signal_annotations::Model> {
+    let row = signal_annotations::ActiveModel {
+        id: sea_orm::NotSet,
+        event_id: Set(event_id),
+        content: Set(content.to_string()),
+        created_at: Set(created_at.to_string()),
+    };
+    let res = signal_annotations::Entity::insert(row)
+        .exec(db)
+        .await
+        .context("回填信号批注失败")?;
+    signal_annotations_for_event(db, event_id)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .find(|r| r.id == res.last_insert_id)
+                .ok_or_else(|| anyhow!("批注回填后读取失败"))
+        })?
+}
+
+pub async fn delete_signal_annotation(db: &DatabaseConnection, id: i64) -> Result<()> {
+    let res = signal_annotations::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("删除信号批注失败")?;
+    if res.rows_affected != 1 {
+        return Err(anyhow!("删除信号批注失败: 影响行数 {}", res.rows_affected));
+    }
+    Ok(())
+}
+
+pub async fn signal_decision(
+    db: &DatabaseConnection,
+    event_id: i64,
+) -> Result<Option<signal_decisions::Model>> {
+    Ok(signal_decisions::Entity::find_by_id(event_id)
+        .one(db)
+        .await
+        .context("查询信号开仓记录失败")?)
+}
+
+pub async fn all_signal_decisions(db: &DatabaseConnection) -> Result<Vec<signal_decisions::Model>> {
+    Ok(signal_decisions::Entity::find()
+        .all(db)
+        .await
+        .context("查询全部信号开仓记录失败")?)
+}
+
+pub async fn set_signal_decision(
+    db: &DatabaseConnection,
+    event_id: i64,
+    opened: bool,
+) -> Result<signal_decisions::Model> {
+    let row = signal_decisions::ActiveModel {
+        event_id: Set(event_id),
+        opened: Set(opened),
+        updated_at: Set(db_now()),
+    };
+    signal_decisions::Entity::insert(row)
+        .on_conflict(
+            OnConflict::columns([signal_decisions::Column::EventId])
+                .update_columns([
+                    signal_decisions::Column::Opened,
+                    signal_decisions::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("写入信号开仓记录失败")?;
+    signal_decision(db, event_id)
+        .await?
+        .ok_or_else(|| anyhow!("开仓记录写入后读取失败"))
+}
+
+/// 重建后按原时间戳回填开仓记录，保留用户记录的更新时间。
+pub(crate) async fn insert_signal_decision_with_ts(
+    db: &DatabaseConnection,
+    event_id: i64,
+    opened: bool,
+    updated_at: &str,
+) -> Result<signal_decisions::Model> {
+    let row = signal_decisions::ActiveModel {
+        event_id: Set(event_id),
+        opened: Set(opened),
+        updated_at: Set(updated_at.to_string()),
+    };
+    signal_decisions::Entity::insert(row)
+        .on_conflict(
+            OnConflict::columns([signal_decisions::Column::EventId])
+                .update_columns([
+                    signal_decisions::Column::Opened,
+                    signal_decisions::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("回填信号开仓记录失败")?;
+    signal_decision(db, event_id)
+        .await?
+        .ok_or_else(|| anyhow!("开仓记录回填后读取失败"))
+}
+
+/// 重建事件时清空旧用户记录；上层先快照再重建，重建后按信号身份回填。
+pub async fn clear_signal_user_data(db: &DatabaseConnection) -> Result<()> {
+    signal_annotations::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("清空信号批注失败")?;
+    signal_decisions::Entity::delete_many()
+        .exec(db)
+        .await
+        .context("清空信号开仓记录失败")?;
+    Ok(())
 }
 
 pub async fn all_settings(
@@ -1088,6 +1283,93 @@ mod tests {
             .await
             .unwrap();
         assert!(!pending.iter().any(|e| e.id == first));
+    }
+
+    #[tokio::test]
+    async fn signal_annotations_and_decisions_roundtrip() {
+        let db = test_db().await;
+        let row = |warning_ts: &str| pattern_events::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("MA0".to_string()),
+            direction: Set("up".to_string()),
+            grade: Set("A级".to_string()),
+            level: Set("fine".to_string()),
+            s0_ts: Set("2026-08-13 09:30".to_string()),
+            s0_price: Set(2550.0),
+            s1_ts: Set("2026-08-13 09:45".to_string()),
+            s1_price: Set(2580.0),
+            s2_ts: Set("2026-08-13 10:00".to_string()),
+            s2_price: Set(2565.0),
+            a_move: Set(30.0),
+            b_move: Set(15.0),
+            a_bars: Set(1),
+            b_bars: Set(1),
+            retracement: Set(0.5),
+            warning_ts: Set(warning_ts.to_string()),
+            detected_at: Set(warning_ts.to_string()),
+            warning_kind: Set("strong".to_string()),
+            entry_score: Set(3.8),
+            entry_score_dims: Set(r#"{"dim_a":3.9,"dim_b":3.7,"dim_warning":3.8}"#.to_string()),
+            entry: Set(2582.0),
+            stop: Set(2568.0),
+            target: Set(2610.0),
+            risk: Set(14.0),
+            rr: Set(2.0),
+            state: Set("pending".to_string()),
+            last_advance_ts: Set(None),
+            trigger_ts: Set(None),
+            trigger_bar_ts: Set(None),
+            trigger_price: Set(None),
+            trigger_score: Set(None),
+            trigger_volume_ratio: Set(None),
+            overshoot_r: Set(None),
+            hold_score: Set(None),
+            hold_score_history: Set("[]".to_string()),
+            outcome: Set(None),
+            exit_reason: Set(None),
+            exit_ts: Set(None),
+            exit_price: Set(None),
+            r_multiple: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            created_at: Set(warning_ts.to_string()),
+            updated_at: Set(warning_ts.to_string()),
+        };
+
+        let id = insert_pattern_event(&db, row("2026-08-13 10:00"))
+            .await
+            .unwrap();
+        let first = add_signal_annotation(&db, id, "A腿质量不错，等触发确认")
+            .await
+            .unwrap();
+        add_signal_annotation(&db, id, "触发后追价太深就不开")
+            .await
+            .unwrap();
+        assert_eq!(
+            signal_annotations_for_event(&db, id).await.unwrap().len(),
+            2
+        );
+
+        delete_signal_annotation(&db, first.id).await.unwrap();
+        let annotations = signal_annotations_for_event(&db, id).await.unwrap();
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].content, "触发后追价太深就不开");
+
+        let opened = set_signal_decision(&db, id, true).await.unwrap();
+        assert!(opened.opened);
+        let skipped = set_signal_decision(&db, id, false).await.unwrap();
+        assert!(!skipped.opened);
+        assert_eq!(
+            signal_decision(&db, id).await.unwrap().unwrap().opened,
+            false
+        );
+
+        delete_pattern_event(&db, id).await.unwrap();
+        assert!(signal_annotations_for_event(&db, id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(signal_decision(&db, id).await.unwrap().is_none());
     }
 
     #[tokio::test]

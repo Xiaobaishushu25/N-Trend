@@ -96,7 +96,7 @@ const A_LEG_GAP_PENALTY_PER_GAP: f64 = 0.15;
 const A_LEG_GAP_PENALTY_PER_EXCESS_ATR: f64 = 0.20;
 const A_LEG_GAP_PENALTY_MAX: f64 = 0.5;
 // 多K累积覆盖的入场分上限：只允许小仓试错，不进入标准仓区间
-const CUMULATIVE_ENTRY_SCORE_MAX: f64 = 3.49;
+const CUMULATIVE_ENTRY_SCORE_MAX: f64 = 3.9;
 // 长影线预警的入场分上限：全分档胜率都弱，不允许进入 3.5+ 标准仓区间。
 pub(crate) const WICK_ENTRY_SCORE_MAX: f64 = 3.0;
 // 预警K线长影线硬门槛（2026-08-15），七条同时满足才识别：
@@ -610,11 +610,12 @@ fn warning_base(kind: &str) -> f64 {
     match kind {
         // engulf 仅保留给历史落盘记录，新识别统一为 strong。
         "strong" | "engulf" | "wick" => 3.5,
+        "cumulative" => 3.0,
         _ => 2.0,
     }
 }
 
-/// 预警K线质量分：强反转/长影线基准 3.5，多K累积覆盖基准 2.0，
+/// 预警K线质量分：强反转/长影线基准 3.5，多K累积覆盖基准 3.0，
 /// 再扣除长影线收盘方向与预警K线体量扣分。
 pub(crate) fn dim_warning(
     bars: &[Bar],
@@ -634,7 +635,7 @@ pub(crate) fn dim_warning(
 }
 
 /// 入场分 = 0.60×A段 + 0.20×B段 + 0.20×预警K线。
-/// 多K累积覆盖总分封顶 3.49，只允许小仓试错；
+/// 多K累积覆盖总分封顶 3.9，只允许小仓试错；
 /// 长影线预警总分封顶 3.0，历史分档胜率全面偏弱，不进 3.5+ 标准仓区间。
 pub(crate) fn entry_score(
     dim_a: f64,
@@ -678,7 +679,7 @@ pub(crate) fn single_reversal_pattern(
         && match dir {
             Dir::Up => {
                 let prev = &bars[w - 1];
-                prev.close < prev.open
+                prev.close <= prev.open
                     && bar.close > bar.open
                     && bar.close >= prev.open
                     && bar.open <= prev.close
@@ -686,7 +687,7 @@ pub(crate) fn single_reversal_pattern(
             }
             Dir::Down => {
                 let prev = &bars[w - 1];
-                prev.close > prev.open
+                prev.close >= prev.open
                     && bar.close < bar.open
                     && bar.open >= prev.close
                     && bar.close <= prev.open
@@ -1532,7 +1533,7 @@ mod tests {
             grade: Grade::B,
             ..pattern()
         };
-        assert!((score_b(&clean) - 3.8).abs() < 1e-9);
+        assert!((score_b(&clean) - 4.3).abs() < 1e-9);
 
         let weakening = NPattern {
             grade: Grade::B,
@@ -1540,7 +1541,7 @@ mod tests {
             b_weakening_ratio: Some(0.5),
             ..pattern()
         };
-        assert!((score_b(&weakening) - 4.1).abs() < 1e-9);
+        assert!((score_b(&weakening) - 4.6).abs() < 1e-9);
 
         // 长b已经扣过动能消耗分，后半段变小不再叠加衰减加分。
         let long_weakening = NPattern {
@@ -1550,7 +1551,7 @@ mod tests {
             b_weakening_ratio: Some(0.5),
             ..pattern()
         };
-        assert!((score_b(&long_weakening) - 3.3).abs() < 1e-9);
+        assert!((score_b(&long_weakening) - 3.8).abs() < 1e-9);
     }
 
     #[test]
@@ -1639,7 +1640,7 @@ mod tests {
     fn cumulative_reversal_confirms_but_downgrades_to_small_position() {
         // 做空：第二根阴线收盘越过强趋势阳线开盘价 → 多K累积覆盖，允许预警但降级为小仓。
         // 故意把 a 段设成幅度足、强K够的形态（否则新评分会把 a 段质量分压得很低，
-        // 测不到“弱确认封顶 3.49 仍落小仓”的本意）。
+        // 测不到“弱确认封顶 3.9 仍落小仓”的本意）。
         let atr = atrs(6, 70.0);
         let p = NPattern {
             dir: Dir::Down,
@@ -2399,7 +2400,7 @@ mod tests {
 
     #[test]
     fn entry_score_uses_60_20_20_and_caps_cumulative() {
-        let base = entry_score(4.0, 4.0, 2.0, "cumulative");
+        let base = entry_score(5.0, 5.0, 3.0, "cumulative");
         assert!((base - CUMULATIVE_ENTRY_SCORE_MAX).abs() < 1e-9);
 
         let strong = entry_score(4.0, 4.0, 3.5, "strong");

@@ -219,6 +219,10 @@ pub fn run() {
             commands::get_review_stats,
             commands::get_recent_outcomes,
             commands::get_review_signal,
+            commands::get_signal_user_data,
+            commands::add_signal_annotation,
+            commands::delete_signal_annotation,
+            commands::set_signal_decision,
             commands::get_config,
             commands::update_config,
             commands::set_last_group,
@@ -372,11 +376,12 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
             let min_score = cfg.notify.new_pattern_min_score;
             if cfg.email.enabled && cfg.email.sendable() {
                 let mut emails = Vec::new();
-                for e in res.new_warnings.iter().filter(|e| e.entry_score >= min_score) {
-                    emails.push((
-                        n_core::notify::email::EventEmailKind::Warning,
-                        e,
-                    ));
+                for e in res
+                    .new_warnings
+                    .iter()
+                    .filter(|e| e.entry_score >= min_score)
+                {
+                    emails.push((n_core::notify::email::EventEmailKind::Warning, e));
                 }
                 for e in res
                     .newly_triggered
@@ -387,7 +392,9 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                 }
                 for (kind, e) in emails {
                     let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
-                    if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                    if let Err(err) =
+                        n_core::notify::email::send_summary(&subject, &body, &cfg.email)
+                    {
                         tracing::error!("邮件发送失败: {err}");
                     }
                 }

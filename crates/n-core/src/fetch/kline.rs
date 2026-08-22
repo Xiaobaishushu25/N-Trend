@@ -1,6 +1,7 @@
 //! K-line parsing and fetching from the Sina futures minute API.
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::NaiveDateTime;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -9,6 +10,8 @@ use crate::fetch::SinaClient;
 /// 支持的分钟级别（5m 为持久化基级，15m/60m 供策略校验与手工抓取）。
 pub const PERIODS: [(&str, &str); 3] = [("5m", "5"), ("15m", "15"), ("60m", "60")];
 pub const DEFAULT_COUNT: usize = 300;
+/// 分钟K线时间戳过去后还需等待的确认时长，避免把接口刚生成的临时K线当最终值。
+pub const MINUTE_BAR_SETTLE_SECS: i64 = 30;
 const API_URL: &str = "http://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_{symbol}_{period}_{ts}_=/InnerFuturesNewService.getFewMinLine?symbol={symbol}&type={period}";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -38,7 +41,19 @@ pub async fn fetch_minute(
     if rows.is_empty() {
         bail!("接口没有返回K线数据");
     }
-    Ok(latest_rows(rows, count))
+    let now = chrono::Local::now().naive_local();
+    Ok(settled_kline_rows(latest_rows(rows, count), now))
+}
+
+/// 丢弃仍未过确认余量的分钟K线；只有时间戳已过去至少 30 秒的 bar 才允许入库。
+pub fn settled_kline_rows(rows: Vec<Kline>, now: NaiveDateTime) -> Vec<Kline> {
+    rows.into_iter()
+        .filter(|k| {
+            NaiveDateTime::parse_from_str(&k.datetime, "%Y-%m-%d %H:%M:%S")
+                .map(|ts| now.signed_duration_since(ts).num_seconds() >= MINUTE_BAR_SETTLE_SECS)
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 pub fn read_symbols(path: &std::path::Path) -> Result<Vec<String>> {
@@ -295,6 +310,25 @@ mod tests {
         let kept = latest_rows(std::mem::take(&mut rows), 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].datetime, "2026-08-02 09:05:00");
+    }
+
+    #[test]
+    fn settled_rows_waits_for_minute_bar_settle_grace() {
+        let row = Kline {
+            datetime: "2026-08-19 14:15:00".to_string(),
+            open: 2834.0,
+            high: 2846.0,
+            low: 2833.0,
+            close: 2836.0,
+            volume: 100.0,
+            hold: 1000.0,
+        };
+        let not_yet = NaiveDateTime::parse_from_str("2026-08-19 14:15:29", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        let settled = NaiveDateTime::parse_from_str("2026-08-19 14:15:30", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        assert!(settled_kline_rows(vec![row.clone()], not_yet).is_empty());
+        assert_eq!(settled_kline_rows(vec![row], settled).len(), 1);
     }
 
     #[test]

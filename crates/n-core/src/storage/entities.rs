@@ -215,3 +215,44 @@ pub mod rollovers {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// 用户批注：同一信号可有多条，只挂在 event_id 上，不影响识别与复盘数据。
+pub mod signal_annotations {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "signal_annotations")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub event_id: i64,
+        pub content: String,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// 用户是否按建议开仓：每个信号最多一条，避免反复勾选产生噪音。
+pub mod signal_decisions {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "signal_decisions")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub event_id: i64,
+        pub opened: bool,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

@@ -89,6 +89,13 @@ let tableSortable: Sortable | null = null
 /** 拖拽中：暂停行情/数据刷新，避免表格重渲染打断正在进行的拖拽 */
 const listDragging = ref(false)
 /** 插入线：将要插入到该代码行之前；null 表示插入到表格末尾 */
+const TABLE_REORDER_KEY = 'ntrend_dashboard_table_reorder_enabled'
+const tableReorderEnabled = ref(localStorage.getItem(TABLE_REORDER_KEY) === '1')
+watch(tableReorderEnabled, (v) => {
+  try { localStorage.setItem(TABLE_REORDER_KEY, v ? '1' : '0') } catch {}
+  if (tableSortable) tableSortable.option('disabled', !v)
+  else if (v) nextTick(() => setupTableSortable())
+})
 const insertBeforeCode = ref<string | null>(null)
 /** 拖拽结束后短暂抑制双击跳转，避免松手时误开K线图 */
 let suppressOpenChart = false
@@ -203,7 +210,7 @@ function openChart(row: WatchRow) {
 
 function rowProps(row: WatchRow): Record<string, unknown> {
   return {
-    style: `cursor: ${listDragging.value ? 'grabbing' : 'grab'}`,
+    style: `cursor: ${!tableReorderEnabled.value ? 'pointer' : listDragging.value ? 'grabbing' : 'grab'}`,
     class: [
       row.flash ? (row.flash === 'up' ? 'row-flash-up' : 'row-flash-down') : '',
       { 'insert-before': listDragging.value && insertBeforeCode.value === row.symbol.code },
@@ -230,6 +237,7 @@ function setupTableSortable() {
   tableSortable = Sortable.create(tbody, {
     animation: 150,
     draggable: 'tr[data-code]',
+    disabled: !tableReorderEnabled.value,
     // 排除启用开关等交互控件：点击开关正常切换，不触发拖拽
     filter: '.n-switch, input, button, textarea, select, a',
     preventOnFilter: false,
@@ -643,14 +651,16 @@ function stateCls(state: string): string {
   return 'muted'
 }
 
-/** 评分分档：3.5 起每 0.2 分一档，2.5-2.7 及以下保持最小样式 */
+/** 评分分档：达到配置门槛按完整样式显示，每低 0.2 分缩小变浅一档 */
 function scoreTier(score: number | null | undefined) {
-  if (score == null || score < 2.7) return 'score-0'
-  if (score >= 3.5) return 'score-5'
-  if (score >= 3.3) return 'score-4'
-  if (score >= 3.1) return 'score-3'
-  if (score >= 2.9) return 'score-2'
-  return 'score-1'
+  const fullScore = settingsStore.settings.ui.score_pill_full_score ?? 3.5
+  if (score == null) return 'score-0'
+  if (score >= fullScore) return 'score-5'
+  if (score >= fullScore - 0.2) return 'score-4'
+  if (score >= fullScore - 0.4) return 'score-3'
+  if (score >= fullScore - 0.6) return 'score-2'
+  if (score >= fullScore - 0.8) return 'score-1'
+  return 'score-0'
 }
 
 const columns: DataTableColumns<WatchRow> = [
@@ -887,7 +897,16 @@ onBeforeUnmount(() => {
         </template>
       </n-tabs>
       <n-space align="center" :size="8">
-        <n-text depth="3" style="font-size: 12px">双击行打开K线图，拖动行可排序</n-text>
+        <div class="reorder-control-dash" :class="{ 'is-enabled': tableReorderEnabled }" :title="tableReorderEnabled ? '已开启拖拽排序 · 拖动行可重排' : '已关闭拖拽 · 开启后可拖动表格行排序'">
+          <n-icon :component="GripVertical" class="reorder-icon-dash" :size="14" />
+          <span class="reorder-label-dash">拖拽排序</span>
+          <n-switch v-model:value="tableReorderEnabled" size="small" :rail-style="() => ({ background: tableReorderEnabled ? '#3b82f6' : undefined })">
+            <template #checked>开</template>
+            <template #unchecked>关</template>
+          </n-switch>
+          <span class="reorder-state-dash" :class="{ on: tableReorderEnabled }">{{ tableReorderEnabled ? '已开启' : '已关闭' }}</span>
+        </div>
+        <n-text depth="3" style="font-size: 12px">双击行打开K线图</n-text>
         <n-button size="small" type="primary" ghost @click="openCreateGroup">
           <template #icon>
             <n-icon :component="FolderPlus" />
@@ -909,7 +928,7 @@ onBeforeUnmount(() => {
     <div
       ref="tableWrapEl"
       class="watch-table-wrap"
-      :class="{ 'insert-at-end': listDragging && insertBeforeCode === null }"
+      :class="{ 'insert-at-end': listDragging && insertBeforeCode === null, 'reorder-enabled': tableReorderEnabled }"
     >
       <n-data-table
         class="watch-table"
@@ -1057,6 +1076,55 @@ onBeforeUnmount(() => {
   height: 100%;
   min-height: 0;
 }
+
+.reorder-control-dash {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px 5px 9px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+}
+.reorder-control-dash:hover {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+}
+.reorder-control-dash.is-enabled {
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  border-color: #93c5fd;
+  box-shadow: 0 1px 6px rgba(59,130,246,0.18);
+}
+.reorder-control-dash .reorder-icon-dash {
+  color: #94a3b8;
+  transition: color 0.2s;
+  flex: none;
+}
+.reorder-control-dash.is-enabled .reorder-icon-dash {
+  color: #3b82f6;
+}
+.reorder-label-dash {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+.reorder-control-dash.is-enabled .reorder-label-dash {
+  color: #1e40af;
+}
+.reorder-state-dash {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  white-space: nowrap;
+  min-width: 36px;
+}
+.reorder-state-dash.on {
+  color: #2563eb;
+}
 .group-bar {
   display: flex;
   align-items: center;
@@ -1201,6 +1269,9 @@ onBeforeUnmount(() => {
 }
 .group-row-chosen {
   background: #dbe9ff;
+}
+.watch-table-wrap:not(.reorder-enabled) :deep(tr[data-code]) {
+  cursor: pointer !important;
 }
 .watch-table-wrap {
   flex: 1;

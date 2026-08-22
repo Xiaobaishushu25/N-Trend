@@ -92,7 +92,7 @@ impl Grade {
     pub fn score_base(self) -> f64 {
         match self {
             Grade::A => 5.0,
-            Grade::B => 3.8,
+            Grade::B => 4.3,
             Grade::C => 2.5,
             Grade::TooShallow => 2.0,
             Grade::TooDeep => 1.0,
@@ -252,3 +252,4 @@ mod tests {
         }
     }
 }
+

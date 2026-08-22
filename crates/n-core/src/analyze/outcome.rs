@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::analyze::model::Bar;
 
 /// 前向事件系统版本号，写入复盘统计结果。
-pub const SIM_VERSION: i64 = 12;
+pub const SIM_VERSION: i64 = 13;
 /// 相似预警去重：预警K线最多相隔多少根 15m。
 pub const DEDUP_WARNING_BARS: usize = 5;
 /// 相似预警去重：计划/实际入场价差上限（按前一条信号的 risk 折算）。

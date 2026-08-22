@@ -1,5 +1,58 @@
 # 更新日志
 
+## 2026-08-22
+
+### B级结构与累计覆盖保守优化
+
+- `model.rs: Grade::B score_base 3.8 → 4.3`（A 5.0 / C 2.5 不变），缩小 A/B 倒挂，回测 B 胜率 52% > A 47.7% 的倒挂回归
+- `pattern.rs: b_too_long` 分级阈值 `A>8 / B>12 / C>14` 才扣 0.5（原统一 >8），B 平均 10.9 根不再被误伤；`best_pattern_for_b_end` 按 `score_a*0.6 + score_b*0.2` 择优，持仓不等时优先非 hard_failure
+- `scoring.rs: score_b` 中 `b_weakening +0.3` 仅 `!b_too_long` 时生效，避免过长已扣分再叠加
+- `scoring.rs: warning_base` 新增 `cumulative => 3.0`（原 2.0，`strong/wick` 3.5 保持），`CUMULATIVE_ENTRY_SCORE_MAX 3.49 → 3.9`，`wick` 维持 3.0 不进 3.5+ 标准仓；`dim_warning` 与 `entry_score` 注释同步
+- 单测同步：`b_leg_weakening` 期望 `3.8/4.1/3.3 → 4.3/4.6/3.8`，`entry_score_uses_60_20_20_and_caps_cumulative` 入参 `4,4,2 → 5,5,3` 触顶验证
+- 回测仿真（884 单库）：`>=3.5` 144→173 (+29)，胜率 48.3%→50.7%，`cumulative>=3.5` 0→29 笔且胜率 65%，B 在 3.5+ 由 26→45 笔保持优势
+
+### 强反转十字星与反向影线（2026-08-19 方案落地）
+
+- 允许吞没前一根十字星（`prev.close <= prev.open` / `prev.close >= prev.open`），实体需覆盖十字星参考价且严格大于其振幅 60%
+- 反向影线门槛 `STRONG_REVERSE_SHADOW_MAX_RATIO` 50% → 30% 概念收紧（代码层已将等值 30% 视为可识别，PB0 09:30 反向影线正好 30% 判 `strong`），超过 30% 不再识别为 `strong`
+- `EVENT_LOGIC_VERSION 4 → 5`，`SIM_VERSION 12 → 13`，`is_wick_warning_bar` 7 门槛与 `STRONG_ENGULF_BODY_ATR_MIN 0.25` 不变
+- 新增 `doji_engulf_warns_at_pb0_0930_like_bar` 与 BU0 1381 对照，SA0 1154 仍因未吞没不识别
+
+### K线结算等待与调度
+
+- `fetch/kline.rs` 新增 `MINUTE_BAR_SETTLE_SECS = 30` 与 `settled_kline_rows`，`fetch_minute` 按本地时间过滤未站稳的分钟 K 线，避免接口早推的未定型 K 线计入形态
+- `scheduler/mod.rs` 与 `service/mod.rs` 同步 30 秒 settle grace，`pattern_window_has_rollover_until` 与实时扫描对齐
+
+### 信号主观备注与判定
+
+- `storage/entities.rs` / `mod.rs` / `repo.rs` 新增 `signal_annotations` 与 `signal_decisions` 表及 `SignalUserData` 聚合，支持按 `event_id` 增删查备注与主观判定
+- `src-tauri/commands.rs` 新增 `get_signal_user_data / add_signal_annotation / delete_signal_annotation / set_signal_decision` 并在 `lib.rs` 注册
+- `ChartView.vue` 右侧卡片接入备注列表与判定切换，`ReviewView.vue` / `DashboardView.vue` 透传展示
+
+### 评分展示与配置
+
+- `config/mod.rs` 新增 `UiConfig.score_pill_full_score` 默认 3.5（每 0.2 一档浅一阶），`Default` 与用例同步
+- `ChartView.vue` / `ReviewView.vue` 评分药丸按可配置满分着色，`SettingsView.vue` 暴露配置项
+- `outcome.rs` `SIM_VERSION 12 → 13`，`DEDUP_WARNING_BARS` 5 根、`0.3R` 去重口径保持
+
+### 其他
+
+- `service/mod.rs` 重构扫描与去重流程，`storage/repo.rs` 补充 pending / dedup 索引，`types.ts` / `api.ts` / `stores/settings.ts` 同步前端类型与接口
+- 全量单测 `165 passed`（含新增十字星用例），历史落盘不回填
+
+
+
+## 2026-08-19
+
+### 强反转吞没十字星与反向影线门槛收紧
+
+- 允许吞没前一根十字星（开盘=收盘）：当前反向K线实体必须覆盖十字星参考价，且实体严格大于十字星振幅的 60%，防止小K线贴住十字星参考点冒充强反转
+- 反向影线门槛由「严格小于 50% 振幅」收紧为「不超过 30% 振幅（含 30%）」，超过 30% 不再识别为 `strong`
+- 普通实体吞没逻辑不变：仍要求反向收盘、实体覆盖前一根实体、至少一侧严格超过、实体至少 `0.25 × ATR20`、仅反转段第一根检查
+- PB0 2026-08-19 09:30（反向影线正好 30%、实体为十字星振幅 100%）与 JD0 10:45 均识别为 `strong`；SA0 1154 仍因前一根是阳线实体且未吞没不识别
+- `EVENT_LOGIC_VERSION` 4 → 5，`SIM_VERSION` 12 → 13；新口径只作用于重建或新扫描信号，历史落盘不回填
+- 新增文档 `docs/2026-08-19 强反转吞没十字星与30%反向影线.md`
+
 ## 2026-08-16
 
 ### 删除快速路径预警

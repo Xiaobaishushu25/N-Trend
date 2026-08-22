@@ -256,6 +256,8 @@ export interface UiConfig {
   chart_right_gap: number
   /** 进入K线图时默认显示首个信号形态 */
   chart_show_first_signal: boolean
+  /** 列表页/表格状态胶囊完整显示的最低评分；每低 0.2 分缩小变浅一档 */
+  score_pill_full_score: number
   /** 启用的K线周期，K线页切换栏只显示勾选的周期 */
   timeframes: string[]
   /** 上次打开的分组表格（null=全部品种），应用启动后恢复 */
@@ -407,6 +409,10 @@ export interface OutcomeDetail {
   rollover_crossed: boolean
   gap_crossed_entry: boolean
   gap_crossed_exit: boolean
+  /** 用户批注，按创建时间正序 */
+  annotations: SignalAnnotation[]
+  /** 用户是否按建议开仓；未记录为 null */
+  opened: boolean | null
 }
 
 export interface OutcomeRefresh {
@@ -417,6 +423,29 @@ export interface OutcomeRefresh {
 export interface ReviewSignalDetail {
   event: PatternEvent
   outcome: OutcomeDetail | null
+  annotations: SignalAnnotation[]
+  opened: boolean | null
+}
+
+/** 用户给信号写的批注 */
+export interface SignalAnnotation {
+  id: number
+  event_id: number
+  content: string
+  created_at: string
+}
+
+/** 用户是否按建议开仓的记录 */
+export interface SignalDecision {
+  event_id: number
+  opened: boolean
+  updated_at: string
+}
+
+/** 单个信号的用户记录聚合 */
+export interface SignalUserData {
+  annotations: SignalAnnotation[]
+  opened: boolean | null
 }
 
 /** K线图上重绘复盘点位所需的出场信息 */

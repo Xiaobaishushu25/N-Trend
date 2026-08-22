@@ -20,6 +20,9 @@ import type {
   ReviewStats,
   ScanResult,
   SchedulerStatus,
+  SignalAnnotation,
+  SignalDecision,
+  SignalUserData,
   SymbolRow,
   TrendPointDto,
 } from '../types'
@@ -100,6 +103,14 @@ export const api = {
     }),
   getReviewSignal: (eventId: number) =>
     invoke<ReviewSignalDetail | null>('get_review_signal', { eventId }),
+  getSignalUserData: (eventId: number) =>
+    invoke<SignalUserData>('get_signal_user_data', { eventId }),
+  addSignalAnnotation: (eventId: number, content: string) =>
+    invoke<SignalAnnotation>('add_signal_annotation', { eventId, content }),
+  deleteSignalAnnotation: (id: number) =>
+    invoke<void>('delete_signal_annotation', { id }),
+  setSignalDecision: (eventId: number, opened: boolean) =>
+    invoke<SignalDecision>('set_signal_decision', { eventId, opened }),
 
   getConfig: () => invoke<Config>('get_config'),
   updateConfig: (config: Config) => invoke<Config>('update_config', { config }),

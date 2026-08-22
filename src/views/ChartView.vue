@@ -1,19 +1,21 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import draggable from 'vuedraggable'
 import {
   NButton,
   NCheckbox,
+  NSwitch,
   NEmpty,
   NIcon,
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, List, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, GripVertical, List, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
+import SignalNotes from '../components/SignalNotes.vue'
 import { useGroupsStore } from '../stores/groups'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
@@ -340,10 +342,19 @@ const recentSignals = ref<PatternDto[]>([])
 const recentLoading = ref(false)
 let recentSeq = 0
 
-/** 该品种最近的历史形态：排除仍在途的当前信号，按事件编号倒序保留 5 个。 */
+/** 该品种最近的历史形态：排除仍在途的当前信号，按预警时间倒序保留 5 个。 */
 const recentHistorySignals = computed<PatternDto[]>(() => {
   const activeNumbers = new Set(signals.value.map((s) => s.number))
-  return recentSignals.value.filter((s) => !activeNumbers.has(s.number)).slice(0, 5)
+  return recentSignals.value
+    .filter((s) => !activeNumbers.has(s.number))
+    .slice()
+    .sort((a, b) => {
+      const ta = a.warning_ts ?? ''
+      const tb = b.warning_ts ?? ''
+      if (ta !== tb) return tb.localeCompare(ta)
+      return b.number - a.number
+    })
+    .slice(0, 5)
 })
 
 async function loadRecentPatterns() {
@@ -358,7 +369,12 @@ async function loadRecentPatterns() {
   try {
     const rows = await api.getRecentOutcomes(20, { symbol: sym })
     if (seq !== recentSeq) return
-    recentSignals.value = rows.map(toChartSignalFromOutcome)
+    recentSignals.value = rows.map(toChartSignalFromOutcome).sort((a, b) => {
+      const ta = a.warning_ts ?? ''
+      const tb = b.warning_ts ?? ''
+      if (ta !== tb) return tb.localeCompare(ta)
+      return b.number - a.number
+    })
   } catch {
     if (seq === recentSeq) recentSignals.value = []
   } finally {
@@ -495,10 +511,13 @@ const displayRows = computed<KlineRow[]>(() => {
   if (!live.length) return rows
   const liveByTs = new Map(live.map((b) => [b.ts, b]))
   const rowByTs = new Map(rows.map((r) => [r.ts, r]))
+  // 只有最后一根实时桶还在形成中，允许它更新历史行；
+  // 更早的“已收未落地”桶一旦库里已有成形K线，就以库内为准，避免旧实时收盘覆盖落库结果。
+  const currentLiveTs = live.length ? live[live.length - 1].ts : null
   const out: KlineRow[] = []
   for (const r of rows) {
     const bar = liveByTs.get(r.ts)
-    if (bar) {
+    if (bar && bar.ts === currentLiveTs) {
       // 库内已有同桶K线（刷新落库的成形桶）：保留真实开盘/成交量，
       // 实时值只负责把高低扩展到已观测到的范围、并更新收盘
       out.push({
@@ -531,6 +550,12 @@ const groupSymbols = ref<SymbolRow[]>([])
 let symbolSuppressClick = false
 /** 插入线：将要插入到该代码行之前；null 表示插入到列表末尾 */
 const insertBeforeCode = ref<string | null>(null)
+const LIST_REORDER_KEY = 'ntrend_chart_list_reorder_enabled'
+const reorderEnabled = ref(localStorage.getItem(LIST_REORDER_KEY) === '1')
+watch(reorderEnabled, (v) => {
+  try { localStorage.setItem(LIST_REORDER_KEY, v ? '1' : '0') } catch {}
+})
+const isListDragDisabled = computed(() => reviewMode.value || !reorderEnabled.value)
 const listDragging = ref(false)
 
 /** 拉取当前分组的成员（按组内 sort_index 顺序） */
@@ -790,14 +815,16 @@ function sigType(state: string) {
   return 'expired'
 }
 
-/** 评分分档：3.5 起每 0.2 分一档，2.5-2.7 及以下保持最小样式 */
+/** 评分分档：达到配置门槛按完整样式显示，每低 0.2 分缩小变浅一档 */
 function scoreTier(score: number | null | undefined) {
-  if (score == null || score < 2.7) return 'score-0'
-  if (score >= 3.5) return 'score-5'
-  if (score >= 3.3) return 'score-4'
-  if (score >= 3.1) return 'score-3'
-  if (score >= 2.9) return 'score-2'
-  return 'score-1'
+  const fullScore = settingsStore.settings.ui.score_pill_full_score ?? 3.5
+  if (score == null) return 'score-0'
+  if (score >= fullScore) return 'score-5'
+  if (score >= fullScore - 0.2) return 'score-4'
+  if (score >= fullScore - 0.4) return 'score-3'
+  if (score >= fullScore - 0.6) return 'score-2'
+  if (score >= fullScore - 0.8) return 'score-1'
+  return 'score-0'
 }
 
 /** 悬停提示：形态编号、方向、级别、状态与触发/预警时间 */
@@ -1192,6 +1219,8 @@ onMounted(async () => {
   )
   unlisteners.push(
     await onDataUpdated(() => {
+      // 数据库刷新后实时临时桶已经转正，清掉残留，避免旧收盘继续覆盖历史K线
+      liveBars.value = []
       loadSnapshots()
       scansStore.refreshLatestSignals()
       loadRecentPatterns()
@@ -1299,6 +1328,16 @@ onBeforeUnmount(() => {
         </span>
       </div>
 
+            <div class="reorder-control" :class="{ 'is-enabled': reorderEnabled && !reviewMode, disabled: reviewMode }" :title="reviewMode ? '复盘模式下不可排序' : (reorderEnabled ? '已开启拖拽排序 · 拖动左侧品种可重排' : '已关闭拖拽 · 开启后可拖动左侧品种排序')">
+              <n-icon :component="GripVertical" class="reorder-icon" :size="14" />
+              <span class="reorder-label">拖拽排序</span>
+              <n-switch v-model:value="reorderEnabled" size="small" :disabled="reviewMode" :rail-style="() => ({ background: reorderEnabled && !reviewMode ? '#3b82f6' : undefined })">
+                <template #checked>开</template>
+                <template #unchecked>关</template>
+              </n-switch>
+              <span class="reorder-state" :class="{ on: reorderEnabled && !reviewMode }">{{ reorderEnabled && !reviewMode ? '已开启' : '已关闭' }}</span>
+            </div>
+
       <div class="topbar-timeframes">
         <div class="tf-group">
           <button
@@ -1357,13 +1396,13 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="main">
-      <div v-if="showList" class="symbol-list can-reorder">
+      <div v-if="showList" class="symbol-list" :class="{ 'can-reorder': reorderEnabled && !reviewMode }">
         <div class="sl-title">品种</div>
         <n-scrollbar style="flex: 1">
           <VueDraggable
             v-model="groupSymbols"
             item-key="code"
-            :disabled="reviewMode"
+            :disabled="isListDragDisabled"
             class="sl-list"
             :class="{ 'insert-at-end': listDragging && insertBeforeCode === null }"
             :animation="150"
@@ -1544,7 +1583,51 @@ onBeforeUnmount(() => {
                   </span>
                   <span class="rv-exit">{{ reviewExitLabel[row.exit_reason] ?? row.exit_reason }}</span>
                 </div>
+                <div class="rv-user">
+                  <!-- 第一行：开仓状态 + 批注数量 -->
+                  <div class="rv-ann-header">
+    <span
+        class="rv-opened"
+        :class="{
+        'is-open': row.opened === true,
+        'is-skip': row.opened === false
+      }"
+    >
+      {{ row.opened == null ? '开仓未记录' : row.opened ? '已按建议开仓' : '未开仓' }}
+    </span>
 
+                    <span
+                        v-if="row.annotations?.length"
+                        class="rv-ann-count"
+                    >
+      共 {{ row.annotations.length }} 条批注
+    </span>
+                  </div>
+
+                  <!-- 第二行开始：具体批注 -->
+                  <div
+                      v-if="row.annotations?.length"
+                      class="rv-ann"
+                  >
+                    <div
+                        v-for="(annotation, index) in row.annotations"
+                        :key="index"
+                        class="rv-ann-item"
+                    >
+      <span class="rv-ann-index">
+        {{ index + 1 }}.
+      </span>
+
+                      <span class="rv-ann-content">
+        {{ annotation.content }}
+      </span>
+
+                      <span class="rv-ann-time">
+        {{ annotation.created_at }}
+      </span>
+                    </div>
+                  </div>
+                </div>
                 <div class="rv-grid">
                   <div class="rv-item">
                     <span>预警时间</span>
@@ -1787,6 +1870,7 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div class="pc-note">{{ s.note }}</div>
+                <SignalNotes :event-id="s.number" />
               </div>
             </div>
             <div v-else class="patterns-empty">当前品种暂无识别出的信号</div>
@@ -1866,6 +1950,7 @@ onBeforeUnmount(() => {
                   <span>b段 {{ r.b_bars }}根 / {{ r.b_move.toFixed(1) }}点</span>
                   <span>回撤 {{ (r.retracement * 100).toFixed(1) }}%</span>
                 </div>
+                <SignalNotes :event-id="r.number" />
               </div>
             </div>
             <div v-else class="patterns-empty">该品种暂无历史形态</div>
@@ -1943,6 +2028,59 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
   padding: 2px 8px;
   border-radius: 999px;
+}
+.reorder-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 5px 10px 5px 9px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+}
+.reorder-control:hover {
+  border-color: #cbd5e1;
+  background: #f1f5f9;
+}
+.reorder-control.is-enabled {
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  border-color: #93c5fd;
+  box-shadow: 0 1px 6px rgba(59,130,246,0.18);
+}
+.reorder-control.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.reorder-control .reorder-icon {
+  color: #94a3b8;
+  transition: color 0.2s;
+  flex: none;
+}
+.reorder-control.is-enabled .reorder-icon {
+  color: #3b82f6;
+}
+.reorder-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+  letter-spacing: 0.2px;
+}
+.reorder-control.is-enabled .reorder-label {
+  color: #1e40af;
+}
+.reorder-state {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  white-space: nowrap;
+  min-width: 36px;
+}
+.reorder-state.on {
+  color: #2563eb;
 }
 .topbar-timeframes {
   display: flex;
@@ -2549,6 +2687,76 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   color: #64748b;
 }
+.rv-user {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  min-width: 0;
+}
+
+.rv-ann-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.rv-opened {
+  flex: 0 0 auto;
+  color: #94a3b8;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #f1f5f9;
+}
+
+.rv-opened.is-open {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+  font-weight: 700;
+}
+
+.rv-opened.is-skip {
+  color: #64748b;
+}
+
+.rv-ann-count {
+  flex: 0 0 auto;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.rv-ann {
+  min-width: 0;
+  margin-top: 6px;
+  padding: 0;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+  overflow: visible;
+}
+
+.rv-ann-item {
+  display: block;
+  margin: 0 0 4px 0;
+  padding: 0;
+}
+
+.rv-ann-item:last-child {
+  margin-bottom: 0;
+}
+
+.rv-ann-index {
+  margin-right: 4px;
+  color: #94a3b8;
+}
+.rv-ann-time {
+  flex: 0 0 auto;
+  margin-left: 8px;
+  color: #94a3b8;
+  font-size: 11px;
+}
 .rv-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2867,4 +3075,27 @@ onBeforeUnmount(() => {
   line-height: 1.6;
   color: #94a3b8;
 }
+
+.rv-ann {
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.rv-ann-item {
+  margin-bottom: 6px;
+}
+
+.rv-ann-item:last-child {
+  margin-bottom: 0;
+}
+
+.rv-ann-index {
+  margin-right: 4px;
+  color: #94a3b8;
+}
 </style>
+
+

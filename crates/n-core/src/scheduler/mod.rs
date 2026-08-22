@@ -1,12 +1,14 @@
 //! 调度状态机（纯逻辑，可单测）：数据刷新与扫描动作的时机判定。
 //!
 //! 默认节奏：每 5 分钟增量刷新 5m 数据，刷新按分钟网格边界对齐（间隔/60 的整数倍分钟，含整点）；
-//! 每 15 分钟边界（:00/:15/:30/:45）跑一次分析。
+//! 每 15 分钟边界顺延 30 秒（:00:30/:15:30/:30:30/:45:30）跑一次分析，给刚收盘的K线留确认余量。
 //! 拉取/分析耗时不会把下一次任务向后推；App 启动时的首次独立补拉由调度循环层处理。
 //! 交易时段过滤默认开启：仅在国内期货日盘/夜盘窗口内触发，避免无效请求。
 
 use chrono::{DateTime, Datelike, Local, NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
+
+use crate::fetch::kline::MINUTE_BAR_SETTLE_SECS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -48,14 +50,19 @@ pub fn next_action(
     // 刷新按分钟网格对齐：间隔 300 秒 → 分钟能被 5 整除（含 :00）才到期；
     // 同时仍要求距上次刷新已满间隔，避免同一个边界时刻重复触发。
     let align_min = (cfg.refresh_interval_secs / 60).max(1) as u32;
-    let refresh_due = now.minute() % align_min == 0
+    let normal_refresh_due = now.minute() % align_min == 0
         && last_refresh.map_or(true, |t| {
             (now - t).num_seconds() >= cfg.refresh_interval_secs as i64
         });
-    let scan_due = now.minute() % 15 == 0
+    // 分析要等 15 分钟边界顺延 30 秒，确保最后一根 5m 成分K线已过确认余量；
+    // 到点后需要先补拉一次，扫描才不会沿用边界时刻的临时值。
+    let settled_scan_due = now.minute() % 15 == 0
+        && now.second() >= MINUTE_BAR_SETTLE_SECS as u32
         && last_scan.map_or(true, |t| {
             (now - t).num_seconds() >= cfg.scan_interval_secs as i64
         });
+    let refresh_due = normal_refresh_due || settled_scan_due;
+    let scan_due = settled_scan_due;
 
     match (refresh_due, scan_due) {
         (true, true) => SchedulerAction::RefreshAndScan,
@@ -111,6 +118,15 @@ mod tests {
             .unwrap()
     }
 
+    fn dt_sec(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Local> {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, s)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+    }
+
     #[test]
     fn trading_window_weekday_day() {
         assert!(is_trading_time(&dt(2026, 8, 3, 9, 30))); // 周一早盘
@@ -148,7 +164,7 @@ mod tests {
     #[test]
     fn refresh_fires_at_session_close() {
         let cfg = SchedulerConfig::default();
-        // 14:55 已刷新过，15:00 收盘那一分钟仍触发刷新（补最后一根K线）+ 扫描
+        // 14:55 已刷新过，15:00 先补最后一根K线；15:00:30 再带刷新扫描
         assert_eq!(
             next_action(
                 dt(2026, 8, 3, 15, 0),
@@ -156,32 +172,58 @@ mod tests {
                 Some(dt(2026, 8, 3, 14, 55)),
                 Some(dt(2026, 8, 3, 14, 45)),
             ),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 15, 0, 30),
+                &cfg,
+                Some(dt(2026, 8, 3, 15, 0)),
+                Some(dt(2026, 8, 3, 14, 45)),
+            ),
             SchedulerAction::RefreshAndScan
         );
     }
 
     #[test]
-    fn scan_only_on_boundaries() {
+    fn scan_runs_thirty_seconds_after_boundary_with_refresh() {
         let cfg = SchedulerConfig::default();
+        // 边界整点只刷新，分析留到 +30 秒
         assert_eq!(
-            next_action(dt(2026, 8, 3, 9, 15), &cfg, None, None),
+            next_action(
+                dt(2026, 8, 3, 9, 15),
+                &cfg,
+                None,
+                None,
+            ),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 15, 30),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 15)),
+                Some(dt(2026, 8, 3, 9, 0)),
+            ),
             SchedulerAction::RefreshAndScan
         );
+        // 非边界时刻不额外动作
         assert_eq!(
             next_action(
                 dt(2026, 8, 3, 9, 20),
                 &cfg,
                 Some(dt(2026, 8, 3, 9, 16)),
-                Some(dt(2026, 8, 3, 9, 15))
+                Some(dt_sec(2026, 8, 3, 9, 15, 30)),
             ),
             SchedulerAction::None
         );
+        // 下一个边界 +30 秒照常刷新 + 扫描
         assert_eq!(
             next_action(
-                dt(2026, 8, 3, 9, 30),
+                dt_sec(2026, 8, 3, 9, 30, 30),
                 &cfg,
-                Some(dt(2026, 8, 3, 9, 20)),
-                Some(dt(2026, 8, 3, 9, 15))
+                Some(dt(2026, 8, 3, 9, 25)),
+                Some(dt_sec(2026, 8, 3, 9, 15, 30)),
             ),
             SchedulerAction::RefreshAndScan
         );
@@ -200,14 +242,23 @@ mod tests {
             next_action(dt(2026, 8, 3, 9, 20), &cfg, None, None),
             SchedulerAction::Refresh
         );
-        // 15 分钟边界（含整点 0 分）：刷新 + 扫描
+        // 15 分钟边界：边界整点先刷新，30 秒后才刷新 + 扫描
         assert_eq!(
             next_action(dt(2026, 8, 3, 9, 30), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 30, 30),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 30)),
+                None,
+            ),
             SchedulerAction::RefreshAndScan
         );
         assert_eq!(
             next_action(dt(2026, 8, 3, 10, 0), &cfg, None, None),
-            SchedulerAction::RefreshAndScan
+            SchedulerAction::Refresh
         );
         // 同一边界时刻已刷新过（不足一个间隔）：不再重复
         assert_eq!(
@@ -231,7 +282,7 @@ mod tests {
         let mut off = cfg.clone();
         off.trading_only = false;
         assert_eq!(
-            next_action(dt(2026, 8, 3, 16, 0), &off, None, None),
+            next_action(dt_sec(2026, 8, 3, 16, 0, 30), &off, None, None),
             SchedulerAction::RefreshAndScan
         );
     }

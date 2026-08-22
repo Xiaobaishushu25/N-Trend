@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn bu0_1381_half_range_reverse_shadow_is_rejected_by_b_grade_gate() {
         // BU0 1381 复盘对照：22:30 阳线 O4180 H4192 L4180 C4186，
-        // 实体 6、上影 6、振幅 12，反向影线正好 50%，B级不识别为强反转。
+        // 实体 6、上影 6、振幅 12，反向影线 50% 已超过新的 30% 门槛，仍不识别为强反转。
         let atr20 = vec![Some(10.0); 3];
         let trend_k = vec![(false, false); 3];
         let bars = vec![
@@ -562,6 +562,37 @@ mod tests {
     }
 
     #[test]
+    fn doji_engulf_warns_at_pb0_0930_like_bar() {
+        // PB0 2026-08-19 09:30 对照：前一根 09:15 十字星
+        // O15950 H15960 L15930 C15950 被 09:30 大阴线覆盖，
+        // 反向影线正好 30%，识别层应在 09:30 返回 strong。
+        let atr20 = vec![Some(30.0); 3];
+        let trend_k = vec![(false, false); 3];
+        let bars = vec![
+            bar(dt(2026, 8, 19, 9, 0), 15930.0, 15960.0, 15920.0, 15940.0),
+            bar(dt(2026, 8, 19, 9, 15), 15950.0, 15960.0, 15930.0, 15950.0),
+            bar(dt(2026, 8, 19, 9, 30), 15950.0, 15955.0, 15905.0, 15920.0),
+        ];
+        let p = NPattern {
+            s1: Swing {
+                index: 0,
+                price: 16000.0,
+                is_high: false,
+            },
+            s2: Swing {
+                index: 1,
+                price: 15950.0,
+                is_high: true,
+            },
+            ..pattern_for(Dir::Down, 16100.0, 16000.0, 15950.0)
+        };
+        assert_eq!(
+            warning_kind_at(&bars, &atr20, &trend_k, &p, 2),
+            Some("strong")
+        );
+    }
+
+    #[test]
     fn oversized_warning_k_lowers_realtime_dim_warning_for_both_directions() {
         let atr20 = vec![Some(10.0), Some(10.0), Some(10.0)];
         let t = dt(2026, 8, 7, 21, 15);
@@ -578,7 +609,7 @@ mod tests {
         let up_small_bars = vec![
             bar(t, 100.0, 100.0, 100.0, 100.0),
             bar(t, 141.0, 150.0, 109.0, 140.0),
-            bar(t, 139.0, 144.0, 138.0, 141.5),
+            bar(t, 139.0, 144.0, 138.0, 142.5),
         ];
         let p_up = pattern_for(Dir::Up, 100.0, 150.0, 138.0);
         let big_up = candidate_for(&up_bars, &atr20, &up_trend, &up_relaxed, &p_up, 2, 1.0)

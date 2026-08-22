@@ -56,6 +56,14 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
             .create_table_from_entity(entities::rollovers::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::signal_annotations::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::signal_decisions::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     for table in tables {
@@ -64,6 +72,12 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     }
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_signal_annotations_event_id \
+         ON signal_annotations(event_id)",
+    )
+    .await
+    .context("创建批注索引失败")?;
 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
