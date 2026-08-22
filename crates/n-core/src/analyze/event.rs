@@ -26,6 +26,8 @@ pub struct WarningCandidate {
     pub target: f64,
     pub risk: f64,
     pub rr: f64,
+    pub trend_state: String,
+    pub trend_bonus: f64,
 }
 
 fn is_opposite_close(bar: &Bar, dir: Dir) -> bool {
@@ -165,6 +167,8 @@ fn candidate_for(
         target,
         risk,
         rr: space / risk,
+        trend_state: String::new(),
+        trend_bonus: 0.0,
     })
 }
 
@@ -696,3 +700,5 @@ mod tests {
         assert_eq!(warning_kind_at(&bars, &atr20, &trend_k, &short_b, 2), None);
     }
 }
+
+

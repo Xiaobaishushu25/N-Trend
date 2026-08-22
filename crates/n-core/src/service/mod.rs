@@ -224,6 +224,8 @@ async fn insert_warning_event(
         "dim_a": candidate.dim_a,
         "dim_b": candidate.dim_b,
         "dim_warning": candidate.dim_warning,
+        "trend_state": candidate.trend_state,
+        "trend_bonus": candidate.trend_bonus,
     })
     .to_string();
     let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);
@@ -2921,6 +2923,8 @@ mod tests {
             target: 2233.0,
             risk: 5.0,
             rr: 0.4,
+            trend_state: String::new(),
+            trend_bonus: 0.0,
         };
 
         assert_eq!(
@@ -3133,6 +3137,8 @@ mod tests {
             target: 14210.0,
             risk: 35.0,
             rr: 1.0,
+            trend_state: String::new(),
+            trend_bonus: 0.0,
         };
         let mut existing = pattern_event(397, 3.8, "triggered");
         existing.warning_ts = "2026-08-14 22:30:00".to_string();
@@ -3170,6 +3176,8 @@ mod tests {
             target: 15100.0,
             risk: 50.0,
             rr: 1.0,
+            trend_state: String::new(),
+            trend_bonus: 0.0,
         };
         let mut existing = pattern_event(397, 3.8, "triggered");
         existing.warning_ts = "2026-08-14 22:30:00".to_string();
@@ -3209,6 +3217,8 @@ mod tests {
             target: 15100.0,
             risk: 50.0,
             rr: 1.0,
+            trend_state: String::new(),
+            trend_bonus: 0.0,
         };
         let mut existing = pattern_event(397, 3.8, "closed");
         existing.warning_ts = "2026-08-14 22:30:00".to_string();
@@ -3437,3 +3447,8 @@ fn kline_model(ts: &str) -> klines::Model {
         source: "derived".to_string(),
     }
 }
+
+
+
+
+

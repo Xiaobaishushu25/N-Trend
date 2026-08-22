@@ -244,6 +244,7 @@ function patternStateRank(state: string): number {
 }
 
 /** 把新事件表记录转换成图表组件使用的旧形态结构 */
+function parseTrendDims(dims: string): {state: string; bonus: number} { try{ const o=JSON.parse(dims); return {state: o.trend_state || "", bonus: Number(o.trend_bonus)||0 } }catch{ return {state:"",bonus:0} } }
 function toChartSignal(e: PatternEvent): PatternDto {
   const s0High = e.direction === 'down'
   return {
@@ -277,6 +278,9 @@ function toChartSignal(e: PatternEvent): PatternDto {
     trigger_overshoot_r: e.overshoot_r,
     box: null,
     note: '',
+    trend_state: parseTrendDims(e.entry_score_dims).state,
+    trend_bonus: parseTrendDims(e.entry_score_dims).bonus,
+    trend_label: trendText(parseTrendDims(e.entry_score_dims).state),
     active: true,
   }
 }
@@ -315,6 +319,9 @@ function toChartSignalFromOutcome(row: OutcomeDetail): PatternDto {
     trigger_overshoot_r: row.overshoot_r,
     box: null,
     note: '',
+    trend_state: parseTrendDims(row.entry_score_dims).state,
+    trend_bonus: parseTrendDims(row.entry_score_dims).bonus,
+    trend_label: trendText(parseTrendDims(row.entry_score_dims).state),
     active: false,
   }
 }
@@ -3133,5 +3140,8 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
+
+
+
 
 
