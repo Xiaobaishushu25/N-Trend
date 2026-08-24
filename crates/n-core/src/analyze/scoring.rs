@@ -43,10 +43,11 @@ enum ALegBarKind {
 // 同色小K给轻分，速度因子负责惩罚“全是小K”的慢腿；
 // 大K、逆势长影、普通/大反向K直接扣分。
 const A_LEG_BAR_CLEAN: f64 = 1.0;
-const A_LEG_BAR_PLAIN_SAME: f64 = 0.6;
+const A_LEG_BAR_PLAIN_SAME: f64 = 0.4;
 const A_LEG_BAR_BIG_SAME: f64 = -0.6;
 const A_LEG_BAR_WICK: f64 = -0.5;
 const A_LEG_BAR_REVERSE_WICK: f64 = -0.9;
+const A_LEG_BAR_REVERSE_WICK_ENDPOINT_EXTRA: f64 = 0.5;
 const A_LEG_BAR_DOJI: f64 = -0.1;
 const A_LEG_BAR_FAVORABLE_WICK: f64 = 0.2;
 const A_LEG_BAR_SMALL_REVERSE: f64 = -0.4;
@@ -87,11 +88,11 @@ const A_LEG_AMPLITUDE_CAP_PER_N_ATR: f64 = 0.5;
 const A_LEG_AMPLITUDE_CAP_DECAY_ATR: f64 = 4.0;
 const A_LEG_AMPLITUDE_CAP_DECAY_MAX: f64 = 0.4;
 const A_LEG_AMPLITUDE_FLOOR: f64 = 0.6;
-// A段跳空处理：向上、向下跳空都统计，单根缺口达到 1 倍 ATR 才算大跳空。
+// A段跳空处理：向上、向下跳空都统计，单根缺口达到 0.8 倍 ATR 才算大跳空。
 // 大跳空先剔除出 a_move，不再贡献幅度和推进速度；再按
-// “每根 0.15 + 超出 1 倍 ATR 部分每 ATR 0.20”计惩罚，封顶 0.5。
+// “每根 0.15 + 超出 0.8 倍 ATR 部分每 ATR 0.20”计惩罚，封顶 0.5。
 // 跨合约换月的 rollover bar 不构成真实跳空，不参与统计。
-const A_LEG_GAP_MIN_ATR: f64 = 1.0;
+const A_LEG_GAP_MIN_ATR: f64 = 0.8;
 const A_LEG_GAP_PENALTY_PER_GAP: f64 = 0.15;
 const A_LEG_GAP_PENALTY_PER_EXCESS_ATR: f64 = 0.20;
 const A_LEG_GAP_PENALTY_MAX: f64 = 0.5;
@@ -173,7 +174,7 @@ pub(crate) fn a_leg_detail(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) ->
 ///    S1 最后一根固定权重 1，其余权重 = clamp(振幅/ATR, 0.25, 2.0)；
 /// 4. 幅度因子带甜区：1.5~2.5 ATR 过渡，2.5 ATR 起满档，上限随
 ///    N_ATR（A+B 净幅度）浮动到 8+（N-12）×0.5，超过上限线性降到 0.6；
-/// 5. A段内部大跳空按次数和超出 1 倍 ATR 的部分单独扣分，
+/// 5. A段内部大跳空按次数和超出 0.8 倍 ATR 的部分单独扣分，
 ///    向上、向下都统计，且不再参与幅度和速度收益。
 pub(crate) fn score_a(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
     let d = a_leg_detail(bars, atr20, p);
@@ -199,7 +200,10 @@ fn a_leg_clean_fit(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> f64 {
             continue;
         };
         let atr = atr20.get(i).copied().flatten();
-        let (score, _) = a_leg_bar_score_detail(bar, atr, p.dir);
+        let (mut score, kind) = a_leg_bar_score_detail(bar, atr, p.dir);
+        if i == p.s1.index && kind == ALegBarKind::ReverseWick {
+            score -= A_LEG_BAR_REVERSE_WICK_ENDPOINT_EXTRA;
+        }
         let weight = if i == p.s1.index {
             1.0
         } else {
@@ -325,7 +329,7 @@ fn a_leg_bar_score_detail(bar: &Bar, atr: Option<f64>, dir: Dir) -> (f64, ALegBa
 }
 
 /// A段大跳空信息：返回（缺口合计、跳空根数、扣分）。
-/// 单根缺口低于 1 倍 ATR 视为可接受的正常波动，不参与扣分。
+/// 单根缺口低于 0.8 倍 ATR 视为可接受的正常波动，不参与扣分。
 fn a_leg_gap_info(bars: &[Bar], p: &NPattern, atr: f64) -> (f64, usize, f64) {
     if atr <= 0.0 || p.a_move <= 0.0 {
         return (0.0, 0, 0.0);
@@ -1344,7 +1348,7 @@ mod tests {
         // 干净同色：实体占比≥0.55、逆势影≤0.4 实体、振幅 0.4~2.0 ATR。
         assert!((a_leg_bar_score(&bar(100.0, 113.0, 98.0, 112.0), Some(10.0), Dir::Up) - 1.0).abs() < 1e-9);
         // 普通同色：实体占比不足，给轻分。
-        assert!((a_leg_bar_score(&bar(100.0, 104.0, 97.0, 102.0), Some(10.0), Dir::Up) - 0.6).abs() < 1e-9);
+        assert!((a_leg_bar_score(&bar(100.0, 104.0, 97.0, 102.0), Some(10.0), Dir::Up) - 0.4).abs() < 1e-9);
         // 大同色：振幅超过 2.5 ATR 直接扣分。
         assert!((a_leg_bar_score(&bar(100.0, 130.0, 98.0, 128.0), Some(10.0), Dir::Up) - -0.6).abs() < 1e-9);
         // 无长影的十字星只轻扣。
@@ -1458,8 +1462,8 @@ mod tests {
             a_move: 100.0,
             ..pattern()
         };
-        // 向上跳空12点、向下跳空12点，都达到 1 倍 ATR（10）门槛，
-        // 缺口合计 24，扣 2×0.15 + 0.4×0.20 = 0.38。
+        // 向上跳空12点、向下跳空12点，都达到 0.8 倍 ATR（8）门槛，
+        // 缺口合计 24，扣 2×0.15 + 0.8×0.20 = 0.46。
         let both = vec![
             bar(0.0, 100.0, 100.0, 100.0),
             bar(110.0, 112.0, 112.0, 112.0),
@@ -1468,12 +1472,12 @@ mod tests {
         let (gap_sum, gap_count, penalty) = a_leg_gap_info(&both, &p, 10.0);
         assert!((gap_sum - 24.0).abs() < 1e-9);
         assert_eq!(gap_count, 2);
-        assert!((penalty - 0.38).abs() < 1e-9);
+        assert!((penalty - 0.46).abs() < 1e-9);
 
-        // 单根缺口 8 点小于 1 倍 ATR（10），小跳空不扣分。
+        // 单根缺口 7 点小于 0.8 倍 ATR（8），小跳空不扣分。
         let small = vec![
             bar(0.0, 100.0, 100.0, 100.0),
-            bar(106.0, 108.0, 108.0, 108.0),
+            bar(105.0, 107.0, 107.0, 107.0),
             bar(90.0, 100.0, 90.0, 90.0),
         ];
         assert_eq!(a_leg_gap_info(&small, &p, 10.0), (0.0, 0, 0.0));
@@ -1526,7 +1530,7 @@ mod tests {
         // 两根干净同色K权重 2 和 1，avg=(1×2+1×1+0×0.25)/3.25=12/13，
         // clean=(12/13+2)/3=38/39；速度 2.0 ATR/根已进入过快降权 0.6；
         // dim_a=0.5+4.5×1×0.6×(38/39)-0.15=2.980769231。
-        assert!((score_a(&bars, &atr, &p) - 2.980769231).abs() < 1e-9);
+        assert!((score_a(&bars, &atr, &p) - 2.940769230769231).abs() < 1e-9);
     }
 
     #[test]
