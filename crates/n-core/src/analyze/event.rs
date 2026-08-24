@@ -144,6 +144,7 @@ fn candidate_for(
         return None;
     }
 
+    let trend = indicators::analyze_60m(&bars[..=w.min(bars.len().saturating_sub(1))]);
     Some(WarningCandidate {
         direction: p.dir,
         grade: p.grade.label().to_string(),
@@ -167,7 +168,7 @@ fn candidate_for(
         target,
         risk,
         rr: space / risk,
-        trend_state: String::new(),
+        trend_state: trend.direction.clone(),
         trend_bonus: 0.0,
     })
 }

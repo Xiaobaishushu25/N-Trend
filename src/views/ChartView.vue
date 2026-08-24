@@ -113,6 +113,9 @@ const reviewFocusTs = computed<string | null>(() => {
   const ev = reviewOverlay.value?.event
   return ev?.trigger_ts || ev?.warning_ts || null
 })
+const reviewFocusKey = computed<number | null>(() => reviewSignalId.value)
+watch(reviewFocusTs, (v) => console.log("[review] focusTs ->", String(v), "key", String(reviewSignalId.value)))
+watch(reviewFocusKey, (v) => console.log("[review] focusKey ->", String(v), "ts", String(reviewFocusTs.value)))
 
 let reviewOverlaySeq = 0
 async function loadReviewOverlay() {
@@ -1513,7 +1516,7 @@ onBeforeUnmount(() => {
           :signals="visibleSignals"
           :show-extremes="showExtremes"
           :review-exit="reviewExit"
-          :focus-ts="reviewFocusTs"
+          :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
           :trend-points="trendPoints"
           :loading="klinesStore.loading"
         />
@@ -1666,6 +1669,10 @@ onBeforeUnmount(() => {
                   <div class="rv-item">
                     <span>预警时间</span>
                     <b>{{ fmtRecentTime(row.warning_ts) }}</b>
+                  </div>
+                  <div class="rv-item">
+                    <span>60m趋势</span>
+                    <b :class="trendClass(parseTrendDims(row.entry_score_dims).state)">{{ trendText(parseTrendDims(row.entry_score_dims).state) }}</b>
                   </div>
                   <div class="rv-item">
                     <span>触发时间</span>
@@ -1840,7 +1847,7 @@ onBeforeUnmount(() => {
                     <span class="pc-dir">{{ dirText(s.direction) }} {{ levelSuffix(s.level) }}</span>
                     <span class="pc-grade">{{ s.grade }}</span>
                     <span class="pc-warning">{{ warningKindText(s.warning_kind) }}</span>
-                    <span class="pc-trend" :class="trendClass(s.trend_state)" :title="s.trend_state || ''">{{ trendText(s.trend_state) }}<em v-if="s.trend_bonus"> {{ trendBonusText(s) }}</em></span>
+                    <span v-if="s.trend_state" class="pc-trend" :class="trendClass(s.trend_state)" :title="s.trend_state || ''">{{ trendText(s.trend_state) }}<em v-if="s.trend_bonus"> {{ trendBonusText(s) }}</em></span>
                   </div>
                   <n-icon
                   :component="isHidden(s.number) ? EyeOff : Eye"
@@ -1934,7 +1941,7 @@ onBeforeUnmount(() => {
                     <span class="pc-dir">{{ dirText(r.direction) }} {{ levelSuffix(r.level) }}</span>
                     <span class="pc-grade">{{ r.grade }}</span>
                     <span class="pc-warning">{{ warningKindText(r.warning_kind) }}</span>
-                    <span class="pc-trend" :class="trendClass(r.trend_state)" :title="r.trend_state || ''">{{ trendText(r.trend_state) }}<em v-if="r.trend_bonus"> {{ trendBonusText(r) }}</em></span>
+                    <span v-if="r.trend_state" class="pc-trend" :class="trendClass(r.trend_state)" :title="r.trend_state || ''">{{ trendText(r.trend_state) }}<em v-if="r.trend_bonus"> {{ trendBonusText(r) }}</em></span>
                   </div>
                   <n-icon
                     :component="isRecentShown(r.number) ? Eye : EyeOff"

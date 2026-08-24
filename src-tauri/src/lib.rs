@@ -177,11 +177,8 @@ pub fn run() {
                 if window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
                     api.prevent_close();
                     let _ = window.hide();
-                }
-            }
-            // 复盘统计等子窗口关闭后立即落盘，避免下次打开时又回到默认大小
-            if let tauri::WindowEvent::Destroyed = event {
-                if window.label() != "main" {
+                } else if window.label() != "main" {
+                    // 子窗口关闭前立即落盘，此时窗口仍在，save_window_state 才能取到最新几何
                     let _ = window
                         .app_handle()
                         .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
@@ -471,7 +468,6 @@ fn open_settings_window(app: &tauri::AppHandle) {
     .title("设置")
     .inner_size(760.0, 640.0)
     .min_inner_size(680.0, 520.0)
-    .center()
     .resizable(true)
     .decorations(false)
     .build();
@@ -502,3 +498,4 @@ pub struct AppInfo {
 // sessionbreak-gapfilter-1605
 
 // bg-enrich-013841
+

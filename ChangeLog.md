@@ -1,5 +1,38 @@
 # 更新日志
 
+## 2026-08-24
+
+### 60m 五档趋势标签（仅展示不计分） — 3f5fc79
+
+- `indicators.rs` 新增 `analyze_60m`：基于 MA20 斜率与价格偏离度输出五档 `强多/弱多/震荡/弱空/强空`，当前仅展示不计入分数
+- `dto.rs / model.rs / scoring.rs / report.rs / config/mod.rs` 打通 `trend_state/trend_bonus/direction` 字段与前端类型
+- `KLineChart.vue / ChartView.vue / SettingsView.vue / settings.ts / types.ts` 预留趋势展示与配置入口
+
+### 趋势标签落库与展示补齐 — 625d981
+
+- `event.rs::candidate_for` 在落库前调用 `indicators::analyze_60m` 填充 `trend_state`（原为空字符串），历史信号通过 `entry_score_dims` 解析补显
+- `service/mod.rs` 与 `ChartView.vue` 同步落库与回显链路，避免新建信号无趋势而历史信号无法解析的问题
+
+### A段三项优化 — 5cf04b8
+
+- `scoring.rs: A_LEG_BAR_PLAIN_SAME 0.6 → 0.4`：同色平淡K线加分收紧，抑制 0 Clean 假高分
+- `scoring.rs` 新增 `ENDPOINT_EXTRA_REVERSE_WICK_PENALTY 0.5`：A段终点若为 `ReverseWick`（长上影阴线等反向影线）在 S1 位置额外 -0.5，命中率约 11.9%
+- `scoring.rs: A_LEG_GAP_MIN_ATR 1.0 → 0.8`：跳空阈值收紧，新增检出约 3.2%
+- 单测同步：`plain_same` 期望 0.6→0.4、`gap` 用例 0.38→0.46、跳空计数 8→7、`score_a` 2.98→2.94；全量单测 165 passed
+- 回测（1068 有效信号，过滤 11 条重算异常）：`≥3.5` 331→277（-54）、`≥3.2` 630→574（-56）、均分 -0.052，胜率 47.4%→47.8% 扁平，完成去假高分目标
+
+### 结算/窗口/聚焦与样式可靠性修复
+
+- `service/mod.rs` 延迟补拉：`refresh_symbol_data` 末尾若落在 5m 收盘后 45 秒内，则在收盘后约 35 秒（`MINUTE_BAR_SETTLE_SECS+5`）后台补拉 5m 并重算 15m/60m，修复 scheduler 在整点立即刷新导致 15m（如 11:30 L8265/L8260）偏差 5 分钟的问题；不改 `get_klines` 热路径，避免切分卡死
+- `src-tauri/lib.rs` 窗口状态落盘时机修正：由 `WindowEvent::Destroyed` 改为 `CloseRequested` 分支内 `save_window_state`（此时窗口仍在可取几何），`open_settings_window` 移除 `.center()` 避免与记忆位置冲突
+- `KLineChart.vue` 复盘聚焦可靠性：新增 `focusKey` 强制同时间戳重复聚焦、`focusRetryTimer` 最多 50 次×60ms 重试、`nextTick` 二次校正、`centerFocusView` 右侧预留 `gap+2` 根、`rowsMatchRequest` 按字母前缀判同品种（换月 MA001/MA 视为同一品种），补全 `rightMaxTo` 越界修正与详细 `[focus]` 日志
+- `ChartView.vue` 复盘链路：`reviewFocusKey` 透传至 `KLineChart`、`focusTs/focusKey` 双 watch、预警明细新增 60m 趋势项（`parseTrendDims`）、`pc-trend` 仅有值时渲染、Line 1526 透传 `:focus-key`
+- `SettingsView.vue` 文案：复盘聚焦右侧说明由“贴到最右侧”改为“右侧倒数第3根（留2根空白）”
+- `openNotificationsWindow.ts / openReviewWindow.ts / openSettingsWindow.ts` 去除 `center:true`（与窗口记忆一致）、统一双引号与注释精简
+- `event.rs` 趋势落库同 625d981 一并纳入本次提交范围
+- `SignalNotes.vue` 批注组件纳入版本（此前未跟踪）：支持按 `eventId` 增删批注与“已按建议开仓”判定，复用 `getSignalUserData` 聚合接口
+
+
 ## 2026-08-22
 
 ### B级结构与累计覆盖保守优化
@@ -220,3 +253,4 @@
 ### 其他
 
 - 新增 ChangeLog.md，后续每次更新同步记录
+

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // reactive 仅被下方被注释的调试面板使用；如取消注释调试面板，需把 reactive 加回 import
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin, NTooltip } from 'naive-ui'
 import {
   CandlestickSeries,
@@ -41,6 +41,8 @@ const props = defineProps<{
   reviewExit?: ReviewExitOverlay | null
   /** 复盘模式：需要自动定位到该K线时间（优先触发/预警） */
   focusTs?: string | null
+  /** 复盘信号唯一标识：用于同时间戳重复聚焦时强制触发 */
+  focusKey?: number | string | null
   /** 当前周期 MA20 长期趋势线数据点 */
   trendPoints?: TrendPointDto[]
 }>()
@@ -1026,14 +1028,15 @@ function centerFocusView(index: number) {
   let to: number
   if (settingsStore.settings.ui.chart_review_focus_right) {
     const gap = rightGapBars(Math.min(span, total))
-    to = index + 0.5 + gap
+    const rightMaxTo = total - 0.5 + gap + 2
+    to = index + 0.5 + gap + 2
     from = to - span
     if (from < -0.5) {
       from = -0.5
       to = from + span
     }
-    if (to > maxTo) {
-      to = maxTo
+    if (to > rightMaxTo) {
+      to = rightMaxTo
       from = Math.max(-0.5, to - span)
     }
   } else {
@@ -1050,21 +1053,75 @@ function centerFocusView(index: number) {
   lastView = { from, to, totalAtCapture: total }
 }
 
-/** 复盘模式自动定位：数据未就绪时先记下，等K线到位后再聚焦 */
-function focusAtTs(ts: string | null) {
-  pendingFocusTs = ts || null
-  if (!pendingFocusTs || !chart || !rowsMatchRequest()) return
+/** 复盘模式自动定位：数据未就绪时先记下，等K线到位后再聚焦；带重试避免时序竞态（50%不聚焦） */
+let focusRetryTimer: ReturnType<typeof setTimeout> | null = null
+let focusRetryCount = 0
+function tryApplyPendingFocus(): boolean {
+  if (!pendingFocusTs || !chart || props.rows.length === 0) return false
+  console.log("[focus] tryApply pending=" + String(pendingFocusTs) + " rows=" + String(props.rows.length) + " chart=" + String(!!chart) + " match=" + String(rowsMatchRequest()) + " first=" + String(props.rows[0]?.symbol) + "/" + String(props.rows[0]?.ts) + " req=" + String(props.symbol) + "/" + String(props.timeframe))
+  if (!rowsMatchRequest()) {
+    const t = toTs(pendingFocusTs)
+    const firstTs = props.rows.length ? toTs(props.rows[0].ts) : t
+    const lastTs = props.rows.length ? toTs(props.rows[props.rows.length-1].ts) : t
+    if (t < firstTs - 7*24*3600 || t > lastTs + 7*24*3600) {
+      console.log("[focus] out of range t=" + String(t) + " first=" + String(firstTs) + " last=" + String(lastTs))
+      return false
+    }
+    console.log("[focus] rowsMatch false but time in range, force focus")
+  }
   const idx = nearestRowIndex(pendingFocusTs)
-  if (idx < 0) return
+  console.log("[focus] nearest idx=" + String(idx) + " for ts=" + String(pendingFocusTs))
+  if (idx < 0) return false
   pendingFocusTs = null
+  focusRetryCount = 0
   focusIndex = idx
   focusFollowsLatest = false
   focusPinnedByKeys = true
   syncFocus()
   centerFocusView(focusIndex)
+  console.log("[focus] centered to idx=" + String(idx) + " focusTs applied")
+  nextTick(() => {
+    if (focusIndex === idx && chart) {
+      centerFocusView(focusIndex)
+      const lr = chart!.timeScale().getVisibleLogicalRange()
+      if (lr && (idx < lr.from || idx > lr.to)) {
+        console.log("[focus] nextTick correction: idx " + String(idx) + " not in " + String(lr.from) + "-" + String(lr.to) + ", re-center")
+        centerFocusView(focusIndex)
+      }
+    }
+  })
+  return true
 }
-
-/** 左右键切换焦点K线：dir=-1 上一根（更早），dir=1 下一根（更晚） */
+function scheduleFocusRetry() {
+  if (focusRetryTimer) clearTimeout(focusRetryTimer)
+  if (focusRetryCount >= 50) {
+    console.log("[focus] retry limit reached pending=" + String(pendingFocusTs))
+    focusRetryCount = 0
+    return
+  }
+  focusRetryCount++
+  focusRetryTimer = setTimeout(() => {
+    focusRetryTimer = null
+    console.log("[focus] retry #" + String(focusRetryCount) + " pending=" + String(pendingFocusTs) + " rows=" + String(props.rows.length))
+    if (!pendingFocusTs) return
+    if (tryApplyPendingFocus()) return
+    scheduleFocusRetry()
+  }, 60)
+}
+function focusAtTs(ts: string | null) {
+  console.log("[focus] focusAtTs called ts=" + String(ts) + " key=" + String((props as any).focusKey) + " rows=" + String(props.rows.length))
+  pendingFocusTs = ts || null
+  focusRetryCount = 0
+  if (!pendingFocusTs) {
+    if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
+    return
+  }
+  if (tryApplyPendingFocus()) {
+    if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
+    return
+  }
+  scheduleFocusRetry()
+}
 function stepCandles(dir: number) {
   if (!chart) return
   if (!candleSeries || candleSeries.data().length === 0) return
@@ -1314,7 +1371,13 @@ let prevTimeframe: string | null = null
  *  用它判断可以避免中间态提前消耗掉切换状态、导致新数据到达后被当成普通刷新 */
 function rowsMatchRequest(): boolean {
   const first = props.rows[0]
-  return !!first && first.symbol === props.symbol && first.timeframe === props.timeframe
+  if (!first || first.timeframe !== props.timeframe) return false
+  if (first.symbol === props.symbol) return true
+  // 换月/连续合约：品种字母前缀相同即视为同一品种（如 MA001 vs MA、MA2409 vs MA001）
+  // 避免因合约月份后缀变化导致 rows 被判为中间态而跳过渲染，进而导致换月后必不聚焦
+  const a = first.symbol.replace(/[^A-Za-z]/g, '')
+  const b = props.symbol.replace(/[^A-Za-z]/g, '')
+  return !!a && !!b && a === b
 }
 
 /** 数据变化时：沿用当前缩放/平移状态（无记录则默认视图）；
@@ -1359,19 +1422,32 @@ function renderData() {
     focusIndex = props.rows.length - 1
   }
   let focusNeedsCenter = false
+  let focusIdxForCenter = -1
   if (pendingFocusTs) {
     const idx = nearestRowIndex(pendingFocusTs)
     if (idx >= 0) {
       pendingFocusTs = null
+      focusRetryCount = 0
+      if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
       focusIndex = idx
       focusFollowsLatest = false
       focusPinnedByKeys = true
       focusNeedsCenter = true
+      focusIdxForCenter = idx
     }
   }
   syncFocus()
-  if (focusNeedsCenter) centerFocusView(focusIndex)
-  else if (focusFollowsLatest) ensureFocusVisible()
+  if (focusNeedsCenter) {
+    centerFocusView(focusIdxForCenter)
+    const savedIdx = focusIdxForCenter
+    nextTick(() => {
+      if (focusIndex === savedIdx && chart) centerFocusView(savedIdx)
+    })
+  } else if (focusFollowsLatest) ensureFocusVisible()
+  else if (pendingFocusTs) {
+    // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
+    scheduleFocusRetry()
+  }
 }
 
 /** 只刷新形态标注与价位线，保留当前缩放/平移状态 */
@@ -1611,6 +1687,10 @@ watch(
   { immediate: true },
 )
 watch(
+  () => (props as any).focusKey,
+  () => focusAtTs(props.focusTs ?? null),
+)
+watch(
   () => props.showExtremes,
   () => {
     syncExtremes()
@@ -1638,6 +1718,8 @@ onBeforeUnmount(() => {
   focusIndex = -1
   focusPinnedByKeys = false
   pendingFocusTs = null
+  focusRetryCount = 0
+  if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
   hoveredTime = null
   isHovering = false
   chart?.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)

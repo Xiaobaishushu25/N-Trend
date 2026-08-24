@@ -1,4 +1,4 @@
-//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
+﻿//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
 use anyhow::{anyhow, Result};
 use chrono::Timelike;
@@ -1591,6 +1591,72 @@ impl Services {
             .collect();
         repo::upsert_klines(&self.db, models).await?;
         self.derive_and_store(code).await?;
+
+        // --- 5分钟收盘结算窗口的延迟补拉（修复 CJ0 15m 11:30 L8265/L8260 类偏差）---
+        // 背景：fetch/kline.rs::settled_kline_rows 会丢弃 now - bar_ts < MINUTE_BAR_SETTLE_SECS(30秒) 的K线，
+        //       目的是避免在收盘瞬间使用半成品K线（如11:29:50去用11:30那根）。
+        // 问题：scheduler的 normal_refresh 固定在 minute%5==0 的整点（如11:30:00）触发 refresh_symbol_data，
+        //       此时新浪那根刚收盘的5m（如11:30 L8260）正好落在30秒结算窗口内，会被当次丢弃。
+        // 后果：当次 derive_and_store 只能用 11:15+11:20+11:25 合成15m，导致15m最低价等字段错5分钟
+        //       （如 8260 被算成 8265），前端在 11:30:10 看到的就是错的，需要等到 11:30:30/11:35 或手动刷新才纠正。
+        // 修复：仅在写路径 refresh_symbol_data 末尾做轻量检测——若本次刷新正好落在5m收盘后45秒内，
+        //       则在后台延迟到收盘后约35秒（MINUTE_BAR_SETTLE_SECS+5）再补拉一次。此为后台任务，不阻塞当前刷新，
+        //       也不改动 get_klines 热路径，避免上次在 get_klines 中实时聚合+并发写库导致的切换卡死问题。
+        // 注意：Services 未实现 Clone（持有 RwLock<SinaClient>/Mutex），故仅 clone db（DatabaseConnection可Clone）和 code，
+        //       SinaClient 在 spawn 内新建。补拉成功后重新 upsert 并 derive_and_store 覆盖 derived 15m/60m。
+        // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> delay=35秒 -> 11:30:35后台重拉，此时11:30已结算完成(>30秒)可正确入库并纠正15m；
+        //       若在11:31:10触发则 secs_since_5m=70 >45，不触发补拉。
+        {
+            let now = chrono::Local::now();
+            let secs_since_5m = now.minute() % 5 * 60 + now.second();
+            if secs_since_5m < 45 {
+                let delay_secs = ((MINUTE_BAR_SETTLE_SECS as i64 + 5) - secs_since_5m as i64).max(5) as u64;
+                let db = self.db.clone();
+                let code_owned = code.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    let client = SinaClient::new();
+                    match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
+                        Ok(fetched) => {
+                            let models: Vec<_> = fetched.iter().map(|k| fetch_to_model(&code_owned, "5m", "raw", k)).collect();
+                            if let Err(e) = repo::upsert_klines(&db, models).await {
+                                tracing::warn!("延迟补拉 upsert 失败 {}: {e:?}", code_owned);
+                                return;
+                            }
+                            let raw = match repo::raw_klines(&db, &code_owned).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("延迟补拉读取 raw 失败 {}: {e:?}", code_owned);
+                                    return;
+                                }
+                            };
+                            if raw.len() < 3 {
+                                return;
+                            }
+                            let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
+                            let mut derived = Vec::new();
+                            for tf in [Timeframe::M15, Timeframe::M60] {
+                                for k in aggregate(&bars, tf) {
+                                    derived.push(fetch_to_model(&code_owned, tf.as_str(), "derived", &k));
+                                }
+                            }
+                            if let Err(e) = repo::delete_derived_klines(&db, &code_owned).await {
+                                tracing::warn!("延迟补拉清理 derived 失败 {}: {e:?}", code_owned);
+                                return;
+                            }
+                            if let Err(e) = repo::upsert_klines(&db, derived).await {
+                                tracing::warn!("延迟补拉写入 derived 失败 {}: {e:?}", code_owned);
+                                return;
+                            }
+                            tracing::info!("延迟补拉完成 {} (收盘后35秒补拉)", code_owned);
+                        }
+                        Err(e) => {
+                            tracing::warn!("延迟补拉抓取失败 {}: {e:?}", code_owned);
+                        }
+                    }
+                });
+            }
+        }
         Ok(())
     }
 

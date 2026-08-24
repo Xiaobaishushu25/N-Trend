@@ -9,3 +9,13 @@ email.toml
 __pycache__/
 _*.py
 _report_out.txt
+
+# local tmp/backtest artifacts
+_backtest*
+_tmp*
+tmp_*.py
+tmp_*.csv
+temp_stats2.py
+read_zhihu.mjs
+zhihu_screenshot.png
+
