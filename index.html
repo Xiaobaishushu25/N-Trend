@@ -4,9 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>N趋势</title>
+    <style>html,body{margin:0;height:100%;background:#f5f7fa} #app{height:100%} .initial-loading{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#667085;font-family:system-ui,sans-serif} .initial-spinner{width:32px;height:32px;border:3px solid #e5e7eb;border-top-color:#1677ff;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:16px} @keyframes spin{to{transform:rotate(360deg)}} .initial-text{font-size:14px}</style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><div class="initial-loading"><div class="initial-spinner"></div><div class="initial-text">正在启动 N趋势...</div></div></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

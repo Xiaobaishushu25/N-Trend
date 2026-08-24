@@ -9,6 +9,7 @@ import type {
   EntryTriggerHit,
   GroupRow,
   KlineRow,
+  PatternEvent,
   MarketSnapshot,
   NewNotificationHistoryItem,
   NotificationHistoryItem,
@@ -70,6 +71,7 @@ export const api = {
     invoke<TrendPointDto[]>('get_trend_series', { symbol, timeframe, limit }),
 
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
+  getActiveEvents: () => invoke<PatternEvent[]>('get_active_events'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
   runScanNow: () => invoke<ScanResult>('run_scan_now'),
   rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),

@@ -42,10 +42,24 @@ export const useScansStore = defineStore('scans', {
         this.running = false
       }
     },
-    /** 页面加载时同步最新形态：已有扫描结果直接复用，否则触发一次扫描 */
+    /** 页面加载时同步最新形态：优先用 DB 缓存秒级渲染，后台静默扫描更新 */
     async refreshLatestSignals() {
-      if (!this.latest) await this.runScan()
-      else this.latestSignals = activeSignals(this.latest.signals)
+      if (this.latest) {
+        this.latestSignals = activeSignals(this.latest.signals)
+        return
+      }
+      try {
+        const cached = await api.getActiveEvents()
+        this.latestSignals = activeSignals(cached as unknown as PatternEvent[])
+        // 后台静默刷新，不阻塞表格首绘；结果通过 scan-completed 事件回流到 ingest
+        if (!cached.length) {
+          this.runScan().catch(() => {})
+        } else {
+          setTimeout(() => this.runScan().catch(() => {}), 1200)
+        }
+      } catch {
+        await this.runScan()
+      }
     },
     /** 扫描完成后统一处理：更新内存结果，并按事件类型弹通知 */
     applyScanResult(result: ScanResult) {

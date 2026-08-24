@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::{Local, NaiveDateTime};
 use n_core::config::Config;
@@ -63,52 +64,41 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
+            let setup_t0 = Instant::now();
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("ntrend.db");
+            let t = Instant::now();
             let db = tauri::async_runtime::block_on(storage::connect(&db_path))?;
-
+            tracing::info!("setup: storage::connect 耗时 {}ms", t.elapsed().as_millis());
             // 配置：JSON 文件优先，旧版 DB 设置首次启动自动迁移
             let config_path = data_dir.join("config.json");
+            let t = Instant::now();
             let config = tauri::async_runtime::block_on(Config::load(&config_path, &db))?;
+            tracing::info!("setup: Config::load 耗时 {}ms", t.elapsed().as_millis());
             init_logging(&data_dir, &config.log.level)?;
-
+            let t = Instant::now();
             let services =
-                tauri::async_runtime::block_on(Services::new(db, config.clone(), config_path))?;
+                tauri::async_runtime::block_on(Services::new(db, config.clone(), config_path.clone()))?;
+            tracing::info!("setup: Services::new 耗时 {}ms", t.elapsed().as_millis());
 
-            // 首启种子：优先读取工程根目录 symbols.txt（若有），否则内置代码表
+            // 首启种子文本（同步读取，不访问 DB）
             let mut seed_text = DEFAULT_SYMBOLS.to_string();
             if let Ok(text) = std::fs::read_to_string("symbols.txt") {
                 if !text.trim().is_empty() {
                     seed_text = text;
                 }
             }
-            tauri::async_runtime::block_on(services.seed_symbols(&seed_text))?;
-
-            // 首次运行兼容导入 email.toml
-            let current = tauri::async_runtime::block_on(services.config());
-            if current.email.smtp_password.is_empty() && current.email.from.is_empty() {
-                let imported =
-                    n_core::config::import_email_toml(std::path::Path::new("email.toml"))?;
-                if !imported.smtp_password.is_empty()
-                    || imported.from != n_core::notify::email::EmailSettings::default().from
-                {
-                    let mut next = current;
-                    next.email = imported;
-                    tauri::async_runtime::block_on(services.apply_config(next))?;
-                }
-            }
-
-            // 补齐品种默认精度（未显式设置的行）
-            let _ = tauri::async_runtime::block_on(services.backfill_tick_sizes());
-
-            let auto_start = tauri::async_runtime::block_on(services.config())
-                .app_config
-                .auto_start_scheduler;
-            // 恢复上次运行记录的最后成功时间，避免应用重启后丢失
-            let saved =
-                tauri::async_runtime::block_on(n_core::storage::repo::all_settings(&services.db))
+            // 轻量同步：读取调度开关与上次成功时间（仅读 2 个 settings key，快）
+            let t = Instant::now();
+            let (auto_start, saved) = tauri::async_runtime::block_on(async {
+                let cfg = services.config().await;
+                let m = n_core::storage::repo::all_settings(&services.db)
+                    .await
                     .unwrap_or_default();
+                (cfg.app_config.auto_start_scheduler, m)
+            });
+            tracing::info!("setup: 读取调度状态 耗时 {}ms", t.elapsed().as_millis());
             let last_refresh = saved
                 .get(KEY_LAST_REFRESH)
                 .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
@@ -129,6 +119,47 @@ pub fn run() {
                 next_notification_id: std::sync::atomic::AtomicU64::new(1),
             });
             app.manage(state.clone());
+            // --- 启动耗时后台化：种子/邮箱迁移/精度回填 不再阻塞窗口首绘 ---
+            {
+                let bg_state = state.clone();
+                let seed = seed_text.clone();
+                tauri::async_runtime::spawn(async move {
+                    let t = Instant::now();
+                    match bg_state.services.seed_symbols(&seed).await {
+                        Ok(n) if n > 0 => tracing::info!("后台 seed_symbols 插入 {n} 条 耗时 {}ms", t.elapsed().as_millis()),
+                        Ok(_) => tracing::info!("后台 seed_symbols 跳过(已存在) 耗时 {}ms", t.elapsed().as_millis()),
+                        Err(e) => tracing::warn!("后台 seed_symbols 失败: {e}"),
+                    }
+                });
+            }
+            {
+                let bg_state2 = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let t = Instant::now();
+                    let cur = bg_state2.services.config().await;
+                    if cur.email.smtp_password.is_empty() && cur.email.from.is_empty() {
+                        if let Ok(imported) = n_core::config::import_email_toml(std::path::Path::new("email.toml")) {
+                            if !imported.smtp_password.is_empty()
+                                || imported.from != n_core::notify::email::EmailSettings::default().from
+                            {
+                                let mut next = cur;
+                                next.email = imported;
+                                if let Err(e) = bg_state2.services.apply_config(next).await {
+                                    tracing::warn!("后台 email 迁移失败: {e}");
+                                } else {
+                                    tracing::info!("后台 email 迁移完成 耗时 {}ms", t.elapsed().as_millis());
+                                }
+                            }
+                        }
+                    }
+                    let t2 = Instant::now();
+                    if let Err(e) = bg_state2.services.backfill_tick_sizes().await {
+                        tracing::warn!("后台 backfill_tick_sizes 失败: {e}");
+                    } else {
+                        tracing::info!("后台 backfill_tick_sizes 完成 耗时 {}ms", t2.elapsed().as_millis());
+                    }
+                });
+            }
             // 后台补齐品种名称：不阻塞启动，完成后通知前端刷新；成功后打标记避免每次启动重复联网
             {
                 let enrich_app = app.handle().clone();
@@ -170,6 +201,7 @@ pub fn run() {
             spawn_scheduler(app.handle().clone(), state.clone());
             spawn_quote_poller(app.handle().clone(), state);
             setup_tray(app)?;
+            tracing::info!("setup 总耗时 {}ms (窗口已就绪，后台任务异步进行)", setup_t0.elapsed().as_millis());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -209,6 +241,7 @@ pub fn run() {
             commands::get_klines,
             commands::get_trend_series,
             commands::get_market_snapshot,
+            commands::get_active_events,
             commands::refresh_data_now,
             commands::run_scan_now,
             commands::rebuild_events_now,

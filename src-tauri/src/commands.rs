@@ -290,6 +290,20 @@ pub async fn get_market_snapshot(
         .map_err(|e| e.to_string())
 }
 
+/// 首屏轻量读取：直接返回 DB 中 pending / triggered 的活跃信号，不触发扫描计算（秒级）
+#[tauri::command]
+pub async fn get_active_events(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<n_core::storage::entities::pattern_events::Model>, String> {
+    let events = n_core::storage::repo::all_pattern_events(&state.services.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(events
+        .into_iter()
+        .filter(|e| e.state == "pending" || e.state == "triggered")
+        .collect())
+}
+
 #[tauri::command]
 pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<RefreshStats, String> {
     let stats = state

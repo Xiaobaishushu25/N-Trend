@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, h, nextTick, onActivated, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
@@ -128,22 +128,21 @@ async function loadAll() {
   loading.value = true
   try {
     await symbolsStore.load()
-    // 分组视图只加载该组内的品种；全部视图加载全部品种
     let symbols = symbolsStore.symbols
     if (groupsStore.selectedId != null) {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
     }
-    // 与K线页共用同一份信号数据（scansStore.latestSignals），避免两处各自拉取不同步
-    await scansStore.refreshLatestSignals()
-    const signals = scansStore.latestSignals
+    // 信号（缓存秒级）与行情快照并行，互不阻塞
+    const [signals, snapshots] = await Promise.all([
+      scansStore.refreshLatestSignals().then(() => scansStore.latestSignals),
+      api.getMarketSnapshot().catch(() => [] as MarketSnapshot[]),
+    ])
     const bySymbol = new Map<string, PatternEvent[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
       arr.push(s)
       bySymbol.set(s.symbol, arr)
     }
-    // 一次快照拿全部品种的最新价/涨跌幅，替代逐个品种拉整段K线
-    const snapshots = await api.getMarketSnapshot()
     const byCode = new Map(snapshots.map((s) => [s.code, s]))
     const list = symbols.map((sym) => {
       const snap = byCode.get(sym.code)
@@ -808,12 +807,10 @@ const columns: DataTableColumns<WatchRow> = [
 ]
 
 onMounted(async () => {
-  try {
-    await settingsStore.load()
-  } catch {
-    // 浏览器预览环境下无后端命令，保持默认值
-  }
-  await groupsStore.load()
+  // 设置与分组并行加载，不串行阻塞首绘
+  const settingsP = settingsStore.load().catch(() => {})
+  const groupsP = groupsStore.load().catch(() => {})
+  await Promise.all([settingsP, groupsP])
   // 恢复上次打开的分组表格；分组已不存在时回退到“全部品种”
   const last = settingsStore.settings.ui.last_group_id
   groupsStore.selectedId =
