@@ -1,5 +1,4 @@
 <script setup lang="ts">
-// reactive 仅被下方被注释的调试面板使用；如取消注释调试面板，需把 reactive 加回 import
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin, NTooltip } from 'naive-ui'
 import {
@@ -334,57 +333,7 @@ let patternLines: ISeriesApi<'Line'>[] = []
 let trendSeries: ISeriesApi<'Line'> | null = null
 let priceExtent = 1
 
-// ============================================================================
-// 【临时调试面板 — 已注释保留，供后续复测“进入K线图被放大成两根巨大K线”问题】
-// 问题现象：从列表/表格页点进K线图时，偶尔只显示最后两三根巨大的K线，
-//           退出重进才恢复正常。
-// 问题原因（已通过真实运行记录定位）：
-//   1) 挂载时全局K线数据里往往还留着上一品种的数据（与当前请求品种不匹配），
-//      首次渲染被跳过，图表处于“空图表”状态；
-//   2) 挂载后的“回退校准帧”在空图表上执行了默认视图设置（setVisibleLogicalRange），
-//      图表库会把“每根K线的像素间距”记为 width/跨度；若此时数据只有寥寥几根
-//      （或视图跨度极小），间距会被污染成 300~400px；
-//   3) 真正数据到达后，图表直接按被污染的间距渲染，只剩最后两三根巨大K线；
-//   4) 该极小视图又被保存为“用户缩放状态”，此后每次数据刷新都沿用，形成卡死。
-// 修复方法：
-//   1) 空图表（series 数据为空）时禁止任何视图设置，杜绝间距被污染；
-//   2) 保存缩放状态时记录当时的数据量，若“数据不足140根、视图被全部数据撑满、
-//      且现在数据明显变多”，判定为短数据瞬态，丢弃该状态回到默认视图。
-// 取消注释即可再次显示调试面板（需同时把上方 import 中的 reactive 加回）。
-// ============================================================================
-// const dbg = reactive({
-//   visible: true,
-//   renderCount: 0,
-//   mountCount: 0,
-//   unmountCount: 0,
-//   rowsLen: 0,
-//   candleLen: 0,
-//   inChartBefore: -1,
-//   lastView: '',
-//   logical: '',
-//   span: 0,
-//   barSpacing: 0,
-//   isSwitch: false,
-//   width: 0,
-//   history: [] as string[],
-// })
-// function updateDbg() {
-//   const ts = chart?.timeScale()
-//   const logical = ts?.getVisibleLogicalRange() ?? null
-//   dbg.renderCount += 1
-//   dbg.rowsLen = props.rows.length
-//   dbg.candleLen = buildCandles().length
-//   dbg.lastView = lastView ? `${lastView.from.toFixed(2)}~${lastView.to.toFixed(2)}` : 'null'
-//   dbg.logical = logical ? `${logical.from.toFixed(2)}~${logical.to.toFixed(2)}` : 'null'
-//   dbg.span = logical ? Number((logical.to - logical.from).toFixed(2)) : 0
-//   dbg.barSpacing = ts ? Number(ts.options().barSpacing.toFixed(2)) : 0
-//   dbg.width = container.value?.clientWidth ?? 0
-//   dbg.history.push(
-//     `#${dbg.renderCount} 行${dbg.rowsLen} 切换${dbg.isSwitch ? 'Y' : 'N'} ` +
-//       `图内${dbg.inChartBefore} 捕获${dbg.lastView} 视图${dbg.logical} 跨度${dbg.span} 间距${dbg.barSpacing}`,
-//   )
-//   if (dbg.history.length > 8) dbg.history.splice(0, dbg.history.length - 8)
-// }
+// 已修复：进入K线图被放大成巨大K线的根因是空图表上执行视图设置导致 barSpacing 污染（详见 git 历史）；保留修复逻辑，已移除调试面板代码
 
 /** 进入图表时默认展示的K线根数（从最新一根往前数），由设置界面配置 */
 const displayKNum = computed(() => Math.max(1, settingsStore.settings.ui.chart_display_bars))
@@ -811,7 +760,6 @@ function applyDefaultView() {
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
-  // dbg.history.push(`== 默认视图: 行${total} 请求${from.toFixed(2)}~${to.toFixed(2)}`)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
 }
@@ -893,7 +841,6 @@ function restoreView() {
   if (!chart) return
   if (!candleSeries || candleSeries.data().length === 0) return
   const priceApi = chart.priceScale('right')
-  // dbg.history.push(
   //   `== 恢复视图: 行${props.rows.length} 保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'}`,
   // )
   dropStaleView(props.rows.length)
@@ -931,7 +878,6 @@ function applySwitchView(span: number) {
   const visible = Math.min(span, total)
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - span)
-  // dbg.history.push(`== 切换视图: 行${total} 跨度请求${span} 请求${from.toFixed(2)}~${to.toFixed(2)}`)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
@@ -1060,19 +1006,15 @@ let focusRetryTimer: ReturnType<typeof setTimeout> | null = null
 let focusRetryCount = 0
 function tryApplyPendingFocus(): boolean {
   if (!pendingFocusTs || !chart || props.rows.length === 0) return false
-  console.log("[focus] tryApply pending=" + String(pendingFocusTs) + " rows=" + String(props.rows.length) + " chart=" + String(!!chart) + " match=" + String(rowsMatchRequest()) + " first=" + String(props.rows[0]?.symbol) + "/" + String(props.rows[0]?.ts) + " req=" + String(props.symbol) + "/" + String(props.timeframe))
   if (!rowsMatchRequest()) {
     const t = toTs(pendingFocusTs)
     const firstTs = props.rows.length ? toTs(props.rows[0].ts) : t
     const lastTs = props.rows.length ? toTs(props.rows[props.rows.length-1].ts) : t
     if (t < firstTs - 7*24*3600 || t > lastTs + 7*24*3600) {
-      console.log("[focus] out of range t=" + String(t) + " first=" + String(firstTs) + " last=" + String(lastTs))
       return false
     }
-    console.log("[focus] rowsMatch false but time in range, force focus")
   }
   const idx = nearestRowIndex(pendingFocusTs)
-  console.log("[focus] nearest idx=" + String(idx) + " for ts=" + String(pendingFocusTs))
   if (idx < 0) return false
   pendingFocusTs = null
   focusRetryCount = 0
@@ -1081,13 +1023,11 @@ function tryApplyPendingFocus(): boolean {
   focusPinnedByKeys = true
   syncFocus()
   centerFocusView(focusIndex)
-  console.log("[focus] centered to idx=" + String(idx) + " focusTs applied")
   nextTick(() => {
     if (focusIndex === idx && chart) {
       centerFocusView(focusIndex)
       const lr = chart!.timeScale().getVisibleLogicalRange()
       if (lr && (idx < lr.from || idx > lr.to)) {
-        console.log("[focus] nextTick correction: idx " + String(idx) + " not in " + String(lr.from) + "-" + String(lr.to) + ", re-center")
         centerFocusView(focusIndex)
       }
     }
@@ -1097,21 +1037,18 @@ function tryApplyPendingFocus(): boolean {
 function scheduleFocusRetry() {
   if (focusRetryTimer) clearTimeout(focusRetryTimer)
   if (focusRetryCount >= 50) {
-    console.log("[focus] retry limit reached pending=" + String(pendingFocusTs))
     focusRetryCount = 0
     return
   }
   focusRetryCount++
   focusRetryTimer = setTimeout(() => {
     focusRetryTimer = null
-    console.log("[focus] retry #" + String(focusRetryCount) + " pending=" + String(pendingFocusTs) + " rows=" + String(props.rows.length))
     if (!pendingFocusTs) return
     if (tryApplyPendingFocus()) return
     scheduleFocusRetry()
   }, 60)
 }
 function focusAtTs(ts: string | null) {
-  console.log("[focus] focusAtTs called ts=" + String(ts) + " key=" + String(props.focusKey) + " rows=" + String(props.rows.length))
   pendingFocusTs = ts || null
   focusRetryCount = 0
   if (!pendingFocusTs) {
@@ -1412,16 +1349,13 @@ function rowsMatchRequest(): boolean {
 function renderData() {
   if (!chart || !candleSeries || !volumeSeries) return
   if (!rowsMatchRequest()) {
-    // dbg.history.push(
     //   `== 跳过渲染: 行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} 请求${props.symbol}/${props.timeframe}`,
     // )
     return
   }
   const isSwitch = prevSymbol !== props.symbol || prevTimeframe !== props.timeframe
-  // dbg.isSwitch = isSwitch
   prevSymbol = props.symbol
   prevTimeframe = props.timeframe
-  // dbg.inChartBefore = candleSeries.data().length
   captureView()
   updatePriceExtent()
   candleSeries.setData(buildCandles())
@@ -1429,7 +1363,6 @@ function renderData() {
   lastDataCount = props.rows.length
   syncGaps()
   syncRollovers()
-  // updateDbg()
   if (isSwitch) {
     dropStaleView(props.rows.length)
     const span = lastView
@@ -1558,9 +1491,6 @@ function handleWheel(e: WheelEvent) {
 onMounted(() => {
   if (!container.value) return
   // 每次进入图表页先回到默认视图（最新 displayKNum 根）；页内切换品种/级别沿用缩放
-  // dbg.mountCount += 1
-  // dbg.history.push(
-  //   `== 挂载#${dbg.mountCount} 上次保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'} ` +
   //     `行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} ` +
   //     `请求${props.symbol}/${props.timeframe} 匹配${rowsMatchRequest() ? 'Y' : 'N'} 旧图${chart ? '有' : '无'}`,
   // )
@@ -1665,7 +1595,6 @@ onMounted(() => {
   // 兜底：确保图表拿到容器实际尺寸
   requestAnimationFrame(() => {
     if (container.value && chart) {
-      // dbg.history.push(
       //   `== 回退帧: 宽${container.value.clientWidth} 行${props.rows.length} 保存${lastView ? '有' : '无'}`,
       // )
       chart.applyOptions({
@@ -1680,7 +1609,6 @@ onMounted(() => {
       // requestAnimationFrame(() => {
       //   if (!chart) return
       //   const lr = chart.timeScale().getVisibleLogicalRange()
-      //   dbg.history.push(
       //     `== 终态: 视图${lr ? lr.from.toFixed(2) + '~' + lr.to.toFixed(2) : 'null'} ` +
       //       `间距${Number(chart.timeScale().options().barSpacing.toFixed(2))}`,
       //   )
@@ -1746,8 +1674,6 @@ watch(
 )
 
 onBeforeUnmount(() => {
-  // dbg.unmountCount += 1
-  // dbg.history.push(`== 卸载#${dbg.unmountCount} 行${props.rows.length} 保存${lastView ? '有' : '无'}`)
   container.value?.removeEventListener('wheel', handleWheel)
   resizeObserver?.disconnect()
   if (gapPrimitive && candleSeries) {
@@ -1800,11 +1726,6 @@ defineExpose({ stepCandles })
     <div ref="timeLeft" class="time-left"></div>
     <div ref="container" class="kline-canvas"></div>
     <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
-    <!-- <div v-if="dbg.visible" class="debug-info">
-      [挂载{{ dbg.mountCount }}] 渲染{{ dbg.renderCount }}
-      行{{ dbg.rowsLen }} 蜡烛{{ dbg.candleLen }} 图内{{ dbg.inChartBefore }} 视图{{ dbg.logical }} 跨度{{ dbg.span }}
-      间距{{ dbg.barSpacing }} 保存{{ dbg.lastView }} 切换{{ dbg.isSwitch ? 'Y' : 'N' }} 宽{{ dbg.width }}
-      <template v-for="(h, i) in dbg.history" :key="i">{{ h }}<br /></template>
     </div> -->
     <n-spin v-if="loading" class="spin-mask" />
     <button
@@ -1997,8 +1918,6 @@ defineExpose({ stepCandles })
   font-family: Consolas, monospace;
 } */
 </style>
-
-
 
 
 

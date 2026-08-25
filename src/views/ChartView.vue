@@ -117,8 +117,6 @@ const reviewFocusTs = computed<string | null>(() => {
   return ev?.trigger_ts || ev?.warning_ts || null
 })
 const reviewFocusKey = computed<number | null>(() => reviewSignalId.value)
-watch(reviewFocusTs, (v) => console.log("[review] focusTs ->", String(v), "key", String(reviewSignalId.value)))
-watch(reviewFocusKey, (v) => console.log("[review] focusKey ->", String(v), "ts", String(reviewFocusTs.value)))
 
 let reviewOverlaySeq = 0
 async function loadReviewOverlay() {

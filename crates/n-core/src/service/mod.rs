@@ -692,10 +692,7 @@ fn now_ts() -> String {
 }
 
 fn bar_ts(bar: &Bar) -> String {
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:00",
-        bar.dt.year, bar.dt.month, bar.dt.day, bar.dt.hour, bar.dt.minute
-    )
+    bar.dt.to_bar_ts()
 }
 
 /// 形态扫描与事件推进只使用已过确认余量的 15m bar，
