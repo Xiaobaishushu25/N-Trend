@@ -10,6 +10,15 @@
 - `renderData` 尾部：历史悬停时查找 `hoveredRow` 并 `innerHTML=formatLegend(...)` + `setCrosshairPosition(close, hoveredTime)` 原地还原，否则走原 `syncFocus()`；`ensureFocusVisible()` 也改为 `shouldAutoFollow` 守卫
 - `onMounted` 初始化 `isHovering=false, hoveredTime=null`，保留 `restoreView` 视口不变；验证 `vue-tsc --noEmit` 与 `vite build` 通过（4405 modules）
 
+### 日志体验全面优化 — 降噪 + 人类可读关键节点
+
+- `src-tauri/lib.rs` 日志过滤重写：`log_filter()` 默认 `sqlx=warn,sea-orm=warn,sea_orm=warn,hyper=warn,reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn`，彻底屏蔽 `sqlx::query: SELECT "klines" ... rows_affected/rows_returned/elapsed` 一天几万条刷屏；保留 `RUST_LOG` 覆盖，开发可 `RUST_LOG=debug,sqlx=info` 调试
+- `init_logging()` 统一本地时间 `LocalTime %Y-%m-%d %H:%M:%S%.3f`、`with_target(false)`、`with_ansi(false)`、`rolling::daily`，并清理 >14 天 `ntrend.log*`
+- 启动链路分段打点并修复丢失：`peek_log_level(config.json) -> init_logging` 提前，新增 `🚀 ntrend vX 启动 | 数据目录 | 日志级别`、`✓ 存储连接就绪 耗时`、`✓ 配置加载完成 耗时 | 刷新/扫描间隔 交易时段 日志级别`、`✓ 服务初始化完成 | 已收录 N 个`、`✓ 调度状态已恢复 | 自启 上次刷新/扫描`、`⏰ 定时调度与实时行情轮询已启动`、`✅ 主窗口就绪 总耗时` 分隔线；原 `storage::connect` 在日志初始化前导致丢失的问题已修复，`last_refresh/last_scan` 读取时序 bug 已修正
+- 定时任务人类可读：`tick_refresh`/`tick_scan` 统一 `⏳ 触发 | HH:MM:SS` → `✅ 完成 耗时 | 成功/失败/总计` + `⚠ 失败警告` / `❌ 失败 | {error}`；`spawn_quote_poller` 成功静默（避免 15s 刷屏），仅失败 `warn`
+- `src-tauri/commands.rs` 全部手动操作补齐 `👆` 追踪 + 耗时 + 结果：`refresh_data_now`/`run_scan_now`/`rebuild_events_now`/`refresh_outcomes_now`/`add_symbol`/`remove_symbol`/`set_symbol_flags`/`set_symbol_tick`/`enrich_symbol_names`/`refresh_symbol_list`/`update_config`/`reset_config`/`set_timeframes`/`open_log_directory`/`set_scheduler_running`，均 `Instant::now()` 统计，成功 `✅` 失败 `❌` 详细错误透传
+- 清理临时模板 `new_*.txt` `patch_*.py` `tick_*.txt` 等 22 个，`cargo check` 全量通过，`ntrend.log` 体积显著下降
+
 ## 2026-08-24
 
 ### 60m 五档趋势标签（仅展示不计分） — 3f5fc79

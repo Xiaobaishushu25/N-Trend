@@ -33,11 +33,24 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
 
 /// 日志过滤规则：读取配置中的日志级别；RUST_LOG 环境变量仍可整体覆盖。
 fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
-    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::try_new(level)
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-    })
+    if std::env::var("RUST_LOG").is_ok() {
+        return tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    }
+    let base = format!(
+        "{level},sqlx=warn,sea-orm=warn,sea_orm=warn,hyper=warn,reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn"
+    );
+    tracing_subscriber::EnvFilter::try_new(&base)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=warn,sea-orm=warn"))
 }
+
+fn peek_log_level(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("log")?.get("level")?.as_str().map(|s| s.to_string())
+}
+
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -68,19 +81,27 @@ pub fn run() {
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("ntrend.db");
+            let config_path = data_dir.join("config.json");
+            // 尽早初始化日志，避免之前的 info 丢失；先按文件中的级别 peek，失败则用 info
+            let peek_level = peek_log_level(&config_path).unwrap_or_else(|| "info".to_string());
+            init_logging(&data_dir, &peek_level)?;
+            tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            tracing::info!("🚀 ntrend v{} 启动 | 数据目录: {} | 日志级别: {}", env!("CARGO_PKG_VERSION"), data_dir.display(), peek_level);
             let t = Instant::now();
             let db = tauri::async_runtime::block_on(storage::connect(&db_path))?;
-            tracing::info!("setup: storage::connect 耗时 {}ms", t.elapsed().as_millis());
-            // 配置：JSON 文件优先，旧版 DB 设置首次启动自动迁移
-            let config_path = data_dir.join("config.json");
+            tracing::info!("✓ 存储连接就绪 耗时 {}ms | {}", t.elapsed().as_millis(), db_path.display());
             let t = Instant::now();
             let config = tauri::async_runtime::block_on(Config::load(&config_path, &db))?;
-            tracing::info!("setup: Config::load 耗时 {}ms", t.elapsed().as_millis());
-            init_logging(&data_dir, &config.log.level)?;
+            tracing::info!("✓ 配置加载完成 耗时 {}ms | 刷新间隔 {}s 扫描间隔 {}s 交易时段限制: {} 日志级别: {}", t.elapsed().as_millis(), config.scheduler.refresh_interval_secs, config.scheduler.scan_interval_secs, config.scheduler.trading_only, config.log.level);
+            if peek_level != config.log.level {
+                tracing::info!("ℹ 日志级别已在配置中改为 {}，重启后生效（当前仍为 {}）", config.log.level, peek_level);
+            }
             let t = Instant::now();
             let services =
                 tauri::async_runtime::block_on(Services::new(db, config.clone(), config_path.clone()))?;
-            tracing::info!("setup: Services::new 耗时 {}ms", t.elapsed().as_millis());
+            let symbol_count = tauri::async_runtime::block_on(async { n_core::storage::repo::list_symbols(&services.db, false).await.map(|v| v.len()).unwrap_or(0) });
+            tracing::info!("✓ 服务初始化完成 耗时 {}ms | 已收录品种 {} 个 | 自启调度: {}", t.elapsed().as_millis(), symbol_count, if config.app_config.auto_start_scheduler { "开启" } else { "关闭" });
+
 
             // 首启种子文本（同步读取，不访问 DB）
             let mut seed_text = DEFAULT_SYMBOLS.to_string();
@@ -98,13 +119,13 @@ pub fn run() {
                     .unwrap_or_default();
                 (cfg.app_config.auto_start_scheduler, m)
             });
-            tracing::info!("setup: 读取调度状态 耗时 {}ms", t.elapsed().as_millis());
             let last_refresh = saved
                 .get(KEY_LAST_REFRESH)
                 .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
             let last_scan = saved
                 .get(KEY_LAST_SCAN)
                 .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+            tracing::info!("✓ 调度状态已恢复 耗时 {}ms | 自启: {} 上次刷新: {} 上次扫描: {}", t.elapsed().as_millis(), if auto_start { "是" } else { "否" }, last_refresh.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "从未".to_string()), last_scan.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "从未".to_string()));
             let state = Arc::new(AppState {
                 services,
                 scheduler: tokio::sync::RwLock::new(SchedulerState {
@@ -199,9 +220,11 @@ pub fn run() {
                 });
             }
             spawn_scheduler(app.handle().clone(), state.clone());
-            spawn_quote_poller(app.handle().clone(), state);
+            spawn_quote_poller(app.handle().clone(), state.clone());
             setup_tray(app)?;
-            tracing::info!("setup 总耗时 {}ms (窗口已就绪，后台任务异步进行)", setup_t0.elapsed().as_millis());
+            tracing::info!("⏰ 定时调度与实时行情轮询已启动 | 交易时段: {} 轮询间隔 {}ms", if config.scheduler.trading_only { "仅交易时段" } else { "全天" }, config.quote.poll_interval_ms);
+            tracing::info!("✅ 主窗口就绪 总耗时 {}ms | 后台任务异步进行中", setup_t0.elapsed().as_millis());
+            tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -276,18 +299,38 @@ fn app_data_dir(app: &tauri::App) -> anyhow::Result<std::path::PathBuf> {
 
 fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // 清理 14 天前的旧日志，避免磁盘占满
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("ntrend.log") {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(elapsed) = now.duration_since(modified) {
+                                if elapsed.as_secs() > 14 * 24 * 3600 {
+                                    let _ = std::fs::remove_file(entry.path());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let file_appender = tracing_appender::rolling::daily(dir, "ntrend.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
-    // 日志写线程随进程存活，guard 需要长期持有
     std::mem::forget(guard);
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(level))
         .with_timer(LocalTime)
         .with_writer(writer)
         .with_ansi(false)
+        .with_target(false)
         .init();
     Ok(())
 }
+
 
 fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
@@ -375,32 +418,44 @@ fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
 }
 
 async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
-    // 先把本次尝试的起点记下来：节奏从起点起算，拉取耗时不会把下一次向后推
+    let t0 = Instant::now();
     state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
+    tracing::info!("⏳ 定时刷新触发 | {}", Local::now().format("%H:%M:%S"));
     match state.services.refresh_data().await {
         Ok(stats) => {
             state.note_refresh_success().await;
             let _ = app.emit("data-updated", &stats);
             tracing::info!(
-                "定时刷新完成: 成功 {} 失败 {}",
+                "✅ 定时刷新完成 耗时 {}ms | 成功 {} 失败 {} | 总计 {}",
+                t0.elapsed().as_millis(),
                 stats.succeeded,
-                stats.failures
+                stats.failures,
+                stats.succeeded + stats.failures
             );
+            if stats.failures > 0 {
+                tracing::warn!("⚠ 本次刷新有 {} 个品种失败，请检查网络或稍后重试", stats.failures);
+            }
         }
-        Err(e) => tracing::error!("定时刷新失败: {e}"),
+        Err(e) => tracing::error!("❌ 定时刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis()),
     }
 }
 
+
 async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
+    let t0 = Instant::now();
     state.scheduler.write().await.scan_anchor = Some(Local::now().naive_local());
+    tracing::info!("🔍 定时扫描触发 | {}", Local::now().format("%H:%M:%S"));
     match state.services.run_scan().await {
         Ok(res) => {
             state.note_scan_success().await;
             let _ = app.emit("scan-completed", &res);
             tracing::info!(
-                "定时扫描完成: 品种 {} 信号 {}",
+                "✅ 定时扫描完成 耗时 {}ms | 扫描 {} 活跃信号 {} 新增预警 {} 新触发 {}",
+                t0.elapsed().as_millis(),
                 res.scanned,
-                res.active_count
+                res.active_count,
+                res.new_warnings.len(),
+                res.newly_triggered.len()
             );
             let cfg = state.services.config().await;
             let min_score = cfg.notify.new_pattern_min_score;
@@ -430,7 +485,7 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                 }
             }
         }
-        Err(e) => tracing::error!("定时扫描失败: {e}"),
+        Err(e) => tracing::error!("❌ 定时扫描失败 耗时 {}ms | {e}", t0.elapsed().as_millis()),
     }
 }
 

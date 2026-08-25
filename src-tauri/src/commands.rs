@@ -1,3 +1,4 @@
+use std::time::Instant;
 use std::sync::Arc;
 
 use n_core::analyze::outcome::ReviewStats;
@@ -181,11 +182,18 @@ pub async fn reorder_symbols(
 
 #[tauri::command]
 pub async fn add_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<usize, String> {
-    state
-        .services
-        .add_symbol(&code)
-        .await
-        .map_err(|e| e.to_string())
+    let t0 = Instant::now();
+    tracing::info!("👆 用户添加品种 | {}", code);
+    match state.services.add_symbol(&code).await {
+        Ok(n) => {
+            tracing::info!("✅ 添加品种完成 | {} 耗时 {}ms | 新增 {} 条K线", code, t0.elapsed().as_millis(), n);
+            Ok(n)
+        }
+        Err(e) => {
+            tracing::error!("❌ 添加品种失败 | {} 耗时 {}ms | {e}", code, t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -202,11 +210,18 @@ pub async fn search_contracts(
 
 #[tauri::command]
 pub async fn remove_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<(), String> {
-    state
-        .services
-        .remove_symbol(&code)
-        .await
-        .map_err(|e| e.to_string())
+    let t0 = Instant::now();
+    tracing::info!("👆 用户移除品种 | {}", code);
+    match state.services.remove_symbol(&code).await {
+        Ok(()) => {
+            tracing::info!("✅ 移除品种完成 | {} 耗时 {}ms", code, t0.elapsed().as_millis());
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("❌ 移除品种失败 | {} 耗时 {}ms | {e}", code, t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -216,9 +231,17 @@ pub async fn set_symbol_flags(
     watchlist: bool,
     enabled: bool,
 ) -> Result<(), String> {
-    n_core::storage::repo::set_symbol_flags(&state.services.db, &code, watchlist, enabled)
-        .await
-        .map_err(|e| e.to_string())
+    tracing::info!("👆 更新品种标记 | {} watchlist={} enabled={}", code, watchlist, enabled);
+    match n_core::storage::repo::set_symbol_flags(&state.services.db, &code, watchlist, enabled).await {
+        Ok(()) => {
+            tracing::info!("✅ 品种标记已更新 | {}", code);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("❌ 更新品种标记失败 | {} | {e}", code);
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 更新品种最小变动价位（tick）。
@@ -228,27 +251,49 @@ pub async fn set_symbol_tick(
     code: String,
     tick: f64,
 ) -> Result<(), String> {
-    n_core::storage::repo::set_symbol_tick(&state.services.db, &code, tick)
-        .await
-        .map_err(|e| e.to_string())
+    tracing::info!("👆 更新品种 tick | {} -> {}", code, tick);
+    match n_core::storage::repo::set_symbol_tick(&state.services.db, &code, tick).await {
+        Ok(()) => {
+            tracing::info!("✅ 品种 tick 已更新 | {}", code);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("❌ 更新品种 tick 失败 | {} | {e}", code);
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn enrich_symbol_names(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    state
-        .services
-        .enrich_existing_symbols()
-        .await
-        .map_err(|e| e.to_string())
+    let t0 = Instant::now();
+    tracing::info!("👆 用户触发补齐品种名称");
+    match state.services.enrich_existing_symbols().await {
+        Ok(n) => {
+            tracing::info!("✅ 补齐品种名称完成 耗时 {}ms | 共 {} 个", t0.elapsed().as_millis(), n);
+            Ok(n)
+        }
+        Err(e) => {
+            tracing::error!("❌ 补齐品种名称失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn refresh_symbol_list(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    state
-        .services
-        .refresh_symbol_list()
-        .await
-        .map_err(|e| e.to_string())
+    let t0 = Instant::now();
+    tracing::info!("👆 用户触发刷新可交易品种列表");
+    match state.services.refresh_symbol_list().await {
+        Ok(n) => {
+            tracing::info!("✅ 品种列表刷新完成 耗时 {}ms | 共 {} 个", t0.elapsed().as_millis(), n);
+            Ok(n)
+        }
+        Err(e) => {
+            tracing::error!("❌ 品种列表刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -306,13 +351,28 @@ pub async fn get_active_events(
 
 #[tauri::command]
 pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<RefreshStats, String> {
-    let stats = state
-        .services
-        .refresh_data()
-        .await
-        .map_err(|e| e.to_string())?;
-    state.note_refresh_success().await;
-    Ok(stats)
+    let t0 = Instant::now();
+    tracing::info!("👆 用户手动触发刷新数据");
+    match state.services.refresh_data().await {
+        Ok(stats) => {
+            state.note_refresh_success().await;
+            tracing::info!(
+                "✅ 手动刷新完成 耗时 {}ms | 成功 {} 失败 {} | 总计 {}",
+                t0.elapsed().as_millis(),
+                stats.succeeded,
+                stats.failures,
+                stats.succeeded + stats.failures
+            );
+            if stats.failures > 0 {
+                tracing::warn!("⚠ 手动刷新有 {} 个品种失败", stats.failures);
+            }
+            Ok(stats)
+        }
+        Err(e) => {
+            tracing::error!("❌ 手动刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -320,11 +380,27 @@ pub async fn run_scan_now(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanResult, String> {
-    let result = state.services.run_scan().await.map_err(|e| e.to_string())?;
-    state.note_scan_success().await;
-    // 与定时扫描一致：广播扫描完成事件，让表格/K线等页面立即刷新，避免停留在旧数据
-    let _ = app.emit("scan-completed", &result);
-    Ok(result)
+    let t0 = Instant::now();
+    tracing::info!("👆 用户手动触发立即扫描");
+    match state.services.run_scan().await {
+        Ok(result) => {
+            state.note_scan_success().await;
+            let _ = app.emit("scan-completed", &result);
+            tracing::info!(
+                "✅ 手动扫描完成 耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
+                t0.elapsed().as_millis(),
+                result.scanned,
+                result.active_count,
+                result.new_warnings.len(),
+                result.newly_triggered.len()
+            );
+            Ok(result)
+        }
+        Err(e) => {
+            tracing::error!("❌ 手动扫描失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -332,11 +408,13 @@ pub async fn rebuild_events_now(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<ScanResult, String> {
-    state
-        .services
-        .rebuild_events()
-        .await
-        .map_err(|e| e.to_string())?;
+    let t0 = Instant::now();
+    tracing::info!("👆 用户手动触发重建事件");
+    if let Err(e) = state.services.rebuild_events().await {
+        tracing::error!("❌ 重建事件失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+        return Err(e.to_string());
+    }
+    tracing::info!("✓ 事件表已清空重建 耗时 {}ms，开始重新扫描…", t0.elapsed().as_millis());
     state
         .notification_history
         .lock()
@@ -344,10 +422,25 @@ pub async fn rebuild_events_now(
         .clear();
     let empty_history: Vec<NotificationHistoryItem> = Vec::new();
     let _ = app.emit("notification-history-updated", &empty_history);
-    let result = state.services.run_scan().await.map_err(|e| e.to_string())?;
-    state.note_scan_success().await;
-    let _ = app.emit("scan-completed", &result);
-    Ok(result)
+    match state.services.run_scan().await {
+        Ok(result) => {
+            state.note_scan_success().await;
+            let _ = app.emit("scan-completed", &result);
+            tracing::info!(
+                "✅ 重建后扫描完成 总耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
+                t0.elapsed().as_millis(),
+                result.scanned,
+                result.active_count,
+                result.new_warnings.len(),
+                result.newly_triggered.len()
+            );
+            Ok(result)
+        }
+        Err(e) => {
+            tracing::error!("❌ 重建后扫描失败 总耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
@@ -355,11 +448,22 @@ pub async fn rebuild_events_now(
 pub async fn refresh_outcomes_now(
     state: State<'_, Arc<AppState>>,
 ) -> Result<OutcomeRefresh, String> {
-    state
-        .services
-        .refresh_outcomes()
-        .await
-        .map_err(|e| e.to_string())
+    let t0 = Instant::now();
+    tracing::info!("👆 用户手动触发结局回填");
+    match state.services.refresh_outcomes().await {
+        Ok(r) => {
+            tracing::info!(
+                "✅ 结局回填完成 耗时 {}ms | 已更新 {}",
+                t0.elapsed().as_millis(),
+                r.updated
+            );
+            Ok(r)
+        }
+        Err(e) => {
+            tracing::error!("❌ 结局回填失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 复盘统计：按维度分组（score_band/grade/direction/level/hour/symbol/vol_confirm/oi/trend60）。
@@ -488,11 +592,27 @@ pub async fn update_config(
     state: State<'_, Arc<AppState>>,
     config: Config,
 ) -> Result<Config, String> {
-    state
-        .services
-        .apply_config(config)
-        .await
-        .map_err(|e| e.to_string())
+    let old = state.services.config().await;
+    tracing::info!(
+        "👆 用户更新配置 | 刷新 {}s->{}s 扫描 {}s->{}s 交易时段 {}->{} 日志 {}->{}",
+        old.scheduler.refresh_interval_secs, config.scheduler.refresh_interval_secs,
+        old.scheduler.scan_interval_secs, config.scheduler.scan_interval_secs,
+        old.scheduler.trading_only, config.scheduler.trading_only,
+        old.log.level, config.log.level
+    );
+    match state.services.apply_config(config).await {
+        Ok(c) => {
+            tracing::info!("✅ 配置已更新");
+            if old.log.level != c.log.level {
+                tracing::info!("ℹ 日志级别已改为 {}，重启后生效", c.log.level);
+            }
+            Ok(c)
+        }
+        Err(e) => {
+            tracing::error!("❌ 配置更新失败 | {e}");
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 记录上次打开的分组表格（null=全部品种）。
@@ -514,29 +634,53 @@ pub async fn set_timeframes(
     state: State<'_, Arc<AppState>>,
     timeframes: Vec<String>,
 ) -> Result<(), String> {
-    state
-        .services
-        .set_timeframes(timeframes)
-        .await
-        .map_err(|e| e.to_string())
+    tracing::info!("👆 用户更新K线周期 | {:?}", timeframes);
+    match state.services.set_timeframes(timeframes).await {
+        Ok(()) => {
+            tracing::info!("✅ K线周期已更新");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("❌ 更新K线周期失败 | {e}");
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 将所有配置恢复为默认值，返回新的默认配置。
 #[tauri::command]
 pub async fn reset_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
-    state
-        .services
-        .reset_config()
-        .await
-        .map_err(|e| e.to_string())
+    tracing::info!("👆 用户重置配置为默认值");
+    match state.services.reset_config().await {
+        Ok(c) => {
+            tracing::info!("✅ 配置已重置");
+            Ok(c)
+        }
+        Err(e) => {
+            tracing::error!("❌ 配置重置失败 | {e}");
+            Err(e.to_string())
+        }
+    }
 }
 
 /// 打开日志目录（与日志文件同目录）。
 #[tauri::command]
 pub async fn open_log_directory(app: tauri::AppHandle) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    open::that(&dir).map_err(|e| e.to_string())
+    tracing::info!("👆 用户打开日志目录");
+    let dir = app.path().app_data_dir().map_err(|e| {
+        tracing::error!("❌ 获取日志目录失败 | {e}");
+        e.to_string()
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        tracing::error!("❌ 创建日志目录失败 | {e}");
+        e.to_string()
+    })?;
+    open::that(&dir).map_err(|e| {
+        tracing::error!("❌ 打开日志目录失败 | {e}");
+        e.to_string()
+    })?;
+    tracing::info!("✅ 已打开日志目录 | {}", dir.display());
+    Ok(())
 }
 
 #[tauri::command]
@@ -554,6 +698,9 @@ pub async fn set_scheduler_running(
     state: State<'_, Arc<AppState>>,
     running: bool,
 ) -> Result<SchedulerStatus, String> {
+    tracing::info!("👆 用户{}调度器", if running { "启动" } else { "暂停" });
     state.scheduler.write().await.running = running;
-    scheduler_status(state).await
+    let s = scheduler_status(state).await?;
+    tracing::info!("✅ 调度器已{} | 运行中: {}", if running { "启动" } else { "暂停" }, s.running);
+    Ok(s)
 }
