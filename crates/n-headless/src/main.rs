@@ -5,6 +5,7 @@ use chrono::Local;
 use n_core::config::Config;
 use n_core::service::Services;
 use n_core::storage;
+use tracing_subscriber::prelude::*;
 #[derive(Clone, Debug)]
 struct LocalTime;
 impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
@@ -91,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_refresh(svc: &Services) -> anyhow::Result<()> {
     let t0 = Instant::now();
     tracing::info!("刷新触发 | {}", Local::now().format("%H:%M:%S"));
-    match svc.run_refresh().await { Ok(s) => { tracing::info!("刷新完成 {}ms | 成功 {} 失败 {}", t0.elapsed().as_millis(), s.succeeded, s.failures); Ok(()) }, Err(e) => { tracing::error!("刷新失败: {e}"); Err(e) } }
+    match svc.refresh_data().await { Ok(s) => { tracing::info!("刷新完成 {}ms | 成功 {} 失败 {}", t0.elapsed().as_millis(), s.succeeded, s.failures); Ok(()) }, Err(e) => { tracing::error!("刷新失败: {e}"); Err(e) } }
 }
 async fn run_scan(svc: &Services) -> anyhow::Result<()> {
     let t0 = Instant::now();
