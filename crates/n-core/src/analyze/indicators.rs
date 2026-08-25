@@ -373,51 +373,33 @@ pub struct BareSignal {
     pub low: f64,
 }
 
-fn bar_ts_str(dt: &crate::analyze::model::DT) -> String {
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:00", dt.year, dt.month, dt.day, dt.hour, dt.minute)
-}
-
-fn dt_add_minutes(dt: &crate::analyze::model::DT, add_mins: i32) -> crate::analyze::model::DT {
-    let mut y = dt.year;
-    let mut m = dt.month;
-    let mut d = dt.day;
-    let mut h = dt.hour;
-    let mut min = dt.minute + add_mins;
-    while min >= 60 { min -= 60; h += 1; }
-    while h >= 24 {
-        h -= 24; d += 1;
-        let dim = days_in_month(y, m);
-        if d > dim { d = 1; m += 1; if m > 12 { m = 1; y += 1; } }
-    }
-    crate::analyze::model::DT { year: y, month: m, day: d, hour: h, minute: min }
-}
-
-fn days_in_month(y: i32, m: i32) -> i32 {
-    match m {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => if (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) { 29 } else { 28 },
-        _ => 30,
-    }
-}
-
 fn calc_atr14(bars: &[crate::analyze::model::Bar]) -> Option<f64> {
     if bars.len() < 15 { return None; }
-    let mut trs: Vec<f64> = Vec::with_capacity(14);
     let start = bars.len() - 14;
+    let mut sum = 0.0;
     for i in start..bars.len() {
         let cur = &bars[i];
         let hl = cur.high - cur.low;
         let tr = if i == 0 || cur.rollover { hl } else { let pc = bars[i - 1].close; hl.max((cur.high - pc).abs()).max((cur.low - pc).abs()) };
-        trs.push(tr);
+        sum += tr;
     }
-    if trs.is_empty() { return None; }
-    Some(trs.iter().sum::<f64>() / trs.len() as f64)
+    Some(sum / 14.0)
+}
+
+fn is_bare_kind(range: f64, body: f64, upper: f64, lower: f64, atr: f64, is_bull: bool) -> Option<BareKind> {
+    if body < 0.25 * range { return None; }
+    if is_bull {
+        if upper <= 0.05 * range && lower >= 1.5 * body && lower >= 0.40 * range && lower >= 0.7 * atr {
+            return Some(BareKind::Hammer);
+        }
+    } else if lower <= 0.05 * range && upper >= 1.5 * body && upper >= 0.40 * range && upper >= 0.7 * atr {
+        return Some(BareKind::Needle);
+    }
+    None
 }
 
 pub fn detect_bare_prev(bars: &[crate::analyze::model::Bar]) -> Option<BareSignal> {
-    if bars.is_empty() { return None; }
-    let b = bars.last().unwrap();
+    let b = bars.last()?;
     let range = b.high - b.low;
     if range <= 0.0 { return None; }
     let body = (b.close - b.open).abs();
@@ -425,23 +407,14 @@ pub fn detect_bare_prev(bars: &[crate::analyze::model::Bar]) -> Option<BareSigna
     let upper = b.high - b.open.max(b.close);
     let lower = b.open.min(b.close) - b.low;
     let atr = calc_atr14(bars).unwrap_or(0.0);
-    let is_hammer = b.close > b.open && upper <= 0.05 * range && lower >= 1.5 * body && lower >= 0.40 * range && lower >= 0.7 * atr && body >= 0.25 * range;
-    if is_hammer { return Some(BareSignal { kind: BareKind::Hammer, bar_ts: bar_ts_str(&b.dt), price: b.close, high: b.high, low: b.low }); }
-    let is_needle = b.close < b.open && lower <= 0.05 * range && upper >= 1.5 * body && upper >= 0.40 * range && upper >= 0.7 * atr && body >= 0.25 * range;
-    if is_needle { return Some(BareSignal { kind: BareKind::Needle, bar_ts: bar_ts_str(&b.dt), price: b.close, high: b.high, low: b.low }); }
-    None
+    let kind = is_bare_kind(range, body, upper, lower, atr, b.close > b.open)?;
+    Some(BareSignal { kind, bar_ts: b.dt.to_bar_ts(), price: b.close, high: b.high, low: b.low })
 }
 
 pub fn bare_expire_ts(trigger_ts: &str) -> String {
-    if trigger_ts.len() < 16 { return trigger_ts.to_string(); }
-    let y: i32 = trigger_ts[0..4].parse().unwrap_or(2000);
-    let m: i32 = trigger_ts[5..7].parse().unwrap_or(1);
-    let d: i32 = trigger_ts[8..10].parse().unwrap_or(1);
-    let h: i32 = trigger_ts[11..13].parse().unwrap_or(0);
-    let min: i32 = trigger_ts[14..16].parse().unwrap_or(0);
-    let dt = crate::analyze::model::DT { year: y, month: m, day: d, hour: h, minute: min };
-    let exp = dt_add_minutes(&dt, 15);
-    bar_ts_str(&exp)
+    crate::analyze::model::DT::from_bar_ts(trigger_ts)
+        .map(|dt| dt.add_minutes(15).to_bar_ts())
+        .unwrap_or_else(|| trigger_ts.to_string())
 }
 #[cfg(test)]
 mod tests {
@@ -517,3 +490,4 @@ mod tests {
         assert_eq!(ma[20], Some(11.5));
     }
 }
+

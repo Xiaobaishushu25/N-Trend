@@ -208,6 +208,7 @@ export interface ScanResult {
   new_warnings: PatternEvent[]
   newly_triggered: PatternEvent[]
   failed: SymbolFailure[]
+  single_bars?: SingleBarEvent[]
 }
 
 export interface RefreshStats {
@@ -538,4 +539,5 @@ export interface NotificationHistoryItem {
 
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
+
 

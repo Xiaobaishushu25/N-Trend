@@ -1,24 +1,22 @@
-import { defineStore } from 'pinia'
+﻿import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import type { PatternEvent, ScanResult, SingleBarEvent } from '../types'
+import { normalizeSingleBar, isExpired } from '../utils/singleBar'
 
-/** 图表右侧只展示仍在途的信号：已了结、已失效、未知状态一律不进入列表 */
 const ACTIVE_STATES = new Set(['pending', 'triggered'])
 
 function activeSignals(rows: PatternEvent[]): PatternEvent[] {
   return rows.filter((e) => ACTIVE_STATES.has(e.state))
 }
 
-let _cleanupInterval: ReturnType<typeof setInterval> | null = null
-function ensureCleanupInterval(store: any) {
-  if (_cleanupInterval != null || typeof window === "undefined") return
-  _cleanupInterval = setInterval(() => store.cleanupSingleBars(), 30000)
+let cleanupInterval: ReturnType<typeof setInterval> | null = null
+function ensureCleanup(store: { cleanupSingleBars: () => void }) {
+  if (cleanupInterval != null || typeof window === 'undefined') return
+  cleanupInterval = setInterval(() => store.cleanupSingleBars(), 30_000)
 }
-
-function toSingleBarTimes(e: SingleBarEvent): SingleBarEvent { const toMs = (v: any) => typeof v === "number" ? v : new Date(String(v).replace(" ", "T")).getTime(); const t = (e as any).trigger_bar_ts ?? (e as any).triggerTime; const ex = (e as any).expire_bar_ts ?? (e as any).expireTime; const triggerTime = typeof t === "number" ? t : toMs(t); const expireTime = typeof ex === "number" ? ex : toMs(ex); return { ...e, trigger_bar_ts: typeof t === "string" ? t : new Date(t).toISOString().slice(0,16).replace("T"," ")+":00", expire_bar_ts: typeof ex === "string" ? ex : new Date(ex).toISOString().slice(0,16).replace("T"," ")+":00", triggerTime, expireTime }; }
 
 function toNotificationSignal(e: PatternEvent, name: string) {
   return {
@@ -51,7 +49,6 @@ export const useScansStore = defineStore('scans', {
         this.running = false
       }
     },
-    /** 页面加载时同步最新形态：优先用 DB 缓存秒级渲染，后台静默扫描更新 */
     async refreshLatestSignals() {
       if (this.latest) {
         this.latestSignals = activeSignals(this.latest.signals)
@@ -60,7 +57,6 @@ export const useScansStore = defineStore('scans', {
       try {
         const cached = await api.getActiveEvents()
         this.latestSignals = activeSignals(cached as unknown as PatternEvent[])
-        // 后台静默刷新，不阻塞表格首绘；结果通过 scan-completed 事件回流到 ingest
         if (!cached.length) {
           this.runScan().catch(() => {})
         } else {
@@ -70,12 +66,12 @@ export const useScansStore = defineStore('scans', {
         await this.runScan()
       }
     },
-    /** 扫描完成后统一处理：更新内存结果，并按事件类型弹通知 */
     applyScanResult(result: ScanResult) {
       this.latest = result
       this.latestSignals = activeSignals(result.signals)
-      if ((result as any).single_bars && Array.isArray((result as any).single_bars)) {
-        ensureCleanupInterval(this as any); this.upsertSingleBars((result as any).single_bars as SingleBarEvent[])
+      if (result.single_bars?.length) {
+        ensureCleanup(this)
+        this.upsertSingleBars(result.single_bars)
       }
       const notifySettings = useSettingsStore().settings.notify
       const symbolsStore = useSymbolsStore()
@@ -106,21 +102,20 @@ export const useScansStore = defineStore('scans', {
     upsertSingleBars(events: SingleBarEvent[]) {
       const now = Date.now()
       for (const raw of events) {
-        if (!raw || (raw as any).timeframe !== "15m") continue
-        const e = toSingleBarTimes(raw as any)
-        if (now > e.expireTime) continue
+        if (!raw || raw.timeframe !== '15m') continue
+        const e = normalizeSingleBar(raw)
+        if (isExpired(e, now)) continue
         this.singleBars.set(e.symbol, e)
       }
       for (const [k, v] of this.singleBars.entries()) {
-        if (now > v.expireTime) this.singleBars.delete(k)
+        if (isExpired(v, now)) this.singleBars.delete(k)
       }
     },
     cleanupSingleBars() {
       const now = Date.now()
       for (const [k, v] of this.singleBars.entries()) {
-        if (now > v.expireTime) this.singleBars.delete(k)
+        if (isExpired(v, now)) this.singleBars.delete(k)
       }
     },
-
   },
 })

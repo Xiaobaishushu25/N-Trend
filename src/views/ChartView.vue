@@ -20,6 +20,7 @@ import { useGroupsStore } from '../stores/groups'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
+import { singleBarBadgeStyle, singleBarTitle } from '../utils/singleBar'
 import { useSettingsStore } from '../stores/settings'
 import { useAppStore } from '../stores/app'
 import { fmtR } from '../stores/review'
@@ -51,6 +52,8 @@ const groupsStore = useGroupsStore()
 const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
+const getSingleBar = (code: string) => scansStore.singleBars.get(code) ?? null
+const chartSingleBars = computed(() => { const sb = scansStore.singleBars.get(symbol.value); return sb ? [sb] : [] })
 const timeframe = ref<Timeframe>('15m')
 const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
 const settingsStore = useSettingsStore()
@@ -1486,7 +1489,7 @@ onBeforeUnmount(() => {
                 >
                   {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
                 </span>
-                <span v-if="(scansStore as any).singleBars.get(element.code)" :style="(scansStore as any).singleBars.get(element.code)?.kind === 'hammer' ? 'margin-left:6px;border:1px dashed #f59e0b;color:#f59e0b;border-radius:999px;padding:0 5px;font-size:10px;line-height:14px;background:rgba(245,158,11,.10)' : 'margin-left:6px;border:1px dashed #a78bfa;color:#a78bfa;border-radius:999px;padding:0 5px;font-size:10px;line-height:14px;background:rgba(167,139,250,.12)'" :title="((scansStore as any).singleBars.get(element.code)?.label || '') + ' ' + ((scansStore as any).singleBars.get(element.code)?.trigger_bar_ts || '')" >{{ (scansStore as any).singleBars.get(element.code)?.kind === 'hammer' ? '锤' : '针' }}·15m</span>
+                <span v-if="getSingleBar(element.code)" :style="singleBarBadgeStyle(getSingleBar(element.code)!.kind) + 'margin-left:6px;padding:0 5px;font-size:10px;line-height:14px'" :title="singleBarTitle(getSingleBar(element.code)!)" >{{ getSingleBar(element.code)?.kind === 'hammer' ? '锤' : '针' }}·15m</span>
                 <div class="sl-quote">
                   <span
                     class="sl-price"
@@ -1519,7 +1522,7 @@ onBeforeUnmount(() => {
           :review-exit="reviewExit"
           :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
            :trend-points="trendPoints"
-          :single-bars="(scansStore as any).singleBars.get(symbol) ? [(scansStore as any).singleBars.get(symbol)] : []"
+          :single-bars="chartSingleBars"
           :loading="klinesStore.loading"
         />
         <n-empty
@@ -3149,6 +3152,9 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
+
+
+
 
 
 
