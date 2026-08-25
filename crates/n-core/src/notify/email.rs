@@ -1,4 +1,4 @@
-//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
+﻿//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -179,9 +179,10 @@ pub fn event_email_payload(kind: EventEmailKind, e: &pattern_events::Model) -> (
         EventEmailKind::Trigger => "触发",
     };
     let subject = format!(
-        "N趋势{kind_label} {symbol} {dir} {score:.2}分",
+        "N趋势{kind_label} [{symbol}] {dir} {grade} {score:.2}分",
         symbol = e.symbol,
         dir = event_dir_label(e),
+        grade = e.grade,
         score = e.entry_score,
     );
 

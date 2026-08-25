@@ -1486,6 +1486,7 @@ onBeforeUnmount(() => {
                 >
                   {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
                 </span>
+                <span v-if="(scansStore as any).singleBars.get(element.code)" :style="(scansStore as any).singleBars.get(element.code)?.kind === 'hammer' ? 'margin-left:6px;border:1px dashed #f59e0b;color:#f59e0b;border-radius:999px;padding:0 5px;font-size:10px;line-height:14px;background:rgba(245,158,11,.10)' : 'margin-left:6px;border:1px dashed #a78bfa;color:#a78bfa;border-radius:999px;padding:0 5px;font-size:10px;line-height:14px;background:rgba(167,139,250,.12)'" :title="((scansStore as any).singleBars.get(element.code)?.label || '') + ' ' + ((scansStore as any).singleBars.get(element.code)?.trigger_bar_ts || '')" >{{ (scansStore as any).singleBars.get(element.code)?.kind === 'hammer' ? '锤' : '针' }}·15m</span>
                 <div class="sl-quote">
                   <span
                     class="sl-price"
@@ -1517,7 +1518,8 @@ onBeforeUnmount(() => {
           :show-extremes="showExtremes"
           :review-exit="reviewExit"
           :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
-          :trend-points="trendPoints"
+           :trend-points="trendPoints"
+          :single-bars="(scansStore as any).singleBars.get(symbol) ? [(scansStore as any).singleBars.get(symbol)] : []"
           :loading="klinesStore.loading"
         />
         <n-empty

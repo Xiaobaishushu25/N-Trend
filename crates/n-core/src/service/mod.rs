@@ -46,6 +46,7 @@ pub struct ScanResult {
     /// 本轮推进时新触发的事件
     pub newly_triggered: Vec<pattern_events::Model>,
     pub failed: Vec<SymbolFailure>,
+    pub single_bars: Vec<crate::analyze::model::SingleBarAlert>,
 }
 
 impl ScanResult {
@@ -1592,69 +1593,101 @@ impl Services {
         repo::upsert_klines(&self.db, models).await?;
         self.derive_and_store(code).await?;
 
-        // --- 5分钟收盘结算窗口的延迟补拉（修复 CJ0 15m 11:30 L8265/L8260 类偏差）---
+        // --- 5分钟收盘结算窗口的延迟补拉（修复 CJ0 15m 11:30 L8265/L8260、PB0 11:30 16085/16095 等偏差）---
         // 背景：fetch/kline.rs::settled_kline_rows 会丢弃 now - bar_ts < MINUTE_BAR_SETTLE_SECS(30秒) 的K线，
         //       目的是避免在收盘瞬间使用半成品K线（如11:29:50去用11:30那根）。
-        // 问题：scheduler的 normal_refresh 固定在 minute%5==0 的整点（如11:30:00）触发 refresh_symbol_data，
+        // 问题：scheduler 的 normal_refresh 固定在 minute%5==0 的整点（如11:30:00）触发 refresh_symbol_data，
         //       此时新浪那根刚收盘的5m（如11:30 L8260）正好落在30秒结算窗口内，会被当次丢弃。
         // 后果：当次 derive_and_store 只能用 11:15+11:20+11:25 合成15m，导致15m最低价等字段错5分钟
         //       （如 8260 被算成 8265），前端在 11:30:10 看到的就是错的，需要等到 11:30:30/11:35 或手动刷新才纠正。
+        // 优化（收盘加强）：普通 5m 边界延迟约35秒（30+5）即可结算完成，但日盘/夜盘收盘的最后一根
+        //       （10:15 / 11:30 / 15:00 / 23:30 / 02:30）交易所撮合与新浪发布会慢 60-90秒，35秒仍可能拉到半成品
+        //       （如 PB0 11:30 H16095 L16090 的中间值，而非最终 H16105 L16080 C16085），且午休/收盘后 scheduler
+        //       的 is_trading_time 为 false，不会再有 normal_refresh，导致错值滞留一整个休市段。
         // 修复：仅在写路径 refresh_symbol_data 末尾做轻量检测——若本次刷新正好落在5m收盘后45秒内，
-        //       则在后台延迟到收盘后约35秒（MINUTE_BAR_SETTLE_SECS+5）再补拉一次。此为后台任务，不阻塞当前刷新，
-        //       也不改动 get_klines 热路径，避免上次在 get_klines 中实时聚合+并发写库导致的切换卡死问题。
+        //       则在后台延迟补拉。此为后台任务，不阻塞当前刷新，也不改动 get_klines 热路径，避免上次在 get_klines
+        //       中实时聚合+并发写库导致的切换卡死问题。
+        // 策略：
+        //   - 普通 5m：收盘后约35秒（MINUTE_BAR_SETTLE_SECS+5）补拉一次
+        //   - 收盘 5m（10:15/11:30/15:00/23:30/02:30）：收盘后约75秒（30+45）补拉一次，并额外在收盘后约90秒二次补拉，
+        //     双保险确保收盘 K 最终定版。二次补拉仅针对收盘，不会增加普通时段的请求量。
         // 注意：Services 未实现 Clone（持有 RwLock<SinaClient>/Mutex），故仅 clone db（DatabaseConnection可Clone）和 code，
-        //       SinaClient 在 spawn 内新建。补拉成功后重新 upsert 并 derive_and_store 覆盖 derived 15m/60m。
-        // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> delay=35秒 -> 11:30:35后台重拉，此时11:30已结算完成(>30秒)可正确入库并纠正15m；
-        //       若在11:31:10触发则 secs_since_5m=70 >45，不触发补拉。
+        //       SinaClient 在 spawn 内新建。补拉成功后重新 upsert 并重聚合覆盖 derived 15m/60m。
+        // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> 识别为收盘 -> delay1=75秒 -> 11:31:15第一次补拉，delay2=90秒 -> 11:31:30第二次补拉；
+        //       10:45:00触发 -> 普通 -> delay=35秒 -> 10:45:35补拉；11:31:10触发 -> secs_since_5m=70 >45 不触发。
         {
             let now = chrono::Local::now();
             let secs_since_5m = now.minute() % 5 * 60 + now.second();
             if secs_since_5m < 45 {
-                let delay_secs = ((MINUTE_BAR_SETTLE_SECS as i64 + 5) - secs_since_5m as i64).max(5) as u64;
+                let is_session_close = matches!((now.hour(), now.minute()), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30));
+                let base_delay = if is_session_close { 75 } else { 35 };
+                let delay_secs = (base_delay as i64 - secs_since_5m as i64).max(5) as u64;
                 let db = self.db.clone();
                 let code_owned = code.to_string();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    let client = SinaClient::new();
-                    match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
-                        Ok(fetched) => {
-                            let models: Vec<_> = fetched.iter().map(|k| fetch_to_model(&code_owned, "5m", "raw", k)).collect();
-                            if let Err(e) = repo::upsert_klines(&db, models).await {
-                                tracing::warn!("延迟补拉 upsert 失败 {}: {e:?}", code_owned);
-                                return;
-                            }
-                            let raw = match repo::raw_klines(&db, &code_owned).await {
-                                Ok(v) => v,
+                let do_refetch = {
+                    let db = db.clone();
+                    let code_owned = code_owned.clone();
+                    move |label: &str| {
+                        let db = db.clone();
+                        let code_owned = code_owned.clone();
+                        let label = label.to_string();
+                        async move {
+                            let client = SinaClient::new();
+                            match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
+                                Ok(fetched) => {
+                                    let models: Vec<_> = fetched.iter().map(|k| fetch_to_model(&code_owned, "5m", "raw", k)).collect();
+                                    if let Err(e) = repo::upsert_klines(&db, models).await {
+                                        tracing::warn!("延迟补拉 upsert 失败 {} ({}): {e:?}", code_owned, label);
+                                        return;
+                                    }
+                                    let raw = match repo::raw_klines(&db, &code_owned).await {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::warn!("延迟补拉读取 raw 失败 {} ({}): {e:?}", code_owned, label);
+                                            return;
+                                        }
+                                    };
+                                    if raw.len() < 3 { return; }
+                                    let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
+                                    let mut derived = Vec::new();
+                                    for tf in [Timeframe::M15, Timeframe::M60] {
+                                        for k in aggregate(&bars, tf) {
+                                            derived.push(fetch_to_model(&code_owned, tf.as_str(), "derived", &k));
+                                        }
+                                    }
+                                    if let Err(e) = repo::delete_derived_klines(&db, &code_owned).await {
+                                        tracing::warn!("延迟补拉清理 derived 失败 {} ({}): {e:?}", code_owned, label);
+                                        return;
+                                    }
+                                    if let Err(e) = repo::upsert_klines(&db, derived).await {
+                                        tracing::warn!("延迟补拉写入 derived 失败 {} ({}): {e:?}", code_owned, label);
+                                        return;
+                                    }
+                                    tracing::info!("延迟补拉完成 {} ({})", code_owned, label);
+                                }
                                 Err(e) => {
-                                    tracing::warn!("延迟补拉读取 raw 失败 {}: {e:?}", code_owned);
-                                    return;
-                                }
-                            };
-                            if raw.len() < 3 {
-                                return;
-                            }
-                            let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
-                            let mut derived = Vec::new();
-                            for tf in [Timeframe::M15, Timeframe::M60] {
-                                for k in aggregate(&bars, tf) {
-                                    derived.push(fetch_to_model(&code_owned, tf.as_str(), "derived", &k));
+                                    tracing::warn!("延迟补拉抓取失败 {} ({}): {e:?}", code_owned, label);
                                 }
                             }
-                            if let Err(e) = repo::delete_derived_klines(&db, &code_owned).await {
-                                tracing::warn!("延迟补拉清理 derived 失败 {}: {e:?}", code_owned);
-                                return;
-                            }
-                            if let Err(e) = repo::upsert_klines(&db, derived).await {
-                                tracing::warn!("延迟补拉写入 derived 失败 {}: {e:?}", code_owned);
-                                return;
-                            }
-                            tracing::info!("延迟补拉完成 {} (收盘后35秒补拉)", code_owned);
-                        }
-                        Err(e) => {
-                            tracing::warn!("延迟补拉抓取失败 {}: {e:?}", code_owned);
                         }
                     }
-                });
+                };
+                {
+                    let fut = do_refetch(if is_session_close { "收盘后75秒补拉" } else { "收盘后35秒补拉" });
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        fut.await;
+                    });
+                }
+                if is_session_close {
+                    let delay2 = (90i64 - secs_since_5m as i64).max(10) as u64;
+                    let delay2 = delay2.max(delay_secs + 15);
+                    let fut2 = do_refetch("收盘后90秒二次补拉");
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay2)).await;
+                        fut2.await;
+                    });
+                }
             }
         }
         Ok(())
@@ -2033,6 +2066,7 @@ impl Services {
         let mut newly_triggered: Vec<pattern_events::Model> = Vec::new();
         let mut signals: Vec<pattern_events::Model> = Vec::new();
         let mut scanned = 0i64;
+        let mut single_bars: Vec<crate::analyze::model::SingleBarAlert> = Vec::new();
 
         for sym in symbols {
             let bars15 = settled_scan_bars(self.bars_for(&sym.code, "15m").await?);
@@ -2044,6 +2078,24 @@ impl Services {
                 continue;
             }
             scanned += 1;
+            if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
+                let (kind_s, label) = match sig.kind {
+                    crate::analyze::indicators::BareKind::Hammer => ("hammer", "锤·15m"),
+                    crate::analyze::indicators::BareKind::Needle => ("needle", "针·15m"),
+                };
+                let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
+                single_bars.push(crate::analyze::model::SingleBarAlert {
+                    symbol: sym.code.clone(),
+                    timeframe: "15m".to_string(),
+                    kind: kind_s.to_string(),
+                    label: label.to_string(),
+                    trigger_bar_ts: sig.bar_ts.clone(),
+                    expire_bar_ts: expire,
+                    price: sig.price,
+                    high: sig.high,
+                    low: sig.low,
+                });
+            }
             let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
             let candidates = event::replay_warnings(&sym.code, &bars15, tick);
             let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
@@ -2101,6 +2153,7 @@ impl Services {
             new_warnings,
             newly_triggered,
             failed,
+            single_bars,
         })
     }
 
@@ -2956,6 +3009,7 @@ mod tests {
                 .collect(),
             newly_triggered: Vec::new(),
             failed: Vec::new(),
+            single_bars: Vec::new(),
         }
     }
 

@@ -26,7 +26,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
-import type { KlineRow, PatternDto, ReviewExitOverlay, TrendPointDto } from '../types'
+import type { KlineRow, PatternDto, ReviewExitOverlay, TrendPointDto, SingleBarEvent } from '../types'
 import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
@@ -34,6 +34,7 @@ const props = defineProps<{
   timeframe: string
   rows: KlineRow[]
   signals: PatternDto[]
+  singleBars?: any[]
   /** 是否在当前可视区间标注最高价/最低价 */
   showExtremes?: boolean
   loading?: boolean
@@ -1329,6 +1330,29 @@ function buildEventLabels(): EventLabelData[] {
     }
   }
 
+  // 单K裸K独立提醒：锤/针 在下一根K线上方/下方打点 priority 5
+  const sbList = (props as any).singleBars as SingleBarEvent[] | undefined
+  if (sbList && sbList.length) {
+    for (const sb of sbList) {
+      if (!sb || sb.timeframe !== "15m") continue
+      const triggerMs = (sb as any).triggerTime ?? new Date(String((sb as any).trigger_bar_ts).replace(" ", "T")).getTime()
+      const expireMs = (sb as any).expireTime ?? triggerMs + 15*60*1000
+      if (Date.now() > expireMs) continue
+      const nextMs = triggerMs + 15*60*1000
+      const row = rowAt(new Date(nextMs).toISOString().slice(0,16).replace("T"," ")+":00") || props.rows[props.rows.length-1]
+      const time = (nextMs/1000) as Time
+      const isHammer = sb.kind === "hammer"
+      labels.push({
+        time,
+        text: isHammer ? "锤" : "针",
+        color: isHammer ? "#f59e0b" : "#a78bfa",
+        price: isHammer ? (row ? row.low : null) : (row ? row.high : null),
+        priority: 5,
+        side: isHammer ? "below" : "above",
+      })
+    }
+  }
+
   if (ex?.ts && ex.price != null && ex.price > 0) {
     const rText = ex.r == null ? '' : ` ${ex.r >= 0 ? '+' : ''}${ex.r.toFixed(2)}R`
     labels.push({
@@ -1342,6 +1366,8 @@ function buildEventLabels(): EventLabelData[] {
   }
   return labels
 }
+
+watch(() => (props as any).singleBars, () => { syncEventLabels() })
 
 function syncEventLabels() {
   if (!chart || !candleSeries) return

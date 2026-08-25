@@ -184,6 +184,22 @@ export interface SymbolFailure {
   reason: string
 }
 
+export type SingleBarKind = "hammer" | "needle"
+
+export interface SingleBarEvent {
+  symbol: string
+  timeframe: "15m"
+  kind: SingleBarKind
+  label: string
+  trigger_bar_ts: string
+  expire_bar_ts: string
+  triggerTime: number
+  expireTime: number
+  price: number
+  high: number
+  low: number
+}
+
 export interface ScanResult {
   scanned: number
   active_count: number

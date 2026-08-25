@@ -745,6 +745,18 @@ const columns: DataTableColumns<WatchRow> = [
     },
   },
   {
+    title: '单K',
+    key: 'singleBar',
+    width: 56,
+    align: 'center',
+    render: (r) => {
+      const sb = (scansStore as any).singleBars.get(r.symbol.code)
+      if (!sb) return h('span', { style: 'color:#9ca3af' }, '—')
+      const isHammer = sb.kind === 'hammer'
+      return h('span', { style: 'border:1px dashed ' + (isHammer ? '#f59e0b' : '#a78bfa') + ';color:' + (isHammer ? '#f59e0b' : '#a78bfa') + ';background:' + (isHammer ? 'rgba(245,158,11,.10)' : 'rgba(167,139,250,.12)') + ';border-radius:999px;padding:1px 6px;font-size:11px;white-space:nowrap', title: sb.label + ' ' + sb.trigger_bar_ts + ' → ' + sb.expire_bar_ts }, sb.label)
+    },
+  },
+  {
     title: '状态',
     key: 'state',
     width: 104,

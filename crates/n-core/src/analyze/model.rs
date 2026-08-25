@@ -239,6 +239,19 @@ impl SignalCheck {
     }
 }
 
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SingleBarAlert {
+    pub symbol: String,
+    pub timeframe: String,
+    pub kind: String,
+    pub label: String,
+    pub trigger_bar_ts: String,
+    pub expire_bar_ts: String,
+    pub price: f64,
+    pub high: f64,
+    pub low: f64,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
