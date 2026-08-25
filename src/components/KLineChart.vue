@@ -1413,10 +1413,13 @@ function renderData() {
   } else {
     restoreView()
   }
+  const lastTsForHover = props.rows.length ? (toTs(props.rows[props.rows.length - 1].ts) as Time) : null
+  const hoveringOnHistory = isHovering && hoveredTime != null && lastTsForHover != null && hoveredTime !== lastTsForHover
+  const shouldAutoFollow = focusFollowsLatest && !hoveringOnHistory
   if (isSwitch) {
     focusIndex = props.rows.length - 1
     focusFollowsLatest = true
-  } else if (focusFollowsLatest) {
+  } else if (shouldAutoFollow) {
     focusIndex = props.rows.length - 1
   } else if (focusIndex < 0 || focusIndex >= props.rows.length) {
     focusIndex = props.rows.length - 1
@@ -1436,14 +1439,26 @@ function renderData() {
       focusIdxForCenter = idx
     }
   }
-  syncFocus()
+  if (hoveringOnHistory) {
+    const hoveredRow = hoveredTime != null ? props.rows.find((r) => (toTs(r.ts) as Time) === hoveredTime) : undefined
+    if (hoveredRow && hoveredTime != null) {
+      if (legend.value) {
+        legend.value.innerHTML = formatLegend({ time: hoveredTime, open: hoveredRow.open, high: hoveredRow.high, low: hoveredRow.low, close: hoveredRow.close } as CandlestickData, hoveredTime)
+      }
+      chart.setCrosshairPosition(hoveredRow.close, hoveredTime, candleSeries)
+    } else {
+      syncFocus()
+    }
+  } else {
+    syncFocus()
+  }
   if (focusNeedsCenter) {
     centerFocusView(focusIdxForCenter)
     const savedIdx = focusIdxForCenter
     nextTick(() => {
       if (focusIndex === savedIdx && chart) centerFocusView(savedIdx)
     })
-  } else if (focusFollowsLatest) ensureFocusVisible()
+  } else if (shouldAutoFollow) ensureFocusVisible()
   else if (pendingFocusTs) {
     // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
     scheduleFocusRetry()
@@ -1591,16 +1606,22 @@ onMounted(() => {
 
   chart.subscribeCrosshairMove((param) => {
     if (!legend.value || !candleSeries) return
-    if (!param.time) {
+    if (!param.time || !param.point) {
+      isHovering = false
+      hoveredTime = null
       if (focusPinnedByKeys) syncFocus()
       else renderFocusLegend()
       return
     }
     const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
     if (!d) {
+      isHovering = false
+      hoveredTime = null
       renderFocusLegend()
       return
     }
+    isHovering = true
+    hoveredTime = param.time as Time
     focusPinnedByKeys = false
     legend.value.innerHTML = formatLegend(d, param.time as Time)
   })

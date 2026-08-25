@@ -1,5 +1,15 @@
 # 更新日志
 
+## 2026-08-25
+
+### K线悬停聚焦修复 — 实时行情不再抢夺历史K线焦点
+
+- `KLineChart.vue` 修复实时行情 `renderData()` 在鼠标悬停历史K线时自动 `syncFocus()`/`ensureFocusVisible()` 把十字线和图例抢回最新K线的问题
+- 新增 `isHovering`/`hoveredTime` 状态，由 `subscribeCrosshairMove` 维护：`!param.time||!param.point` 及 `!seriesData` 时清除悬停，否则记录 `hoveredTime=param.time`
+- `renderData` 头部计算 `hoveringOnHistory = isHovering && hoveredTime != lastTs` 与 `shouldAutoFollow = focusFollowsLatest && !hoveringOnHistory`，仅非历史悬停时才自动跟随最新K线
+- `renderData` 尾部：历史悬停时查找 `hoveredRow` 并 `innerHTML=formatLegend(...)` + `setCrosshairPosition(close, hoveredTime)` 原地还原，否则走原 `syncFocus()`；`ensureFocusVisible()` 也改为 `shouldAutoFollow` 守卫
+- `onMounted` 初始化 `isHovering=false, hoveredTime=null`，保留 `restoreView` 视口不变；验证 `vue-tsc --noEmit` 与 `vite build` 通过（4405 modules）
+
 ## 2026-08-24
 
 ### 60m 五档趋势标签（仅展示不计分） — 3f5fc79
