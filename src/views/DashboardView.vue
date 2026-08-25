@@ -701,7 +701,8 @@ const columns: DataTableColumns<WatchRow> = [
     align: 'right',
     render: (r) =>
       r.changePct == null
-        ? h('span', { class: 'cell-empty' }, '—')
+        ? h('span', { class:'cell-empty' }, '—')
+      // placeholder
         : h(
             'span',
             { class: 'cell-pct', style: { color: trendColor(r.changePct) } },
@@ -715,7 +716,8 @@ const columns: DataTableColumns<WatchRow> = [
     align: 'right',
     render: (r) =>
       r.changePts == null
-        ? h('span', { class: 'cell-empty' }, '—')
+        ? h('span', { class:'cell-empty' }, '—')
+      // placeholder
         : h(
             'span',
             { class: 'cell-pts', style: { color: trendColor(r.changePct) } },
@@ -729,7 +731,8 @@ const columns: DataTableColumns<WatchRow> = [
     maxWidth: 150,
     render: (r) => {
       const s = r.signal
-      if (!s) return h('span', { class: 'cell-empty' }, '—')
+      if (!s) return h('span', { class:'cell-empty' }, '—')
+      // placeholder
       const tip = `${patternLabel(s)} · ${s.grade} · 评分 ${s.entry_score.toFixed(2)}`
       return h(
         'div',
@@ -748,12 +751,16 @@ const columns: DataTableColumns<WatchRow> = [
   {
     title: '单K',
     key: 'singleBar',
-    width: 56,
+    width: 84, // 原 56 → 84 防止挤到涨跌点数
     align: 'center',
     render: (r) => {
       const sb = scansStore.singleBars.get(r.symbol.code)
-      if (!sb) return h('span', { style: 'color:#9ca3af' }, '—')
-      return h('span', { style: singleBarBadgeStyle(sb.kind) + 'padding:1px 6px;font-size:11px;white-space:nowrap', title: singleBarTitle(sb) }, sb.label)
+      if (!sb) return h('span', { class:'cell-empty' }, '—')
+      return h('span', { 
+      class: 'cell-singlebar',
+      style: singleBarBadgeStyle(sb.kind)+'padding:1px 7px;font-size:11px;white-space:nowrap;line-height:16px;display:inline-block',
+      title: singleBarTitle(sb)
+    }, sb.label)
     },
   },
   {
@@ -771,7 +778,8 @@ const columns: DataTableColumns<WatchRow> = [
             },
             [h('span', { class: 'state-dot' }), stateLabel(sig.state)],
           )
-        : h('span', { class: 'cell-empty' }, '—')
+        : h('span', { class:'cell-empty' }, '—')
+      // placeholder
     },
   },
   {
@@ -803,7 +811,8 @@ const columns: DataTableColumns<WatchRow> = [
     render: (r) =>
       r.signal
         ? h('span', { class: 'cell-score' }, r.signal.entry_score.toFixed(2))
-        : h('span', { class: 'cell-empty' }, '—'),
+        : h('span', { class:'cell-empty' }, '—')
+      // placeholder,
   },
   {
     title: '启用',
@@ -1525,6 +1534,8 @@ onBeforeUnmount(() => {
 }
 
 </style>
+
+
 
 
 

@@ -475,8 +475,16 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                 {
                     emails.push((n_core::notify::email::EventEmailKind::Trigger, e));
                 }
+                // 单K锤/针独立邮件(不受评分阈值限制,有就发)
+                for sb in &res.single_bars {
+                    let (subject, body) = n_core::notify::email::single_bar_email_payload(sb);
+                    if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                        tracing::error!("单K邮件发送失败: {err}");
+                    }
+                }
                 for (kind, e) in emails {
                     let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
+                    tracing::info!("[SEND_MAIL] subject='{}' to='{}' symbol='{}'", subject, cfg.email.to, e.symbol);
                     if let Err(err) =
                         n_core::notify::email::send_summary(&subject, &body, &cfg.email)
                     {
@@ -586,4 +594,5 @@ pub struct AppInfo {
 // sessionbreak-gapfilter-1605
 
 // bg-enrich-013841
+
 

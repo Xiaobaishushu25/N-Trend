@@ -1487,7 +1487,7 @@ onBeforeUnmount(() => {
                 >
                   {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
                 </span>
-                <span v-if="getSingleBar(element.code)" :style="singleBarBadgeStyle(getSingleBar(element.code)!.kind) + 'margin-left:6px;padding:0 5px;font-size:10px;line-height:14px'" :title="singleBarTitle(getSingleBar(element.code)!)" >{{ getSingleBar(element.code)?.kind === 'hammer' ? '锤' : '针' }}·15m</span>
+                <span v-if="getSingleBar(element.code)" :style="singleBarBadgeStyle(getSingleBar(element.code)!.kind) + 'margin-left:6px;padding:0 6px;font-size:10px;line-height:16px;display:inline-flex;align-items:center'" :title="singleBarTitle(getSingleBar(element.code)!)" >{{ getSingleBar(element.code)!.label }}</span>
                 <div class="sl-quote">
                   <span
                     class="sl-price"
@@ -3150,6 +3150,7 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
+
 
 
 

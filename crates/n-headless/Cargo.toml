@@ -1,0 +1,15 @@
+[package]
+name = "n-headless"
+version.workspace = true
+edition.workspace = true
+description = "Headless daemon"
+
+[dependencies]
+n-core = { path = "../n-core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serde_json = "1"

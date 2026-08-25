@@ -1,4 +1,4 @@
-﻿//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
+//! 邮件通知（SMTP）。桌面通知由前端监听信号事件后弹出，不在此模块。
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -185,6 +185,7 @@ pub fn event_email_payload(kind: EventEmailKind, e: &pattern_events::Model) -> (
         grade = e.grade,
         score = e.entry_score,
     );
+    tracing::info!("[MAIL_SUBJECT] kind={} symbol={} subject={}", kind_label, e.symbol, subject);
 
     let (dim_a, dim_b, dim_w) = event_dims(e);
     let dims_text = format!(
@@ -253,6 +254,23 @@ pub fn event_email_payload(kind: EventEmailKind, e: &pattern_events::Model) -> (
         ));
     }
 
+    (subject, body)
+}
+
+pub fn single_bar_email_payload(alert: &crate::analyze::model::SingleBarAlert) -> (String, String) {
+    let kind_label = if alert.kind == "hammer" { "锤" } else { "针" };
+    let subject = format!("N趋势{}·15m [{}] {}", kind_label, alert.symbol, alert.trigger_bar_ts);
+    let body = format!(
+        "品种：{}\n形态：{}·15m ({})\n触发K线：{}\n有效期至：{}\n收盘价：{:.1}\n最高：{:.1}  最低：{:.1}\n时间框架：15m\n\n说明：光头/光脚长影线，影线≥1.5倍实体且≥40%振幅且≥0.7ATR，反向影线≤5%振幅，实体≥25%振幅。下一根K线内有效。",
+        alert.symbol,
+        kind_label,
+        alert.kind,
+        alert.trigger_bar_ts,
+        alert.expire_bar_ts,
+        alert.price,
+        alert.high,
+        alert.low,
+    );
     (subject, body)
 }
 
@@ -355,3 +373,4 @@ mod tests {
         assert!(body.contains("当前持仓评分：4.10"));
     }
 }
+

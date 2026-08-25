@@ -5,7 +5,7 @@ import router from '../router'
 
 /** 点击信号通知跳转到对应品种的K线图，并顺手关闭该通知 */
 function openSignalChart(item: NotifyItem) {
-  const code = item.signal?.code ?? item.entryTrigger?.symbol
+  const code = item.signal?.code ?? item.entryTrigger?.symbol ?? item.singleBar?.symbol
   if (!code) return
   dismiss(item.id)
   router.push({ name: 'chart', params: { symbol: code } })
@@ -24,7 +24,7 @@ function fmtPrice(v: number): string {
         v-for="item in notifyItems"
         :key="item.id"
         class="notify-item"
-        :class="[`is-${item.type}`, { 'is-clickable': item.signal || item.entryTrigger }]"
+        :class="[`is-${item.type}`, { 'is-clickable': item.signal || item.entryTrigger || item.singleBar }]"
         @click="openSignalChart(item)"
         @mouseenter="item.keepAliveOnHover && suspend(item.id)"
         @mouseleave="item.keepAliveOnHover && resume(item.id)"
@@ -96,6 +96,15 @@ function fmtPrice(v: number): string {
                   最新 <b>{{ fmtPrice(item.entryTrigger.latest) }}</b>
                 </span>
               </div>
+            </div>
+          </template>
+          <template v-else-if="item.singleBar">
+            <div class="ns-inline">
+              <span class="ns-code">{{ item.singleBar.symbol }}</span>
+              <span class="ns-name">{{ item.singleBar.name || item.singleBar.symbol }}</span>
+              <span class="ns-dir" :class="item.singleBar.kind==='hammer'?'is-hammer':'is-needle'">{{ item.singleBar.label }}</span>
+              <span class="ns-time">{{ item.singleBar.time }}</span>
+              <span class="ns-score" style="color:#64748b;background:rgba(100,116,139,.08)">收盘<b>{{ fmtPrice(item.singleBar.price) }}</b></span>
             </div>
           </template>
           <template v-else-if="item.signal">
@@ -409,3 +418,6 @@ function fmtPrice(v: number): string {
   transition: transform 0.25s ease;
 }
 </style>
+
+
+

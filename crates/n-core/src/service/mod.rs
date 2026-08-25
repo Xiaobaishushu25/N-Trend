@@ -1,4 +1,4 @@
-﻿//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
+//! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
 use anyhow::{anyhow, Result};
 use chrono::Timelike;
@@ -2077,8 +2077,8 @@ impl Services {
             scanned += 1;
             if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
                 let (kind_s, label) = match sig.kind {
-                    crate::analyze::indicators::BareKind::Hammer => ("hammer", "锤·15m"),
-                    crate::analyze::indicators::BareKind::Needle => ("needle", "针·15m"),
+                    crate::analyze::indicators::BareKind::Hammer => ("hammer", "下影锤"), // 长下影，实体在上
+                    crate::analyze::indicators::BareKind::Needle => ("needle", "上影锤"), // 长上影，实体在下
                 };
                 let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
                 single_bars.push(crate::analyze::model::SingleBarAlert {
@@ -3564,6 +3564,8 @@ fn kline_model(ts: &str) -> klines::Model {
         source: "derived".to_string(),
     }
 }
+
+
 
 
 

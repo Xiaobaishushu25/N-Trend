@@ -1281,7 +1281,7 @@ function buildEventLabels(): EventLabelData[] {
       const isHammer = sb.kind === "hammer"
       labels.push({
         time,
-        text: isHammer ? "锤" : "针",
+        text: isHammer ? "下影锤" : "上影锤",
         color: SINGLE_BAR_COLORS[sb.kind].chart,
         price: isHammer ? (row ? row.low : null) : (row ? row.high : null),
         priority: 5,
@@ -1726,7 +1726,6 @@ defineExpose({ stepCandles })
     <div ref="timeLeft" class="time-left"></div>
     <div ref="container" class="kline-canvas"></div>
     <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
-    </div> -->
     <n-spin v-if="loading" class="spin-mask" />
     <button
       class="trend-toggle"
@@ -1918,6 +1917,7 @@ defineExpose({ stepCandles })
   font-family: Consolas, monospace;
 } */
 </style>
+
 
 
 

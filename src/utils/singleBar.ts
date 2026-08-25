@@ -1,4 +1,4 @@
-﻿import type { SingleBarEvent, SingleBarKind } from '../types'
+import type { SingleBarEvent, SingleBarKind } from '../types'
 
 type RawSingleBar = Partial<SingleBarEvent> & {
   triggerTime?: unknown
@@ -14,13 +14,17 @@ type RawSingleBar = Partial<SingleBarEvent> & {
 }
 
 export const SINGLE_BAR_COLORS: Record<SingleBarKind, { border: string; text: string; bg: string; chart: string }> = {
-  hammer: { border: '#f59e0b', text: '#f59e0b', bg: 'rgba(245,158,11,.10)', chart: '#f59e0b' },
-  needle: { border: '#a78bfa', text: '#a78bfa', bg: 'rgba(167,139,250,.12)', chart: '#a78bfa' },
+  hammer: { border: '#f59e0b', text: '#f59e0b', bg: 'rgba(245,158,11,.10)', chart: '#f59e0b' }, // 下影锤 橙
+  needle: { border: '#a78bfa', text: '#a78bfa', bg: 'rgba(167,139,250,.12)', chart: '#a78bfa' }, // 上影锤 紫
 }
 
 export function singleBarBadgeStyle(kind: SingleBarKind): string {
   const c = SINGLE_BAR_COLORS[kind]
   return `border:1px dashed ${c.border};color:${c.text};background:${c.bg};border-radius:999px;`
+}
+
+export function singleBarLabel(kind: SingleBarKind): string {
+  return kind === 'needle' ? '上影锤' : '下影锤'
 }
 
 export function toMs(ts: string): number {
@@ -34,11 +38,12 @@ export function normalizeSingleBar(e: RawSingleBar): SingleBarEvent {
   const expireTime = typeof (e as Record<string, unknown>).expireTime === 'number' ? ((e as Record<string, unknown>).expireTime as number) : toMs(expire_bar_ts)
   const tStr = typeof trigger_bar_ts === 'string' && trigger_bar_ts.length >= 16 ? trigger_bar_ts : new Date(triggerTime).toISOString().slice(0, 16).replace('T', ' ') + ':00'
   const eStr = typeof expire_bar_ts === 'string' && expire_bar_ts.length >= 16 ? expire_bar_ts : new Date(expireTime).toISOString().slice(0, 16).replace('T', ' ') + ':00'
+  const kind: SingleBarKind = (e.kind === 'needle' ? 'needle' : 'hammer')
   return {
     symbol: String(e.symbol ?? ''),
     timeframe: '15m',
-    kind: (e.kind === 'needle' ? 'needle' : 'hammer') as SingleBarKind,
-    label: String(e.label ?? (e.kind === 'needle' ? '针·15m' : '锤·15m')),
+    kind,
+    label: String(e.label ?? singleBarLabel(kind)),
     trigger_bar_ts: tStr,
     expire_bar_ts: eStr,
     triggerTime,

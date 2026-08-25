@@ -21,6 +21,8 @@ export interface NotifyOptions {
   signal?: NotifyItem['signal']
   /** 可选：结构化入场价提醒内容 */
   entryTrigger?: NotifyItem['entryTrigger']
+  /** 单K锤形态结构化通知 */
+  singleBar?: NotifyItem['singleBar']
   /** 仅写入历史通知，不弹出应用内卡片 */
   recordOnly?: boolean
 }
@@ -57,6 +59,15 @@ export interface NotifyItem {
     direction: string
     entry: number
     latest: number
+  }
+  /** 单K形态：上影锤/下影锤 卡片内容 */
+  singleBar?: {
+    symbol: string
+    name: string
+    label: string // 上影锤 / 下影锤
+    kind: 'hammer' | 'needle'
+    time: string // HH:mm
+    price: number
   }
 }
 
@@ -109,6 +120,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     startedAt: Date.now(),
     signal: options?.signal,
     entryTrigger: options?.entryTrigger,
+    singleBar: options?.singleBar,
   }
   if (!recordOnly) {
     notifyItems.push(item)
@@ -123,6 +135,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
         ? { ...item.signal, time: item.signal.time ?? null }
         : null,
       entry_trigger: item.entryTrigger ?? null,
+      single_bar: (item as any).singleBar ?? null,
     }).catch(() => {
       // 浏览器预览或后端未包含新命令时，历史功能静默降级
     })
@@ -190,6 +203,11 @@ export const notify = {
   recordSignal: (data: NonNullable<NotifyItem['signal']>) =>
     push('info', '', { duration: 0, recordOnly: true, signal: withSignalTime(data) }),
   /** 持久化的入场价提醒（不自动关闭，可手动关闭） */
+  singleBar: (data: NonNullable<NotifyItem['singleBar']>) =>
+    push('info', '', { duration: 4000, singleBar: data }),
   entryTrigger: (data: NonNullable<NotifyItem['entryTrigger']>) =>
     push('info', '', { duration: 0, entryTrigger: data }),
 }
+
+
+

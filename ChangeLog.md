@@ -1,5 +1,35 @@
 # 更新日志
 
+## 2026-08-26
+
+### 单K锤/针独立通道重塑 + 无头版 + ATR阈值放宽
+
+#### 后端 `n-core`
+- `crates/n-core/src/analyze/indicators.rs:389-401` 单K检测阈值 `0.7*ATR → 0.5*ATR` 放宽（Hammer/Needle 同步），`cargo check -p n-core` 通过；其余形态闸 `body≥0.25*range / 1.5*body / 0.40*range / 0.05*range` 保持不变，修复 CF0 22:45 等上影不足被误判为锤的边界
+- `crates/n-core/src/notify/email.rs` 新增 `single_bar_email_payload()`，标题 `N趋势锤/针·15m [SYMBOL] bar_ts`，正文透传 `trigger/expire/price/high/low` 与阈值说明；`event_email_payload` 追加 `[MAIL_SUBJECT]` 追踪日志；BOM 头清理
+- `crates/n-core/src/service/mod.rs:2080` 标签 `锤·15m/针·15m → 下影锤/上影锤`（注释长下影实体在上/长上影实体在下），BOM 头清理
+
+#### 无头版 `n-headless`（新增 crate）
+- 新增 `crates/n-headless/Cargo.toml + src/main.rs`，`anyhow/chrono/tokio/tracing` 独立启动，支持 `--data-dir` / `NTREND_DATA_DIR`，复用 `n-core::Services` 与 `storage::connect`，带 `LocalTime` 日志、`sqlx=warn` 降噪与 `email.toml` 自动导入；`Cargo.toml` workspace `members += crates/n-headless`，`Cargo.lock` 新增 `n-headless` 依赖树（`parking_lot/signal-hook-registry` 等）
+
+#### 桌面壳与扫描
+- `src-tauri/src/lib.rs:475-485` `tick_scan` 在 `res.single_bars` 循环中独立调用 `single_bar_email_payload` + `send_summary`，失败 `tracing::error!`，`event_email` 追加 `[SEND_MAIL]` 日志
+
+#### 前端
+- `src/utils/singleBar.ts` 新增 `singleBarLabel(kind)` 统一标签 `下影锤/上影锤`，`normalizeSingleBar()`/`singleBarBadgeStyle()`/`SINGLE_BAR_COLORS` 注释补齐，`label` 不再硬编码 `锤·15m/针·15m`
+- `src/utils/notify.ts` `NotifyOptions/NotifyItem` 新增 `singleBar{ symbol,name,label,kind,time,price }` 透传，`push()` 接收 `single_bar`，新增 `notify.singleBar(duration:4000)`，修复注释转义 `/**`
+- `src/components/AppNotificationHost.vue` `openSignalChart` 支持 `singleBar`、通知卡片新增 `is-clickable` 与 `v-else-if="item.singleBar"` 分支 `.is-hammer/.is-needle` 样式，模板 `as` 断言修正为 `item.singleBar`
+- `src/stores/scans.ts` `applyScanResult` 前置 `notifySettings/symbolsStore/nameOf`，单K通知由 `notify.success → notify.singleBar`，`injectMockHammer()` 标签与通知同步更新
+- `src/views/DashboardView.vue` 单K列 `width 56→84` 防拥挤，`render` 改 `class:cell-singlebar + white-space:nowrap;line-height:16px;display:inline-block;padding:1px 7px`
+- `src/views/ChartView.vue:1490` 左侧徽标 `锤/针·15m → getSingleBar(...).label`，`padding 0 5px→0 6px + inline-flex align:center`
+- `src/components/KLineChart.vue:1284` 图表内标注 `锤/针 → 下影锤/上影锤`
+
+#### 校验
+- `cargo check -p n-core` 通过；DB 实测 `CF0 22:30`（阳线上影）与 `22:45`（阴线上影10<22.5且<0.5ATR）正确拦截，`8-21 22:15`（阴线上影15）在 `0.5*ATR=18.39` 仍差 3.39 需二档放宽
+- 前端 `src` 已无 `锤·15m/针·15m` 硬编码残留
+
+
+
 ## 2026-08-25
 
 ### K线悬停聚焦修复 — 实时行情不再抢夺历史K线焦点
@@ -272,4 +302,5 @@
 ### 其他
 
 - 新增 ChangeLog.md，后续每次更新同步记录
+
 
