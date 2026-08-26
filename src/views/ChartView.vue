@@ -1240,7 +1240,7 @@ watch([symbol, timeframe], async () => {
     await loadTrendLine()
     scansStore.refreshLatestSignals()
   }
-})
+}, { immediate: true })
 
 // 分组/组内顺序在别处被改动（如列表页表格拖拽）时，重拉本页列表
 watch(() => groupsStore.revision, () => loadGroupSymbols())
@@ -1302,7 +1302,9 @@ onMounted(async () => {
       // 无数据时扫描失败不影响看图
     }
   }
-  if (symbol.value) {
+  // 首屏K线已由 watch([symbol,timeframe], immediate:true) 加载，
+  // 这里仅做兜底：若因时序/空路由未加载到则补拉一次，避免显示无数据
+  if (symbol.value && (!klinesStore.rows.length || klinesStore.rows[0]?.symbol !== symbol.value || klinesStore.rows[0]?.timeframe !== timeframe.value)) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
     await loadTrendLine()
     scansStore.refreshLatestSignals()

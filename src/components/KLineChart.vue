@@ -1348,6 +1348,20 @@ function rowsMatchRequest(): boolean {
  *  数据与请求的品种/周期不一致（切换中间态）时跳过视图处理，等新数据到达再切换 */
 function renderData() {
   if (!chart || !candleSeries || !volumeSeries) return
+  // 空数据时清空图表，避免残留旧品种
+  if (!props.rows.length) {
+    candleSeries.setData([])
+    volumeSeries.setData([])
+    if (gapPrimitive && candleSeries) {
+      candleSeries.detachPrimitive(gapPrimitive)
+      gapPrimitive = null
+    }
+    if (rolloverPrimitive && candleSeries) {
+      candleSeries.detachPrimitive(rolloverPrimitive)
+      rolloverPrimitive = null
+    }
+    return
+  }
   if (!rowsMatchRequest()) {
     //   `== 跳过渲染: 行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} 请求${props.symbol}/${props.timeframe}`,
     // )
