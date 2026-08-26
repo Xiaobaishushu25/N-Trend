@@ -102,10 +102,20 @@ async fn run_scan(svc: &Services) -> anyhow::Result<()> {
     let cfg = svc.config().await;
     let min_score = cfg.notify.new_pattern_min_score;
     if cfg.email.enabled && cfg.email.sendable() {
+        let triggered_ids: std::collections::HashSet<i64> = res.newly_triggered.iter().map(|e| e.id).collect();
         let mut emails = Vec::new();
-        for e in res.new_warnings.iter().filter(|e| e.entry_score >= min_score) { emails.push((n_core::notify::email::EventEmailKind::Warning, e)); }
+        for e in res.new_warnings.iter().filter(|e| e.entry_score >= min_score && !triggered_ids.contains(&e.id)) { emails.push((n_core::notify::email::EventEmailKind::Warning, e)); }
         for e in res.newly_triggered.iter().filter(|e| e.entry_score >= min_score) { emails.push((n_core::notify::email::EventEmailKind::Trigger, e)); }
-        for (kind, e) in emails { let (subject, body) = n_core::notify::email::event_email_payload(kind, e); if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) { tracing::error!("邮件发送失败: {err}"); } else { tracing::info!("已发送邮件 {} {}", e.symbol, if kind == n_core::notify::email::EventEmailKind::Warning { "预警" } else { "触发" }); } }
+        for (kind, e) in emails { let (subject, body) = n_core::notify::email::event_email_payload(kind, e); tracing::info!("[SEND_MAIL] subject='{}' to='{}' symbol='{}'", subject, cfg.email.to, e.symbol); if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) { tracing::error!("邮件发送失败: {err}"); } else { tracing::info!("已发送邮件 {} {}", e.symbol, if kind == n_core::notify::email::EventEmailKind::Warning { "预警" } else { "触发" }); } }
+        // 单K锤/针独立邮件（不受评分阈值限制，有就发，与 src-tauri/lib.rs 保持一致）
+        for sb in &res.single_bars {
+            let (subject, body) = n_core::notify::email::single_bar_email_payload(sb);
+            if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                tracing::error!("单K邮件发送失败: {err}");
+            } else {
+                tracing::info!("[SEND_MAIL] 单K {} {} {}", sb.symbol, sb.kind, sb.trigger_bar_ts);
+            }
+        }
     } else if res.has_notifiable_signal(min_score) { tracing::warn!("有新信号但邮件未配置"); }
     Ok(())
 }

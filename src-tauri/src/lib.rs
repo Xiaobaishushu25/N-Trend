@@ -460,11 +460,12 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
             let cfg = state.services.config().await;
             let min_score = cfg.notify.new_pattern_min_score;
             if cfg.email.enabled && cfg.email.sendable() {
+                let triggered_ids: std::collections::HashSet<i64> = res.newly_triggered.iter().map(|e| e.id).collect();
                 let mut emails = Vec::new();
                 for e in res
                     .new_warnings
                     .iter()
-                    .filter(|e| e.entry_score >= min_score)
+                    .filter(|e| e.entry_score >= min_score && !triggered_ids.contains(&e.id))
                 {
                     emails.push((n_core::notify::email::EventEmailKind::Warning, e));
                 }
