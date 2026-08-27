@@ -1,10 +1,10 @@
-﻿use n_core::service::Services;
+use n_core::service::Services;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-/// 设置表里保存“最近一次成功获取K线数据时间”的键
+/// 设置表里保存"最近一次成功获取K线数据时间"的键
 pub const KEY_LAST_REFRESH: &str = "scheduler_last_refresh";
-/// 设置表里保存“最近一次成功扫描形态时间”的键
+/// 设置表里保存"最近一次成功扫描形态时间"的键
 pub const KEY_LAST_SCAN: &str = "scheduler_last_scan";
 /// 内存通知历史最多保留条数，软件退出即清空，不落盘
 pub const NOTIFICATION_HISTORY_LIMIT: usize = 40;
@@ -24,6 +24,16 @@ pub struct NotificationSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationSingleBar {
+    pub symbol: String,
+    pub name: String,
+    pub label: String,
+    pub kind: String,
+    pub time: String,
+    pub price: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationEntryTrigger {
     pub symbol: String,
     pub name: String,
@@ -32,7 +42,7 @@ pub struct NotificationEntryTrigger {
     pub latest: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationHistoryItem {
     pub id: u64,
     pub created_at: String,
@@ -41,6 +51,7 @@ pub struct NotificationHistoryItem {
     pub content: String,
     pub signal: Option<NotificationSignal>,
     pub entry_trigger: Option<NotificationEntryTrigger>,
+    pub single_bar: Option<NotificationSingleBar>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +61,8 @@ pub struct NewNotificationHistoryItem {
     pub content: String,
     pub signal: Option<NotificationSignal>,
     pub entry_trigger: Option<NotificationEntryTrigger>,
+    #[serde(default)]
+    pub single_bar: Option<NotificationSingleBar>,
 }
 
 pub struct AppState {
@@ -85,6 +98,7 @@ impl AppState {
             content: input.content,
             signal: input.signal,
             entry_trigger: input.entry_trigger,
+            single_bar: input.single_bar,
         };
         let mut list = self.notification_history.lock().expect("通知历史锁可用");
         list.insert(0, item);

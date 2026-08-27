@@ -135,7 +135,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
         ? { ...item.signal, time: item.signal.time ?? null }
         : null,
       entry_trigger: item.entryTrigger ?? null,
-      single_bar: (item as any).singleBar ?? null,
+      single_bar: item.singleBar ?? null,
     }).catch(() => {
       // 浏览器预览或后端未包含新命令时，历史功能静默降级
     })

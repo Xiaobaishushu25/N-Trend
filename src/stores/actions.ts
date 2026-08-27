@@ -51,7 +51,7 @@ export const useActionsStore = defineStore('actions', {
       if (this.scanning) return
       this.scanning = true
       try {
-        await useScansStore().runScan()
+        await useScansStore().runScanFast()
         const result = useScansStore().latest
         notify.success(`扫描完成：${result?.scanned ?? 0} 个品种，${result?.active_count ?? 0} 个信号`)
         await this.syncStatus()
@@ -90,3 +90,4 @@ export const useActionsStore = defineStore('actions', {
     },
   },
 })
+

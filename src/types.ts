@@ -519,12 +519,22 @@ export interface NotificationEntryTrigger {
   latest: number
 }
 
+export interface NotificationSingleBar {
+  symbol: string
+  name: string
+  label: string
+  kind: string
+  time: string
+  price: number
+}
+
 export interface NewNotificationHistoryItem {
   kind: NotifyKind
   title?: string | null
   content: string
   signal?: NotificationSignal | null
   entry_trigger?: NotificationEntryTrigger | null
+  single_bar?: NotificationSingleBar | null
 }
 
 export interface NotificationHistoryItem {
@@ -535,6 +545,7 @@ export interface NotificationHistoryItem {
   content: string
   signal?: NotificationSignal | null
   entry_trigger?: NotificationEntryTrigger | null
+  single_bar?: NotificationSingleBar | null
 }
 
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const

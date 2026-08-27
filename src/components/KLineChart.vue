@@ -217,7 +217,7 @@ class GapPaneRenderer implements IPrimitivePaneRenderer {
         const yBottom = this.source.priceToCoordinate(gap.bottom)
         if (x1 == null || x2 == null || yTop == null || yBottom == null) continue
         const left = Math.min(x1, x2)
-        const width = Math.abs(x2 - x1)
+        const width = Math.max(2, Math.abs(x2 - x1))
         const topY = Math.min(yTop, yBottom)
         const height = Math.abs(yTop - yBottom)
         if (height <= 0) continue
@@ -1117,13 +1117,14 @@ function computeGaps(): GapRect[] {
     let end = i
     for (let j = i; j < n; j++) {
       const bar = props.rows[j]
-      if (bar.low < top && bar.high > bottom) {
+      const filled = cur.low > prev.high ? bar.low <= bottom : bar.high >= top
+      if (filled) {
         break
       }
       end = j
     }
     gaps.push({
-      from: toTs(prev.ts) as Time,
+      from: toTs(cur.ts) as Time,
       to: toTs(props.rows[end].ts) as Time,
       top,
       bottom,

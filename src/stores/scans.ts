@@ -40,6 +40,15 @@ export const useScansStore = defineStore('scans', {
     running: false,
   }),
   actions: {
+    async runScanFast() {
+      this.running = true
+      try {
+        const result = await api.runScanFastNow()
+        this.applyScanResult(result)
+      } finally {
+        this.running = false
+      }
+    },
     async runScan() {
       this.running = true
       try {
@@ -169,6 +178,7 @@ export const useScansStore = defineStore('scans', {
     },
   },
 })
+
 
 
 

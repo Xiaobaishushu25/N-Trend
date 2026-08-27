@@ -404,6 +404,39 @@ pub async fn run_scan_now(
 }
 
 #[tauri::command]
+pub async fn run_scan_fast_now(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<ScanResult, String> {
+    let t0 = Instant::now();
+    tracing::info!("👆 用户手动触发立即扫描(快速)");
+    match state.services.run_scan_fast().await {
+        Ok(result) => {
+            state.note_scan_success().await;
+            let _ = app.emit("scan-completed", &result);
+            tracing::info!(
+                "✅ 手动扫描完成 耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
+                t0.elapsed().as_millis(),
+                result.scanned,
+                result.active_count,
+                result.new_warnings.len(),
+                result.newly_triggered.len()
+            );
+            Ok(result)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("扫描进行中") {
+                tracing::warn!("⚠ 手动扫描被限流 耗时 {}ms | {msg}", t0.elapsed().as_millis());
+            } else {
+                tracing::error!("❌ 手动扫描失败 耗时 {}ms | {msg}", t0.elapsed().as_millis());
+            }
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
 pub async fn rebuild_events_now(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -704,3 +737,4 @@ pub async fn set_scheduler_running(
     tracing::info!("✅ 调度器已{} | 运行中: {}", if running { "启动" } else { "暂停" }, s.running);
     Ok(s)
 }
+

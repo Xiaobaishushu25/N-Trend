@@ -1152,6 +1152,8 @@ pub struct Services {
     client: RwLock<SinaClient>,
     /// 实时行情专用客户端：独立限速额度，避免与K线抓取互相排队。
     quote_client: RwLock<SinaClient>,
+    /// 换月确认专用客户端：独立限速额度，避免阻塞扫描热路径。
+    rollover_client: RwLock<SinaClient>,
     config: RwLock<Config>,
     /// 配置文件路径（保存配置用）
     config_path: std::path::PathBuf,
@@ -1181,10 +1183,12 @@ impl Services {
             config.quote.request_interval_ms,
             config.quote.minutely_budget,
         );
+        let rollover_client = SinaClient::with_limits(150, 120);
         Ok(Self {
             db,
             client: RwLock::new(client),
             quote_client: RwLock::new(quote_client),
+            rollover_client: RwLock::new(rollover_client),
             config: RwLock::new(config),
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
@@ -1204,6 +1208,7 @@ impl Services {
             SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
         *self.quote_client.write().await =
             SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
+        *self.rollover_client.write().await = SinaClient::with_limits(150, 120);
         c.save(&self.config_path)?;
         *self.config.write().await = c;
         Ok(self.config().await)
@@ -1312,6 +1317,7 @@ impl Services {
             SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
         *self.quote_client.write().await =
             SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
+        *self.rollover_client.write().await = SinaClient::with_limits(150, 120);
         c.save(&self.config_path)?;
         *self.config.write().await = c.clone();
         Ok(c)
@@ -1768,7 +1774,7 @@ impl Services {
         }
 
         let prefix = contract_prefix(symbol);
-        let contracts = match self.search_contracts(&prefix).await {
+        let contracts = match crate::fetch::symbols::search_contracts(&*self.rollover_client.read().await, &prefix).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("{symbol} 换月确认跳过（合约列表获取失败）: {e}");
@@ -1874,7 +1880,7 @@ impl Services {
             return Ok(rows);
         }
         let rows =
-            crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count).await?;
+            crate::fetch::kline::fetch_minute(&*self.rollover_client.read().await, code, "5", count).await?;
         self.month_kline_cache
             .write()
             .await
@@ -2051,9 +2057,21 @@ impl Services {
 
     /// 全品种扫描：15m 前向重放识别预警，插入 pattern_events 并推进在途事件。
     pub async fn run_scan(&self) -> Result<ScanResult> {
-        let _scan_guard = self.scan_lock.lock().await;
+        let _guard = self.scan_lock.lock().await;
+        self.run_scan_internal(true).await
+    }
+
+    /// 手工快速扫描：跳过换月、try_lock防排队，定时任务会后台补换月
+    pub async fn run_scan_fast(&self) -> Result<ScanResult> {
+        let _guard = self.scan_lock.try_lock().map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
+        self.run_scan_internal(false).await
+    }
+
+    async fn run_scan_internal(&self, with_rollover: bool) -> Result<ScanResult> {
         let started = now_ts();
-        self.sync_rollovers_if_needed().await?;
+        if with_rollover {
+            self.sync_rollovers_if_needed().await?;
+        }
         repo::delete_fast_pattern_events(&self.db).await?;
         let cfg = self.config().await;
         let min_score = cfg.notify.new_pattern_min_score;
@@ -3564,6 +3582,10 @@ fn kline_model(ts: &str) -> klines::Model {
         source: "derived".to_string(),
     }
 }
+
+
+
+
 
 
 

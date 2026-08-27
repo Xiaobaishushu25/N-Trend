@@ -1,5 +1,27 @@
 # 更新日志
 
+## 2026-08-27
+
+### 手动“立即扫描”卡顿修复 — 慢 5 分钟 → 秒级响应
+
+**问题**
+- 启动后不在扫描时段（仅交易时段轮询）时，定时刷新 11s + 定时扫描 189s 占住 scan_lock，手工 un_scan 串行排队 324s（日志：✅ 手动扫描完成 耗时 324039ms），体验为“点了好几分钟才完成”。
+
+**根因**
+- crates/n-core/src/service/mod.rs:2053 run_scan() 单 Mutex scan_lock + sync_rollovers_if_needed() 对 22 品种串行 search_contracts/etch_minute 月合约共用 SinaClient(400/60) 限流桶，换月网络耗时被放大到扫描主链路。
+
+**修复**
+- 后端 
+-core：新增 ollover_client: RwLock<SinaClient>(150,120) 独立桶（service/mod.rs:1156/1186/1211/1320），search_contracts:1777 与 month_kline_cached:1883 改走独立桶；拆分 un_scan():2060 lock+with_rollover=true 与 un_scan_fast():2065 try_lock+with_rollover=false（	ry_lock 失败直接 扫描进行中，请稍后再试），un_scan_internal(with_rollover) 跳过换月，定时任务后台补换月。
+- Tauri 命令：src-tauri/src/commands.rs:407 run_scan_fast_now（耗时/限流分级日志）、src-tauri/src/lib.rs:269 注册。
+- 前端：src/services/api.ts:77 runScanFastNow、src/stores/scans.ts:43 runScanFast()（修复 }, 缺失致 Expected "}" but found "async"）、src/stores/actions.ts:54 scanNow()->runScanFast()。
+- 通知历史类型补齐：src-tauri/src/state.rs 新增 NotificationSingleBar{symbol,name,label,kind,time,price} 并给 NotificationHistoryItem/NewNotificationHistoryItem.single_bar（#[serde(default)]），src/types.ts 同步新增接口，src/utils/notify.ts:138 去 s any 改直连 single_bar: item.singleBar，KLineChart.vue 徽标跟随新标签。
+
+**验证**
+- cargo check -p n-core / cargo check -p ntrend (tauri) 均 Finished；
+pm run build (vue-tsc --noEmit && vite build) ✓ 4406 modules, 19.27s 通过。
+- 预期：非扫描时段手工扫描 ~2-4s 完成，连点二次提示限流，不再排队 300s+。
+
 ## 2026-08-26
 
 ### 单K锤/针独立通道重塑 + 无头版 + ATR阈值放宽

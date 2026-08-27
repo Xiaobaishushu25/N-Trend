@@ -1,4 +1,4 @@
-﻿// 后端命令与事件的一层类型化封装
+// 后端命令与事件的一层类型化封装
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -74,6 +74,7 @@ export const api = {
   getActiveEvents: () => invoke<PatternEvent[]>('get_active_events'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
   runScanNow: () => invoke<ScanResult>('run_scan_now'),
+  runScanFastNow: () => invoke<ScanResult>('run_scan_fast_now'),
   rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),
 
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
@@ -150,5 +151,6 @@ export function onNotificationHistoryUpdated(
     cb(e.payload),
   )
 }
+
 
 

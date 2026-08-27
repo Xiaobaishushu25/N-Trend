@@ -267,6 +267,7 @@ pub fn run() {
             commands::get_active_events,
             commands::refresh_data_now,
             commands::run_scan_now,
+            commands::run_scan_fast_now,
             commands::rebuild_events_now,
             commands::refresh_outcomes_now,
             commands::get_review_stats,
@@ -595,5 +596,6 @@ pub struct AppInfo {
 // sessionbreak-gapfilter-1605
 
 // bg-enrich-013841
+
 
 
