@@ -22,6 +22,20 @@
 pm run build (vue-tsc --noEmit && vite build) ✓ 4406 modules, 19.27s 通过。
 - 预期：非扫描时段手工扫描 ~2-4s 完成，连点二次提示限流，不再排队 300s+。
 
+### 单K锤/针无影阈值放宽 0.05→0.10 — SF0 09:30 漏检修复
+
+**问题**
+- SF0 2026-08-27 09:30 O5926 H5936 L5914 C5934（range22 body8 上2 下12 ATR19.86）肉眼为标准下影锤，但未产生信号、未发邮件；复算显示 4/5 门槛通过，仅 `upper <= 0.05*range (1.1)` 不过，差 0.9 价位。
+
+**根因**
+- `crates/n-core/src/analyze/indicators.rs:392,395` `is_bare_kind` 对锤要求上影、针要求下影 `<=0.05*range`（极严，range22时仅允1.1），纺锤过滤过度，1-2价位轻微上影即被判非锤。
+
+**修复**
+- `indicators.rs:392` `upper <= 0.05*range → 0.10*range`，`395` `lower <= 0.05*range → 0.10*range`，锤/针对称放宽；其余 `0.25range /1.5body /0.40range /0.5ATR` 不变；`cargo check` 通过。
+
+**验证**
+- SF0 09:30 复算：`0.10*range=2.2`，`2.0<=2.2` 通过，5项全过判为 `Hammer`，下次扫描将进 `single_bars` 并触发 `single_bar_email_payload` 邮件；CJ0 2026-08-26 14:30 针（下0上15）仍判 `Needle`。
+
 ## 2026-08-26
 
 ### 单K锤/针独立通道重塑 + 无头版 + ATR阈值放宽
@@ -324,5 +338,6 @@ pm run build (vue-tsc --noEmit && vite build) ✓ 4406 modules, 19.27s 通过。
 ### 其他
 
 - 新增 ChangeLog.md，后续每次更新同步记录
+
 
 

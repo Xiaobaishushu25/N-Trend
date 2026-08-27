@@ -389,10 +389,10 @@ fn calc_atr14(bars: &[crate::analyze::model::Bar]) -> Option<f64> {
 fn is_bare_kind(range: f64, body: f64, upper: f64, lower: f64, atr: f64, is_bull: bool) -> Option<BareKind> {
     if body < 0.25 * range { return None; }
     if is_bull {
-        if upper <= 0.05 * range && lower >= 1.5 * body && lower >= 0.40 * range && lower >= 0.5 * atr {
+        if upper <= 0.10 * range && lower >= 1.5 * body && lower >= 0.40 * range && lower >= 0.5 * atr {
             return Some(BareKind::Hammer);
         }
-    } else if lower <= 0.05 * range && upper >= 1.5 * body && upper >= 0.40 * range && upper >= 0.5 * atr {
+    } else if lower <= 0.10 * range && upper >= 1.5 * body && upper >= 0.40 * range && upper >= 0.5 * atr {
         return Some(BareKind::Needle);
     }
     None
@@ -490,5 +490,6 @@ mod tests {
         assert_eq!(ma[20], Some(11.5));
     }
 }
+
 
 
