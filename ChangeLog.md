@@ -1,5 +1,17 @@
 # 更新日志
 
+## 2026-08-28
+
+### 临时调试入口清理 — 工作区收敛
+
+**清理**
+- 移除 `crates/n-core/src/bin/debug_sched.rs`（`next_action` / `is_trading_time` 本地墙钟验证，08-26 临时创建）与 `crates/n-core/src/bin/manual_email.rs`（读取 `AppData\Roaming\com.ntrend.app\config.json` 伪造 `pattern_events::Model` 直发 `event_email_payload` 验证，08-26 临时创建），均未曾入版本库，本次删除后工作区恢复干净（`git status` clean）。
+- `manual_email.rs` 含本机绝对路径与 `send_summary` 直发逻辑，仅本地验证用，移除避免误提交与路径泄露。
+
+**说明**
+- 已验证 `ChangeLog.md` 已覆盖至 `55e2e74 fix(bare): Hammer/Needle 0.05->0.10` 与 `bcf146e fix(scan): 手动扫描秒级响应`，本次无新增业务改动，仅工作区卫生清理。
+- 后续临时验证建议用 `cargo run -p n-core --bin` 临时文件或 `git update-index --skip-worktree`，避免 `src/bin` 滞留。
+
 ## 2026-08-27
 
 ### 手动“立即扫描”卡顿修复 — 慢 5 分钟 → 秒级响应
