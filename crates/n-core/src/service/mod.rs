@@ -1529,8 +1529,14 @@ impl Services {
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
     pub async fn refresh_data(&self) -> Result<RefreshStats> {
         let symbols = repo::list_symbols(&self.db, true).await?;
+        let now = chrono::Local::now();
         let mut stats = RefreshStats::default();
         for sym in symbols {
+            // 品种交易时段智能过滤（Issue 06）：休市且超出收盘宽限期的品种跳过增量轮询，
+            // 彻底消除无夜盘品种（如 CJ、AP 等）在夜间进行的无意义网络请求与计算。
+            if !crate::session::SessionCalendar::is_active_for_refresh(&sym.code, &now) {
+                continue;
+            }
             match self.refresh_symbol_data(&sym.code).await {
                 Ok(_) => stats.succeeded += 1,
                 Err(e) => {
@@ -1617,7 +1623,7 @@ impl Services {
             let now = chrono::Local::now();
             let secs_since_5m = now.minute() % 5 * 60 + now.second();
             if secs_since_5m < 45 {
-                let is_session_close = matches!((now.hour(), now.minute()), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30));
+                let is_session_close = crate::session::SessionCalendar::is_session_close(code, now.hour(), now.minute());
                 let base_delay = if is_session_close { 75 } else { 35 };
                 let delay_secs = (base_delay as i64 - secs_since_5m as i64).max(5) as u64;
                 let pipeline = self.pipeline.clone();

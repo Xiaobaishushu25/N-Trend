@@ -2,52 +2,11 @@
 
 use chrono::{Datelike, NaiveDateTime, Timelike, Weekday};
 
-/// 夜盘交易时段类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NightSessionType {
-    /// 无夜盘
-    None,
-    /// 23:00 收盘（黑色金属、大多数化工、农产品等）
-    Close2300,
-    /// 23:30 收盘
-    Close2330,
-    /// 01:00 收盘（有色金属：铜、铝、锌、铅、镍、锡等）
-    Close0100,
-    /// 02:30 收盘（贵金属：黄金、白银，以及原油）
-    Close0230,
-}
+pub use crate::session::{classify_night_session, NightSessionType};
 
 /// 根据合约代码提取大写前缀（字母部分）。
 pub fn contract_prefix(symbol: &str) -> String {
-    symbol
-        .chars()
-        .take_while(|c| c.is_alphabetic())
-        .collect::<String>()
-        .to_uppercase()
-}
-
-/// 根据合约代码判断夜盘类型。
-pub fn classify_night_session(symbol: &str) -> NightSessionType {
-    let prefix = contract_prefix(symbol);
-    match prefix.as_str() {
-        // 02:30 贵金属与原油
-        "AU" | "AG" | "SC" => NightSessionType::Close0230,
-
-        // 01:00 有色金属
-        "CU" | "AL" | "ZN" | "PB" | "NI" | "SN" | "BC" => NightSessionType::Close0100,
-
-        // 23:30 纯碱、玻璃
-        "SA" | "FG" => NightSessionType::Close2330,
-
-        // 无夜盘品种
-        "AP" | "CJ" | "JD" | "LH" | "PK" | "SI" | "LC" | "UR" | "WH" | "PM" | "RI" | "JR"
-        | "LR" | "BB" | "FB" | "IF" | "IH" | "IC" | "IM" | "TF" | "T" | "TS" | "TL" => {
-            NightSessionType::None
-        }
-
-        // 默认大多数活跃商品 23:00 收盘
-        _ => NightSessionType::Close2300,
-    }
+    crate::session::SessionCalendar::contract_prefix(symbol)
 }
 
 /// 检查给定 5m 时间戳是否属于该品种的合法交易时段。

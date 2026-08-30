@@ -7,7 +7,7 @@
 //! 拉取/分析耗时不会把下一次任务向后推；App 启动时的首次独立补拉由调度循环层处理。
 //! 交易时段过滤默认开启：仅在国内期货日盘/夜盘窗口内触发，避免无效请求。
 
-use chrono::{DateTime, Datelike, Local, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{DateTime, Local, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,16 +62,10 @@ pub fn next_action(
     }
 }
 
-const ORDINARY_SETTLE_SECS: u32 = 40;
-const CLOSE_SETTLE_SECS: u32 = 80;
 const SCAN_WINDOW_SECS: i64 = 75;
 
 fn scan_settle_secs(hour: u32, minute: u32) -> u32 {
-    if matches!((hour, minute), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30)) {
-        CLOSE_SETTLE_SECS
-    } else {
-        ORDINARY_SETTLE_SECS
-    }
+    crate::session::SessionCalendar::global_scan_settle_secs(hour, minute)
 }
 
 fn is_settled_scan_due(now: DateTime<Local>, last_scan: Option<DateTime<Local>>) -> bool {
@@ -97,7 +91,7 @@ fn is_close_grace_due(now: DateTime<Local>, last_scan: Option<DateTime<Local>>) 
     let hour = now.hour();
     // 当前 floor 格子
     if let Some(scan_time) = scan_time_for_grid(now, hour, grid_min) {
-        if matches!((hour, grid_min), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30)) {
+        if crate::session::SessionCalendar::is_any_close_moment(hour, grid_min) {
             let window = chrono::Duration::seconds(SCAN_WINDOW_SECS);
             if now.naive_local() >= scan_time && now.naive_local() < scan_time + window {
                 if last_scan.map_or(true, |t| t.naive_local() < scan_time) {
@@ -112,7 +106,7 @@ fn is_close_grace_due(now: DateTime<Local>, last_scan: Option<DateTime<Local>>) 
     let prev = now - chrono::Duration::minutes(15);
     let ph = prev.hour();
     let pm = prev.minute() / 15 * 15;
-    if matches!((ph, pm), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30)) {
+    if crate::session::SessionCalendar::is_any_close_moment(ph, pm) {
         if let Some(scan_time) = scan_time_for_grid(prev, ph, pm) {
             let window = chrono::Duration::seconds(SCAN_WINDOW_SECS);
             if now.naive_local() >= scan_time && now.naive_local() < scan_time + window {
@@ -132,35 +126,16 @@ fn scan_time_for_grid(now: DateTime<Local>, hour: u32, grid_min: u32) -> Option<
     Some(grid_time + chrono::Duration::seconds(settle))
 }
 
-/// 国内期货常见交易窗口（近似）：
-/// - 日盘 09:00-10:15 / 10:30-11:30 / 13:30-15:00
-/// - 夜盘 21:00-23:30（周五夜盘顺延至周六 02:30）
-/// 右边界含收盘那一分钟（15:00/11:30/10:15/23:30/02:30），
-/// 保证收盘最后一根 5m K线能被定时刷新拉到。
+/// 国内期货交易窗口判断（统一委托至 SessionCalendar）：
+/// - 支持按品种查询；
+/// - 全局模式以全市场最大交易时段（含夜盘至 02:30 的贵金属）为准。
 pub fn is_trading_time(now: &DateTime<Local>) -> bool {
-    let weekday = now.weekday().num_days_from_monday();
-    let t = now.time();
-    let fri_night = weekday == 4 && t >= NaiveTime::from_hms_opt(21, 0, 0).unwrap();
-    let early_sat = weekday == 5 && t < NaiveTime::from_hms_opt(2, 31, 0).unwrap();
-    if fri_night || early_sat {
-        return true;
-    }
-    if weekday >= 5 {
-        return false;
-    }
-    in_day_window(t) || in_night_window(t)
+    crate::session::SessionCalendar::is_global_trading_time(now)
 }
 
-fn in_day_window(t: NaiveTime) -> bool {
-    let open = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-    (t >= open(9, 0) && t < open(10, 16))
-        || (t >= open(10, 30) && t < open(11, 31))
-        || (t >= open(13, 30) && t < open(15, 1))
-}
-
-fn in_night_window(t: NaiveTime) -> bool {
-    let open = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-    t >= open(21, 0) && t < open(23, 31)
+/// 查询特定品种在当前时刻是否处于交易时段。
+pub fn is_symbol_trading_time(symbol: &str, now: &DateTime<Local>) -> bool {
+    crate::session::SessionCalendar::is_trading_time(symbol, now)
 }
 
 #[cfg(test)]
@@ -188,8 +163,14 @@ mod tests {
         assert!(!is_trading_time(&dt(2026, 8, 3, 10, 16)));
         assert!(!is_trading_time(&dt(2026, 8, 3, 11, 31)));
         assert!(!is_trading_time(&dt(2026, 8, 3, 15, 1)));
-        assert!(!is_trading_time(&dt(2026, 8, 3, 23, 31)));
         assert!(!is_trading_time(&dt(2026, 8, 8, 2, 31)));
+
+        // 品种级时段精确测试
+        assert!(is_symbol_trading_time("RB0", &dt(2026, 8, 3, 23, 0)));
+        assert!(!is_symbol_trading_time("RB0", &dt(2026, 8, 3, 23, 1)));
+        assert!(!is_symbol_trading_time("CJ0", &dt(2026, 8, 3, 21, 5)));
+        assert!(is_symbol_trading_time("CU0", &dt(2026, 8, 8, 1, 0)));
+        assert!(!is_symbol_trading_time("CU0", &dt(2026, 8, 8, 1, 1)));
     }
     #[test]
     fn refresh_fires_at_session_close() {
