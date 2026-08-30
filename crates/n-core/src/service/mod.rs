@@ -14,7 +14,7 @@ use crate::analyze::model::{Bar, Dir, Grade, NPattern, Swing, ATR_PERIOD, DT};
 use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
-use crate::fetch::kline::{Kline, MINUTE_BAR_SETTLE_SECS};
+use crate::fetch::kline::Kline;
 use crate::fetch::SinaClient;
 use crate::scheduler::SchedulerConfig;
 use crate::storage::entities::{klines, pattern_events, symbols};
@@ -697,29 +697,6 @@ fn now_ts() -> String {
 
 fn bar_ts(bar: &Bar) -> String {
     bar.dt.to_bar_ts()
-}
-
-/// 形态扫描与事件推进只使用已过确认余量的 15m bar，
-/// 避免把最后一根仍在确认期的成分K线当成最终值。
-fn settled_scan_bars_at(bars: Vec<Bar>, now: chrono::NaiveDateTime) -> Vec<Bar> {
-    bars.into_iter()
-        .filter(|b| {
-            let Some(ts) = chrono::NaiveDate::from_ymd_opt(
-                b.dt.year,
-                b.dt.month as u32,
-                b.dt.day as u32,
-            )
-            .and_then(|d| d.and_hms_opt(b.dt.hour as u32, b.dt.minute as u32, 0))
-            else {
-                return false;
-            };
-            now.signed_duration_since(ts).num_seconds() >= MINUTE_BAR_SETTLE_SECS
-        })
-        .collect()
-}
-
-fn settled_scan_bars(bars: Vec<Bar>) -> Vec<Bar> {
-    settled_scan_bars_at(bars, chrono::Local::now().naive_local())
 }
 
 fn event_dir(e: &pattern_events::Model) -> Dir {
@@ -2061,7 +2038,7 @@ impl Services {
         let mut single_bars: Vec<crate::analyze::model::SingleBarAlert> = Vec::new();
 
         for sym in symbols {
-            let bars15 = settled_scan_bars(self.bars_for(&sym.code, "15m").await?);
+            let bars15 = self.bars_for(&sym.code, "15m").await?;
             if bars15.len() < ATR_PERIOD + 2 {
                 failed.push(SymbolFailure {
                     symbol: sym.code,
@@ -2207,7 +2184,7 @@ impl Services {
         let symbols = repo::list_symbols(&self.db, true).await?;
         let mut inserted = 0usize;
         for sym in symbols {
-            let bars15 = settled_scan_bars(self.bars_for(&sym.code, "15m").await?);
+            let bars15 = self.bars_for(&sym.code, "15m").await?;
             if bars15.len() < ATR_PERIOD + 2 {
                 continue;
             }
@@ -2330,7 +2307,7 @@ impl Services {
         }
         let mut updated = 0usize;
         for (symbol, list) in by_symbol {
-            let bars15 = settled_scan_bars(self.bars_for(&symbol, "15m").await?);
+            let bars15 = self.bars_for(&symbol, "15m").await?;
             for mut e in list {
                 if advance_event_model(&mut e, &bars15) {
                     repo::update_pattern_event(&self.db, e).await?;
@@ -3281,31 +3258,6 @@ mod tests {
             ts_gap_minutes("2026-08-03 10:00:00", "2026-08-03 08:00:00"),
             Some(120)
         );
-    }
-
-    #[test]
-    fn settled_scan_bars_waits_for_settle_grace() {
-        let bars = vec![
-            bar_model("2026-08-19 14:00:00", 0.0, 0.0, 0.0, 0.0),
-            bar_model("2026-08-19 14:15:00", 0.0, 0.0, 0.0, 0.0),
-        ];
-        let not_yet = chrono::NaiveDateTime::parse_from_str(
-            "2026-08-19 14:15:29",
-            "%Y-%m-%d %H:%M:%S",
-        )
-        .unwrap();
-        let settled = chrono::NaiveDateTime::parse_from_str(
-            "2026-08-19 14:15:30",
-            "%Y-%m-%d %H:%M:%S",
-        )
-        .unwrap();
-
-        let pending = settled_scan_bars_at(bars.clone(), not_yet);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].dt.minute, 0);
-
-        let ready = settled_scan_bars_at(bars, settled);
-        assert_eq!(ready.len(), 2);
     }
 
     #[test]
