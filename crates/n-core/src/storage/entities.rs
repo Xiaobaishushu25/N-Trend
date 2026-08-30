@@ -256,3 +256,70 @@ pub mod signal_decisions {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod bar_observations {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "bar_observations")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub bar_ts: String,
+        pub observed_at: String,
+        pub elapsed_ms: i64,
+        pub probe_index: i32,
+        pub open: f64,
+        pub high: f64,
+        pub low: f64,
+        pub close: f64,
+        pub volume: f64,
+        pub hold: f64,
+        pub fingerprint: String,
+        pub session_type: String,
+        pub is_revision: bool,
+        pub raw_response: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod bar_finality_trials {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "bar_finality_trials")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub bar_ts: String,
+        pub session_type: String,
+        pub first_seen_at: Option<String>,
+        pub first_seen_delay_ms: Option<i64>,
+        pub candidate_final_at: Option<String>,
+        pub candidate_delay_ms: Option<i64>,
+        pub revision_count: i32,
+        pub last_revision_at: Option<String>,
+        pub last_revision_delay_ms: Option<i64>,
+        pub false_final: bool,
+        pub candidate_fingerprint: Option<String>,
+        pub final_fingerprint: Option<String>,
+        pub probe_count: i32,
+        pub completed: bool,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+

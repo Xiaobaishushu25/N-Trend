@@ -39,6 +39,9 @@ fn print_help() {
 用法:
   cargo run -p n-headless -- --data-dir ./data
   cargo run -p n-headless -- --data-dir /opt/ntrend/data
+  cargo run -p n-headless -- --data-dir ./data --report-finality
+  cargo run -p n-headless -- --data-dir ./data --simulate-finality
+  cargo run -p n-headless -- --data-dir ./data --sentinel-eval
 把本地 C:\Users\...\AppData\Roaming\com.ntrend.app\ntrend.db 复制到 ./data/ntrend.db 即可
 "#);
 }
@@ -54,6 +57,36 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("n-headless v{} 启动 | 数据目录: {}", env!("CARGO_PKG_VERSION"), data_dir.display());
     if !db_path.exists() { tracing::warn!("未找到 {}，将新建空库。请把本地 ntrend.db 复制到此路径", db_path.display()); }
     let db = storage::connect(&db_path).await?;
+
+    if std::env::args().any(|a| a == "--report-finality") {
+        let trials = n_core::storage::repo::load_all_finality_trials(&db).await?;
+        let report = n_core::finality::summarize_trials(&trials);
+        println!("\n{}", n_core::finality::format_finality_report(&report));
+        return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--simulate-finality") {
+        let obs = n_core::storage::repo::load_all_observations(&db).await?;
+        let strats = n_core::finality::StrategyDef::default_strategies();
+        let results = n_core::finality::simulate_strategies(&obs, &strats);
+        println!("\n=== 多策略离线仿真对比结果 ===\n");
+        println!("{}", n_core::finality::format_simulation_table(&results));
+        return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--sentinel-eval") {
+        let obs = n_core::storage::repo::load_all_observations(&db).await?;
+        let trials = n_core::storage::repo::load_all_finality_trials(&db).await?;
+        let default_sentinels: Vec<String> = n_core::finality::DEFAULT_SENTINELS.iter().map(|s| s.to_string()).collect();
+        let res = n_core::finality::evaluate_sentinels(&obs, &trials, &default_sentinels);
+        println!("\n=== 哨兵批次定盘安全性评估 ===");
+        println!("哨兵集合: {:?}", res.sentinel_symbols);
+        println!("总批次数: {} | 有效全哨兵批次: {}", res.total_batches, res.valid_batches);
+        println!("存在其他品种晚修订的批次数: {} (批次误判率: {:.2}%)", res.batches_with_non_sentinel_late_revision, res.batch_false_final_rate * 100.0);
+        println!("哨兵批次确认平均延迟: {:.1}s | P95延迟: {:.1}s\n", res.avg_sentinel_batch_delay_secs, res.p95_sentinel_batch_delay_secs);
+        return Ok(());
+    }
+
     let mut config = Config::load(&config_path, &db).await?;
     if config.email.smtp_password.is_empty() && config.email.from.is_empty() {
         for p in [data_dir.join("email.toml"), PathBuf::from("email.toml")] {
@@ -62,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("配置 | 刷新 {}s 扫描 {}s 交易时段限制 {} 邮件 {}", config.scheduler.refresh_interval_secs, config.scheduler.scan_interval_secs, config.scheduler.trading_only, if config.email.enabled && config.email.sendable() { "已配置" } else { "未配置" });
     let services = Arc::new(Services::new(db, config.clone(), config_path.clone()).await?);
+    services.spawn_finality_observer();
     let cnt = n_core::storage::repo::list_symbols(&services.db, false).await.map(|v| v.len()).unwrap_or(0);
     tracing::info!("品种数 {} | 邮件 {}", cnt, services.config().await.email.to);
     let svc = services.clone();

@@ -81,6 +81,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
+    create_finality_tables(db).await?;
     info!("数据库表结构已就绪");
     Ok(())
 }
@@ -256,6 +257,60 @@ async fn mark_migrated(db: &DatabaseConnection) -> Result<()> {
     )
     .await
     .context("写入 schema_migrated 标记失败")?;
+    Ok(())
+}
+
+async fn create_finality_tables(db: &DatabaseConnection) -> Result<()> {
+    db.execute_unprepared(
+        r#"
+        CREATE TABLE IF NOT EXISTS bar_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            bar_ts TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            elapsed_ms INTEGER NOT NULL,
+            probe_index INTEGER NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL NOT NULL,
+            hold REAL NOT NULL,
+            fingerprint TEXT NOT NULL,
+            session_type TEXT NOT NULL,
+            is_revision INTEGER NOT NULL DEFAULT 0,
+            raw_response TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_bar_obs_sym_bar ON bar_observations(symbol, bar_ts);
+        CREATE INDEX IF NOT EXISTS idx_bar_obs_session ON bar_observations(session_type);
+
+        CREATE TABLE IF NOT EXISTS bar_finality_trials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            bar_ts TEXT NOT NULL,
+            session_type TEXT NOT NULL,
+            first_seen_at TEXT,
+            first_seen_delay_ms INTEGER,
+            candidate_final_at TEXT,
+            candidate_delay_ms INTEGER,
+            revision_count INTEGER NOT NULL DEFAULT 0,
+            last_revision_at TEXT,
+            last_revision_delay_ms INTEGER,
+            false_final INTEGER NOT NULL DEFAULT 0,
+            candidate_fingerprint TEXT,
+            final_fingerprint TEXT,
+            probe_count INTEGER NOT NULL DEFAULT 0,
+            completed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(symbol, bar_ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bar_trials_sym_bar ON bar_finality_trials(symbol, bar_ts);
+        CREATE INDEX IF NOT EXISTS idx_bar_trials_session ON bar_finality_trials(session_type);
+        "#,
+    )
+    .await
+    .context("创建 finality 观测表失败")?;
     Ok(())
 }
 

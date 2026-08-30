@@ -5,6 +5,7 @@ use chrono::Timelike;
 use sea_orm::{DatabaseConnection, Set};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
@@ -1147,13 +1148,21 @@ pub struct EntryTriggerHit {
     pub latest: f64,
 }
 
+/// 计算综合新浪接口限流参数：综合历史K线抓取与实时行情轮询的最小间隔和分钟预算。
+pub fn coordinator_limits_from_config(config: &Config) -> (u64, usize) {
+    let interval_ms = config
+        .fetch
+        .request_interval_ms
+        .min(config.quote.request_interval_ms)
+        .clamp(50, 1000);
+    let budget = (config.fetch.minutely_budget + config.quote.minutely_budget + 60).max(120);
+    (interval_ms, budget)
+}
+
 pub struct Services {
     pub db: DatabaseConnection,
-    client: RwLock<SinaClient>,
-    /// 实时行情专用客户端：独立限速额度，避免与K线抓取互相排队。
-    quote_client: RwLock<SinaClient>,
-    /// 换月确认专用客户端：独立限速额度，避免阻塞扫描热路径。
-    rollover_client: RwLock<SinaClient>,
+    /// 全局共享新浪客户端句柄（接入统一 SinaRequestCoordinator 与全局 RateLimiter）。
+    client: SinaClient,
     config: RwLock<Config>,
     /// 配置文件路径（保存配置用）
     config_path: std::path::PathBuf,
@@ -1173,22 +1182,12 @@ impl Services {
         config: Config,
         config_path: std::path::PathBuf,
     ) -> Result<Self> {
-        let client = SinaClient::with_limits(
-            config.fetch.request_interval_ms,
-            config.fetch.minutely_budget,
-        );
-        // 实时行情轮询：单批最多 50 个品种、轮询间隔数秒，200ms/120次每分钟足够，
-        // 且与K线抓取的 60/分钟预算互不影响。
-        let quote_client = SinaClient::with_limits(
-            config.quote.request_interval_ms,
-            config.quote.minutely_budget,
-        );
-        let rollover_client = SinaClient::with_limits(150, 120);
+        let (interval_ms, budget) = coordinator_limits_from_config(&config);
+        let client = SinaClient::global();
+        client.update_limits(interval_ms, budget).await;
         Ok(Self {
             db,
-            client: RwLock::new(client),
-            quote_client: RwLock::new(quote_client),
-            rollover_client: RwLock::new(rollover_client),
+            client,
             config: RwLock::new(config),
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
@@ -1198,17 +1197,19 @@ impl Services {
         })
     }
 
+    /// 获取全局共享客户端句柄的轻量克隆。
+    pub fn client(&self) -> SinaClient {
+        self.client.clone()
+    }
+
     pub async fn config(&self) -> Config {
         self.config.read().await.clone()
     }
 
-    /// 应用新配置：重建抓取/实时行情限速器，写 JSON 文件，更新内存。
+    /// 应用新配置：平滑更新全局限速器时隙与预算，写 JSON 文件，更新内存。
     pub async fn apply_config(&self, c: Config) -> Result<Config> {
-        *self.client.write().await =
-            SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
-        *self.quote_client.write().await =
-            SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
-        *self.rollover_client.write().await = SinaClient::with_limits(150, 120);
+        let (interval_ms, budget) = coordinator_limits_from_config(&c);
+        self.client.update_limits(interval_ms, budget).await;
         c.save(&self.config_path)?;
         *self.config.write().await = c;
         Ok(self.config().await)
@@ -1310,14 +1311,11 @@ impl Services {
         c.save(&self.config_path)
     }
 
-    /// 将所有配置恢复为默认值：重建限速器、写 JSON、更新内存，返回新的默认配置。
+    /// 将所有配置恢复为默认值：重置全局限速器、写 JSON、更新内存，返回新的默认配置。
     pub async fn reset_config(&self) -> Result<Config> {
         let c = Config::default();
-        *self.client.write().await =
-            SinaClient::with_limits(c.fetch.request_interval_ms, c.fetch.minutely_budget);
-        *self.quote_client.write().await =
-            SinaClient::with_limits(c.quote.request_interval_ms, c.quote.minutely_budget);
-        *self.rollover_client.write().await = SinaClient::with_limits(150, 120);
+        let (interval_ms, budget) = coordinator_limits_from_config(&c);
+        self.client.update_limits(interval_ms, budget).await;
         c.save(&self.config_path)?;
         *self.config.write().await = c.clone();
         Ok(c)
@@ -1358,7 +1356,7 @@ impl Services {
 
     /// 从新浪节点表刷新全部品种（名称/交易所/板块信息）。
     pub async fn refresh_symbol_list(&self) -> Result<usize> {
-        let rows = crate::fetch::symbols::refresh(&*self.client.read().await).await?;
+        let rows = crate::fetch::symbols::refresh(&self.client).await?;
         let now = crate::analyze::time::now_display();
         let models: Vec<symbols::ActiveModel> = rows
             .into_iter()
@@ -1400,8 +1398,7 @@ impl Services {
         if missing.is_empty() {
             return Ok(0);
         }
-        let names =
-            crate::fetch::symbols::fetch_quote_names(&*self.client.read().await, &missing).await?;
+        let names = crate::fetch::symbols::fetch_quote_names(&self.client, &missing).await?;
         if names.is_empty() {
             return Ok(0);
         }
@@ -1459,7 +1456,7 @@ impl Services {
     /// 新品种一次性回填历史 5m 并派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
         let rows =
-            crate::fetch::kline::fetch_minute(&*self.client.read().await, symbol, "5", count)
+            crate::fetch::kline::fetch_minute(&self.client, symbol, "5", count)
                 .await?;
         let models: Vec<_> = rows
             .iter()
@@ -1480,7 +1477,7 @@ impl Services {
             // 新代码先向行情接口确认存在并取中文名：
             // 无效代码在这里就给出明确提示，避免建档后回填时报「接口没有返回K线数据」这类模糊错误
             let names = crate::fetch::symbols::fetch_quote_names(
-                &*self.client.read().await,
+                &self.client,
                 &[code.clone()],
             )
             .await?;
@@ -1517,7 +1514,7 @@ impl Services {
         &self,
         keyword: &str,
     ) -> Result<Vec<crate::fetch::symbols::FuturesSymbol>> {
-        crate::fetch::symbols::search_contracts(&*self.client.read().await, keyword).await
+        crate::fetch::symbols::search_contracts(&self.client, keyword).await
     }
 
     /// 删除品种及其K线数据。
@@ -1568,7 +1565,7 @@ impl Services {
             needed
         };
         let fetched =
-            crate::fetch::kline::fetch_minute(&*self.client.read().await, code, "5", count).await?;
+            crate::fetch::kline::fetch_minute(&self.client, code, "5", count).await?;
         if count >= s.fetch.backfill_count {
             self.deep_backfilled.write().await.insert(code.to_string());
         }
@@ -1614,8 +1611,8 @@ impl Services {
         //   - 普通 5m：收盘后约35秒（MINUTE_BAR_SETTLE_SECS+5）补拉一次
         //   - 收盘 5m（10:15/11:30/15:00/23:30/02:30）：收盘后约75秒（30+45）补拉一次，并额外在收盘后约90秒二次补拉，
         //     双保险确保收盘 K 最终定版。二次补拉仅针对收盘，不会增加普通时段的请求量。
-        // 注意：Services 未实现 Clone（持有 RwLock<SinaClient>/Mutex），故仅 clone db（DatabaseConnection可Clone）和 code，
-        //       SinaClient 在 spawn 内新建。补拉成功后重新 upsert 并重聚合覆盖 derived 15m/60m。
+        // 协调机制（Issue 03）：直接克隆共享 SinaClient 注入后台补拉任务，统一经过 SinaRequestCoordinator 与
+        //                      全局 RateLimiter 排队调度，彻底杜绝 20 个品种唤醒时单独新建 Client 导致的请求惊群。
         // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> 识别为收盘 -> delay1=75秒 -> 11:31:15第一次补拉，delay2=90秒 -> 11:31:30第二次补拉；
         //       10:45:00触发 -> 普通 -> delay=35秒 -> 10:45:35补拉；11:31:10触发 -> secs_since_5m=70 >45 不触发。
         {
@@ -1627,15 +1624,17 @@ impl Services {
                 let delay_secs = (base_delay as i64 - secs_since_5m as i64).max(5) as u64;
                 let db = self.db.clone();
                 let code_owned = code.to_string();
+                let client = self.client.clone();
                 let do_refetch = {
                     let db = db.clone();
                     let code_owned = code_owned.clone();
+                    let client = client.clone();
                     move |label: &str| {
                         let db = db.clone();
                         let code_owned = code_owned.clone();
+                        let client = client.clone();
                         let label = label.to_string();
                         async move {
-                            let client = SinaClient::new();
                             match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
                                 Ok(fetched) => {
                                     let models: Vec<_> = fetched.iter().map(|k| fetch_to_model(&code_owned, "5m", "raw", k)).collect();
@@ -1774,7 +1773,7 @@ impl Services {
         }
 
         let prefix = contract_prefix(symbol);
-        let contracts = match crate::fetch::symbols::search_contracts(&*self.rollover_client.read().await, &prefix).await {
+        let contracts = match crate::fetch::symbols::search_contracts(&self.client, &prefix).await {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!("{symbol} 换月确认跳过（合约列表获取失败）: {e}");
@@ -1880,7 +1879,7 @@ impl Services {
             return Ok(rows);
         }
         let rows =
-            crate::fetch::kline::fetch_minute(&*self.rollover_client.read().await, code, "5", count).await?;
+            crate::fetch::kline::fetch_minute(&self.client, code, "5", count).await?;
         self.month_kline_cache
             .write()
             .await
@@ -2041,7 +2040,7 @@ impl Services {
             return Ok(Vec::new());
         }
         let quotes =
-            crate::fetch::quotes::fetch_quotes(&*self.quote_client.read().await, &codes).await?;
+            crate::fetch::quotes::fetch_quotes(&self.client, &codes).await?;
         Ok(symbols
             .into_iter()
             .map(|s| {
@@ -2578,6 +2577,50 @@ impl Services {
             opened: row.opened,
             updated_at: row.updated_at,
         })
+    }
+
+    /// 启动 Finality 独立观测系统后台任务（零风险影子判定，接入统一协调层与全局 RateLimiter）。
+    pub fn spawn_finality_observer(&self) -> tokio::task::JoinHandle<()> {
+        let observer = Arc::new(crate::finality::FinalityObserver::new(
+            self.db.clone(),
+            crate::finality::FinalityConfig::default(),
+            self.client.clone(),
+        ));
+        observer.start()
+    }
+
+    /// 获取当前 Finality 实测观测报告。
+    pub async fn finality_report(&self) -> Result<crate::finality::FinalityReport> {
+        let trials = repo::load_all_finality_trials(&self.db).await?;
+        Ok(crate::finality::summarize_trials(&trials))
+    }
+
+    /// 获取多策略仿真结果对比。
+    pub async fn finality_simulate_strategies(
+        &self,
+    ) -> Result<Vec<crate::finality::StrategySimulationResult>> {
+        let observations = repo::load_all_observations(&self.db).await?;
+        let strats = crate::finality::StrategyDef::default_strategies();
+        Ok(crate::finality::simulate_strategies(&observations, &strats))
+    }
+
+    /// 评估哨兵批次定盘安全性。
+    pub async fn finality_sentinel_eval(
+        &self,
+        sentinels: Option<&[String]>,
+    ) -> Result<crate::finality::SentinelEvaluationResult> {
+        let observations = repo::load_all_observations(&self.db).await?;
+        let trials = repo::load_all_finality_trials(&self.db).await?;
+        let default_list: Vec<String> = crate::finality::DEFAULT_SENTINELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let target_sentinels = sentinels.unwrap_or(&default_list);
+        Ok(crate::finality::evaluate_sentinels(
+            &observations,
+            &trials,
+            target_sentinels,
+        ))
     }
 }
 
@@ -3550,6 +3593,14 @@ mod tests {
         assert_eq!(contract_prefix("BU0"), "BU");
         assert_eq!(contract_prefix("RB2610"), "RB");
         assert_eq!(contract_prefix("0"), "0");
+    }
+
+    #[test]
+    fn coordinator_limits_from_config_calculates_sensible_values() {
+        let cfg = Config::default();
+        let (interval_ms, budget) = coordinator_limits_from_config(&cfg);
+        assert_eq!(interval_ms, 200); // min(400, 200)
+        assert_eq!(budget, 240); // 60 + 120 + 60 = 240
     }
 }
 

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::fetch::SinaClient;
+use crate::fetch::{RequestPriority, SinaClient};
 
 const HQ_QUOTE_URL: &str = "https://hq.sinajs.cn/list=";
 const HQ_REFERER: &str = "https://finance.sina.com.cn";
@@ -27,9 +27,18 @@ pub struct Quote {
     pub change_pct: Option<f64>,
 }
 
-/// 批量拉取实时行情：每个品种对应 `nf_{code}`，每批最多 50 个代码。
+/// 批量拉取实时行情：每个品种对应 `nf_{code}`，每批最多 50 个代码（默认按 P1 实时行情优先级调度）。
 /// 单条解析失败只跳过该品种，不影响整批结果。
 pub async fn fetch_quotes(client: &SinaClient, codes: &[String]) -> Result<HashMap<String, Quote>> {
+    fetch_quotes_with_priority(client, codes, RequestPriority::P1).await
+}
+
+/// 支持指定优先级的批量实时行情拉取。
+pub async fn fetch_quotes_with_priority(
+    client: &SinaClient,
+    codes: &[String],
+    priority: RequestPriority,
+) -> Result<HashMap<String, Quote>> {
     let mut out = HashMap::new();
     for chunk in codes.chunks(BATCH_SIZE) {
         let joined = chunk
@@ -38,7 +47,9 @@ pub async fn fetch_quotes(client: &SinaClient, codes: &[String]) -> Result<HashM
             .collect::<Vec<_>>()
             .join(",");
         let url = format!("{HQ_QUOTE_URL}{joined}");
-        let text = client.get_text_with_referer(&url, HQ_REFERER).await?;
+        let text = client
+            .get_text_with_referer_and_priority(&url, HQ_REFERER, priority)
+            .await?;
         for line in text.lines() {
             if let Some((code, quote)) = parse_quote_line(line) {
                 out.insert(code, quote);

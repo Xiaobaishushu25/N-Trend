@@ -8,9 +8,10 @@ use sea_orm::{
     QueryOrder, QuerySelect, Set,
 };
 
+use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
-    groups, klines, pattern_events, rollovers, settings, signal_annotations, signal_decisions,
-    symbol_groups, symbols,
+    bar_finality_trials, bar_observations, groups, klines, pattern_events, rollovers, settings,
+    signal_annotations, signal_decisions, symbol_groups, symbols,
 };
 
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
@@ -1003,6 +1004,178 @@ pub async fn delete_settings(db: &DatabaseConnection, keys: &[String]) -> Result
     Ok(())
 }
 
+/// 写入一条 Finality 观测探测记录。
+pub async fn insert_bar_observation(
+    db: &DatabaseConnection,
+    record: &ObservationRecord,
+) -> Result<i64> {
+    let active = bar_observations::ActiveModel {
+        id: sea_orm::NotSet,
+        symbol: Set(record.symbol.clone()),
+        bar_ts: Set(record.bar_ts.clone()),
+        observed_at: Set(record.observed_at.clone()),
+        elapsed_ms: Set(record.elapsed_ms),
+        probe_index: Set(record.probe_index),
+        open: Set(record.open),
+        high: Set(record.high),
+        low: Set(record.low),
+        close: Set(record.close),
+        volume: Set(record.volume),
+        hold: Set(record.hold),
+        fingerprint: Set(record.fingerprint.clone()),
+        session_type: Set(record.session_type.clone()),
+        is_revision: Set(record.is_revision),
+        raw_response: Set(record.raw_response.clone()),
+    };
+    let res = bar_observations::Entity::insert(active)
+        .exec(db)
+        .await
+        .context("写入观测探测记录失败")?;
+    Ok(res.last_insert_id)
+}
+
+/// 写入或更新一根 Bar 的 Finality 判定试验状态。
+pub async fn upsert_finality_trial(
+    db: &DatabaseConnection,
+    trial: &FinalityTrial,
+) -> Result<()> {
+    let active = bar_finality_trials::ActiveModel {
+        id: sea_orm::NotSet,
+        symbol: Set(trial.symbol.clone()),
+        bar_ts: Set(trial.bar_ts.clone()),
+        session_type: Set(trial.session_type.clone()),
+        first_seen_at: Set(trial.first_seen_at.clone()),
+        first_seen_delay_ms: Set(trial.first_seen_delay_ms),
+        candidate_final_at: Set(trial.candidate_final_at.clone()),
+        candidate_delay_ms: Set(trial.candidate_delay_ms),
+        revision_count: Set(trial.revision_count),
+        last_revision_at: Set(trial.last_revision_at.clone()),
+        last_revision_delay_ms: Set(trial.last_revision_delay_ms),
+        false_final: Set(trial.false_final),
+        candidate_fingerprint: Set(trial.candidate_fingerprint.clone()),
+        final_fingerprint: Set(trial.final_fingerprint.clone()),
+        probe_count: Set(trial.probe_count),
+        completed: Set(trial.completed),
+        created_at: Set(trial.created_at.clone()),
+        updated_at: Set(trial.updated_at.clone()),
+    };
+
+    bar_finality_trials::Entity::insert(active)
+        .on_conflict(
+            OnConflict::columns([
+                bar_finality_trials::Column::Symbol,
+                bar_finality_trials::Column::BarTs,
+            ])
+            .update_columns([
+                bar_finality_trials::Column::FirstSeenAt,
+                bar_finality_trials::Column::FirstSeenDelayMs,
+                bar_finality_trials::Column::CandidateFinalAt,
+                bar_finality_trials::Column::CandidateDelayMs,
+                bar_finality_trials::Column::RevisionCount,
+                bar_finality_trials::Column::LastRevisionAt,
+                bar_finality_trials::Column::LastRevisionDelayMs,
+                bar_finality_trials::Column::FalseFinal,
+                bar_finality_trials::Column::CandidateFingerprint,
+                bar_finality_trials::Column::FinalFingerprint,
+                bar_finality_trials::Column::ProbeCount,
+                bar_finality_trials::Column::Completed,
+                bar_finality_trials::Column::UpdatedAt,
+            ])
+            .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("写入/更新 finality trial 失败")?;
+    Ok(())
+}
+
+/// 查询指定品种和 bar_ts 的所有观测记录，按 probe_index 升序。
+pub async fn load_observations_for_bar(
+    db: &DatabaseConnection,
+    symbol: &str,
+    bar_ts: &str,
+) -> Result<Vec<ObservationRecord>> {
+    let rows = bar_observations::Entity::find()
+        .filter(bar_observations::Column::Symbol.eq(symbol))
+        .filter(bar_observations::Column::BarTs.eq(bar_ts))
+        .order_by_asc(bar_observations::Column::ProbeIndex)
+        .all(db)
+        .await
+        .context("查询指定 bar 的观测记录失败")?;
+    Ok(rows.into_iter().map(observation_model_to_record).collect())
+}
+
+/// 查询全部 finality trials 记录。
+pub async fn load_all_finality_trials(
+    db: &DatabaseConnection,
+) -> Result<Vec<FinalityTrial>> {
+    let rows = bar_finality_trials::Entity::find()
+        .order_by_asc(bar_finality_trials::Column::BarTs)
+        .order_by_asc(bar_finality_trials::Column::Symbol)
+        .all(db)
+        .await
+        .context("查询全部 finality trials 失败")?;
+    Ok(rows.into_iter().map(trial_model_to_dto).collect())
+}
+
+/// 查询全部观测记录。
+pub async fn load_all_observations(
+    db: &DatabaseConnection,
+) -> Result<Vec<ObservationRecord>> {
+    let rows = bar_observations::Entity::find()
+        .order_by_asc(bar_observations::Column::BarTs)
+        .order_by_asc(bar_observations::Column::Symbol)
+        .order_by_asc(bar_observations::Column::ProbeIndex)
+        .all(db)
+        .await
+        .context("查询全部观测记录失败")?;
+    Ok(rows.into_iter().map(observation_model_to_record).collect())
+}
+
+fn observation_model_to_record(m: bar_observations::Model) -> ObservationRecord {
+    ObservationRecord {
+        id: Some(m.id),
+        symbol: m.symbol,
+        bar_ts: m.bar_ts,
+        observed_at: m.observed_at,
+        elapsed_ms: m.elapsed_ms,
+        probe_index: m.probe_index,
+        open: m.open,
+        high: m.high,
+        low: m.low,
+        close: m.close,
+        volume: m.volume,
+        hold: m.hold,
+        fingerprint: m.fingerprint,
+        session_type: m.session_type,
+        is_revision: m.is_revision,
+        raw_response: m.raw_response,
+    }
+}
+
+fn trial_model_to_dto(m: bar_finality_trials::Model) -> FinalityTrial {
+    FinalityTrial {
+        id: Some(m.id),
+        symbol: m.symbol,
+        bar_ts: m.bar_ts,
+        session_type: m.session_type,
+        first_seen_at: m.first_seen_at,
+        first_seen_delay_ms: m.first_seen_delay_ms,
+        candidate_final_at: m.candidate_final_at,
+        candidate_delay_ms: m.candidate_delay_ms,
+        revision_count: m.revision_count,
+        last_revision_at: m.last_revision_at,
+        last_revision_delay_ms: m.last_revision_delay_ms,
+        false_final: m.false_final,
+        candidate_fingerprint: m.candidate_fingerprint,
+        final_fingerprint: m.final_fingerprint,
+        probe_count: m.probe_count,
+        completed: m.completed,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::DatabaseConnection;
@@ -1419,5 +1592,72 @@ mod tests {
 
         delete_symbol_rollovers(&db, "BU0").await.unwrap();
         assert!(symbol_rollovers(&db, "BU0").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finality_observations_and_trials_roundtrip() {
+        let db = test_db().await;
+        let obs = ObservationRecord {
+            id: None,
+            symbol: "RB0".to_string(),
+            bar_ts: "2026-08-28 10:45:00".to_string(),
+            observed_at: "2026-08-28 10:45:05.123".to_string(),
+            elapsed_ms: 5123,
+            probe_index: 1,
+            open: 8260.0,
+            high: 8265.0,
+            low: 8250.0,
+            close: 8255.0,
+            volume: 120.0,
+            hold: 5000.0,
+            fingerprint: "O:8260 H:8265 L:8250 C:8255 V:120 P:5000".to_string(),
+            session_type: "normal".to_string(),
+            is_revision: false,
+            raw_response: Some("var _test=...".to_string()),
+        };
+        let id = insert_bar_observation(&db, &obs).await.unwrap();
+        assert!(id > 0);
+
+        let records = load_observations_for_bar(&db, "RB0", "2026-08-28 10:45:00").await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].fingerprint, obs.fingerprint);
+        assert_eq!(records[0].raw_response.as_deref(), Some("var _test=..."));
+
+        let trial = FinalityTrial {
+            id: None,
+            symbol: "RB0".to_string(),
+            bar_ts: "2026-08-28 10:45:00".to_string(),
+            session_type: "normal".to_string(),
+            first_seen_at: Some("10:45:00".to_string()),
+            first_seen_delay_ms: Some(100),
+            candidate_final_at: Some("10:45:10".to_string()),
+            candidate_delay_ms: Some(10100),
+            revision_count: 0,
+            last_revision_at: None,
+            last_revision_delay_ms: None,
+            false_final: false,
+            candidate_fingerprint: Some(obs.fingerprint.clone()),
+            final_fingerprint: Some(obs.fingerprint.clone()),
+            probe_count: 3,
+            completed: false,
+            created_at: "2026-08-28 10:45:00".to_string(),
+            updated_at: "2026-08-28 10:45:10".to_string(),
+        };
+        upsert_finality_trial(&db, &trial).await.unwrap();
+
+        let trials = load_all_finality_trials(&db).await.unwrap();
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].candidate_delay_ms, Some(10100));
+
+        // Update trial to completed
+        let mut updated = trial.clone();
+        updated.completed = true;
+        updated.probe_count = 25;
+        upsert_finality_trial(&db, &updated).await.unwrap();
+
+        let trials2 = load_all_finality_trials(&db).await.unwrap();
+        assert_eq!(trials2.len(), 1);
+        assert!(trials2[0].completed);
+        assert_eq!(trials2[0].probe_count, 25);
     }
 }

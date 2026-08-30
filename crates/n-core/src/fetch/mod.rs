@@ -1,25 +1,32 @@
 //! Sina futures data fetching with a polite rate limiter.
 
+pub mod coordinator;
 pub mod kline;
 pub mod quotes;
 pub mod symbols;
 
+pub use coordinator::{CoordinatorStats, RequestPriority, SinaRequest, SinaRequestCoordinator};
+
 use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::Result;
 use tokio::time::{sleep, Instant};
 
 const DEFAULT_INTERVAL_MS: u64 = 400;
 const DEFAULT_MINUTELY_BUDGET: usize = 60;
-const MAX_RETRIES: usize = 2;
 
-/// 滑动窗口节流器：同时约束“单请求最小间隔”和“每分钟请求预算”。
-pub struct RateLimiter {
+struct LimiterState {
     min_interval: Duration,
     budget: usize,
     window: Duration,
-    hits: tokio::sync::Mutex<VecDeque<Instant>>,
+    hits: VecDeque<Instant>,
+}
+
+/// 滑动窗口节流器：同时约束“单请求最小间隔”和“每分钟请求预算”。
+pub struct RateLimiter {
+    state: tokio::sync::Mutex<LimiterState>,
 }
 
 impl RateLimiter {
@@ -29,136 +36,169 @@ impl RateLimiter {
 
     pub fn with_window(interval_ms: u64, minutely_budget: usize, window_ms: u64) -> Self {
         Self {
-            min_interval: Duration::from_millis(interval_ms.max(50)),
-            budget: minutely_budget.max(1),
-            window: Duration::from_millis(window_ms.max(100)),
-            hits: tokio::sync::Mutex::new(VecDeque::new()),
+            state: tokio::sync::Mutex::new(LimiterState {
+                min_interval: Duration::from_millis(interval_ms.max(50)),
+                budget: minutely_budget.max(1),
+                window: Duration::from_millis(window_ms.max(100)),
+                hits: VecDeque::new(),
+            }),
         }
+    }
+
+    /// 动态热更新单请求最小间隔与每分钟预算。
+    pub async fn update_limits(&self, interval_ms: u64, minutely_budget: usize) {
+        let mut state = self.state.lock().await;
+        state.min_interval = Duration::from_millis(interval_ms.max(50));
+        state.budget = minutely_budget.max(1);
     }
 
     pub async fn acquire(&self) {
         loop {
-            let mut hits = self.hits.lock().await;
+            let mut state = self.state.lock().await;
             let now = Instant::now();
-            while hits
+            while state
+                .hits
                 .front()
-                .is_some_and(|t| now.duration_since(*t) >= self.window)
+                .is_some_and(|t| now.duration_since(*t) >= state.window)
             {
-                hits.pop_front();
+                state.hits.pop_front();
             }
-            if hits.len() < self.budget {
-                let wait = hits
+            if state.hits.len() < state.budget {
+                let wait = state
+                    .hits
                     .back()
-                    .map(|t| self.min_interval.saturating_sub(now.duration_since(*t)))
+                    .map(|t| state.min_interval.saturating_sub(now.duration_since(*t)))
                     .unwrap_or(Duration::ZERO);
                 if wait.is_zero() {
-                    hits.push_back(now);
+                    state.hits.push_back(now);
                     return;
                 }
-                drop(hits);
+                drop(state);
                 sleep(wait).await;
                 continue;
             }
-            let oldest = *hits.front().expect("预算满时队列非空");
-            drop(hits);
-            sleep(
-                self.window.saturating_sub(now.duration_since(oldest)) + Duration::from_millis(1),
-            )
-            .await;
+            let oldest = *state.hits.front().expect("预算满时队列非空");
+            let window = state.window;
+            drop(state);
+            sleep(window.saturating_sub(now.duration_since(oldest)) + Duration::from_millis(1))
+                .await;
         }
     }
 }
 
+static GLOBAL_COORDINATOR: OnceLock<Arc<SinaRequestCoordinator>> = OnceLock::new();
+
+/// 获取或创建全局进程单例 SinaRequestCoordinator。
+pub fn global_sina_coordinator() -> Arc<SinaRequestCoordinator> {
+    GLOBAL_COORDINATOR
+        .get_or_init(|| SinaRequestCoordinator::new(DEFAULT_INTERVAL_MS, DEFAULT_MINUTELY_BUDGET))
+        .clone()
+}
+
+/// 客户端门面：轻量级、可廉价 Clone，底层接入统一的 `SinaRequestCoordinator` 与 `Global RateLimiter`。
+#[derive(Clone)]
 pub struct SinaClient {
-    http: reqwest::Client,
-    limiter: RateLimiter,
+    coordinator: Arc<SinaRequestCoordinator>,
 }
 
 impl SinaClient {
+    /// 默认使用进程级共享协调器与全局限流器。
     pub fn new() -> Self {
-        Self::with_limits(DEFAULT_INTERVAL_MS, DEFAULT_MINUTELY_BUDGET)
-    }
-
-    pub fn with_limits(interval_ms: u64, minutely_budget: usize) -> Self {
-        let http = reqwest::Client::builder()
-            .user_agent(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            )
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("构建 HTTP 客户端失败");
         Self {
-            http,
-            limiter: RateLimiter::new(interval_ms, minutely_budget),
+            coordinator: global_sina_coordinator(),
         }
     }
 
-    /// 带节流与指数退避重试的文本请求。
-    pub async fn get_text(&self, url: &str) -> Result<String> {
-        self.get_text_with_headers(url, &[]).await
+    /// 显式获取全局共享客户端单例。
+    pub fn global() -> Self {
+        Self::new()
     }
 
-    /// 带 Referer 头（新浪行情接口要求）的文本请求。
+    /// 获取底层全局协调器 Arc 引用。
+    pub fn global_coordinator() -> Arc<SinaRequestCoordinator> {
+        global_sina_coordinator()
+    }
+
+    /// 创建具有独立限流与独立协调器的客户端（常用于独立集成测试或隔离环境）。
+    pub fn with_limits(interval_ms: u64, minutely_budget: usize) -> Self {
+        Self {
+            coordinator: SinaRequestCoordinator::new(interval_ms, minutely_budget),
+        }
+    }
+
+    /// 使用指定的协调器构建客户端句柄。
+    pub fn with_coordinator(coordinator: Arc<SinaRequestCoordinator>) -> Self {
+        Self { coordinator }
+    }
+
+    /// 获取底层协调器句柄。
+    pub fn coordinator(&self) -> &Arc<SinaRequestCoordinator> {
+        &self.coordinator
+    }
+
+    /// 动态热更新底层限速器参数。
+    pub async fn update_limits(&self, interval_ms: u64, minutely_budget: usize) {
+        self.coordinator
+            .update_limits(interval_ms, minutely_budget)
+            .await;
+    }
+
+    /// 默认优先级 (P2) 的文本请求。
+    pub async fn get_text(&self, url: &str) -> Result<String> {
+        self.get_text_with_priority(url, RequestPriority::P2).await
+    }
+
+    /// 按指定优先级请求文本。
+    pub async fn get_text_with_priority(
+        &self,
+        url: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
+        self.coordinator.fetch_text(url, &[], priority).await
+    }
+
+    /// 带 Referer 头的文本请求（默认按 P1 实时行情优先级调度）。
     pub async fn get_text_with_referer(&self, url: &str, referer: &str) -> Result<String> {
-        self.get_text_with_headers(url, &[("Referer", referer)])
+        self.get_text_with_referer_and_priority(url, referer, RequestPriority::P1)
             .await
     }
 
-    async fn get_text_with_headers(&self, url: &str, headers: &[(&str, &str)]) -> Result<String> {
-        let mut attempt = 0usize;
-        loop {
-            self.limiter.acquire().await;
-            let mut req = self.http.get(url);
-            for (key, value) in headers {
-                req = req.header(*key, *value);
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let bytes = resp.bytes().await.context("读取响应失败")?;
-                    return decode_text(&bytes);
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    if attempt < MAX_RETRIES {
-                        attempt += 1;
-                        sleep(backoff(attempt)).await;
-                        continue;
-                    }
-                    bail!("HTTP {status} for {url}");
-                }
-                Err(e) => {
-                    if attempt < MAX_RETRIES {
-                        attempt += 1;
-                        sleep(backoff(attempt)).await;
-                        continue;
-                    }
-                    return Err(anyhow!("请求失败 {url}: {e}"));
-                }
-            }
-        }
+    /// 带 Referer 头及指定优先级的文本请求。
+    pub async fn get_text_with_referer_and_priority(
+        &self,
+        url: &str,
+        referer: &str,
+        priority: RequestPriority,
+    ) -> Result<String> {
+        self.coordinator
+            .fetch_text(url, &[("Referer", referer)], priority)
+            .await
+    }
+
+    /// 带自定义 Header 头及指定优先级的文本请求。
+    pub async fn get_text_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<String> {
+        self.get_text_with_headers_and_priority(url, headers, RequestPriority::P2)
+            .await
+    }
+
+    /// 带自定义 Header 头及指定优先级的文本请求。
+    pub async fn get_text_with_headers_and_priority(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        priority: RequestPriority,
+    ) -> Result<String> {
+        self.coordinator.fetch_text(url, headers, priority).await
     }
 }
 
 impl Default for SinaClient {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn backoff(attempt: usize) -> Duration {
-    Duration::from_millis(500 * (1u64 << attempt))
-}
-
-fn decode_text(bytes: &[u8]) -> Result<String> {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Ok(text.to_string()),
-        Err(_) => {
-            let (text, _, had_errors) = encoding_rs::GBK.decode(bytes);
-            if had_errors {
-                bail!("response is neither valid UTF-8 nor GBK");
-            }
-            Ok(text.into_owned())
-        }
     }
 }
 
@@ -184,5 +224,23 @@ mod tests {
         limiter.acquire().await;
         limiter.acquire().await;
         assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn limiter_update_limits_dynamically() {
+        let limiter = RateLimiter::new(200, 10);
+        limiter.update_limits(50, 100).await;
+        let start = Instant::now();
+        limiter.acquire().await;
+        limiter.acquire().await;
+        // 应该以 50ms 左右的间隔通过
+        assert!(start.elapsed() >= Duration::from_millis(40));
+    }
+
+    #[tokio::test]
+    async fn sina_client_shares_coordinator() {
+        let client_a = SinaClient::new();
+        let client_b = client_a.clone();
+        assert!(Arc::ptr_eq(client_a.coordinator(), client_b.coordinator()));
     }
 }

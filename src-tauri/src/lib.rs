@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+﻿use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -221,6 +221,13 @@ pub fn run() {
             }
             spawn_scheduler(app.handle().clone(), state.clone());
             spawn_quote_poller(app.handle().clone(), state.clone());
+            // Finality 独立观测需在 Tokio runtime 内 spawn，直接在 setup 同步上下文调用会 panic (there is no reactor running)，改用 tauri 运行时兜底
+            {
+                let state_for_finality = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    state_for_finality.services.spawn_finality_observer();
+                });
+            }
             setup_tray(app)?;
             tracing::info!("⏰ 定时调度与实时行情轮询已启动 | 交易时段: {} 轮询间隔 {}ms", if config.scheduler.trading_only { "仅交易时段" } else { "全天" }, config.quote.poll_interval_ms);
             tracing::info!("✅ 主窗口就绪 总耗时 {}ms | 后台任务异步进行中", setup_t0.elapsed().as_millis());
@@ -288,6 +295,9 @@ pub fn run() {
             commands::app_info,
             commands::record_notification,
             commands::get_notification_history,
+            commands::get_finality_report,
+            commands::get_finality_simulation,
+            commands::get_finality_sentinel_eval,
         ])
         .run(tauri::generate_context!())
         .expect("运行 N趋势 失败");

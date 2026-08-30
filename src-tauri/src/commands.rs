@@ -738,3 +738,36 @@ pub async fn set_scheduler_running(
     Ok(s)
 }
 
+#[tauri::command]
+pub async fn get_finality_report(
+    state: State<'_, Arc<AppState>>,
+) -> Result<n_core::finality::FinalityReport, String> {
+    state
+        .services
+        .finality_report()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_finality_simulation(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<n_core::finality::StrategySimulationResult>, String> {
+    state
+        .services
+        .finality_simulate_strategies()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_finality_sentinel_eval(
+    state: State<'_, Arc<AppState>>,
+    sentinels: Option<Vec<String>>,
+) -> Result<n_core::finality::SentinelEvaluationResult, String> {
+    state
+        .services
+        .finality_sentinel_eval(sentinels.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}

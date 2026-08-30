@@ -5,7 +5,7 @@ use chrono::NaiveDateTime;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::fetch::SinaClient;
+use crate::fetch::{RequestPriority, SinaClient};
 
 /// 支持的分钟级别（5m 为持久化基级，15m/60m 供策略校验与手工抓取）。
 pub const PERIODS: [(&str, &str); 3] = [("5m", "5"), ("15m", "15"), ("60m", "60")];
@@ -25,18 +25,68 @@ pub struct Kline {
     pub hold: f64,
 }
 
-/// 抓取指定品种、指定分钟级别的最近 count 根K线（已按时间升序去重）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RawKlineResponse {
+    pub klines: Vec<Kline>,
+    pub raw_text: String,
+}
+
+/// 抓取指定品种原始分钟级别K线与接口原始文本（默认使用最高优先级 P0 探针通道）。
+/// 不经过 MINUTE_BAR_SETTLE_SECS (30s) 过滤，保留新浪接口最新返回的真实版本。
+/// 仅用于观测系统与影子判定器，生产数据入库请继续使用 `fetch_minute`。
+pub async fn fetch_minute_raw(
+    client: &SinaClient,
+    symbol: &str,
+    period: &str,
+    count: usize,
+) -> Result<RawKlineResponse> {
+    fetch_minute_raw_with_priority(client, symbol, period, count, RequestPriority::P0).await
+}
+
+/// 支持指定优先级的原始分钟K线抓取。
+pub async fn fetch_minute_raw_with_priority(
+    client: &SinaClient,
+    symbol: &str,
+    period: &str,
+    count: usize,
+    priority: RequestPriority,
+) -> Result<RawKlineResponse> {
+    let url = API_URL
+        .replace("{symbol}", symbol)
+        .replace("{period}", period)
+        .replace("{ts}", "0");
+    let raw_text = client.get_text_with_priority(&url, priority).await?;
+    let rows = parse_jsonp(&raw_text)?;
+    if rows.is_empty() {
+        bail!("接口没有返回K线数据");
+    }
+    let klines = latest_rows(rows, count);
+    Ok(RawKlineResponse { klines, raw_text })
+}
+
+/// 抓取指定品种、指定分钟级别的最近 count 根K线（已按时间升序去重，默认 P2 优先级）。
 pub async fn fetch_minute(
     client: &SinaClient,
     symbol: &str,
     period: &str,
     count: usize,
 ) -> Result<Vec<Kline>> {
+    fetch_minute_with_priority(client, symbol, period, count, RequestPriority::P2).await
+}
+
+/// 支持指定优先级的生产分钟K线抓取。
+pub async fn fetch_minute_with_priority(
+    client: &SinaClient,
+    symbol: &str,
+    period: &str,
+    count: usize,
+    priority: RequestPriority,
+) -> Result<Vec<Kline>> {
     let url = API_URL
         .replace("{symbol}", symbol)
         .replace("{period}", period)
         .replace("{ts}", "0");
-    let text = client.get_text(&url).await?;
+    let text = client.get_text_with_priority(&url, priority).await?;
     let rows = parse_jsonp(&text)?;
     if rows.is_empty() {
         bail!("接口没有返回K线数据");
@@ -329,6 +379,27 @@ mod tests {
             .unwrap();
         assert!(settled_kline_rows(vec![row.clone()], not_yet).is_empty());
         assert_eq!(settled_kline_rows(vec![row], settled).len(), 1);
+    }
+
+    #[test]
+    fn raw_rows_bypasses_settle_filter() {
+        let row = Kline {
+            datetime: "2026-08-19 14:15:00".to_string(),
+            open: 2834.0,
+            high: 2846.0,
+            low: 2833.0,
+            close: 2836.0,
+            volume: 100.0,
+            hold: 1000.0,
+        };
+        let just_arrived = NaiveDateTime::parse_from_str("2026-08-19 14:15:05", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        // 生产链路 30s 过滤会丢弃
+        assert!(settled_kline_rows(vec![row.clone()], just_arrived).is_empty());
+        // 原始抓取保留
+        let raw = latest_rows(vec![row.clone()], 1);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].datetime, "2026-08-19 14:15:00");
     }
 
     #[test]
