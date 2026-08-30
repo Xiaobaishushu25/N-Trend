@@ -5,7 +5,7 @@ use sea_orm::sea_query::OnConflict;
 use sea_orm::ConnectionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
@@ -39,6 +39,87 @@ pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveMode
         .exec(db)
         .await
         .context("upsert K线失败")?;
+    Ok(())
+}
+
+/// 在单个数据库事务中原子保存 Raw 5m 并替换指定品种的 Derived K 线（Issue 02 核心要求）。
+/// 确保外部观察者绝不会看到 Raw 已更新但 Derived 尚未更新的中间状态，
+/// 任何步骤发生错误时整组操作自动回滚。
+pub async fn atomically_save_raw_and_derived(
+    db: &DatabaseConnection,
+    symbol: &str,
+    raw_rows: Vec<klines::ActiveModel>,
+    derived_rows: Vec<klines::ActiveModel>,
+) -> Result<()> {
+    let symbol = symbol.to_string();
+    db.transaction::<_, (), anyhow::Error>(|txn| {
+        Box::pin(async move {
+            // 1. 事务内 upsert raw 5m K线
+            if !raw_rows.is_empty() {
+                klines::Entity::insert_many(raw_rows)
+                    .on_conflict(
+                        OnConflict::columns([
+                            klines::Column::Symbol,
+                            klines::Column::Timeframe,
+                            klines::Column::Ts,
+                        ])
+                        .update_columns([
+                            klines::Column::Open,
+                            klines::Column::High,
+                            klines::Column::Low,
+                            klines::Column::Close,
+                            klines::Column::Volume,
+                            klines::Column::Hold,
+                            klines::Column::Source,
+                        ])
+                        .to_owned(),
+                    )
+                    .exec(txn)
+                    .await
+                    .context("事务内写入 raw 5m 失败")?;
+            }
+
+            // 2. 事务内原子清理该品种的旧 derived K线
+            klines::Entity::delete_many()
+                .filter(klines::Column::Symbol.eq(symbol))
+                .filter(klines::Column::Source.eq("derived"))
+                .exec(txn)
+                .await
+                .context("事务内清理旧 derived K线失败")?;
+
+            // 3. 事务内批量插入该品种的新 derived K线
+            if !derived_rows.is_empty() {
+                for chunk in derived_rows.chunks(100) {
+                    klines::Entity::insert_many(chunk.to_vec())
+                        .on_conflict(
+                            OnConflict::columns([
+                                klines::Column::Symbol,
+                                klines::Column::Timeframe,
+                                klines::Column::Ts,
+                            ])
+                            .update_columns([
+                                klines::Column::Open,
+                                klines::Column::High,
+                                klines::Column::Low,
+                                klines::Column::Close,
+                                klines::Column::Volume,
+                                klines::Column::Hold,
+                                klines::Column::Source,
+                            ])
+                            .to_owned(),
+                        )
+                        .exec(txn)
+                        .await
+                        .context("事务内写入 derived K线失败")?;
+                }
+            }
+
+            Ok(())
+        })
+    })
+    .await
+    .context("atomically_save_raw_and_derived 事务执行失败")?;
+
     Ok(())
 }
 
@@ -1659,5 +1740,66 @@ mod tests {
         assert_eq!(trials2.len(), 1);
         assert!(trials2[0].completed);
         assert_eq!(trials2[0].probe_count, 25);
+    }
+
+    #[tokio::test]
+    async fn test_atomically_save_raw_and_derived() {
+        let db = test_db().await;
+        let make_raw = |ts: &str, close: f64| klines::ActiveModel {
+            symbol: Set("RB0".to_string()),
+            timeframe: Set("5m".to_string()),
+            ts: Set(ts.to_string()),
+            open: Set(100.0),
+            high: Set(105.0),
+            low: Set(99.0),
+            close: Set(close),
+            volume: Set(10.0),
+            hold: Set(50.0),
+            source: Set("raw".to_string()),
+        };
+        let make_derived = |tf: &str, ts: &str, close: f64| klines::ActiveModel {
+            symbol: Set("RB0".to_string()),
+            timeframe: Set(tf.to_string()),
+            ts: Set(ts.to_string()),
+            open: Set(100.0),
+            high: Set(105.0),
+            low: Set(99.0),
+            close: Set(close),
+            volume: Set(30.0),
+            hold: Set(50.0),
+            source: Set("derived".to_string()),
+        };
+
+        // 首次写入：1 根 raw 5m，1 根 derived 15m
+        let raw1 = vec![make_raw("2026-08-28 10:45:00", 102.0)];
+        let derived1 = vec![make_derived("15m", "2026-08-28 10:45:00", 102.0)];
+        atomically_save_raw_and_derived(&db, "RB0", raw1, derived1).await.unwrap();
+
+        let raw_rows = klines(&db, "RB0", "5m", None, None).await.unwrap();
+        assert_eq!(raw_rows.len(), 1);
+        assert_eq!(raw_rows[0].close, 102.0);
+        let derived_rows = klines(&db, "RB0", "15m", None, None).await.unwrap();
+        assert_eq!(derived_rows.len(), 1);
+        assert_eq!(derived_rows[0].close, 102.0);
+
+        // 第二次原子替换：更新 raw 5m close 为 104.0 并新增一根 raw，替换 derived 为新值
+        let raw2 = vec![
+            make_raw("2026-08-28 10:45:00", 104.0),
+            make_raw("2026-08-28 10:50:00", 106.0),
+        ];
+        let derived2 = vec![
+            make_derived("15m", "2026-08-28 10:45:00", 104.0),
+            make_derived("15m", "2026-08-28 11:00:00", 106.0),
+        ];
+        atomically_save_raw_and_derived(&db, "RB0", raw2, derived2).await.unwrap();
+
+        let raw_rows2 = klines(&db, "RB0", "5m", None, None).await.unwrap();
+        assert_eq!(raw_rows2.len(), 2);
+        assert_eq!(raw_rows2[0].close, 104.0);
+        assert_eq!(raw_rows2[1].close, 106.0);
+        let derived_rows2 = klines(&db, "RB0", "15m", None, None).await.unwrap();
+        assert_eq!(derived_rows2.len(), 2);
+        assert_eq!(derived_rows2[0].close, 104.0);
+        assert_eq!(derived_rows2[1].close, 106.0);
     }
 }

@@ -20,6 +20,9 @@ use crate::scheduler::SchedulerConfig;
 use crate::storage::entities::{klines, pattern_events, symbols};
 use crate::storage::repo;
 
+pub mod pipeline;
+pub use pipeline::{RawPipeline, SymbolLocks};
+
 const MONTH_KLINE_CACHE_TTL: Duration = Duration::from_secs(900);
 const ROLLOVER_SCAN_SETTING_PREFIX: &str = "rollover_scanned::";
 const ROLLOVER_PENDING_RETENTION_DAYS: i64 = 30;
@@ -1174,6 +1177,8 @@ pub struct Services {
     month_kline_cache: RwLock<HashMap<String, (Instant, usize, Vec<Kline>)>>,
     /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
     scan_lock: Mutex<()>,
+    /// 统一原子化行情写入与派生管道（Issue 02）。
+    pub pipeline: RawPipeline,
 }
 
 impl Services {
@@ -1185,6 +1190,7 @@ impl Services {
         let (interval_ms, budget) = coordinator_limits_from_config(&config);
         let client = SinaClient::global();
         client.update_limits(interval_ms, budget).await;
+        let pipeline = RawPipeline::new(db.clone(), SymbolLocks::new());
         Ok(Self {
             db,
             client,
@@ -1194,6 +1200,7 @@ impl Services {
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            pipeline,
         })
     }
 
@@ -1453,17 +1460,12 @@ impl Services {
         }
         Ok(updated)
     }
-    /// 新品种一次性回填历史 5m 并派生 15m/60m。
+    /// 新品种一次性回填历史 5m 并原子化派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
         let rows =
             crate::fetch::kline::fetch_minute(&self.client, symbol, "5", count)
                 .await?;
-        let models: Vec<_> = rows
-            .iter()
-            .map(|k| fetch_to_model(symbol, "5m", "raw", k))
-            .collect();
-        repo::upsert_klines(&self.db, models).await?;
-        self.derive_and_store(symbol).await?;
+        self.pipeline.process_raw_batch(symbol, &rows).await?;
         Ok(rows.len())
     }
 
@@ -1586,12 +1588,7 @@ impl Services {
                 }
             }
         }
-        let models: Vec<_> = fetched
-            .iter()
-            .map(|k| fetch_to_model(code, "5m", "raw", k))
-            .collect();
-        repo::upsert_klines(&self.db, models).await?;
-        self.derive_and_store(code).await?;
+        self.pipeline.process_raw_batch(code, &fetched).await?;
 
         // --- 5分钟收盘结算窗口的延迟补拉（修复 CJ0 15m 11:30 L8265/L8260、PB0 11:30 16085/16095 等偏差）---
         // 背景：fetch/kline.rs::settled_kline_rows 会丢弃 now - bar_ts < MINUTE_BAR_SETTLE_SECS(30秒) 的K线，
@@ -1611,8 +1608,9 @@ impl Services {
         //   - 普通 5m：收盘后约35秒（MINUTE_BAR_SETTLE_SECS+5）补拉一次
         //   - 收盘 5m（10:15/11:30/15:00/23:30/02:30）：收盘后约75秒（30+45）补拉一次，并额外在收盘后约90秒二次补拉，
         //     双保险确保收盘 K 最终定版。二次补拉仅针对收盘，不会增加普通时段的请求量。
-        // 协调机制（Issue 03）：直接克隆共享 SinaClient 注入后台补拉任务，统一经过 SinaRequestCoordinator 与
-        //                      全局 RateLimiter 排队调度，彻底杜绝 20 个品种唤醒时单独新建 Client 导致的请求惊群。
+        // 协调机制（Issue 02 & Issue 03）：直接克隆共享 SinaClient 与 RawPipeline 注入后台补拉任务。
+        //                               统一经过 SinaRequestCoordinator 协调调度，写入时受 Per-Symbol 互斥锁与
+        //                               单一数据库事务保护，彻底杜绝异步任务乱序覆盖或中间状态暴露。
         // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> 识别为收盘 -> delay1=75秒 -> 11:31:15第一次补拉，delay2=90秒 -> 11:31:30第二次补拉；
         //       10:45:00触发 -> 普通 -> delay=35秒 -> 10:45:35补拉；11:31:10触发 -> secs_since_5m=70 >45 不触发。
         {
@@ -1622,50 +1620,26 @@ impl Services {
                 let is_session_close = matches!((now.hour(), now.minute()), (10, 15) | (11, 30) | (15, 0) | (23, 30) | (2, 30));
                 let base_delay = if is_session_close { 75 } else { 35 };
                 let delay_secs = (base_delay as i64 - secs_since_5m as i64).max(5) as u64;
-                let db = self.db.clone();
+                let pipeline = self.pipeline.clone();
                 let code_owned = code.to_string();
                 let client = self.client.clone();
                 let do_refetch = {
-                    let db = db.clone();
+                    let pipeline = pipeline.clone();
                     let code_owned = code_owned.clone();
                     let client = client.clone();
                     move |label: &str| {
-                        let db = db.clone();
+                        let pipeline = pipeline.clone();
                         let code_owned = code_owned.clone();
                         let client = client.clone();
                         let label = label.to_string();
                         async move {
                             match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
                                 Ok(fetched) => {
-                                    let models: Vec<_> = fetched.iter().map(|k| fetch_to_model(&code_owned, "5m", "raw", k)).collect();
-                                    if let Err(e) = repo::upsert_klines(&db, models).await {
-                                        tracing::warn!("延迟补拉 upsert 失败 {} ({}): {e:?}", code_owned, label);
-                                        return;
+                                    if let Err(e) = pipeline.process_raw_batch(&code_owned, &fetched).await {
+                                        tracing::warn!("延迟补拉原子更新失败 {} ({}): {e:?}", code_owned, label);
+                                    } else {
+                                        tracing::info!("延迟补拉完成 {} ({})", code_owned, label);
                                     }
-                                    let raw = match repo::raw_klines(&db, &code_owned).await {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            tracing::warn!("延迟补拉读取 raw 失败 {} ({}): {e:?}", code_owned, label);
-                                            return;
-                                        }
-                                    };
-                                    if raw.len() < 3 { return; }
-                                    let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
-                                    let mut derived = Vec::new();
-                                    for tf in [Timeframe::M15, Timeframe::M60] {
-                                        for k in aggregate(&bars, tf) {
-                                            derived.push(fetch_to_model(&code_owned, tf.as_str(), "derived", &k));
-                                        }
-                                    }
-                                    if let Err(e) = repo::delete_derived_klines(&db, &code_owned).await {
-                                        tracing::warn!("延迟补拉清理 derived 失败 {} ({}): {e:?}", code_owned, label);
-                                        return;
-                                    }
-                                    if let Err(e) = repo::upsert_klines(&db, derived).await {
-                                        tracing::warn!("延迟补拉写入 derived 失败 {} ({}): {e:?}", code_owned, label);
-                                        return;
-                                    }
-                                    tracing::info!("延迟补拉完成 {} ({})", code_owned, label);
                                 }
                                 Err(e) => {
                                     tracing::warn!("延迟补拉抓取失败 {} ({}): {e:?}", code_owned, label);
@@ -1695,22 +1669,20 @@ impl Services {
         Ok(())
     }
 
-    /// 用原始 5m 重新派生并落库 15m/60m（策略热路径）。
+    /// 用原始 5m 重新派生并落库 15m/60m（Issue 02：受 Per-Symbol 锁与单事务保护）。
     pub async fn derive_and_store(&self, symbol: &str) -> Result<()> {
-        let raw = repo::raw_klines(&self.db, symbol).await?;
-        if raw.len() < 3 {
-            return Ok(());
-        }
-        let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
-        let mut models = Vec::new();
-        for tf in [Timeframe::M15, Timeframe::M60] {
-            for k in aggregate(&bars, tf) {
-                models.push(fetch_to_model(symbol, tf.as_str(), "derived", &k));
-            }
-        }
-        repo::delete_derived_klines(&self.db, symbol).await?;
-        repo::upsert_klines(&self.db, models).await?;
+        self.pipeline.rebuild_derived(symbol).await?;
         Ok(())
+    }
+
+    /// 统一批量原始 5m 行情写入与原子派生入口（Issue 02）。
+    pub async fn process_raw_batch(&self, symbol: &str, bars: &[Kline]) -> Result<usize> {
+        self.pipeline.process_raw_batch(symbol, bars).await
+    }
+
+    /// 统一单根 Final 5m 行情写入与原子派生入口（Issue 02）。
+    pub async fn process_final_bar(&self, symbol: &str, bar: &Kline) -> Result<usize> {
+        self.pipeline.process_final_bar(symbol, bar).await
     }
 
     /// 低频换月扫描入口：只处理有新增断点或仍待确认的品种，
