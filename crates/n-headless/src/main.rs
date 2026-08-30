@@ -42,6 +42,8 @@ fn print_help() {
   cargo run -p n-headless -- --data-dir ./data --report-finality
   cargo run -p n-headless -- --data-dir ./data --simulate-finality
   cargo run -p n-headless -- --data-dir ./data --sentinel-eval
+  cargo run -p n-headless -- --data-dir ./data --check-integrity
+  cargo run -p n-headless -- --data-dir ./data --repair-integrity
 把本地 C:\Users\...\AppData\Roaming\com.ntrend.app\ntrend.db 复制到 ./data/ntrend.db 即可
 "#);
 }
@@ -84,6 +86,48 @@ async fn main() -> anyhow::Result<()> {
         println!("总批次数: {} | 有效全哨兵批次: {}", res.total_batches, res.valid_batches);
         println!("存在其他品种晚修订的批次数: {} (批次误判率: {:.2}%)", res.batches_with_non_sentinel_late_revision, res.batch_false_final_rate * 100.0);
         println!("哨兵批次确认平均延迟: {:.1}s | P95延迟: {:.1}s\n", res.avg_sentinel_batch_delay_secs, res.p95_sentinel_batch_delay_secs);
+        return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--check-integrity") {
+        let symbols = n_core::storage::repo::list_symbols(&db, true).await?;
+        println!("\n=== Raw 5m 数据完整性体检报告 (Issue 05) ===\n");
+        let mut all_clean = true;
+        for s in &symbols {
+            let report = n_core::integrity::RawDataIntegrityChecker::inspect_symbol(&db, &s.code, 1000).await?;
+            println!("{}", report.format_summary());
+            for gap in &report.missing_gaps {
+                println!(
+                    "   ↳ 缺口: {} ~ {} (缺失 {} 根, {})",
+                    gap.start_ts,
+                    gap.end_ts,
+                    gap.missing_count,
+                    if gap.recoverable_by_api { "可接口自愈" } else { "超出接口窗口" }
+                );
+            }
+            if !report.is_clean {
+                all_clean = false;
+            }
+        }
+        if all_clean {
+            println!("\n🎉 全部 {} 个监控品种数据均 100% 完整无缺洞！\n", symbols.len());
+        } else {
+            println!("\n提示: 可使用 `--repair-integrity` 参数尝试自动补齐上述可自愈缺口。\n");
+        }
+        return Ok(());
+    }
+
+    if std::env::args().any(|a| a == "--repair-integrity") {
+        let config = Config::load(&config_path, &db).await?;
+        let services = Arc::new(Services::new(db.clone(), config, config_path.clone()).await?);
+        println!("\n=== 启动 Raw 5m 数据缺洞自愈修复管道 (Issue 05) ===\n");
+        let results = services.repair_all_symbols_integrity().await?;
+        for r in &results {
+            if r.initial_missing > 0 {
+                println!("🛠️ [{}] 初始缺失: {} 根 | 修复: {} 根 | 剩余: {} 根 | 结果: {}", r.symbol, r.initial_missing, r.repaired_count, r.remaining_missing, r.message);
+            }
+        }
+        println!("\n自愈修复执行完毕。\n");
         return Ok(());
     }
 

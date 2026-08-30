@@ -2594,6 +2594,76 @@ impl Services {
             target_sentinels,
         ))
     }
+
+    /// 检查指定品种的 Raw 5m 数据完整性（Issue 05）。
+    pub async fn check_symbol_integrity(
+        &self,
+        symbol: &str,
+    ) -> Result<crate::integrity::SymbolIntegrityReport> {
+        let s = self.config().await;
+        crate::integrity::RawDataIntegrityChecker::inspect_symbol(
+            &self.db,
+            symbol,
+            s.fetch.backfill_count,
+        )
+        .await
+    }
+
+    /// 检查全部监控品种的 Raw 5m 数据完整性（Issue 05）。
+    pub async fn check_all_symbols_integrity(
+        &self,
+    ) -> Result<Vec<crate::integrity::SymbolIntegrityReport>> {
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let s = self.config().await;
+        let mut reports = Vec::new();
+        for sym in symbols {
+            let rep = crate::integrity::RawDataIntegrityChecker::inspect_symbol(
+                &self.db,
+                &sym.code,
+                s.fetch.backfill_count,
+            )
+            .await?;
+            reports.push(rep);
+        }
+        Ok(reports)
+    }
+
+    /// 针对指定品种执行缺洞自愈修复（Issue 05）。
+    pub async fn repair_symbol_integrity(
+        &self,
+        symbol: &str,
+    ) -> Result<crate::integrity::RepairResult> {
+        let s = self.config().await;
+        crate::integrity::IntegrityRepairer::repair_symbol(
+            &self.db,
+            &self.pipeline,
+            &self.client,
+            symbol,
+            s.fetch.backfill_count,
+        )
+        .await
+    }
+
+    /// 对全部有可恢复缺口的品种执行批量自愈修复（Issue 05）。
+    pub async fn repair_all_symbols_integrity(
+        &self,
+    ) -> Result<Vec<crate::integrity::RepairResult>> {
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let s = self.config().await;
+        let mut results = Vec::new();
+        for sym in symbols {
+            let res = crate::integrity::IntegrityRepairer::repair_symbol(
+                &self.db,
+                &self.pipeline,
+                &self.client,
+                &sym.code,
+                s.fetch.backfill_count,
+            )
+            .await?;
+            results.push(res);
+        }
+        Ok(results)
+    }
 }
 
 fn build_scan_summary(

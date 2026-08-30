@@ -1,4 +1,4 @@
-﻿use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -298,6 +298,9 @@ pub fn run() {
             commands::get_finality_report,
             commands::get_finality_simulation,
             commands::get_finality_sentinel_eval,
+            commands::check_symbol_integrity,
+            commands::check_all_symbols_integrity,
+            commands::repair_symbol_integrity,
         ])
         .run(tauri::generate_context!())
         .expect("运行 N趋势 失败");

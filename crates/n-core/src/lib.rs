@@ -5,6 +5,7 @@ pub mod config;
 pub mod derive;
 pub mod fetch;
 pub mod finality;
+pub mod integrity;
 pub mod notify;
 pub mod precision;
 pub mod scheduler;

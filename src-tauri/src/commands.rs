@@ -771,3 +771,38 @@ pub async fn get_finality_sentinel_eval(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn check_symbol_integrity(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<n_core::integrity::SymbolIntegrityReport, String> {
+    state
+        .services
+        .check_symbol_integrity(&symbol)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn check_all_symbols_integrity(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<n_core::integrity::SymbolIntegrityReport>, String> {
+    state
+        .services
+        .check_all_symbols_integrity()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn repair_symbol_integrity(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<n_core::integrity::RepairResult, String> {
+    state
+        .services
+        .repair_symbol_integrity(&symbol)
+        .await
+        .map_err(|e| e.to_string())
+}
