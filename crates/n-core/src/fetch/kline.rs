@@ -92,18 +92,18 @@ pub async fn fetch_minute_with_priority(
         bail!("接口没有返回K线数据");
     }
     let now = chrono::Local::now().naive_local();
-    Ok(settled_kline_rows(latest_rows(rows, count), now))
+    let judger = crate::finality::FinalityJudger::default();
+    Ok(judger.filter_final_rows(symbol, latest_rows(rows, count), now))
 }
 
-/// 丢弃仍未过确认余量的分钟K线；只有时间戳已过去至少 30 秒的 bar 才允许入库。
+/// 丢弃仍未过确认余量的分钟K线；统一委托 FinalityJudger 进行定版过滤。
 pub fn settled_kline_rows(rows: Vec<Kline>, now: NaiveDateTime) -> Vec<Kline> {
-    rows.into_iter()
-        .filter(|k| {
-            NaiveDateTime::parse_from_str(&k.datetime, "%Y-%m-%d %H:%M:%S")
-                .map(|ts| now.signed_duration_since(ts).num_seconds() >= MINUTE_BAR_SETTLE_SECS)
-                .unwrap_or(true)
-        })
-        .collect()
+    crate::finality::FinalityJudger::default().filter_final_rows("", rows, now)
+}
+
+/// 按指定品种时段与 Finality 策略过滤已定版 K 线。
+pub fn filter_final_rows_for_symbol(symbol: &str, rows: Vec<Kline>, now: NaiveDateTime) -> Vec<Kline> {
+    crate::finality::FinalityJudger::default().filter_final_rows(symbol, rows, now)
 }
 
 pub fn read_symbols(path: &std::path::Path) -> Result<Vec<String>> {
@@ -379,6 +379,26 @@ mod tests {
             .unwrap();
         assert!(settled_kline_rows(vec![row.clone()], not_yet).is_empty());
         assert_eq!(settled_kline_rows(vec![row], settled).len(), 1);
+    }
+
+    #[test]
+    fn filter_final_rows_for_symbol_respects_session_close_settle() {
+        let row = Kline {
+            datetime: "2026-08-19 11:30:00".to_string(),
+            open: 2834.0,
+            high: 2846.0,
+            low: 2833.0,
+            close: 2836.0,
+            volume: 100.0,
+            hold: 1000.0,
+        };
+        // 11:30:40 (40秒后)：普通 K 线已通过，但收盘 K 仍未过 75s
+        let now_40 = NaiveDateTime::parse_from_str("2026-08-19 11:30:40", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert!(filter_final_rows_for_symbol("RB0", vec![row.clone()], now_40).is_empty());
+
+        // 11:31:15 (75秒后)：收盘 K 线正式定版通过
+        let now_75 = NaiveDateTime::parse_from_str("2026-08-19 11:31:15", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(filter_final_rows_for_symbol("RB0", vec![row], now_75).len(), 1);
     }
 
     #[test]

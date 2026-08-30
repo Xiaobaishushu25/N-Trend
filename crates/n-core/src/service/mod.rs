@@ -1596,56 +1596,60 @@ impl Services {
         //                               单一数据库事务保护，彻底杜绝异步任务乱序覆盖或中间状态暴露。
         // 示例：11:30:00触发 -> secs_since_5m=0 <45 -> 识别为收盘 -> delay1=75秒 -> 11:31:15第一次补拉，delay2=90秒 -> 11:31:30第二次补拉；
         //       10:45:00触发 -> 普通 -> delay=35秒 -> 10:45:35补拉；11:31:10触发 -> secs_since_5m=70 >45 不触发。
+        // --- 5分钟 Finality 结算补拉（Issue 01：由 FinalityJudger 统一精确驱动）---
         {
             let now = chrono::Local::now();
-            let secs_since_5m = now.minute() % 5 * 60 + now.second();
-            if secs_since_5m < 45 {
-                let is_session_close = crate::session::SessionCalendar::is_session_close(code, now.hour(), now.minute());
-                let base_delay = if is_session_close { 75 } else { 35 };
-                let delay_secs = (base_delay as i64 - secs_since_5m as i64).max(5) as u64;
-                let pipeline = self.pipeline.clone();
-                let code_owned = code.to_string();
-                let client = self.client.clone();
-                let do_refetch = {
-                    let pipeline = pipeline.clone();
-                    let code_owned = code_owned.clone();
-                    let client = client.clone();
-                    move |label: &str| {
+            let judger = crate::finality::FinalityJudger::default();
+            let bar_min = now.minute() / 5 * 5;
+            if let Some(bar_dt) = now.date_naive().and_hms_opt(now.hour(), bar_min, 0) {
+                let remaining = judger.remaining_settle_secs(code, &bar_dt, &now.naive_local());
+                // 若仍在结算期内，精准调度等待至 Finality 确认时刻补拉
+                if remaining > 0 {
+                    let delay_secs = (remaining as u64).max(2);
+                    let is_session_close = judger.required_settle_secs(code, bar_dt.hour(), bar_dt.minute()) > judger.policy().ordinary_settle_secs;
+                    let pipeline = self.pipeline.clone();
+                    let code_owned = code.to_string();
+                    let client = self.client.clone();
+                    let do_refetch = {
                         let pipeline = pipeline.clone();
                         let code_owned = code_owned.clone();
                         let client = client.clone();
-                        let label = label.to_string();
-                        async move {
-                            match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
-                                Ok(fetched) => {
-                                    if let Err(e) = pipeline.process_raw_batch(&code_owned, &fetched).await {
-                                        tracing::warn!("延迟补拉原子更新失败 {} ({}): {e:?}", code_owned, label);
-                                    } else {
-                                        tracing::info!("延迟补拉完成 {} ({})", code_owned, label);
+                        move |label: &str| {
+                            let pipeline = pipeline.clone();
+                            let code_owned = code_owned.clone();
+                            let client = client.clone();
+                            let label = label.to_string();
+                            async move {
+                                match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
+                                    Ok(fetched) => {
+                                        if let Err(e) = pipeline.process_raw_batch(&code_owned, &fetched).await {
+                                            tracing::warn!("Finality 延迟补拉更新失败 {} ({}): {e:?}", code_owned, label);
+                                        } else {
+                                            tracing::info!("Finality 延迟补拉完成 {} ({})", code_owned, label);
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("延迟补拉抓取失败 {} ({}): {e:?}", code_owned, label);
+                                    Err(e) => {
+                                        tracing::warn!("Finality 延迟补拉抓取失败 {} ({}): {e:?}", code_owned, label);
+                                    }
                                 }
                             }
                         }
+                    };
+                    {
+                        let fut = do_refetch(if is_session_close { "收盘终态补拉" } else { "普通终态补拉" });
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                            fut.await;
+                        });
                     }
-                };
-                {
-                    let fut = do_refetch(if is_session_close { "收盘后75秒补拉" } else { "收盘后35秒补拉" });
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                        fut.await;
-                    });
-                }
-                if is_session_close {
-                    let delay2 = (90i64 - secs_since_5m as i64).max(10) as u64;
-                    let delay2 = delay2.max(delay_secs + 15);
-                    let fut2 = do_refetch("收盘后90秒二次补拉");
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(delay2)).await;
-                        fut2.await;
-                    });
+                    if is_session_close {
+                        let delay2 = delay_secs + 15;
+                        let fut2 = do_refetch("收盘终态二次定版");
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(delay2)).await;
+                            fut2.await;
+                        });
+                    }
                 }
             }
         }

@@ -44,11 +44,33 @@ impl SymbolLocks {
 pub struct RawPipeline {
     db: DatabaseConnection,
     symbol_locks: SymbolLocks,
+    judger: crate::finality::FinalityJudger,
 }
 
 impl RawPipeline {
     pub fn new(db: DatabaseConnection, symbol_locks: SymbolLocks) -> Self {
-        Self { db, symbol_locks }
+        Self {
+            db,
+            symbol_locks,
+            judger: crate::finality::FinalityJudger::default(),
+        }
+    }
+
+    pub fn with_judger(
+        db: DatabaseConnection,
+        symbol_locks: SymbolLocks,
+        judger: crate::finality::FinalityJudger,
+    ) -> Self {
+        Self {
+            db,
+            symbol_locks,
+            judger,
+        }
+    }
+
+    /// 获取底层 FinalityJudger 引用。
+    pub fn judger(&self) -> &crate::finality::FinalityJudger {
+        &self.judger
     }
 
     /// 获取底层 symbol_locks 引用。

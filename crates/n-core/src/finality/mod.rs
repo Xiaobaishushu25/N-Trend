@@ -4,6 +4,7 @@
 //! 真实修改行为、候选确认判定（Candidate Final）有效性与最小结算期（minimum settle）参数。
 
 pub mod analysis;
+pub mod judger;
 pub mod model;
 pub mod observer;
 pub mod tracker;
@@ -13,6 +14,7 @@ pub use analysis::{
     summarize_trials, FinalityReport, SentinelEvaluationResult, StrategyDef,
     StrategySimulationResult,
 };
+pub use judger::{FinalityJudger, FinalityPolicy, FinalityStatus};
 pub use model::{
     BarFingerprint, FinalityTrial, ObservationRecord, SessionType, DEFAULT_SENTINELS,
 };
