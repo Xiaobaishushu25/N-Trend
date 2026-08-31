@@ -31,13 +31,19 @@ export function toMs(ts: string): number {
   return new Date(ts.replace(' ', 'T')).getTime()
 }
 
+function formatLocalTs(ms: number): string {
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`
+}
+
 export function normalizeSingleBar(e: RawSingleBar): SingleBarEvent {
   const trigger_bar_ts = String((e as Record<string, unknown>).trigger_bar_ts ?? (e as Record<string, unknown>).triggerTime ?? '')
   const expire_bar_ts = String((e as Record<string, unknown>).expire_bar_ts ?? (e as Record<string, unknown>).expireTime ?? '')
   const triggerTime = typeof (e as Record<string, unknown>).triggerTime === 'number' ? ((e as Record<string, unknown>).triggerTime as number) : toMs(trigger_bar_ts)
   const expireTime = typeof (e as Record<string, unknown>).expireTime === 'number' ? ((e as Record<string, unknown>).expireTime as number) : toMs(expire_bar_ts)
-  const tStr = typeof trigger_bar_ts === 'string' && trigger_bar_ts.length >= 16 ? trigger_bar_ts : new Date(triggerTime).toISOString().slice(0, 16).replace('T', ' ') + ':00'
-  const eStr = typeof expire_bar_ts === 'string' && expire_bar_ts.length >= 16 ? expire_bar_ts : new Date(expireTime).toISOString().slice(0, 16).replace('T', ' ') + ':00'
+  const tStr = typeof trigger_bar_ts === 'string' && trigger_bar_ts.length >= 16 ? trigger_bar_ts : formatLocalTs(triggerTime)
+  const eStr = typeof expire_bar_ts === 'string' && expire_bar_ts.length >= 16 ? expire_bar_ts : formatLocalTs(expireTime)
   const kind: SingleBarKind = (e.kind === 'needle' ? 'needle' : 'hammer')
   return {
     symbol: String(e.symbol ?? ''),

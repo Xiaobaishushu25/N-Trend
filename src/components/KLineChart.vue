@@ -1269,24 +1269,26 @@ function buildEventLabels(): EventLabelData[] {
     }
   }
 
-  // 单K裸K独立提醒：锤/针 在下一根K线上方/下方打点 priority 5
+  // 单K裸K独立提醒：锤/针 在形态所在K线上方/下方打点 priority 5
   const sbList = props.singleBars
   if (sbList?.length) {
     const now = Date.now()
     for (const sb of sbList) {
-      if (!sb || sb.timeframe !== "15m") continue
+      if (!sb || sb.timeframe !== props.timeframe) continue
       if (now > sb.expireTime) continue
-      const nextMs = sb.triggerTime + 15 * 60 * 1000
-      const row = rowAt(new Date(nextMs).toISOString().slice(0, 16).replace("T", " ") + ":00") || props.rows[props.rows.length - 1]
-      const time = (nextMs / 1000) as Time
-      const isHammer = sb.kind === "hammer"
+      const row = rowAt(sb.trigger_bar_ts)
+      const time = toTs(sb.trigger_bar_ts) as Time
+      const isHammer = sb.kind === 'hammer'
+      const price = isHammer
+        ? (row ? row.low : (sb.low || null))
+        : (row ? row.high : (sb.high || null))
       labels.push({
         time,
-        text: isHammer ? "下影锤" : "上影锤",
+        text: isHammer ? '下影锤' : '上影锤',
         color: SINGLE_BAR_COLORS[sb.kind].chart,
-        price: isHammer ? (row ? row.low : null) : (row ? row.high : null),
+        price,
         priority: 5,
-        side: isHammer ? "below" : "above",
+        side: isHammer ? 'below' : 'above',
       })
     }
   }

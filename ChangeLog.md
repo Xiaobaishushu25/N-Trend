@@ -1,5 +1,28 @@
 # 更新日志
 
+## 2026-09-01
+
+### 单K形态（下影锤/上影锤）图表标注位置修复
+
+**问题**
+- 2026-08-31 22:45:00 FG0 产生 15m 下影锤信号，但在 K 线图上，标注却错误地标在当日 15:00:00 K 线下方的异常位置。
+
+**根因**
+- `src/components/KLineChart.vue` 旧代码计算下一根 K 线时间时使用了 `new Date(nextMs).toISOString()`，北京时间夜盘 23:00 转换 ISO 后被减去 8 小时变成 UTC 15:00；恰逢国内商品期货下午收盘为 15:00:00，被 `rowAt()` 错误匹配。
+- 坐标直接强转 `nextMs / 1000`，数值恰好等同于 Lightweight Charts 内部北京时间 15:00 的秒级时间戳，导致直接映射在 15:00 K 线上。
+- 且系统内所有形态标注（S0/S1/S2、预警、触发）均统一定位于产生形态所在的 K 线，单K此前尝试标注在下一根 K 线的做法不仅会在收盘断层时失效，也与系统规范不一致。
+
+**修复**
+- 前端 `KLineChart.vue`：
+  - 将单K标注统一锚定至形态触发 K 线本身（`sb.trigger_bar_ts`：22:45:00），下影锤对齐最低点 `low`，上影锤对齐最高点 `high`。
+  - 时间坐标统一使用标准的 `toTs(sb.trigger_bar_ts)` 映射，彻底杜绝任何时区偏差。
+  - 增加周期匹配防护：`sb.timeframe !== props.timeframe` 时跳过，确保单K只在对应周期（15m）图表中渲染。
+- 前端 `src/utils/singleBar.ts`：
+  - 提取 `formatLocalTs` 本地时间格式化函数，修复 `normalizeSingleBar()` 兜底转换中的 `.toISOString()` 隐患，杜绝时区回退偏移。
+
+**验证**
+- `npm run build`（`vue-tsc --noEmit && vite build`）通过，无任何类型或编译错误。
+
 ## 2026-08-28
 
 ### 临时调试入口清理 — 工作区收敛
