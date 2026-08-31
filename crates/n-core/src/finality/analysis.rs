@@ -35,6 +35,9 @@ impl StrategyDef {
             Self::new("min 15s + 3次一致", 15, 3),
             Self::new("min 30s + 1次探测 (当前生产基准)", 30, 1),
             Self::new("min 30s + 3次一致", 30, 3),
+            Self::new("min 45s + 1次探测", 45, 1),
+            Self::new("min 60s + 1次探测", 60, 1),
+            Self::new("min 75s + 1次探测 (收盘基准)", 75, 1),
         ]
     }
 }
