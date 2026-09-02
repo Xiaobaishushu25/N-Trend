@@ -139,7 +139,8 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("配置 | 刷新 {}s 扫描 {}s 交易时段限制 {} 邮件 {}", config.scheduler.refresh_interval_secs, config.scheduler.scan_interval_secs, config.scheduler.trading_only, if config.email.enabled && config.email.sendable() { "已配置" } else { "未配置" });
     let services = Arc::new(Services::new(db, config.clone(), config_path.clone()).await?);
-    services.spawn_finality_observer();
+    // 2026-09-02 暂停 Finality 独立观测（迭代两个版本后删除）：观测已完成历史使命，新浪最小确认值已固化 30s/75s，暂停写入 bar_observations 以回收 DB 空间
+    // services.spawn_finality_observer();
     let cnt = n_core::storage::repo::list_symbols(&services.db, false).await.map(|v| v.len()).unwrap_or(0);
     tracing::info!("品种数 {} | 邮件 {}", cnt, services.config().await.email.to);
     let svc = services.clone();

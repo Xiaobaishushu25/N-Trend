@@ -222,13 +222,14 @@ pub fn run() {
             spawn_scheduler(app.handle().clone(), state.clone());
             spawn_quote_poller(app.handle().clone(), state.clone());
             spawn_tq_bar_event_consumer(app.handle().clone(), state.clone());
-            // Finality 独立观测需在 Tokio runtime 内 spawn，直接在 setup 同步上下文调用会 panic (there is no reactor running)，改用 tauri 运行时兜底
-            {
-                let state_for_finality = state.clone();
-                tauri::async_runtime::spawn(async move {
-                    state_for_finality.services.spawn_finality_observer();
-                });
-            }
+            // 2026-09-02 暂停 Finality 独立观测（迭代两个版本后删除）：观测已完成历史使命，新浪最小确认值已固化 30s/75s，暂停写入 bar_observations 以回收 DB 空间
+            // // Finality 独立观测需在 Tokio runtime 内 spawn，直接在 setup 同步上下文调用会 panic (there is no reactor running)，改用 tauri 运行时兜底
+            // {
+            //     let state_for_finality = state.clone();
+            //     tauri::async_runtime::spawn(async move {
+            //         state_for_finality.services.spawn_finality_observer();
+            //     });
+            // }
             // 监听数据源自动降级与恢复事件，并推送至前端右下角通知
             {
                 let mut ds_rx = state.services.subscribe_data_source_events();
