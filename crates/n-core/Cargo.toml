@@ -30,5 +30,5 @@ name = "v2-dataset"
 path = "src/bin/v2_dataset.rs"
 
 [[bin]]
-name = "v2_dataset"
-path = "src/bin/v2_dataset.rs"
+name = "v2-train"
+path = "src/bin/v2_train.rs"
