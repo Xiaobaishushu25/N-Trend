@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, defineComponent, h, onMounted, ref } from 'vue'
 import {
+  NAlert,
   NButton,
   NIcon,
   NInput,
@@ -131,14 +132,33 @@ const logLevels = [
 ]
 
 function cloneConfig(config: Config): Config {
-  return JSON.parse(JSON.stringify(config))
+  const d = JSON.parse(JSON.stringify(config))
+  if (!d.data_source) {
+    d.data_source = {
+      primary_source: 'tqsdk',
+      fallback_enabled: true,
+      tq_account: '',
+      tq_password: '',
+      bridge_port: 8765,
+      auto_spawn_bridge: true,
+      python_path: null,
+    }
+  }
+  return d
 }
 
 async function save() {
   saving.value = true
   try {
+    const ds = form.value.data_source
     await settingsStore.save(form.value)
-    message.success('设置已保存')
+    if (ds?.primary_source === 'tqsdk' && settingsStore.status.active_data_source === '天勤') {
+      message.success('设置已保存，天勤数据源已连接并通过健康检查')
+    } else if (ds?.primary_source === 'tqsdk') {
+      message.warning('设置已保存，但天勤尚未通过健康检查，当前继续使用新浪备用数据源')
+    } else {
+      message.success('设置已保存')
+    }
   } catch (e) {
     message.error(String(e))
   } finally {
@@ -491,6 +511,91 @@ onMounted(async () => {
           </div>
         </template>
         <div class="tab-body">
+          <label class="section-title">数据源</label>
+          <div class="setting-card">
+            <n-alert
+              v-if="form.data_source.primary_source === 'tqsdk' && (!form.data_source.tq_account?.trim() || !form.data_source.tq_password)"
+              type="warning"
+              title="请配置天勤快期账号"
+              :bordered="false"
+              style="margin-bottom: 14px; border-radius: 6px"
+            >
+              当前选择天勤为主力数据源，但账号或密码尚未完整配置。请在下方填写后保存；配置不完整时系统将使用新浪备用数据源。
+            </n-alert>
+            <div class="setting-card-row">
+              <div class="row-label">
+                主力数据源
+                <Tip text="选择主行情与K线数据来源。天勤量化（TqSdk）支持毫秒级行情推送与更完整的5分钟K线历史；新浪接口作为免登录的轻量备用源。" />
+              </div>
+              <n-radio-group v-model:value="form.data_source.primary_source">
+                <n-radio-button value="tqsdk">天勤量化 (TqSdk)</n-radio-button>
+                <n-radio-button value="sina">新浪财经 (Sina)</n-radio-button>
+              </n-radio-group>
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                故障自动降级至新浪
+                <Tip text="开启后，当主力数据源（天勤）连接断开或连续超时时，自动平滑无缝降级至新浪接口；数据源恢复后自动切回。" />
+              </div>
+              <n-switch v-model:value="form.data_source.fallback_enabled" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                天勤快期账号
+                <Tip text="在天勤官网（shinnytech.com）免费注册的手机账号；免费用户享有国内全交易所实时与历史K线权限。" />
+              </div>
+              <n-input
+                v-model:value="form.data_source.tq_account"
+                placeholder="手机号 / 账号"
+                style="width: 260px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                天勤快期密码
+                <Tip text="快期账户登录密码；保存后保存在本地配置文件中。" />
+              </div>
+              <n-input
+                v-model:value="form.data_source.tq_password"
+                type="password"
+                show-password-on="click"
+                placeholder="账户密码"
+                style="width: 260px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                自动启动 Python 桥接服务
+                <Tip text="开启后应用启动时自动检测 Python 环境并静默启动 tq_bridge 桥接进程；应用退出时自动安全终止。" />
+              </div>
+              <n-switch v-model:value="form.data_source.auto_spawn_bridge" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                本地桥接端口
+                <Tip text="Python TqSdk 桥接服务监听的本地 HTTP 端口，默认 8765。" />
+              </div>
+              <n-input-number
+                v-model:value="form.data_source.bridge_port"
+                :min="1024"
+                :max="65535"
+                style="width: 200px"
+              />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">
+                自定义 Python 路径（可选）
+                <Tip text="留空则自动从系统 PATH 及常见安装路径探测 python.exe；若有特定 Python 环境可在此填写完整可执行文件路径。" />
+              </div>
+              <n-input
+                :value="form.data_source.python_path ?? ''"
+                placeholder="留空自动探测，例如 C:\Python310\python.exe"
+                style="width: 260px"
+                @update:value="(v: string) => { form.data_source.python_path = v.trim() ? v.trim() : null }"
+              />
+            </div>
+          </div>
+
           <label class="section-title">定时任务</label>
           <div class="setting-card">
             <div class="setting-card-row">

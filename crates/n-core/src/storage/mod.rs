@@ -307,6 +307,18 @@ async fn create_finality_tables(db: &DatabaseConnection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_bar_trials_sym_bar ON bar_finality_trials(symbol, bar_ts);
         CREATE INDEX IF NOT EXISTS idx_bar_trials_session ON bar_finality_trials(session_type);
+
+        CREATE TABLE IF NOT EXISTS scan_watermarks (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            bar_end TEXT NOT NULL,
+            logic_version TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(symbol, timeframe, bar_end, logic_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_watermarks_updated ON scan_watermarks(updated_at);
         "#,
     )
     .await

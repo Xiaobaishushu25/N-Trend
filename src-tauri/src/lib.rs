@@ -221,11 +221,22 @@ pub fn run() {
             }
             spawn_scheduler(app.handle().clone(), state.clone());
             spawn_quote_poller(app.handle().clone(), state.clone());
+            spawn_tq_bar_event_consumer(app.handle().clone(), state.clone());
             // Finality 独立观测需在 Tokio runtime 内 spawn，直接在 setup 同步上下文调用会 panic (there is no reactor running)，改用 tauri 运行时兜底
             {
                 let state_for_finality = state.clone();
                 tauri::async_runtime::spawn(async move {
                     state_for_finality.services.spawn_finality_observer();
+                });
+            }
+            // 监听数据源自动降级与恢复事件，并推送至前端右下角通知
+            {
+                let mut ds_rx = state.services.subscribe_data_source_events();
+                let app_handle_for_ds = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Ok(evt) = ds_rx.recv().await {
+                        let _ = app_handle_for_ds.emit("data-source-failover", &evt);
+                    }
                 });
             }
             setup_tray(app)?;
@@ -431,6 +442,210 @@ fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
     });
 }
 
+/// 天勤闭合K线快速路径：批量预订阅5m，可靠长轮询事件并仅扫描对应品种。
+/// 入场触发继续由现有3秒实时行情轮询负责。
+fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        let mut after_id = 0u64;
+        let mut stream_id = String::new();
+        loop {
+            let cfg = state.services.config().await;
+            if cfg.data_source.primary_source != "tqsdk"
+                || !state.services.data_source.tq_is_available()
+            {
+                after_id = 0;
+                stream_id.clear();
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                continue;
+            }
+
+            let codes: Vec<String> = match n_core::storage::repo::list_symbols(
+                &state.services.db,
+                true,
+            )
+            .await
+            {
+                Ok(rows) => rows.into_iter().map(|row| row.code).collect(),
+                Err(error) => {
+                    tracing::warn!("天勤闭合事件订阅读取品种失败: {error}");
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    continue;
+                }
+            };
+            if codes.is_empty() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            let tq = state.services.data_source.tq_client().await;
+            let subscription = match tq.subscribe_klines(&codes, "5m", 1000).await {
+                Ok(response) => response,
+                Err(error) => {
+                    // 快速路径订阅失败仅暂停快速路径，不立即将整个天勤行情源判死（主行情仍可走 tqsdk）
+                    tracing::warn!("天勤K线批量订阅失败，快速路径暂停(不影响主行情源): {error:#}");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            let stream_changed = stream_id != subscription.stream_id;
+            if stream_changed {
+                stream_id = subscription.stream_id;
+                after_id = 0;
+            }
+            if !subscription.failed.is_empty() {
+                tracing::warn!(
+                    "[FAST_PATH] isolates_failed={:?} fallback=legacy (单品种隔离)",
+                    subscription.failed
+                );
+            }
+            if subscription.subscribed.len() != codes.len() {
+                let subscribed: std::collections::HashSet<&str> =
+                    subscription.subscribed.iter().map(String::as_str).collect();
+                let missing: Vec<&str> = codes
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|code| !subscribed.contains(code))
+                    .collect();
+                tracing::warn!(
+                    "[FAST_PATH_TIMEOUT] subscription_missing={:?} fallback=legacy",
+                    missing
+                );
+            }
+            tracing::info!(
+                "天勤闭合事件快速路径已订阅 {} 个品种(失败{}个) | stream={}",
+                subscription.subscribed.len(),
+                subscription.failed.len(),
+                stream_id
+            );
+            if stream_changed {
+                let stats = state.services.reconcile_sina_finality(&codes).await;
+                tracing::info!(
+                    "事件流初始化 Finality 安全补齐完成 | 成功 {} 失败 {}",
+                    stats.succeeded,
+                    stats.failures
+                );
+            }
+
+            let subscribed_at = Instant::now();
+            loop {
+                if state.services.config().await.data_source.primary_source != "tqsdk"
+                    || !state.services.data_source.tq_is_available()
+                    || subscribed_at.elapsed() > Duration::from_secs(60)
+                {
+                    break;
+                }
+                let response = match tq.poll_closed_bar_events(after_id, 25).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // 长轮询失败仅中断本轮快速路径，重新订阅即可，不降级主数据源
+                        tracing::warn!("天勤闭合事件长轮询失败，快速路径暂停(不影响主行情源): {error:#}");
+                        break;
+                    }
+                };
+                if response.stream_id != stream_id {
+                    tracing::warn!(
+                        "天勤事件流实例已变化 {} -> {}，重新建立水位",
+                        stream_id,
+                        response.stream_id
+                    );
+                    stream_id = response.stream_id;
+                    after_id = 0;
+                    break;
+                }
+                if after_id > 0 && response.oldest_event_id > after_id.saturating_add(1) {
+                    tracing::warn!(
+                        "[FAST_PATH_TIMEOUT] event_gap after={} oldest={} latest={} fallback=legacy",
+                        after_id,
+                        response.oldest_event_id,
+                        response.latest_event_id
+                    );
+                    after_id = response.latest_event_id;
+                    continue;
+                }
+
+                for event in response.events {
+                    if event.event_id <= after_id {
+                        continue;
+                    }
+                    if event.event_id != after_id.saturating_add(1) && after_id != 0 {
+                        tracing::warn!(
+                            "[FAST_PATH_TIMEOUT] event_out_of_order expected={} actual={} fallback=legacy",
+                            after_id + 1,
+                            event.event_id
+                        );
+                        after_id = event.event_id;
+                        continue;
+                    }
+                    after_id = event.event_id;
+
+                    let event_age_ms = chrono::DateTime::parse_from_rfc3339(&event.emitted_at)
+                        .ok()
+                        .map(|time| {
+                            (chrono::Utc::now() - time.with_timezone(&chrono::Utc))
+                                .num_milliseconds()
+                                .max(0)
+                        })
+                        .unwrap_or(i64::MAX);
+                    if event_age_ms > 5_000 || event.source != "tqsdk" {
+                        tracing::warn!(
+                            "[FAST_PATH_TIMEOUT] {} bar_end={} age={}ms source={} fallback=legacy",
+                            event.symbol,
+                            event.bar_end,
+                            event_age_ms,
+                            event.source
+                        );
+                        continue;
+                    }
+                    if !state.services.data_source.tq_is_available() {
+                        tracing::warn!(
+                            "[FAST_PATH_TIMEOUT] {} bar_end={} actual_source=fallback fallback=legacy",
+                            event.symbol,
+                            event.bar_end
+                        );
+                        continue;
+                    }
+
+                    let total_started = Instant::now();
+                    match state.services.process_tq_closed_bar_event(&event).await {
+                        Ok(outcome) => {
+                            if let Some(result) = outcome.scan_result {
+                                let signal_count = result.new_warnings.len();
+                                let _ = app.emit("scan-completed", &result);
+                                tracing::info!(
+                                    "[FAST_SCAN] {} bar_end={} proof={:?} pipeline={}ms scan={}ms total={}ms signal={} duplicate_skipped={}",
+                                    event.symbol,
+                                    event.bar_end,
+                                    event.proof,
+                                    outcome.pipeline_ms,
+                                    outcome.scan_ms,
+                                    total_started.elapsed().as_millis(),
+                                    signal_count,
+                                    outcome.duplicate_skipped
+                                );
+                            } else {
+                                tracing::info!(
+                                    "[TQ_BAR_CLOSED] {} 5m_end={} proof={:?} event_lag={}ms pipeline={}ms duplicate_skipped={}",
+                                    event.symbol,
+                                    event.bar_end,
+                                    event.proof,
+                                    event.event_lag_ms,
+                                    outcome.pipeline_ms,
+                                    outcome.duplicate_skipped
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            "天勤闭合事件处理失败 {} {}: {error:#}，交由定时安全路径补扫",
+                            event.symbol,
+                            event.bar_end
+                        ),
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
     let t0 = Instant::now();
     state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
@@ -537,6 +752,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             "quit" => {
                 QUITTING.store(true, Ordering::SeqCst);
                 let _ = app.save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
+                n_core::process::SidecarManager::stop();
                 app.exit(0);
             }
             _ => {}

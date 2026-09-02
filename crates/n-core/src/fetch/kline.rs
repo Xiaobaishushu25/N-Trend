@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::NaiveDateTime;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::fetch::{RequestPriority, SinaClient};
@@ -14,7 +14,7 @@ pub const DEFAULT_COUNT: usize = 300;
 pub const MINUTE_BAR_SETTLE_SECS: i64 = 30;
 const API_URL: &str = "http://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20_{symbol}_{period}_{ts}_=/InnerFuturesNewService.getFewMinLine?symbol={symbol}&type={period}";
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Kline {
     pub datetime: String,
     pub open: f64,

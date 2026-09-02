@@ -4,8 +4,8 @@ use anyhow::{anyhow, Context, Result};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::ConnectionTrait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
@@ -263,6 +263,119 @@ pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<kli
         .await
         .context("查询原始K线失败")?;
     Ok(rows)
+}
+
+/// 抢占指定K线的扫描水位。相同指纹已经完成时返回 false；修订后的新指纹允许重扫。
+pub async fn claim_scan_watermark(
+    db: &DatabaseConnection,
+    symbol: &str,
+    timeframe: &str,
+    bar_end: &str,
+    logic_version: &str,
+    fingerprint: &str,
+) -> Result<bool> {
+    let existing = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT fingerprint, status FROM scan_watermarks \
+             WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 AND logic_version=?4",
+            vec![symbol.into(), timeframe.into(), bar_end.into(), logic_version.into()],
+        ))
+        .await?;
+    if let Some(row) = existing {
+        let old_fingerprint: String = row.try_get("", "fingerprint")?;
+        let status: String = row.try_get("", "status")?;
+        if old_fingerprint == fingerprint && status == "completed" {
+            return Ok(false);
+        }
+    }
+    let now = crate::analyze::time::now_display();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO scan_watermarks(symbol,timeframe,bar_end,logic_version,fingerprint,status,updated_at) \
+         VALUES(?1,?2,?3,?4,?5,'processing',?6) \
+         ON CONFLICT(symbol,timeframe,bar_end,logic_version) DO UPDATE SET \
+         fingerprint=excluded.fingerprint,status='processing',updated_at=excluded.updated_at",
+        vec![
+            symbol.into(), timeframe.into(), bar_end.into(), logic_version.into(),
+            fingerprint.into(), now.into(),
+        ],
+    ))
+    .await?;
+    Ok(true)
+}
+
+pub async fn complete_scan_watermark(
+    db: &DatabaseConnection,
+    symbol: &str,
+    timeframe: &str,
+    bar_end: &str,
+    logic_version: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let now = crate::analyze::time::now_display();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE scan_watermarks SET status='completed',updated_at=?6 \
+         WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 AND logic_version=?4 AND fingerprint=?5",
+        vec![
+            symbol.into(), timeframe.into(), bar_end.into(), logic_version.into(),
+            fingerprint.into(), now.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+pub async fn release_scan_watermark(
+    db: &DatabaseConnection,
+    symbol: &str,
+    timeframe: &str,
+    bar_end: &str,
+    logic_version: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM scan_watermarks WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 \
+         AND logic_version=?4 AND fingerprint=?5 AND status='processing'",
+        vec![
+            symbol.into(), timeframe.into(), bar_end.into(), logic_version.into(),
+            fingerprint.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod scan_watermark_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_watermark_skips_same_fingerprint_but_allows_revision() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
+            .await
+            .unwrap());
+        complete_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
+            .await
+            .unwrap();
+        assert!(!claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
+            .await
+            .unwrap());
+        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
+            .await
+            .unwrap());
+        release_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
+            .await
+            .unwrap();
+        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
+            .await
+            .unwrap());
+    }
 }
 
 pub async fn list_symbols(
@@ -800,6 +913,19 @@ pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> 
         .await
         .context("清理快速路径信号失败")?;
     Ok(res.rows_affected)
+}
+
+pub async fn delete_fast_pattern_events_by_symbol(
+    db: &DatabaseConnection,
+    symbol: &str,
+) -> Result<u64> {
+    let result = pattern_events::Entity::delete_many()
+        .filter(pattern_events::Column::WarningKind.eq("fast"))
+        .filter(pattern_events::Column::Symbol.eq(symbol))
+        .exec(db)
+        .await
+        .context("删除品种快速形态事件失败")?;
+    Ok(result.rows_affected)
 }
 
 /// 按 id 删除单条信号事件（重复信号清理用）。

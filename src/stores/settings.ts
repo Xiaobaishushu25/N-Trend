@@ -53,12 +53,21 @@ const defaultConfig = (): Config => ({
     last_group_id: null,
     chart_review_focus_right: false,
   },
+  data_source: {
+    primary_source: 'tqsdk',
+    fallback_enabled: true,
+    tq_account: '',
+    tq_password: '',
+    bridge_port: 8765,
+    auto_spawn_bridge: true,
+    python_path: null,
+  },
 })
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     settings: defaultConfig() as Config,
-    status: { running: false, last_refresh: null, last_scan: null } as SchedulerStatus,
+    status: { running: false, last_refresh: null, last_scan: null, active_data_source: '天勤' } as SchedulerStatus,
   }),
   actions: {
     async load() {

@@ -51,7 +51,11 @@ export const useActionsStore = defineStore('actions', {
       if (this.scanning) return
       this.scanning = true
       try {
-        await useScansStore().runScanFast()
+        const started = await useScansStore().runScanFast()
+        if (!started) {
+          notify.warning('扫描正在进行，请勿重复点击')
+          return
+        }
         const result = useScansStore().latest
         notify.success(`扫描完成：${result?.scanned ?? 0} 个品种，${result?.active_count ?? 0} 个信号`)
         await this.syncStatus()

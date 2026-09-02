@@ -1,7 +1,7 @@
 //! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
 use anyhow::{anyhow, Result};
-use chrono::Timelike;
+use chrono::{NaiveDateTime, Timelike};
 use sea_orm::{DatabaseConnection, Set};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -15,7 +15,8 @@ use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
 use crate::fetch::kline::Kline;
-use crate::fetch::SinaClient;
+use crate::fetch::{ClosedBarEvent, HybridDataSource, MarketDataSource, SinaClient, TqBridgeClient};
+use crate::process::SidecarManager;
 use crate::scheduler::SchedulerConfig;
 use crate::storage::entities::{klines, pattern_events, symbols};
 use crate::storage::repo;
@@ -51,6 +52,14 @@ pub struct ScanResult {
     pub newly_triggered: Vec<pattern_events::Model>,
     pub failed: Vec<SymbolFailure>,
     pub single_bars: Vec<crate::analyze::model::SingleBarAlert>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FastPathOutcome {
+    pub scan_result: Option<ScanResult>,
+    pub duplicate_skipped: bool,
+    pub pipeline_ms: u128,
+    pub scan_ms: u128,
 }
 
 impl ScanResult {
@@ -699,6 +708,18 @@ fn bar_ts(bar: &Bar) -> String {
     bar.dt.to_bar_ts()
 }
 
+fn scan_bar_fingerprint(bar: &Bar) -> String {
+    format!(
+        "{:016x}:{:016x}:{:016x}:{:016x}:{:016x}:{:016x}",
+        bar.open.to_bits(),
+        bar.high.to_bits(),
+        bar.low.to_bits(),
+        bar.close.to_bits(),
+        bar.volume.to_bits(),
+        bar.hold.to_bits(),
+    )
+}
+
 fn event_dir(e: &pattern_events::Model) -> Dir {
     if e.direction == "down" {
         Dir::Down
@@ -1143,7 +1164,9 @@ pub struct Services {
     pub db: DatabaseConnection,
     /// 全局共享新浪客户端句柄（接入统一 SinaRequestCoordinator 与全局 RateLimiter）。
     client: SinaClient,
-    config: RwLock<Config>,
+    /// 统一双轨制数据源（天勤主力 + 新浪备选）。
+    pub data_source: Arc<HybridDataSource>,
+    config: Arc<RwLock<Config>>,
     /// 配置文件路径（保存配置用）
     config_path: std::path::PathBuf,
     /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
@@ -1154,6 +1177,8 @@ pub struct Services {
     month_kline_cache: RwLock<HashMap<String, (Instant, usize, Vec<Kline>)>>,
     /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
     scan_lock: Mutex<()>,
+    /// 串行化全量行情刷新与扫描，避免启动刷新尚未完成时扫描读取半批新、半批旧数据。
+    data_cycle_lock: Mutex<()>,
     /// 统一原子化行情写入与派生管道（Issue 02）。
     pub pipeline: RawPipeline,
 }
@@ -1167,16 +1192,49 @@ impl Services {
         let (interval_ms, budget) = coordinator_limits_from_config(&config);
         let client = SinaClient::global();
         client.update_limits(interval_ms, budget).await;
+
+        let wants_tq = config.data_source.primary_source == "tqsdk";
+        // 尝试启动 Python Sidecar 桥接服务；启动成功仍需在 HybridDataSource 上真实探活。
+        let sidecar_started = if let Err(e) = SidecarManager::start(&config.data_source).await {
+            tracing::warn!("天勤桥接服务启动异常，将使用备用数据源: {e:#}");
+            false
+        } else {
+            true
+        };
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let tq_port = config_arc.read().await.data_source.bridge_port;
+        let tq_client = TqBridgeClient::with_port(tq_port);
+        let data_source = Arc::new(HybridDataSource::new(
+            tq_client,
+            client.clone(),
+            config_arc.clone(),
+        ));
+        if wants_tq && sidecar_started {
+            if !data_source
+                .probe_and_activate("天勤桥接服务启动并通过健康检查", false)
+                .await
+            {
+                tracing::warn!("天勤桥接服务未通过健康检查，当前使用新浪备用数据源");
+            }
+        } else {
+            data_source
+                .mark_tq_unavailable("天勤主力数据源未启用，当前使用新浪数据源", false)
+                .await;
+        }
+
         let pipeline = RawPipeline::new(db.clone(), SymbolLocks::new());
         Ok(Self {
             db,
             client,
-            config: RwLock::new(config),
+            data_source,
+            config: config_arc,
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
+            data_cycle_lock: Mutex::new(()),
             pipeline,
         })
     }
@@ -1184,6 +1242,11 @@ impl Services {
     /// 获取全局共享客户端句柄的轻量克隆。
     pub fn client(&self) -> SinaClient {
         self.client.clone()
+    }
+
+    /// 获取统一双轨制数据源句柄。
+    pub fn data_source(&self) -> Arc<HybridDataSource> {
+        self.data_source.clone()
     }
 
     pub async fn config(&self) -> Config {
@@ -1194,8 +1257,76 @@ impl Services {
     pub async fn apply_config(&self, c: Config) -> Result<Config> {
         let (interval_ms, budget) = coordinator_limits_from_config(&c);
         self.client.update_limits(interval_ms, budget).await;
+
+        let old_ds = self.config.read().await.data_source.clone();
+        let ds_changed = old_ds.bridge_port != c.data_source.bridge_port
+            || old_ds.tq_account != c.data_source.tq_account
+            || old_ds.tq_password != c.data_source.tq_password
+            || old_ds.auto_spawn_bridge != c.data_source.auto_spawn_bridge
+            || old_ds.python_path != c.data_source.python_path
+            || old_ds.primary_source != c.data_source.primary_source;
+
+        // 1. 立即持久化落盘并更新内存配置
         c.save(&self.config_path)?;
-        *self.config.write().await = c;
+        *self.config.write().await = c.clone();
+
+        // 2. 应用数据源配置。进程启动成功不代表服务可用，必须通过真实健康探测。
+        if ds_changed {
+            tracing::info!("🔄 数据源配置发生变更，正在后台平滑更新服务与客户端连接...");
+            self.data_source.update_bridge_port(c.data_source.bridge_port).await;
+        }
+
+        if c.data_source.primary_source != "tqsdk" {
+            SidecarManager::stop();
+            self.data_source
+                .mark_tq_unavailable("已切换为新浪主力数据源", false)
+                .await;
+        } else if c.data_source.tq_account.trim().is_empty()
+            || c.data_source.tq_password.is_empty()
+        {
+            SidecarManager::stop();
+            self.data_source
+                .mark_tq_unavailable("天勤账号或密码未配置，当前使用新浪备用数据源", true)
+                .await;
+            tracing::warn!("⚠️ 快期/天勤账号或密码未配置，系统将暂时使用新浪备用数据源");
+        } else {
+            let start_result = if ds_changed && c.data_source.auto_spawn_bridge {
+                SidecarManager::restart(&c.data_source).await
+            } else {
+                if ds_changed && !c.data_source.auto_spawn_bridge {
+                    // 关闭自动拉起时只停止本程序拥有的子进程，随后仍允许探测外部手工桥接。
+                    SidecarManager::stop();
+                }
+                SidecarManager::start(&c.data_source).await
+            };
+
+            match start_result {
+                Ok(()) => {
+                    if self
+                        .data_source
+                        .probe_and_activate(
+                            "天勤账号配置已更新，已自动连接主力天勤数据源",
+                            true,
+                        )
+                        .await
+                    {
+                        tracing::info!("✅ 天勤桥接服务健康检查通过，已切回主力数据源");
+                    } else {
+                        tracing::warn!("天勤桥接进程已处理，但健康检查失败，继续使用新浪备用数据源");
+                    }
+                }
+                Err(e) => {
+                    self.data_source
+                        .mark_tq_unavailable(
+                            &format!("天勤桥接服务启动失败（{e:#}），当前使用新浪备用数据源"),
+                            true,
+                        )
+                        .await;
+                    tracing::warn!("Sidecar 启动/重启异常，继续使用新浪备用数据源: {e:#}");
+                }
+            }
+        }
+
         Ok(self.config().await)
     }
 
@@ -1297,12 +1428,7 @@ impl Services {
 
     /// 将所有配置恢复为默认值：重置全局限速器、写 JSON、更新内存，返回新的默认配置。
     pub async fn reset_config(&self) -> Result<Config> {
-        let c = Config::default();
-        let (interval_ms, budget) = coordinator_limits_from_config(&c);
-        self.client.update_limits(interval_ms, budget).await;
-        c.save(&self.config_path)?;
-        *self.config.write().await = c.clone();
-        Ok(c)
+        self.apply_config(Config::default()).await
     }
 
     pub async fn scheduler_config(&self) -> SchedulerConfig {
@@ -1439,9 +1565,7 @@ impl Services {
     }
     /// 新品种一次性回填历史 5m 并原子化派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
-        let rows =
-            crate::fetch::kline::fetch_minute(&self.client, symbol, "5", count)
-                .await?;
+        let rows = self.data_source.fetch_minute(symbol, "5", count).await?;
         self.pipeline.process_raw_batch(symbol, &rows).await?;
         Ok(rows.len())
     }
@@ -1488,12 +1612,12 @@ impl Services {
         self.backfill_symbol(&code, count).await
     }
 
-    /// 标题栏搜索提示用：按前缀搜索新浪期货合约（如 RB → RB0、RB2609、RB2608…）。
+    /// 标题栏搜索提示用：按前缀搜索期货合约（优先天勤，回退新浪）。
     pub async fn search_contracts(
         &self,
         keyword: &str,
     ) -> Result<Vec<crate::fetch::symbols::FuturesSymbol>> {
-        crate::fetch::symbols::search_contracts(&self.client, keyword).await
+        self.data_source.search_contracts(keyword).await
     }
 
     /// 删除品种及其K线数据。
@@ -1505,6 +1629,7 @@ impl Services {
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
     pub async fn refresh_data(&self) -> Result<RefreshStats> {
+        let _cycle_guard = self.data_cycle_lock.lock().await;
         let symbols = repo::list_symbols(&self.db, true).await?;
         let now = chrono::Local::now();
         let mut stats = RefreshStats::default();
@@ -1549,8 +1674,7 @@ impl Services {
         } else {
             needed
         };
-        let fetched =
-            crate::fetch::kline::fetch_minute(&self.client, code, "5", count).await?;
+        let fetched = self.data_source.fetch_minute(code, "5", count).await?;
         if count >= s.fetch.backfill_count {
             self.deep_backfilled.write().await.insert(code.to_string());
         }
@@ -1609,6 +1733,8 @@ impl Services {
                     let is_session_close = judger.required_settle_secs(code, bar_dt.hour(), bar_dt.minute()) > judger.policy().ordinary_settle_secs;
                     let pipeline = self.pipeline.clone();
                     let code_owned = code.to_string();
+                    // 没有天勤闭合证明时，安全兜底必须明确走新浪30/75秒定版过滤。
+                    // 不能调用 Hybrid：休市最后一根在天勤序列末行，会被生产接口安全排除。
                     let client = self.client.clone();
                     let do_refetch = {
                         let pipeline = pipeline.clone();
@@ -1670,6 +1796,95 @@ impl Services {
     /// 统一单根 Final 5m 行情写入与原子派生入口（Issue 02）。
     pub async fn process_final_bar(&self, symbol: &str, bar: &Kline) -> Result<usize> {
         self.pipeline.process_final_bar(symbol, bar).await
+    }
+
+    /// 事件流初始化不回放历史闭合事件；用新浪 Finality 规则补齐重启前可能遗漏的收盘末根。
+    pub async fn reconcile_sina_finality(&self, symbols: &[String]) -> RefreshStats {
+        let mut stats = RefreshStats::default();
+        for symbol in symbols {
+            match crate::fetch::kline::fetch_minute(&self.client, symbol, "5", 10).await {
+                Ok(rows) => match self.pipeline.process_raw_batch(symbol, &rows).await {
+                    Ok(_) => stats.succeeded += 1,
+                    Err(error) => {
+                        stats.failures += 1;
+                        tracing::warn!("重启 Finality 补齐写入失败 {symbol}: {error:#}");
+                    }
+                },
+                Err(error) => {
+                    stats.failures += 1;
+                    tracing::warn!("重启 Finality 补齐抓取失败 {symbol}: {error:#}");
+                }
+            }
+        }
+        stats
+    }
+
+    /// 校验并处理一个具备闭合证明的天勤5m事件。入场触发仍由现有3秒行情轮询负责。
+    pub async fn process_tq_closed_bar_event(
+        &self,
+        event: &ClosedBarEvent,
+    ) -> Result<FastPathOutcome> {
+        if event.source != "tqsdk" || event.event_type != "bar_closed" || event.period != "5m" {
+            return Err(anyhow!("非法闭合事件来源或类型"));
+        }
+        if event.kline.datetime != event.bar_end {
+            return Err(anyhow!("闭合事件 bar_end 与 K 线时间不一致"));
+        }
+        if ![
+            event.kline.open,
+            event.kline.high,
+            event.kline.low,
+            event.kline.close,
+            event.kline.volume,
+            event.kline.hold,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            || event.kline.high < event.kline.low
+            || event.kline.open < event.kline.low
+            || event.kline.open > event.kline.high
+            || event.kline.close < event.kline.low
+            || event.kline.close > event.kline.high
+        {
+            return Err(anyhow!("闭合事件 OHLC/成交数据无效"));
+        }
+        let bar_end = NaiveDateTime::parse_from_str(&event.bar_end, "%Y-%m-%d %H:%M:%S")
+            .map_err(|_| anyhow!("闭合事件时间格式无效: {}", event.bar_end))?;
+        if bar_end.minute() % 5 != 0 {
+            return Err(anyhow!("闭合事件不在5分钟边界: {}", event.bar_end));
+        }
+        let enabled = repo::list_symbols(&self.db, true)
+            .await?
+            .into_iter()
+            .any(|symbol| symbol.code == event.symbol);
+        if !enabled {
+            return Err(anyhow!("闭合事件品种未启用: {}", event.symbol));
+        }
+
+        let pipeline_started = Instant::now();
+        self.pipeline
+            .process_final_bar(&event.symbol, &event.kline)
+            .await?;
+        let pipeline_ms = pipeline_started.elapsed().as_millis();
+        if bar_end.minute() % 15 != 0 {
+            return Ok(FastPathOutcome {
+                scan_result: None,
+                duplicate_skipped: false,
+                pipeline_ms,
+                scan_ms: 0,
+            });
+        }
+
+        let scan_started = Instant::now();
+        let (scan_result, duplicate_skipped) = self
+            .run_event_scan_symbol(&event.symbol, &event.bar_end)
+            .await?;
+        Ok(FastPathOutcome {
+            scan_result,
+            duplicate_skipped,
+            pipeline_ms,
+            scan_ms: scan_started.elapsed().as_millis(),
+        })
     }
 
     /// 低频换月扫描入口：只处理有新增断点或仍待确认的品种，
@@ -1837,8 +2052,7 @@ impl Services {
         if let Some(rows) = fresh {
             return Ok(rows);
         }
-        let rows =
-            crate::fetch::kline::fetch_minute(&self.client, code, "5", count).await?;
+        let rows = self.data_source.fetch_minute(code, "5", count).await?;
         self.month_kline_cache
             .write()
             .await
@@ -1990,7 +2204,7 @@ impl Services {
         (Some(latest), Some(pct))
     }
 
-    /// 实时现价快照：从新浪批量行情接口拉取启用品种的实时价。
+    /// 实时现价快照：拉取启用品种的实时价（优先天勤，回退新浪）。
     /// 缺失/解析失败的品种返回 `latest: None`，由前端回退到库内旧数据。
     pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
         let symbols = repo::list_symbols(&self.db, true).await?;
@@ -1998,8 +2212,7 @@ impl Services {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
-        let quotes =
-            crate::fetch::quotes::fetch_quotes(&self.client, &codes).await?;
+        let quotes = self.data_source.fetch_quotes(&codes).await?;
         Ok(symbols
             .into_iter()
             .map(|s| {
@@ -2013,27 +2226,142 @@ impl Services {
             .collect())
     }
 
+    /// 订阅数据源降级/恢复事件通知。
+    pub fn subscribe_data_source_events(&self) -> tokio::sync::broadcast::Receiver<crate::fetch::DataSourceEvent> {
+        self.data_source.subscribe_events()
+    }
+
+    /// 获取当前生效的数据源展示名称（如 "天勤"、"新浪"、"新浪 (降级)"）
+    pub async fn active_data_source_name(&self) -> String {
+        let cfg = self.config().await;
+        if cfg.data_source.primary_source == "sina" {
+            "新浪".to_string()
+        } else {
+            let name = self.data_source.name();
+            if name.contains("fallback") {
+                "新浪 (降级)".to_string()
+            } else {
+                "天勤".to_string()
+            }
+        }
+    }
+
     /// 全品种扫描：15m 前向重放识别预警，插入 pattern_events 并推进在途事件。
     pub async fn run_scan(&self) -> Result<ScanResult> {
         let _guard = self.scan_lock.lock().await;
+        let _cycle_guard = self.data_cycle_lock.lock().await;
+        self.run_scan_internal(true).await
+    }
+
+    /// 手工完整扫描：保留换月同步，但忙时立即拒绝，绝不在锁前排队。
+    pub async fn run_scan_try(&self) -> Result<ScanResult> {
+        let _guard = self
+            .scan_lock
+            .try_lock()
+            .map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
+        let _cycle_guard = self
+            .data_cycle_lock
+            .try_lock()
+            .map_err(|_| anyhow!("行情数据正在刷新，请稍后再试"))?;
         self.run_scan_internal(true).await
     }
 
     /// 手工快速扫描：跳过换月、try_lock防排队，定时任务会后台补换月
     pub async fn run_scan_fast(&self) -> Result<ScanResult> {
         let _guard = self.scan_lock.try_lock().map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
+        let _cycle_guard = self
+            .data_cycle_lock
+            .try_lock()
+            .map_err(|_| anyhow!("行情数据正在刷新，请稍后再试"))?;
         self.run_scan_internal(false).await
     }
 
     async fn run_scan_internal(&self, with_rollover: bool) -> Result<ScanResult> {
-        let started = now_ts();
         if with_rollover {
             self.sync_rollovers_if_needed().await?;
         }
-        repo::delete_fast_pattern_events(&self.db).await?;
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        self.run_scan_models(symbols, true, true).await
+    }
+
+    /// 天勤闭合事件快速路径：只扫描事件涉及的品种，不等待全市场最慢品种。
+    pub async fn run_scan_symbols(&self, codes: &[String]) -> Result<ScanResult> {
+        let _guard = self.scan_lock.lock().await;
+        let wanted: HashSet<&str> = codes.iter().map(String::as_str).collect();
+        let symbols = repo::list_symbols(&self.db, true)
+            .await?
+            .into_iter()
+            .filter(|symbol| wanted.contains(symbol.code.as_str()))
+            .collect();
+        self.run_scan_models(symbols, false, false).await
+    }
+
+    async fn run_event_scan_symbol(
+        &self,
+        symbol: &str,
+        bar_end: &str,
+    ) -> Result<(Option<ScanResult>, bool)> {
+        let _guard = self.scan_lock.lock().await;
+        let bars15 = self.bars_for(symbol, "15m").await?;
+        let Some(bar) = bars15.iter().find(|bar| bar.dt.to_bar_ts() == bar_end) else {
+            return Err(anyhow!("闭合事件入库后未生成目标15m K线: {symbol}/{bar_end}"));
+        };
+        let fingerprint = scan_bar_fingerprint(bar);
+        if !repo::claim_scan_watermark(
+            &self.db,
+            symbol,
+            "15m",
+            bar_end,
+            EVENT_LOGIC_VERSION,
+            &fingerprint,
+        )
+        .await?
+        {
+            return Ok((None, true));
+        }
+
+        let symbols = repo::list_symbols(&self.db, true)
+            .await?
+            .into_iter()
+            .filter(|row| row.code == symbol)
+            .collect();
+        match self.run_scan_models(symbols, false, false).await {
+            Ok(result) => {
+                repo::complete_scan_watermark(
+                    &self.db,
+                    symbol,
+                    "15m",
+                    bar_end,
+                    EVENT_LOGIC_VERSION,
+                    &fingerprint,
+                )
+                .await?;
+                Ok((Some(result), false))
+            }
+            Err(error) => {
+                let _ = repo::release_scan_watermark(
+                    &self.db,
+                    symbol,
+                    "15m",
+                    bar_end,
+                    EVENT_LOGIC_VERSION,
+                    &fingerprint,
+                )
+                .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn run_scan_models(
+        &self,
+        symbols: Vec<symbols::Model>,
+        delete_fast_events: bool,
+        cleanup_duplicates: bool,
+    ) -> Result<ScanResult> {
+        let started = now_ts();
         let cfg = self.config().await;
         let min_score = cfg.notify.new_pattern_min_score;
-        let symbols = repo::list_symbols(&self.db, true).await?;
         let mut failed: Vec<SymbolFailure> = Vec::new();
         let mut new_warnings: Vec<pattern_events::Model> = Vec::new();
         let mut newly_triggered: Vec<pattern_events::Model> = Vec::new();
@@ -2050,6 +2378,32 @@ impl Services {
                 });
                 continue;
             }
+            let watermark = if delete_fast_events {
+                let latest = bars15.last().expect("bars15 length checked");
+                let bar_end = latest.dt.to_bar_ts();
+                let fingerprint = scan_bar_fingerprint(latest);
+                if !repo::claim_scan_watermark(
+                    &self.db,
+                    &sym.code,
+                    "15m",
+                    &bar_end,
+                    EVENT_LOGIC_VERSION,
+                    &fingerprint,
+                )
+                .await?
+                {
+                    tracing::debug!(
+                        "[SCAN_WATERMARK] {} {} duplicate_skipped=true",
+                        sym.code,
+                        bar_end
+                    );
+                    continue;
+                }
+                repo::delete_fast_pattern_events_by_symbol(&self.db, &sym.code).await?;
+                Some((bar_end, fingerprint))
+            } else {
+                None
+            };
             scanned += 1;
             if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
                 let (kind_s, label) = match sig.kind {
@@ -2099,9 +2453,22 @@ impl Services {
                 }
                 signals.push(e);
             }
+            if let Some((bar_end, fingerprint)) = watermark {
+                repo::complete_scan_watermark(
+                    &self.db,
+                    &sym.code,
+                    "15m",
+                    &bar_end,
+                    EVENT_LOGIC_VERSION,
+                    &fingerprint,
+                )
+                .await?;
+            }
         }
 
-        self.cleanup_duplicate_events().await?;
+        if cleanup_duplicates {
+            self.cleanup_duplicate_events().await?;
+        }
         signals = repo::all_pattern_events(&self.db).await?;
 
         let finished = now_ts();

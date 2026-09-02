@@ -165,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
     });
     tokio::signal::ctrl_c().await?;
     tracing::info!("收到退出信号");
+    n_core::process::SidecarManager::stop();
     Ok(())
 }
 async fn run_refresh(svc: &Services) -> anyhow::Result<()> {

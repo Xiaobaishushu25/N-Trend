@@ -18,6 +18,7 @@ import {
 import {
   BellX,
   Clock,
+  Database,
   DotsVertical,
   History,
   Plus,
@@ -46,6 +47,20 @@ const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
+
+const activeDataSource = computed(() => {
+  return (
+    settingsStore.status.active_data_source ||
+    (settingsStore.settings?.data_source?.primary_source === 'sina' ? '新浪' : '天勤')
+  )
+})
+
+const dataSourceTagType = computed<'default' | 'info' | 'warning' | 'success'>(() => {
+  const ds = activeDataSource.value
+  if (ds.includes('降级')) return 'warning'
+  if (ds.includes('天勤')) return 'info'
+  return 'default'
+})
 
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
 const isStandaloneWindow = computed(
@@ -360,6 +375,21 @@ onBeforeUnmount(() => {
             <span>运行中</span>
           </div>
           <n-tag v-else type="warning" size="small" round>已暂停</n-tag>
+
+          <!-- 实时数据源显示 -->
+          <n-tag
+            size="small"
+            round
+            :bordered="false"
+            :type="dataSourceTagType"
+            class="ds-tag"
+            :title="`当前实时数据源: ${activeDataSource}`"
+          >
+            <template #icon>
+              <n-icon :component="Database" size="12" />
+            </template>
+            {{ activeDataSource }}
+          </n-tag>
           <div class="status-meta">
             <div
               class="status-item"
@@ -497,7 +527,17 @@ onBeforeUnmount(() => {
 .status-area {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
+}
+.ds-tag {
+  font-size: 11px;
+  font-weight: 600;
+  height: 22px;
+  padding: 0 8px;
+  cursor: default;
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.2px;
 }
 .live-tag {
   display: inline-flex;

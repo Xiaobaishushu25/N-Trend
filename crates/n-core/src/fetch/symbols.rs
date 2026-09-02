@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -15,7 +15,7 @@ const NODES_JS_URL: &str =
 const HQ_DATA_URL: &str = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQFuturesData?page=1&num=1&sort=position&asc=0&node={node}&base={base}";
 const HQ_ALL_DATA_URL: &str = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQFuturesData?page=1&num=1000&sort=position&asc=0&node={node}&base={base}";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuturesSymbol {
     pub code: String,
     pub name: String,

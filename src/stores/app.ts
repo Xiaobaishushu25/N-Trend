@@ -1,4 +1,4 @@
-﻿import { defineStore } from 'pinia'
+import { defineStore } from 'pinia'
 import { listen } from '@tauri-apps/api/event'
 import {
   isPermissionGranted,
@@ -82,6 +82,25 @@ export const useAppStore = defineStore('app', {
                 `入场价 ${fmtPrice(hit.entry)} · 最新 ${fmtPrice(hit.latest)}`,
               )
             }
+          }
+        }),
+      )
+      this.listeners.push(
+        await listen<{ from: string; to: string; reason: string }>('data-source-failover', (event) => {
+          if (!isMainWindow()) return
+          const settingsStore = useSettingsStore()
+          if (event.payload.to === 'sina') {
+            settingsStore.status.active_data_source = '新浪 (降级)'
+            notify.warning(event.payload.reason, {
+              title: '数据源已自动降级',
+              duration: 8000,
+            })
+          } else {
+            settingsStore.status.active_data_source = '天勤'
+            notify.success(event.payload.reason, {
+              title: '主力数据源已恢复',
+              duration: 5000,
+            })
           }
         }),
       )

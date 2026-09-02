@@ -13,6 +13,9 @@ function activeSignals(rows: PatternEvent[]): PatternEvent[] {
 }
 
 let cleanupInterval: ReturnType<typeof setInterval> | null = null
+let latestRefreshPromise: Promise<void> | null = null
+let initialScanScheduled = false
+
 function ensureCleanup(store: { cleanupSingleBars: () => void }) {
   if (cleanupInterval != null || typeof window === 'undefined') return
   cleanupInterval = setInterval(() => store.cleanupSingleBars(), 30_000)
@@ -40,20 +43,24 @@ export const useScansStore = defineStore('scans', {
     running: false,
   }),
   actions: {
-    async runScanFast() {
+    async runScanFast(): Promise<boolean> {
+      if (this.running) return false
       this.running = true
       try {
         const result = await api.runScanFastNow()
         this.applyScanResult(result)
+        return true
       } finally {
         this.running = false
       }
     },
-    async runScan() {
+    async runScan(): Promise<boolean> {
+      if (this.running) return false
       this.running = true
       try {
         const result = await api.runScanNow()
         this.applyScanResult(result)
+        return true
       } finally {
         this.running = false
       }
@@ -63,17 +70,29 @@ export const useScansStore = defineStore('scans', {
         this.latestSignals = activeSignals(this.latest.signals)
         return
       }
-      try {
-        const cached = await api.getActiveEvents()
-        this.latestSignals = activeSignals(cached as unknown as PatternEvent[])
-        if (!cached.length) {
-          this.runScan().catch(() => {})
-        } else {
-          setTimeout(() => this.runScan().catch(() => {}), 1200)
+      if (latestRefreshPromise) return latestRefreshPromise
+
+      latestRefreshPromise = (async () => {
+        try {
+          const cached = await api.getActiveEvents()
+          this.latestSignals = activeSignals(cached as unknown as PatternEvent[])
+        } catch {
+          // 缓存读取失败时仍允许下面安排一次后台扫描恢复数据。
+          this.latestSignals = []
         }
-      } catch {
-        await this.runScan()
-      }
+
+        // Dashboard/Chart 等多个视图会在启动时同时调用本方法。整个前端会话只安排
+        // 一次后台扫描，避免把相同请求连续塞进 Rust 的扫描锁队列。
+        if (!initialScanScheduled) {
+          initialScanScheduled = true
+          const delay = this.latestSignals.length ? 1200 : 0
+          setTimeout(() => this.runScan().catch(() => {}), delay)
+        }
+      })().finally(() => {
+        latestRefreshPromise = null
+      })
+
+      return latestRefreshPromise
     },
     applyScanResult(result: ScanResult) {
       const notifySettings = useSettingsStore().settings.notify

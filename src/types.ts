@@ -285,6 +285,23 @@ export interface UiConfig {
   chart_review_focus_right: boolean
 }
 
+export interface DataSourceConfig {
+  /** 主力数据源: "tqsdk" 或 "sina" */
+  primary_source: string
+  /** 是否在主力数据源不可用时自动降级到新浪 */
+  fallback_enabled: boolean
+  /** 快期账户 */
+  tq_account: string
+  /** 快期密码 */
+  tq_password: string
+  /** Python 桥接服务端口 (默认 8765) */
+  bridge_port: number
+  /** 是否由主程序自动启动 Python Sidecar 桥接进程 */
+  auto_spawn_bridge: boolean
+  /** Python 可执行文件路径 (可选，留空则自动搜索系统环境) */
+  python_path: string | null
+}
+
 export interface Config {
   app_config: AppConfig
   scheduler: SchedulerConfig
@@ -294,6 +311,7 @@ export interface Config {
   notify: NotifyConfig
   log: LogConfig
   ui: UiConfig
+  data_source: DataSourceConfig
 }
 
 /** 入场价触发命中：最新价已触及某形态入场点（做空=跌破，做多=突破） */
@@ -312,6 +330,7 @@ export interface SchedulerStatus {
   running: boolean
   last_refresh: string | null
   last_scan: string | null
+  active_data_source?: string
 }
 
 export interface MarketSnapshot {

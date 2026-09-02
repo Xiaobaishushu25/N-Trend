@@ -19,6 +19,7 @@ pub struct SchedulerStatus {
     pub running: bool,
     pub last_refresh: Option<String>,
     pub last_scan: Option<String>,
+    pub active_data_source: String,
 }
 
 #[tauri::command]
@@ -382,7 +383,7 @@ pub async fn run_scan_now(
 ) -> Result<ScanResult, String> {
     let t0 = Instant::now();
     tracing::info!("👆 用户手动触发立即扫描");
-    match state.services.run_scan().await {
+    match state.services.run_scan_try().await {
         Ok(result) => {
             state.note_scan_success().await;
             let _ = app.emit("scan-completed", &result);
@@ -397,8 +398,13 @@ pub async fn run_scan_now(
             Ok(result)
         }
         Err(e) => {
-            tracing::error!("❌ 手动扫描失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
-            Err(e.to_string())
+            let msg = e.to_string();
+            if msg.contains("扫描进行中") || msg.contains("行情数据正在刷新") {
+                tracing::warn!("⚠ 手动扫描被限流 耗时 {}ms | {msg}", t0.elapsed().as_millis());
+            } else {
+                tracing::error!("❌ 手动扫描失败 耗时 {}ms | {msg}", t0.elapsed().as_millis());
+            }
+            Err(msg)
         }
     }
 }
@@ -426,7 +432,7 @@ pub async fn run_scan_fast_now(
         }
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("扫描进行中") {
+            if msg.contains("扫描进行中") || msg.contains("行情数据正在刷新") {
                 tracing::warn!("⚠ 手动扫描被限流 耗时 {}ms | {msg}", t0.elapsed().as_millis());
             } else {
                 tracing::error!("❌ 手动扫描失败 耗时 {}ms | {msg}", t0.elapsed().as_millis());
@@ -719,10 +725,12 @@ pub async fn open_log_directory(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn scheduler_status(state: State<'_, Arc<AppState>>) -> Result<SchedulerStatus, String> {
     let rt = state.scheduler.read().await;
+    let active_data_source = state.services.active_data_source_name().await;
     Ok(SchedulerStatus {
         running: rt.running,
         last_refresh: rt.last_refresh.map(crate::fmt_naive),
         last_scan: rt.last_scan.map(crate::fmt_naive),
+        active_data_source,
     })
 }
 

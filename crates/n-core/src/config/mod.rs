@@ -58,6 +58,8 @@ pub struct Config {
     pub log: LogConfig,
     /// 界面细节
     pub ui: UiConfig,
+    /// 数据源配置（天勤/新浪双轨制）
+    pub data_source: DataSourceConfig,
 }
 
 impl Default for Config {
@@ -71,6 +73,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             log: LogConfig::default(),
             ui: UiConfig::default(),
+            data_source: DataSourceConfig::default(),
         }
     }
 }
@@ -172,6 +175,7 @@ impl Config {
                 level: get_str(map, "log_level", &d.log.level),
             },
             ui: UiConfig::default(),
+            data_source: DataSourceConfig::default(),
         }
     }
 }
@@ -320,6 +324,39 @@ impl Default for UiConfig {
             timeframes: DEFAULT_TIMEFRAMES.iter().map(|s| s.to_string()).collect(),
             last_group_id: None,
             chart_review_focus_right: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DataSourceConfig {
+    /// 主力数据源: "tqsdk" 或 "sina"
+    pub primary_source: String,
+    /// 是否在主力数据源不可用时自动降级到新浪
+    pub fallback_enabled: bool,
+    /// 快期账户
+    pub tq_account: String,
+    /// 快期密码
+    pub tq_password: String,
+    /// Python 桥接服务端口 (默认 8765)
+    pub bridge_port: u16,
+    /// 是否由主程序自动启动 Python Sidecar 桥接进程
+    pub auto_spawn_bridge: bool,
+    /// Python 可执行文件路径 (可选，留空则自动搜索系统环境)
+    pub python_path: Option<String>,
+}
+
+impl Default for DataSourceConfig {
+    fn default() -> Self {
+        Self {
+            primary_source: "tqsdk".to_string(),
+            fallback_enabled: true,
+            tq_account: String::new(),
+            tq_password: String::new(),
+            bridge_port: 8765,
+            auto_spawn_bridge: true,
+            python_path: None,
         }
     }
 }

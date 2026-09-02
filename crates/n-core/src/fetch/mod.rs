@@ -1,11 +1,20 @@
 //! Sina futures data fetching with a polite rate limiter.
 
 pub mod coordinator;
+pub mod datasource;
+pub mod hybrid;
 pub mod kline;
 pub mod quotes;
 pub mod symbols;
+pub mod tq_client;
 
 pub use coordinator::{CoordinatorStats, RequestPriority, SinaRequest, SinaRequestCoordinator};
+pub use datasource::MarketDataSource;
+pub use hybrid::{DataSourceEvent, HybridDataSource};
+pub use tq_client::{
+    BarCloseProof, ClosedBarEvent, ClosedBarEventsResponse, SubscribeKlinesResponse,
+    TqBridgeClient,
+};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -199,6 +208,45 @@ impl SinaClient {
 impl Default for SinaClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MarketDataSource for SinaClient {
+    fn name(&self) -> &'static str {
+        "sina"
+    }
+
+    async fn fetch_quotes(
+        &self,
+        codes: &[String],
+    ) -> Result<std::collections::HashMap<String, quotes::Quote>> {
+        quotes::fetch_quotes(self, codes).await
+    }
+
+    async fn fetch_minute(
+        &self,
+        symbol: &str,
+        period: &str,
+        count: usize,
+    ) -> Result<Vec<kline::Kline>> {
+        kline::fetch_minute(self, symbol, period, count).await
+    }
+
+    async fn fetch_minute_raw(
+        &self,
+        symbol: &str,
+        period: &str,
+        count: usize,
+    ) -> Result<kline::RawKlineResponse> {
+        kline::fetch_minute_raw(self, symbol, period, count).await
+    }
+
+    async fn search_contracts(&self, keyword: &str) -> Result<Vec<symbols::FuturesSymbol>> {
+        symbols::search_contracts(self, keyword).await
+    }
+
+    async fn is_healthy(&self) -> bool {
+        true
     }
 }
 
