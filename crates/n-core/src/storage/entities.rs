@@ -323,3 +323,178 @@ pub mod bar_finality_trials {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+
+pub mod v2_trade_events {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_trade_events")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub direction: String,
+        pub grade: String,
+        pub level: String,
+        pub state: String,
+        pub s0_ts: String,
+        pub s0_price: f64,
+        pub s1_ts: String,
+        pub s1_price: f64,
+        pub s2_ts: String,
+        pub s2_price: f64,
+        pub a_move: f64,
+        pub b_move: f64,
+        pub a_bars: i64,
+        pub b_bars: i64,
+        pub retracement: f64,
+        pub warning_ts: String,
+        pub warning_kind: String,
+        pub entry: f64,
+        pub stop: f64,
+        pub target: f64,
+        pub risk: f64,
+        pub rr: f64,
+        pub trigger_level: f64,
+        pub last_advance_ts: Option<String>,
+        pub trigger_bar_ts: Option<String>,
+        pub entry_ts: Option<String>,
+        pub entry_price: Option<f64>,
+        pub created_at: String,
+        pub updated_at: String,
+        pub schema_version: String,
+        pub pattern_version: String,
+        pub execution_version: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod v2_setup_features {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_setup_features")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub event_id: i64,
+        pub setup_quality: f64,
+        pub a_move: f64,
+        pub b_move: f64,
+        pub a_move_atr: f64,
+        pub b_move_atr: f64,
+        pub a_speed: f64,
+        pub a_bars: i64,
+        pub b_bars: i64,
+        pub retracement: f64,
+        pub grade: String,
+        pub level: String,
+        pub direction: String,
+        pub trend60_state: String,
+        pub warning_close_location: Option<f64>,
+        pub warning_body_atr: Option<f64>,
+        pub warning_wick_ratio: Option<f64>,
+        pub warning_volume_ratio: Option<f64>,
+        pub normalized: bool,
+        pub missing_mask: i64,
+        pub raw_json: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod v2_trigger_features {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_trigger_features")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub event_id: i64,
+        pub trigger_bar_ts: String,
+        pub trigger_level: f64,
+        pub close_price: f64,
+        pub close_overshoot_r: Option<f64>,
+        pub close_location: Option<f64>,
+        pub body_atr: Option<f64>,
+        pub volume_ratio: Option<f64>,
+        pub oi_ratio: Option<f64>,
+        pub internal_swing_margin_r: Option<f64>,
+        pub wick_atr: Option<f64>,
+        pub chase_distance_r: Option<f64>,
+        pub risk: f64,
+        pub missing_mask: i64,
+        pub raw_json: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod v2_model_predictions {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_model_predictions")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub event_id: i64,
+        pub model_id: String,
+        pub p_win: Option<f64>,
+        pub logit: Option<f64>,
+        pub feature_hash: String,
+        pub predicted_at: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod v2_trade_outcomes {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_trade_outcomes")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub event_id: i64,
+        pub outcome: String,
+        pub exit_reason: String,
+        pub exit_ts: String,
+        pub exit_price: f64,
+        pub r_multiple: f64,
+        pub mfe_r: Option<f64>,
+        pub mae_r: Option<f64>,
+        pub is_1r_aux_win: Option<bool>,
+        pub label_version: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod v2_model_registry {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "v2_model_registry")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub model_id: String,
+        pub name: String,
+        pub schema_version: String,
+        pub feature_whitelist: String,
+        pub train_window: String,
+        pub dataset_hash: String,
+        pub coefficients: String,
+        pub spline_knots: Option<String>,
+        pub metrics: String,
+        pub created_at: String,
+    }
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+    impl ActiveModelBehavior for ActiveModel {}
+}

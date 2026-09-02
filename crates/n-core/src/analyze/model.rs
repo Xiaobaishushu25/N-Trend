@@ -180,6 +180,7 @@ pub struct NPattern {
     pub c_hard_failure: bool,
 }
 
+#[derive(Debug)]
 pub struct Trend60 {
     pub direction: String,
     pub ma20: f64,
@@ -325,6 +326,8 @@ mod tests {
         }
     }
 }
+
+
 
 
 

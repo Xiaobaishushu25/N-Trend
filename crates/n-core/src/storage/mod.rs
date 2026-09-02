@@ -82,6 +82,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
     create_finality_tables(db).await?;
+    create_v2_tables(db).await?;
     info!("数据库表结构已就绪");
     Ok(())
 }
@@ -544,4 +545,28 @@ mod tests {
         migrate_with_path(&db, Some(&db_path)).await.unwrap();
         migrate_with_path(&db, Some(&db_path)).await.unwrap();
     }
+}
+
+
+async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
+    let schema = Schema::new(DbBackend::Sqlite);
+    let v2_tables = [
+        schema.create_table_from_entity(entities::v2_trade_events::Entity).if_not_exists().to_owned(),
+        schema.create_table_from_entity(entities::v2_setup_features::Entity).if_not_exists().to_owned(),
+        schema.create_table_from_entity(entities::v2_trigger_features::Entity).if_not_exists().to_owned(),
+        schema.create_table_from_entity(entities::v2_model_predictions::Entity).if_not_exists().to_owned(),
+        schema.create_table_from_entity(entities::v2_trade_outcomes::Entity).if_not_exists().to_owned(),
+        schema.create_table_from_entity(entities::v2_model_registry::Entity).if_not_exists().to_owned(),
+    ];
+    let backend = db.get_database_backend();
+    for table in v2_tables {
+        let stmt = backend.build(&table);
+        db.execute(stmt).await.context("创建 V2 数据表失败")?;
+    }
+    db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)").await.context("创建 V2 索引失败")?;
+    db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_warning_ts ON v2_trade_events(warning_ts)").await.context("创建 V2 索引失败")?;
+    // mark migrated to 4
+    db.execute_unprepared("INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_migrated', '4')").await.ok();
+    db.execute_unprepared("UPDATE settings SET value='4' WHERE key=''schema_migrated'' AND value IN ('2','3')").await.ok();
+    Ok(())
 }

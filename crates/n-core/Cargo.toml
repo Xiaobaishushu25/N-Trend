@@ -6,6 +6,7 @@ description = "Core library for the n_trend_analyzer desktop client"
 
 [dependencies]
 anyhow = "1"
+blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1.3"
 encoding_rs = "0.8"
@@ -20,5 +21,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 toml = "0.8"
 tracing = "0.1"
 
+[[bin]]
+name = "migrate"
+path = "src/bin/migrate.rs"
 
+[[bin]]
+name = "v2-dataset"
+path = "src/bin/v2_dataset.rs"
 
+[[bin]]
+name = "v2_dataset"
+path = "src/bin/v2_dataset.rs"

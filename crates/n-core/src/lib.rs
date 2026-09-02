@@ -14,4 +14,7 @@ pub mod session;
 pub mod service;
 pub mod storage;
 
+pub mod v2;
+
 pub use derive::Timeframe;
+
