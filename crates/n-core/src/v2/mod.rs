@@ -7,15 +7,16 @@ pub mod replay;
 pub mod dataset;
 pub mod model;
 pub mod prediction;
+pub mod version;
 
 /// Feature schema version — bump when any feature definition changes
-pub const FEATURE_SCHEMA_VERSION: &str = "v2.1";
+pub const FEATURE_SCHEMA_VERSION: &str = version::FEATURE_SCHEMA_VERSION;
 /// Pattern logic version — bump when N detection thresholds change
-pub const PATTERN_LOGIC_VERSION: &str = "v2-strict-1";
+pub const PATTERN_LOGIC_VERSION: &str = version::PATTERN_LOGIC_VERSION;
 /// Execution version — bump when aggregation or bar derivation rules change
-pub const EXECUTION_VERSION: &str = "v2-exec-1";
+pub const EXECUTION_VERSION: &str = version::EXECUTION_LOGIC_VERSION;
 /// Label contract version
-pub const LABEL_CONTRACT_VERSION: &str = "v2-label-1";
+pub const LABEL_CONTRACT_VERSION: &str = version::LABEL_CONTRACT_VERSION;
 
 /// V2 event state machine (Section 3 of the spec)
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -563,6 +563,14 @@ async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
         let stmt = backend.build(&table);
         db.execute(stmt).await.context("创建 V2 数据表失败")?;
     }
+    // Existing installations predate the lifecycle columns.  Keep old
+    // models archived by default, then retain only the latest historical
+    // logistic as the fallback champion for the default scoring slot.
+    db.execute_unprepared("ALTER TABLE v2_model_registry ADD COLUMN status TEXT NOT NULL DEFAULT 'archived'").await.ok();
+    db.execute_unprepared("ALTER TABLE v2_model_registry ADD COLUMN scoring_slot TEXT NOT NULL DEFAULT 'default'").await.ok();
+    db.execute_unprepared("ALTER TABLE v2_model_predictions ADD COLUMN prediction_mode TEXT NOT NULL DEFAULT 'live'").await.ok();
+    db.execute_unprepared("UPDATE v2_model_registry SET status='champion' WHERE status='archived' AND model_id=(SELECT model_id FROM v2_model_registry WHERE name='logistic-v1' ORDER BY created_at DESC LIMIT 1)").await.ok();
+    db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_registry_one_champion_per_slot ON v2_model_registry(scoring_slot) WHERE status='champion'").await.ok();
     db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)").await.context("创建 V2 索引失败")?;
     db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_warning_ts ON v2_trade_events(warning_ts)").await.context("创建 V2 索引失败")?;
     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_predictions_event_model ON v2_model_predictions(event_id, model_id)").await.context("创建 V2 预测唯一索引失败")?;

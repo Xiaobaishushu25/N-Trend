@@ -314,6 +314,7 @@ pub fn run() {
             commands::check_all_symbols_integrity,
             commands::repair_symbol_integrity,
             commands::get_v2_models,
+            commands::set_v2_model_status,
             commands::get_v2_predictions,
             commands::backfill_v2_predictions,
             commands::get_v2_dataset_report,

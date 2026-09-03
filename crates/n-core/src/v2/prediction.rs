@@ -5,17 +5,18 @@
 //! those two pieces for both historical backfill and live trigger events.
 
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, Statement};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter, Statement};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use crate::analyze::indicators;
 use crate::analyze::model::{Bar, DT, ATR_PERIOD};
 use crate::analyze::outcome;
-use crate::storage::entities::{klines, pattern_events, v2_model_registry};
+use crate::derive::{aggregate, Timeframe};
+use crate::storage::entities::{klines, pattern_events, rollovers, v2_model_registry};
 use crate::storage::repo;
 use crate::v2::dataset::DatasetRow;
-use crate::v2::features::{normalize_direction, extract_trigger_features, SetupFeatures};
+use crate::v2::features::{extract_market_context, normalize_direction, extract_trigger_features, MarketContextSnapshot, SetupFeatures};
 use crate::v2::model::{
     predict_gam, predict_logistic, GamModel, InferenceBundle, LogisticModel, Prediction,
     SplineTable,
@@ -108,7 +109,9 @@ fn bundle_from_registry(row: &v2_model_registry::Model) -> Option<InferenceBundl
 }
 
 async fn load_bundles(db: &DatabaseConnection) -> Result<Vec<InferenceBundle>> {
-    let rows = v2_model_registry::Entity::find().all(db).await?;
+    let rows = v2_model_registry::Entity::find()
+        .filter(v2_model_registry::Column::Status.eq("champion"))
+        .all(db).await?;
     Ok(rows.iter().filter_map(bundle_from_registry).collect())
 }
 
@@ -130,6 +133,13 @@ fn to_bars(rows: &[klines::Model]) -> Vec<Bar> {
         .collect()
 }
 
+fn to_rollover_records(rows: &[rollovers::Model]) -> Vec<crate::derive::rollover::RolloverRecord> {
+    rows.iter().filter(|r| r.confirmed).map(|r| crate::derive::rollover::RolloverRecord {
+        symbol: r.symbol.clone(), ts: r.ts.clone(), from_contract: r.from_contract.clone(),
+        to_contract: r.to_contract.clone(), confirmed: r.confirmed,
+    }).collect()
+}
+
 fn find_bar_index(bars: &[Bar], ts: &str) -> Option<usize> {
     bars.iter().position(|bar| {
         let actual = bar.dt.to_bar_ts();
@@ -146,7 +156,7 @@ fn event_dim_string(event: &pattern_events::Model, key: &str) -> Option<String> 
 }
 
 fn is_current_event_cohort(event: &pattern_events::Model) -> bool {
-    event_dim_string(event, "event_logic_version").as_deref() == Some("5")
+    event_dim_string(event, "event_logic_version").as_deref() == Some(crate::v2::version::EVENT_LOGIC_VERSION)
         && event_dim_string(event, "pattern_version").as_deref()
             == Some(crate::v2::PATTERN_LOGIC_VERSION)
         && event_dim_string(event, "execution_version").as_deref()
@@ -159,6 +169,14 @@ fn is_current_event_cohort(event: &pattern_events::Model) -> bool {
 /// the trained models.  Trigger features are calculated only from the closed
 /// trigger bar and bars before it.
 pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Option<DatasetRow> {
+    dataset_row_from_event_with_context(event, bars, None)
+}
+
+pub fn dataset_row_from_event_with_context(
+    event: &pattern_events::Model,
+    bars: &[Bar],
+    market_context: Option<MarketContextSnapshot>,
+) -> Option<DatasetRow> {
     let trigger_ts = event.trigger_bar_ts.as_deref()?;
     let trigger_index = find_bar_index(bars, trigger_ts)?;
     let trigger_bar = bars.get(trigger_index)?;
@@ -260,10 +278,38 @@ pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Op
         trigger_bar_ts: Some(trigger.trigger_bar_ts),
         exit_ts: event.exit_ts.clone(),
         schema_version: crate::v2::FEATURE_SCHEMA_VERSION.to_string(),
+        trend_gap_60: market_context.as_ref().and_then(|c| c.trend_gap_60),
+        trend_slope_60: market_context.as_ref().and_then(|c| c.trend_slope_60),
+        trend_strength_60: market_context.as_ref().and_then(|c| c.trend_strength_60),
+        trend_alignment_60: market_context.as_ref().and_then(|c| c.trend_alignment_60),
+        trend_10d: market_context.as_ref().and_then(|c| c.trend_10d),
+        trend_alignment_10d: market_context.as_ref().and_then(|c| c.trend_alignment_10d),
+        range_position_10d: market_context.as_ref().and_then(|c| c.range_position_10d),
+        mr_position_10d: market_context.as_ref().and_then(|c| c.mr_position_10d),
+        distance_ma10_dir: market_context.as_ref().and_then(|c| c.distance_ma10_dir),
+        trend_position_interaction: market_context.as_ref().and_then(|c| c.trend_position_interaction),
+        context_as_of_ts: market_context.as_ref().map(|c| c.as_of_ts.clone()),
+        context_last_60m_ts: market_context.as_ref().and_then(|c| c.latest_60m_close_ts.clone()),
+        context_last_daily_day: market_context.as_ref().and_then(|c| c.latest_daily_trading_day.clone()),
+        crossed_rollover_10d: market_context.as_ref().map(|c| c.crossed_rollover_10d).unwrap_or(false),
     })
 }
 
 fn predict(bundle: &InferenceBundle, row: &DatasetRow) -> Option<Prediction> {
+    // A context model must never silently turn unavailable context into
+    // scaled zero/mean values.  The caller can retain the V0 champion as the
+    // fallback when this returns None.
+    let context_features = [
+        "trend_gap_60", "trend_slope_60", "trend_strength_60", "trend_alignment_60",
+        "trend_10d", "trend_alignment_10d", "range_position_10d", "mr_position_10d",
+        "distance_ma10_dir", "trend_position_interaction",
+    ];
+    if bundle.feature_whitelist.iter().any(|name| context_features.contains(&name.as_str())) {
+        let complete = bundle.feature_whitelist.iter().all(|name| {
+            !context_features.contains(&name.as_str()) || crate::v2::model::get_feature(row, name).is_some()
+        });
+        if !complete { return None; }
+    }
     if bundle.logistic.is_some() {
         predict_logistic(bundle, row)
     } else {
@@ -281,13 +327,14 @@ async fn upsert_prediction(
     prediction: &Prediction,
 ) -> Result<()> {
     let sql = format!(
-        "INSERT INTO v2_model_predictions (event_id, model_id, p_win, logit, feature_hash, predicted_at) VALUES ({}, '{}', {}, {}, '{}', '{}') ON CONFLICT(event_id, model_id) DO UPDATE SET p_win=excluded.p_win, logit=excluded.logit, feature_hash=excluded.feature_hash, predicted_at=excluded.predicted_at",
+        "INSERT INTO v2_model_predictions (event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode) VALUES ({}, '{}', {}, {}, '{}', '{}', '{}') ON CONFLICT(event_id, model_id) DO UPDATE SET p_win=excluded.p_win, logit=excluded.logit, feature_hash=excluded.feature_hash, predicted_at=excluded.predicted_at, prediction_mode=excluded.prediction_mode",
         event_id,
         sql_quote(&prediction.model_id),
         prediction.p_win,
         prediction.logit,
         sql_quote(&prediction.feature_hash),
         sql_quote(&prediction.predicted_at),
+        sql_quote(&prediction.prediction_mode),
     );
     db.execute(Statement::from_string(DbBackend::Sqlite, sql))
         .await
@@ -301,7 +348,18 @@ pub async fn predict_event(
     event: &pattern_events::Model,
     bars: &[Bar],
 ) -> Result<usize> {
-    let Some(row) = dataset_row_from_event(event, bars) else {
+    let raw_rows = repo::raw_klines(db, &event.symbol).await?;
+    let rollover_rows = repo::symbol_rollovers(db, &event.symbol).await?;
+    let rollover_records = to_rollover_records(&rollover_rows);
+    let raw = raw_rows.iter().map(crate::service::model_to_fetch).collect::<Vec<_>>();
+    let (_, bars60) = {
+        let m15 = aggregate(&raw, Timeframe::M15).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+        let m60 = aggregate(&raw, Timeframe::M60).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+        (m15, m60)
+    };
+    let daily = aggregate(&raw, Timeframe::Day).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+    let context = event.trigger_bar_ts.as_deref().and_then(|ts| extract_market_context(&event.symbol, ts, &event.direction, bars, &bars60, &daily, &rollover_records));
+    let Some(row) = dataset_row_from_event_with_context(event, bars, context) else {
         return Ok(0);
     };
     let bundles = load_bundles(db).await?;
@@ -365,9 +423,16 @@ pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
     for (symbol, events) in by_symbol {
         let rows = repo::klines(db, &symbol, "15m", None, None).await?;
         let bars = to_bars(&rows);
+        let rollover_rows = repo::symbol_rollovers(db, &symbol).await?;
+        let rollover_records = to_rollover_records(&rollover_rows);
+        let raw_rows = repo::raw_klines(db, &symbol).await?;
+        let raw = raw_rows.iter().map(crate::service::model_to_fetch).collect::<Vec<_>>();
+        let bars60 = aggregate(&raw, Timeframe::M60).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+        let daily = aggregate(&raw, Timeframe::Day).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
         for event in events {
             result.events_seen += 1;
-            let Some(row) = dataset_row_from_event(&event, &bars) else {
+            let context = event.trigger_bar_ts.as_deref().and_then(|ts| extract_market_context(&symbol, ts, &event.direction, &bars, &bars60, &daily, &rollover_records));
+            let Some(row) = dataset_row_from_event_with_context(&event, &bars, context) else {
                 continue;
             };
             let mut scored = false;

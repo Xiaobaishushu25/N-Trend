@@ -85,7 +85,13 @@ async fn main() -> Result<()> {
                     let hold: f64 = r.try_get("","hold").unwrap_or(0.0);
                     raw5m.push(n_core::fetch::kline::Kline{ datetime: ts, open, high, low, close, volume, hold });
                 }
-                if let Ok(evts) = engine.replay_history(sym, &raw5m, tick) {
+                let rollover_rows = db.query_all(Statement::from_string(DbBackend::Sqlite, format!("SELECT ts, from_contract, to_contract, confirmed FROM rollovers WHERE symbol='{}' ORDER BY ts ASC", sym.replace("'", "''")))).await.unwrap_or_default();
+                let rollover_records = rollover_rows.into_iter().filter_map(|r| {
+                    let confirmed: bool = r.try_get("", "confirmed").ok()?;
+                    if !confirmed { return None; }
+                    Some(n_core::derive::rollover::RolloverRecord { symbol: sym.clone(), ts: r.try_get("", "ts").ok()?, from_contract: r.try_get("", "from_contract").ok()?, to_contract: r.try_get("", "to_contract").ok()?, confirmed })
+                }).collect::<Vec<_>>();
+                if let Ok(evts) = engine.replay_history_with_rollovers(sym, &raw5m, tick, &rollover_records) {
                     real_events_total += evts.len();
                     all_events.extend(evts);
                 }
@@ -150,6 +156,7 @@ async fn main() -> Result<()> {
     std::fs::write(out_dir.join("acceptance.md"), &md)?;
     // Also write report.md per spec
     std::fs::write(out_dir.join("report.md"), &md)?;
+    std::fs::write(out_dir.join("market_context_research.md"), n_core::v2::dataset::render_market_context_research(&rows))?;
     println!("Wrote target/v2_reports/acceptance.md and report.md");
     Ok(())
 }

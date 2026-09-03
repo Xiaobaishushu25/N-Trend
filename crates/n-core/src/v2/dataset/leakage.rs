@@ -18,7 +18,16 @@ pub fn assert_no_leakage(rows: &[DatasetRow]) -> Result<(), LeakageError> {
         if r.schema_version.is_empty() {
             return Err(LeakageError{ msg: format!("missing schema_version for {}", r.event_id) });
         }
-        // trigger features must be sampled at or before trigger_bar close; we approximate by ensuring no exit before trigger
+        if let (Some(trigger), Some(as_of)) = (r.trigger_bar_ts.as_deref(), r.context_as_of_ts.as_deref()) {
+            if as_of > trigger {
+                return Err(LeakageError{ msg: format!("context as_of {} is after trigger {} for {}", as_of, trigger, r.event_id) });
+            }
+        }
+        if let (Some(as_of), Some(last60)) = (r.context_as_of_ts.as_deref(), r.context_last_60m_ts.as_deref()) {
+            if last60 > as_of {
+                return Err(LeakageError{ msg: format!("60m close {} is after context cutoff {} for {}", last60, as_of, r.event_id) });
+            }
+        }
     }
     Ok(())
 }

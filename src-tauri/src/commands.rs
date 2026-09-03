@@ -818,7 +818,7 @@ pub async fn repair_symbol_integrity(
 #[tauri::command]
 pub async fn get_v2_models(state: State<'_, Arc<AppState>>) -> Result<Vec<n_core::storage::entities::v2_model_registry::Model>, String> {
     use n_core::sea_orm::{ConnectionTrait, Statement, DbBackend};
-    let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, "SELECT model_id, name, schema_version, feature_whitelist, train_window, dataset_hash, coefficients, spline_knots, metrics, created_at FROM v2_model_registry ORDER BY created_at DESC".to_string())).await.map_err(|e| e.to_string())?;
+    let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, "SELECT model_id, name, schema_version, feature_whitelist, train_window, dataset_hash, coefficients, spline_knots, metrics, created_at, status, scoring_slot FROM v2_model_registry ORDER BY created_at DESC".to_string())).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for r in rows {
         let get = |k: &str| -> String { r.try_get("", k).unwrap_or_default() };
@@ -828,6 +828,7 @@ pub async fn get_v2_models(state: State<'_, Arc<AppState>>) -> Result<Vec<n_core
             feature_whitelist: get("feature_whitelist"), train_window: get("train_window"),
             dataset_hash: get("dataset_hash"), coefficients: get("coefficients"),
             spline_knots: get_opt("spline_knots"), metrics: get("metrics"), created_at: get("created_at"),
+            status: get("status"), scoring_slot: get("scoring_slot"),
         });
     }
     Ok(out)
@@ -837,7 +838,7 @@ pub async fn get_v2_models(state: State<'_, Arc<AppState>>) -> Result<Vec<n_core
 pub async fn get_v2_dataset_report(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     // 优先读 target/v2_reports 下文件，回退读 DB 统计
     let mut v = serde_json::json!({});
-    for name in ["logistic_report.md","gam_report.md","acceptance.md"] {
+    for name in ["logistic_report.md","gam_report.md","acceptance.md","market_context_research.md"] {
         let p = std::path::Path::new("target/v2_reports").join(name);
         if let Ok(s) = std::fs::read_to_string(&p) { v[name] = serde_json::Value::String(s); }
     }
@@ -848,9 +849,9 @@ pub async fn get_v2_dataset_report(state: State<'_, Arc<AppState>>) -> Result<se
 pub async fn get_v2_predictions(state: State<'_, Arc<AppState>>, model_id: Option<String>) -> Result<Vec<n_core::storage::entities::v2_model_predictions::Model>, String> {
     use n_core::sea_orm::{ConnectionTrait, Statement, DbBackend};
     let sql = if let Some(mid) = model_id.filter(|s| !s.is_empty()) {
-        format!("SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at FROM v2_model_predictions WHERE model_id='{}' ORDER BY predicted_at DESC LIMIT 2000", mid.replace("'","''"))
+        format!("SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode FROM v2_model_predictions WHERE model_id='{}' ORDER BY predicted_at DESC LIMIT 2000", mid.replace("'","''"))
     } else {
-        "SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at FROM v2_model_predictions ORDER BY predicted_at DESC LIMIT 2000".to_string()
+        "SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode FROM v2_model_predictions ORDER BY predicted_at DESC LIMIT 2000".to_string()
     };
     let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, sql)).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -863,9 +864,25 @@ pub async fn get_v2_predictions(state: State<'_, Arc<AppState>>, model_id: Optio
             logit: r.try_get("", "logit").ok(),
             feature_hash: r.try_get("", "feature_hash").unwrap_or_default(),
             predicted_at: r.try_get("", "predicted_at").unwrap_or_default(),
+            prediction_mode: r.try_get("", "prediction_mode").unwrap_or_else(|_| "live".to_string()),
         });
     }
     Ok(out)
+}
+
+#[tauri::command]
+pub async fn set_v2_model_status(
+    state: State<'_, Arc<AppState>>,
+    model_id: String,
+    status: String,
+    scoring_slot: Option<String>,
+) -> Result<(), String> {
+    n_core::storage::repo::set_v2_model_status(
+        &state.services.db,
+        &model_id,
+        &status,
+        scoring_slot.as_deref().unwrap_or("default"),
+    ).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]

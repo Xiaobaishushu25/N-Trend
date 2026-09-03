@@ -56,6 +56,16 @@ pub fn get_feature(row: &DatasetRow, name: &str) -> Option<f64> {
         "trigger_wick_atr" => row.trigger_wick_atr,
         "internal_swing_margin_r" => row.internal_swing_margin_r,
         "chase_distance_r" => row.chase_distance_r,
+        "trend_gap_60" => row.trend_gap_60,
+        "trend_slope_60" => row.trend_slope_60,
+        "trend_strength_60" => row.trend_strength_60,
+        "trend_alignment_60" => row.trend_alignment_60,
+        "trend_10d" => row.trend_10d,
+        "trend_alignment_10d" => row.trend_alignment_10d,
+        "range_position_10d" => row.range_position_10d,
+        "mr_position_10d" => row.mr_position_10d,
+        "distance_ma10_dir" => row.distance_ma10_dir,
+        "trend_position_interaction" => row.trend_position_interaction,
         _ => None,
     }
 }
@@ -69,7 +79,7 @@ mod tests {
     use super::*;
     use crate::v2::dataset::DatasetRow;
     fn mk_row(a_atr: f64, ret: f64) -> DatasetRow {
-        DatasetRow { event_id: "x".into(), symbol: "RB".into(), direction: "up".into(), setup_quality: 3.0, a_move: 10.0, b_move: 5.0, a_move_atr: a_atr, b_move_atr: 1.0, a_speed: 2.0, retracement: ret, warning_volume_ratio: Some(1.0), trigger_close_overshoot_r: Some(0.2), trigger_close_location: Some(0.5), trigger_body_atr: Some(1.0), trigger_volume_ratio: Some(1.0), trigger_wick_atr: Some(0.3), internal_swing_margin_r: Some(0.2), chase_distance_r: Some(0.1), missing_mask: 0, label_win: 1, r_multiple: Some(1.0), is_1r_aux_win: Some(true), trigger_bar_ts: Some("2024-01-01 10:00:00".into()), exit_ts: Some("2024-01-01 11:00:00".into()), schema_version: "v2.1".into() }
+        DatasetRow { event_id: "x".into(), symbol: "RB".into(), direction: "up".into(), setup_quality: 3.0, a_move: 10.0, b_move: 5.0, a_move_atr: a_atr, b_move_atr: 1.0, a_speed: 2.0, retracement: ret, warning_volume_ratio: Some(1.0), trigger_close_overshoot_r: Some(0.2), trigger_close_location: Some(0.5), trigger_body_atr: Some(1.0), trigger_volume_ratio: Some(1.0), trigger_wick_atr: Some(0.3), internal_swing_margin_r: Some(0.2), chase_distance_r: Some(0.1), missing_mask: 0, label_win: 1, r_multiple: Some(1.0), is_1r_aux_win: Some(true), trigger_bar_ts: Some("2024-01-01 10:00:00".into()), exit_ts: Some("2024-01-01 11:00:00".into()), schema_version: crate::v2::FEATURE_SCHEMA_VERSION.into(), trend_gap_60:None, trend_slope_60:None, trend_strength_60:None, trend_alignment_60:None, trend_10d:None, trend_alignment_10d:None, range_position_10d:None, mr_position_10d:None, distance_ma10_dir:None, trend_position_interaction:None, context_as_of_ts:None, context_last_60m_ts:None, context_last_daily_day:None, crossed_rollover_10d:false }
     }
     #[test]
     fn scaler_mean_std() {

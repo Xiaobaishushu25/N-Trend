@@ -14,6 +14,40 @@ use crate::storage::entities::{
     signal_annotations, signal_decisions, symbol_groups, symbols,
 };
 
+/// Move a trained model through the lifecycle registry.  Promotion is
+/// transactional: a scoring slot can never expose two champions.
+pub async fn set_v2_model_status(
+    db: &DatabaseConnection,
+    model_id: &str,
+    status: &str,
+    scoring_slot: &str,
+) -> Result<()> {
+    if !matches!(status, "challenger" | "champion" | "archived") {
+        return Err(anyhow!("invalid V2 model status: {status}"));
+    }
+    db.transaction::<_, (), anyhow::Error>(|txn| {
+        let model_id = model_id.to_string();
+        let status = status.to_string();
+        let scoring_slot = scoring_slot.to_string();
+        Box::pin(async move {
+            if status == "champion" {
+                txn.execute(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE v2_model_registry SET status='archived' WHERE scoring_slot=?1 AND status='champion' AND model_id<>?2",
+                    vec![scoring_slot.clone().into(), model_id.clone().into()],
+                )).await?;
+            }
+            txn.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE v2_model_registry SET status=?1, scoring_slot=?2 WHERE model_id=?3",
+                vec![status.into(), scoring_slot.into(), model_id.into()],
+            )).await?;
+            Ok(())
+        })
+    }).await.context("更新 V2 model lifecycle 失败")?;
+    Ok(())
+}
+
 pub async fn upsert_klines(db: &DatabaseConnection, rows: Vec<klines::ActiveModel>) -> Result<()> {
     if rows.is_empty() {
         return Ok(());

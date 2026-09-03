@@ -15,9 +15,9 @@
 
 ## Version Contracts
 
-- `FEATURE_SCHEMA_VERSION = v2.1`
+- `EVENT_LOGIC_VERSION = 6`, `FEATURE_SCHEMA_VERSION = 2`, `EXECUTION_LOGIC_VERSION = 6` (single source: `crates/n-core/src/v2/version.rs`)
 - `PATTERN_LOGIC_VERSION = v2-strict-1`
-- `EXECUTION_VERSION = v2-exec-1`
+- `EXECUTION_VERSION = 6` (compatibility alias for `EXECUTION_LOGIC_VERSION`)
 - `LABEL_CONTRACT_VERSION = v2-label-1`
 All four versions are written into every `v2_trade_events` row for reproducibility.
 
@@ -25,8 +25,8 @@ All four versions are written into every `v2_trade_events` row for reproducibili
 
 - Hand-rolled `StandardScaler` (mean/std from train only) + L2-regularized gradient descent (`lr=0.05, epochs=400, l2=1.0`); no `linfa` heavy dep, zero Python.
 - Input: `DatasetRow` via `ReplayEngine` -> `DatasetBuilder` (whitelist + `blake3` hash); `--from` controls window, empty DB falls back to deterministic synth (200 rows) so CI never blocks.
-- Time split: 80% Development / 20% Final Test (strict `train_last < test_first` by `trigger_bar_ts`); Walk-Forward 5 expanding folds with purge (`assert_purge`).
-- Metrics: Brier / LogLoss / AUC (pairwise tie-aware) / Accuracy / Calibration 10 bins / Top20% lift, plus Constant Baseline (train win rate) for Brier/LogLoss.
+- Time split: final 300 chronologically sorted rows are `LOCKED_HISTORICAL_TEST`; Walk-Forward uses only `DEV` with four expanding folds and label-end purge (`assert_purge`). The locked test is opt-in via `--evaluate-locked`.
+- Metrics: Brier / Brier Skill / LogLoss / AUC (pairwise tie-aware) / Accuracy / calibration slope/intercept / equal-frequency deciles / Top10% and Top20% lift, plus Constant Baseline (train win rate).
 - Output: `v2_model_registry` (`logistic-v1-<hash8>`, feature_whitelist, train_window, dataset_hash, coefficients/intercept + scaler JSON, metrics, git_commit), `InferenceBundle` JSON (feature_order/mean/std/coefficients), `target/v2_reports/logistic_report.md`.
 
 ## Phase 7 — GAM Challenger (low-DF)
@@ -66,3 +66,10 @@ All four versions are written into every `v2_trade_events` row for reproducibili
 ## Out of Scope (Still)
 
 Dynamic position sizing, EV/fee modeling, multi-target optimization, RL/NN, auto-retraining. Stack is pure Rust; `linfa` intentionally not introduced to keep build light — Logistic is hand-rolled gradient descent, GAM is quantile-binned lookup.
+
+## Strict stage-2 trend/position validation
+
+- `MarketContextSnapshot` is point-in-time: closed 60m bars only, previous ten completed exchange trading days only, and an auditable `as_of_ts`.
+- The first context schema contains 60m trend, ten-day trend, 10-day range position, mean-reversion position, distance from MA10 and one trend-position interaction. `rr` is intentionally excluded.
+- Confirmed rollover crossings disable all ten-day context features for that row. The baseline remains the fallback; runtime registry loading is restricted to `champion` models and promotion is transactional per scoring slot.
+- `target/v2_reports/market_context_research.md` is descriptive DEV-only research with fixed thresholds; it does not fit a model or inspect the locked test.

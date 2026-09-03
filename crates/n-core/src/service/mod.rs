@@ -203,7 +203,7 @@ pub struct OutcomeFilter {
     pub version: Option<String>,
 }
 
-const EVENT_LOGIC_VERSION: &str = "5";
+const EVENT_LOGIC_VERSION: &str = crate::v2::version::EVENT_LOGIC_VERSION;
 
 fn pattern_endpoint_prices(bars: &[Bar], candidate: &event::WarningCandidate) -> (f64, f64, f64) {
     if candidate.direction == Dir::Up {

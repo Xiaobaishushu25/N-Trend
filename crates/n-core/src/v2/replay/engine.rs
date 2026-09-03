@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::analyze::model::Bar;
 use crate::derive::{aggregate, Timeframe};
 use crate::fetch::kline::Kline;
-use crate::v2::features::{extract_trigger_features, SetupFeatures, TriggerFeatures};
+use crate::derive::rollover::RolloverRecord;
+use crate::v2::features::{extract_market_context, extract_trigger_features, MarketContextSnapshot, SetupFeatures, TriggerFeatures};
 use crate::v2::{FEATURE_SCHEMA_VERSION, PATTERN_LOGIC_VERSION, EXECUTION_VERSION};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +59,7 @@ pub struct ReplayEvent {
     pub entry_ts: Option<String>,
     pub entry_price: Option<f64>,
     pub outcome: Option<ReplayOutcome>,
+    pub market_context: Option<MarketContextSnapshot>,
     pub schema_version: String,
     pub pattern_version: String,
     pub execution_version: String,
@@ -94,7 +96,21 @@ impl ReplayEngine {
     /// Replay history using the same forward warning extractor as live scans.
     /// Returns deduped events (symbol+s0/s1/s2+direction earliest warning wins).
     pub fn replay_history(&self, symbol: &str, raw5m: &[Kline], tick_size: f64) -> Result<Vec<ReplayEvent>> {
-        let (bars15, _bars60) = self.aggregate_bars(raw5m);
+        self.replay_history_with_rollovers(symbol, raw5m, tick_size, &[])
+    }
+
+    /// Replay with the point-in-time rollover records known at the event
+    /// cutoff.  The three-argument method remains a safe empty-marker helper
+    /// for callers that do not have contract metadata.
+    pub fn replay_history_with_rollovers(
+        &self,
+        symbol: &str,
+        raw5m: &[Kline],
+        tick_size: f64,
+        rollovers: &[RolloverRecord],
+    ) -> Result<Vec<ReplayEvent>> {
+        let (bars15, bars60) = self.aggregate_bars(raw5m);
+        let daily_bars = kline_to_bar(&aggregate(raw5m, Timeframe::Day));
         if bars15.len() < 30 { return Ok(vec![]); }
         let candidates = crate::analyze::event::replay_warnings(symbol, &bars15, tick_size);
         let mut events: Vec<ReplayEvent> = Vec::with_capacity(candidates.len());
@@ -148,6 +164,7 @@ impl ReplayEngine {
                 target: candidate.target, risk: candidate.risk, rr: candidate.rr, warning_extreme, tick_size,
                 trigger_level: candidate.entry, setup_features: sf, trigger_features: None, trigger_bar_ts: None,
                 entry_ts: None, entry_price: None, outcome: None, schema_version: FEATURE_SCHEMA_VERSION.into(),
+                market_context: None,
                 pattern_version: PATTERN_LOGIC_VERSION.into(), execution_version: EXECUTION_VERSION.into(),
             });
         }
@@ -182,6 +199,15 @@ impl ReplayEngine {
                 }
                 ev.entry_ts = Some(tb.dt.to_bar_ts());
                 ev.entry_price = Some(fill);
+                ev.market_context = extract_market_context(
+                    symbol,
+                    &tb.dt.to_bar_ts(),
+                    &ev.direction,
+                    &bars15,
+                    &bars60,
+                    &daily_bars,
+                    rollovers,
+                );
 
                 let mut exit: Option<(usize, f64, &str)> = None;
                 let base_tp = if is_long { fill + risk } else { fill - risk };

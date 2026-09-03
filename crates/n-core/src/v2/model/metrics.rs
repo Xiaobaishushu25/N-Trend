@@ -9,9 +9,15 @@ pub struct Metrics {
     pub accuracy: f64,
     pub baseline_brier: f64,
     pub baseline_logloss: f64,
+    pub brier_skill: f64,
     pub top20_lift: f64,
+    pub top10_win_rate: f64,
+    pub bottom10_win_rate: f64,
+    pub calibration_slope: f64,
+    pub calibration_intercept: f64,
     pub constant_win_rate: f64,
     pub calibration: Vec<CalibrationBucket>,
+    pub equal_frequency_deciles: Vec<CalibrationBucket>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,6 +91,38 @@ pub fn top20_lift(y_true: &[i32], p_pred: &[f64]) -> f64 {
     top_wins / overall
 }
 
+fn tail_win_rate(y_true: &[i32], p_pred: &[f64], top: bool) -> f64 {
+    if y_true.is_empty() { return 0.0; }
+    let mut pairs: Vec<(f64, i32)> = y_true.iter().zip(p_pred).map(|(y,p)| (*p,*y)).collect();
+    pairs.sort_by(|a,b| a.0.total_cmp(&b.0));
+    if top { pairs.reverse(); }
+    let k = ((pairs.len() as f64 * 0.1).ceil() as usize).max(1).min(pairs.len());
+    pairs[..k].iter().filter(|(_, y)| *y == 1).count() as f64 / k as f64
+}
+
+fn calibration_line(y_true: &[i32], p_pred: &[f64]) -> (f64, f64) {
+    if y_true.len() < 2 { return (0.0, 0.0); }
+    let xs: Vec<f64> = p_pred.iter().map(|p| (p.clamp(1e-6, 1.0 - 1e-6) / (1.0 - p.clamp(1e-6, 1.0 - 1e-6))).ln()).collect();
+    let mx = xs.iter().sum::<f64>() / xs.len() as f64;
+    let my = y_true.iter().map(|y| *y as f64).sum::<f64>() / y_true.len() as f64;
+    let denom = xs.iter().map(|x| (x - mx).powi(2)).sum::<f64>();
+    if denom <= 1e-12 { return (0.0, my); }
+    let slope = xs.iter().zip(y_true).map(|(x,y)| (x-mx) * (*y as f64-my)).sum::<f64>() / denom;
+    (slope, my - slope * mx)
+}
+
+fn equal_frequency_deciles(y_true: &[i32], p_pred: &[f64]) -> Vec<CalibrationBucket> {
+    let mut pairs: Vec<(f64, i32)> = y_true.iter().zip(p_pred).map(|(y,p)| (*p,*y)).collect();
+    pairs.sort_by(|a,b| a.0.total_cmp(&b.0));
+    if pairs.is_empty() { return vec![]; }
+    (0..10).map(|bin| {
+        let start = bin * pairs.len() / 10;
+        let end = ((bin + 1) * pairs.len() / 10).max(start + 1).min(pairs.len());
+        let part = &pairs[start..end];
+        CalibrationBucket { bin, count: part.len(), avg_p: part.iter().map(|(p,_)| *p).sum::<f64>() / part.len() as f64, avg_y: part.iter().map(|(_,y)| *y as f64).sum::<f64>() / part.len() as f64 }
+    }).collect()
+}
+
 pub fn compute_metrics(y_true: &[i32], p_pred: &[f64]) -> Metrics {
     let observed_prior = if y_true.is_empty() { 0.5 } else {
         y_true.iter().filter(|y| **y == 1).count() as f64 / y_true.len() as f64
@@ -109,7 +147,15 @@ pub fn compute_metrics_with_baseline(y_true: &[i32], p_pred: &[f64], baseline_pr
     let baseline_logloss = logloss(y_true, &const_pred);
     let lift = top20_lift(y_true, p_pred);
     let cal = calibration(y_true, p_pred, 10);
-    Metrics { n, brier, logloss: ll, auc: auc_v, accuracy: acc, baseline_brier, baseline_logloss, top20_lift: lift, constant_win_rate: win_rate, calibration: cal }
+    let (calibration_slope, calibration_intercept) = calibration_line(y_true, p_pred);
+    Metrics {
+        n, brier, logloss: ll, auc: auc_v, accuracy: acc, baseline_brier, baseline_logloss,
+        brier_skill: if baseline_brier > 1e-12 { 1.0 - brier / baseline_brier } else { 0.0 },
+        top20_lift: lift, top10_win_rate: tail_win_rate(y_true, p_pred, true),
+        bottom10_win_rate: tail_win_rate(y_true, p_pred, false), constant_win_rate: win_rate,
+        calibration_slope, calibration_intercept, calibration: cal,
+        equal_frequency_deciles: equal_frequency_deciles(y_true, p_pred),
+    }
 }
 
 #[cfg(test)]

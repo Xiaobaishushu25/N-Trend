@@ -447,6 +447,7 @@ pub mod v2_model_predictions {
         pub logit: Option<f64>,
         pub feature_hash: String,
         pub predicted_at: String,
+        pub prediction_mode: String,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
@@ -493,6 +494,8 @@ pub mod v2_model_registry {
         pub spline_knots: Option<String>,
         pub metrics: String,
         pub created_at: String,
+        pub status: String,
+        pub scoring_slot: String,
     }
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
