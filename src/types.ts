@@ -570,4 +570,7 @@ export interface NotificationHistoryItem {
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
 
-
+// ---- V2 ----
+export interface V2ModelRow { model_id: string; name: string; schema_version: string; feature_whitelist: string; train_window: string; dataset_hash: string; coefficients: string; spline_knots: string | null; metrics: string; created_at: string; }
+export interface V2PredictionRow { id: number; event_id: number; model_id: string; p_win: number | null; logit: number | null; feature_hash: string; predicted_at: string; }
+export interface V2ReportBundle { "logistic_report.md"?: string; "gam_report.md"?: string; "acceptance.md"?: string; [k: string]: string | undefined; }

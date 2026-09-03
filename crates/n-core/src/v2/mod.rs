@@ -6,6 +6,7 @@ pub mod features;
 pub mod replay;
 pub mod dataset;
 pub mod model;
+pub mod prediction;
 
 /// Feature schema version — bump when any feature definition changes
 pub const FEATURE_SCHEMA_VERSION: &str = "v2.1";

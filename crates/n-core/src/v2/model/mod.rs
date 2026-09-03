@@ -8,5 +8,6 @@ pub use logistic::{LogisticModel, predict_p, TrainConfig, TrainOutput, train as 
 pub use gam::{GamModel, SplineTable, GamTrainConfig, train_gam, quantile_knots};
 pub use scaler::{StandardScaler, get_feature};
 pub use metrics::{Metrics, CalibrationBucket, compute_metrics, brier_score, logloss, auc, top20_lift};
-pub use walk_forward::{walk_forward, assert_purge, Fold};
+pub use walk_forward::{walk_forward, walk_forward_purge_aware, assert_purge, Fold};
 pub use inference::{InferenceBundle, Prediction, feature_hash, predict_logistic, predict_gam};
+

@@ -18,14 +18,42 @@ pub fn walk_forward(n: usize, n_splits: usize) -> Vec<Fold> {
     for _ in 0..n_splits {
         let valid_end = (valid_start + fold_size).min(n);
         if valid_start >= n { break; }
-        // train is everything before valid_start
         let train_start = 0;
         let train_end = valid_start;
         folds.push(Fold { train_start, train_end, valid_start, valid_end });
         valid_start = valid_end;
     }
-    // Expanding window: first fold train may be empty — drop it; require at least 10 train rows
     folds.into_iter().filter(|f| f.train_end - f.train_start >= 10 && f.valid_end > f.valid_start).collect()
+}
+
+/// Purge-aware walk-forward: adjusts fold boundaries so train_last_ts < valid_first_ts
+pub fn walk_forward_purge_aware(rows: &[DatasetRow], n_splits: usize) -> Vec<Fold> {
+    let mut folds = walk_forward(rows.len(), n_splits);
+    for f in folds.iter_mut() {
+        if f.train_end == 0 || f.valid_start >= rows.len() { continue; }
+        // if same timestamp straddles boundary, expand train to include all rows with that timestamp
+        let mut vs = f.valid_start;
+        let train_last_ts = rows.get(f.train_end.saturating_sub(1)).and_then(|r| r.trigger_bar_ts.as_deref()).unwrap_or("");
+        // move valid_start forward while it shares timestamp with train_last
+        while vs < f.valid_end {
+            let vs_ts = rows.get(vs).and_then(|r| r.trigger_bar_ts.as_deref()).unwrap_or("");
+            if !train_last_ts.is_empty() && !vs_ts.is_empty() && vs_ts == train_last_ts {
+                vs += 1;
+            } else { break; }
+        }
+        if vs != f.valid_start {
+            f.valid_start = vs;
+            f.train_end = vs;
+        }
+        // also ensure valid range itself doesn't split same timestamp at its end — extend valid_end to include same-ts tail
+        while f.valid_end < rows.len() {
+            let cur_ts = rows.get(f.valid_end - 1).and_then(|r| r.trigger_bar_ts.as_deref()).unwrap_or("");
+            let next_ts = rows.get(f.valid_end).and_then(|r| r.trigger_bar_ts.as_deref()).unwrap_or("");
+            if !cur_ts.is_empty() && cur_ts == next_ts { f.valid_end += 1; } else { break; }
+        }
+    }
+    // re-filter after adjustments (may have empty valid)
+    folds.into_iter().filter(|f| f.valid_start < f.valid_end && f.train_end - f.train_start >= 5).collect()
 }
 
 /// Expanding walk-forward with purge gap: ensure train last trigger_bar_ts < valid first trigger_bar_ts
@@ -78,3 +106,4 @@ mod tests {
         assert!(assert_purge(&rows, &folds).is_err());
     }
 }
+

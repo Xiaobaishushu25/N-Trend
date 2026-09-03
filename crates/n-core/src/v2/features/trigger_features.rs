@@ -42,6 +42,7 @@ pub fn extract_trigger_features(
     oi_ratio: Option<f64>,
     internal_swing_margin: Option<f64>,
 ) -> TriggerFeatures {
+    let atr_missing = atr.is_none() || atr.unwrap_or(0.0) <= 0.0;
     let atr = atr.unwrap_or(1.0).max(1e-9);
     let range = (trigger_bar.high - trigger_bar.low).max(1e-9);
     let close_location = (trigger_bar.close - trigger_bar.low) / range;
@@ -55,9 +56,9 @@ pub fn extract_trigger_features(
     let swing_r = internal_swing_margin.map(|v| if risk.abs()>1e-9 { v / risk } else { 0.0 });
 
     let mut mask = 0u32;
-    if atr <= 0.0 { mask |= 1; }
-    if volume_ratio.is_none() { mask |= 2; }
-    if oi_ratio.is_none() { mask |= 4; }
+    if atr_missing { mask |= 4; } // bit4 = ATR missing (discard)
+    if volume_ratio.is_none() { mask |= 2; } // bit2 = vol missing (optional)
+    if oi_ratio.is_none() { mask |= 8; } // bit8 = OI missing (optional, never discard)
 
     TriggerFeatures {
         trigger_bar_ts: trigger_bar.dt.to_bar_ts(),

@@ -15,6 +15,7 @@ pub mod service;
 pub mod storage;
 
 pub mod v2;
+pub use sea_orm;
 
 pub use derive::Timeframe;
 

@@ -814,3 +814,65 @@ pub async fn repair_symbol_integrity(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn get_v2_models(state: State<'_, Arc<AppState>>) -> Result<Vec<n_core::storage::entities::v2_model_registry::Model>, String> {
+    use n_core::sea_orm::{ConnectionTrait, Statement, DbBackend};
+    let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, "SELECT model_id, name, schema_version, feature_whitelist, train_window, dataset_hash, coefficients, spline_knots, metrics, created_at FROM v2_model_registry ORDER BY created_at DESC".to_string())).await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        let get = |k: &str| -> String { r.try_get("", k).unwrap_or_default() };
+        let get_opt = |k: &str| -> Option<String> { r.try_get("", k).ok() };
+        out.push(n_core::storage::entities::v2_model_registry::Model {
+            model_id: get("model_id"), name: get("name"), schema_version: get("schema_version"),
+            feature_whitelist: get("feature_whitelist"), train_window: get("train_window"),
+            dataset_hash: get("dataset_hash"), coefficients: get("coefficients"),
+            spline_knots: get_opt("spline_knots"), metrics: get("metrics"), created_at: get("created_at"),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn get_v2_dataset_report(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
+    // 优先读 target/v2_reports 下文件，回退读 DB 统计
+    let mut v = serde_json::json!({});
+    for name in ["logistic_report.md","gam_report.md","acceptance.md"] {
+        let p = std::path::Path::new("target/v2_reports").join(name);
+        if let Ok(s) = std::fs::read_to_string(&p) { v[name] = serde_json::Value::String(s); }
+    }
+    Ok(v)
+}
+
+#[tauri::command]
+pub async fn get_v2_predictions(state: State<'_, Arc<AppState>>, model_id: Option<String>) -> Result<Vec<n_core::storage::entities::v2_model_predictions::Model>, String> {
+    use n_core::sea_orm::{ConnectionTrait, Statement, DbBackend};
+    let sql = if let Some(mid) = model_id.filter(|s| !s.is_empty()) {
+        format!("SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at FROM v2_model_predictions WHERE model_id='{}' ORDER BY predicted_at DESC LIMIT 2000", mid.replace("'","''"))
+    } else {
+        "SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at FROM v2_model_predictions ORDER BY predicted_at DESC LIMIT 2000".to_string()
+    };
+    let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, sql)).await.map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(n_core::storage::entities::v2_model_predictions::Model {
+            id: r.try_get("", "id").unwrap_or(0),
+            event_id: r.try_get("", "event_id").unwrap_or(0),
+            model_id: r.try_get("", "model_id").unwrap_or_default(),
+            p_win: r.try_get("", "p_win").ok(),
+            logit: r.try_get("", "logit").ok(),
+            feature_hash: r.try_get("", "feature_hash").unwrap_or_default(),
+            predicted_at: r.try_get("", "predicted_at").unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn backfill_v2_predictions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<n_core::v2::prediction::BackfillResult, String> {
+    n_core::v2::prediction::backfill(&state.services.db)
+        .await
+        .map_err(|e| e.to_string())
+}

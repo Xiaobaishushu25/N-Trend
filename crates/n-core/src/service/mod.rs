@@ -1193,15 +1193,6 @@ impl Services {
         let client = SinaClient::global();
         client.update_limits(interval_ms, budget).await;
 
-        let wants_tq = config.data_source.primary_source == "tqsdk";
-        // 尝试启动 Python Sidecar 桥接服务；启动成功仍需在 HybridDataSource 上真实探活。
-        let sidecar_started = if let Err(e) = SidecarManager::start(&config.data_source).await {
-            tracing::warn!("天勤桥接服务启动异常，将使用备用数据源: {e:#}");
-            false
-        } else {
-            true
-        };
-
         let config_arc = Arc::new(RwLock::new(config));
         let tq_port = config_arc.read().await.data_source.bridge_port;
         let tq_client = TqBridgeClient::with_port(tq_port);
@@ -1210,17 +1201,38 @@ impl Services {
             client.clone(),
             config_arc.clone(),
         ));
-        if wants_tq && sidecar_started {
-            if !data_source
-                .probe_and_activate("天勤桥接服务启动并通过健康检查", false)
-                .await
-            {
-                tracing::warn!("天勤桥接服务未通过健康检查，当前使用新浪备用数据源");
+        // 白屏修复：Sidecar 30秒探测不再阻塞 Services::new / 窗口首绘，改为后台异步拉起
+        {
+            let ds_cfg = config_arc.read().await.data_source.clone();
+            let wants_tq_initial = ds_cfg.primary_source == "tqsdk";
+            if !wants_tq_initial {
+                let ds2 = data_source.clone();
+                tokio::spawn(async move {
+                    ds2.mark_tq_unavailable("天勤主力数据源未启用，当前使用新浪数据源", false).await;
+                });
+            } else {
+                let ds_for_spawn = data_source.clone();
+                let ds_for_mark = data_source.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let sidecar_started = match SidecarManager::start(&ds_cfg).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!("天勤桥接服务启动异常，将使用备用数据源: {e:#}");
+                            ds_for_spawn.mark_tq_unavailable(&format!("天勤桥接服务启动失败（{e:#}），当前使用新浪备用数据源"), true).await;
+                            false
+                        }
+                    };
+                    if sidecar_started {
+                        if !ds_for_spawn.probe_and_activate("天勤桥接服务启动并通过健康检查", true).await {
+                            tracing::warn!("天勤桥接服务未通过健康检查，当前使用新浪备用数据源");
+                        } else {
+                            tracing::info!("✅ 天勤桥接服务后台就绪，已切回主力天勤数据源");
+                        }
+                    }
+                });
+                ds_for_mark.mark_tq_unavailable("天勤桥接服务后台启动中，暂用新浪数据源", false).await;
             }
-        } else {
-            data_source
-                .mark_tq_unavailable("天勤主力数据源未启用，当前使用新浪数据源", false)
-                .await;
         }
 
         let pipeline = RawPipeline::new(db.clone(), SymbolLocks::new());
@@ -2449,6 +2461,9 @@ impl Services {
                     repo::update_pattern_event(&self.db, e.clone()).await?;
                 }
                 if !was_triggered && e.trigger_ts.is_some() {
+                    if let Err(error) = crate::v2::prediction::predict_event(&self.db, &e, &bars15).await {
+                        tracing::warn!(event_id = e.id, "V2 实时预测写入失败: {error:#}");
+                    }
                     newly_triggered.push(e.clone());
                 }
                 signals.push(e);
@@ -2991,7 +3006,7 @@ impl Services {
         crate::integrity::IntegrityRepairer::repair_symbol(
             &self.db,
             &self.pipeline,
-            &self.client,
+            &self.data_source,
             symbol,
             s.fetch.backfill_count,
         )
@@ -3009,7 +3024,7 @@ impl Services {
             let res = crate::integrity::IntegrityRepairer::repair_symbol(
                 &self.db,
                 &self.pipeline,
-                &self.client,
+                &self.data_source,
                 &sym.code,
                 s.fetch.backfill_count,
             )
@@ -4004,6 +4019,7 @@ fn kline_model(ts: &str) -> klines::Model {
         source: "derived".to_string(),
     }
 }
+
 
 
 

@@ -565,6 +565,7 @@ async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
     }
     db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)").await.context("创建 V2 索引失败")?;
     db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_warning_ts ON v2_trade_events(warning_ts)").await.context("创建 V2 索引失败")?;
+    db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_predictions_event_model ON v2_model_predictions(event_id, model_id)").await.context("创建 V2 预测唯一索引失败")?;
     // mark migrated to 4
     db.execute_unprepared("INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_migrated', '4')").await.ok();
     db.execute_unprepared("UPDATE settings SET value='4' WHERE key=''schema_migrated'' AND value IN ('2','3')").await.ok();

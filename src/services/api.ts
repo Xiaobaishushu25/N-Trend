@@ -3,6 +3,9 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type {
+  V2ModelRow,
+  V2PredictionRow,
+  V2ReportBundle,
   AppInfo,
   Config,
   ContractSuggestion,
@@ -126,6 +129,13 @@ export const api = {
   schedulerStatus: () => invoke<SchedulerStatus>('scheduler_status'),
   setSchedulerRunning: (running: boolean) =>
     invoke<SchedulerStatus>('set_scheduler_running', { running }),
+  checkSymbolIntegrity: (symbol: string) => invoke<any>('check_symbol_integrity', { symbol }),
+  checkAllSymbolsIntegrity: () => invoke<any[]>('check_all_symbols_integrity'),
+  repairSymbolIntegrity: (symbol: string) => invoke<any>('repair_symbol_integrity', { symbol }),
+  getV2Models: () => invoke<V2ModelRow[]>('get_v2_models'),
+  getV2Predictions: (modelId?: string | null) => invoke<V2PredictionRow[]>('get_v2_predictions', { modelId: modelId || null }),
+  backfillV2Predictions: () => invoke<{ models: number; events_seen: number; events_scored: number; predictions_written: number }>('backfill_v2_predictions'),
+  getV2Report: () => invoke<V2ReportBundle>('get_v2_dataset_report'),
 }
 
 export function onDataUpdated(cb: (stats: RefreshStats) => void) {
@@ -151,6 +161,5 @@ export function onNotificationHistoryUpdated(
     cb(e.payload),
   )
 }
-
 
 

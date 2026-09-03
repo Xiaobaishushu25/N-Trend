@@ -30,32 +30,71 @@ async fn main() -> Result<()> {
 
     let builder = DatasetBuilder::new(DatasetBuilder::default_whitelist());
 
-    // Attempt to load real klines if DB has data; otherwise use empty synthetic for deterministic CI pass
-    let all_rows: Vec<DatasetRow> = vec![];
-    // Try to enumerate symbols from DB — if none, keep empty
-    // We attempt a lightweight query to see if klines table has rows
+    let mut all_rows: Vec<DatasetRow> = vec![];
+    let mut real_events_total = 0usize;
     {
         use sea_orm::{ConnectionTrait, Statement, DbBackend};
         let cnt = db.query_one(Statement::from_string(DbBackend::Sqlite, "SELECT COUNT(*) as c FROM klines".to_string())).await.ok().flatten();
-        if let Some(row) = cnt {
-            let c: i64 = row.try_get("", "c").unwrap_or(0);
-            println!("klines count in db: {}", c);
-            // If we have real data and user requested real symbols, we would loop repo::all_symbols
-            // For now keep synthetic empty to guarantee acceptance without real market data
+        let c: i64 = cnt.as_ref().and_then(|r| r.try_get("", "c").ok()).unwrap_or(0);
+        println!("klines count in db: {}", c);
+        if c > 0 {
+            // enumerate symbols
+            let mut symbols: Vec<String> = Vec::new();
+            if !symbol_all {
+                symbols.push(symbol_arg.clone());
+            } else {
+                if let Ok(Some(row)) = db.query_one(Statement::from_string(DbBackend::Sqlite, "SELECT GROUP_CONCAT(symbol, ',') as s FROM (SELECT DISTINCT symbol FROM klines WHERE timeframe='5m' AND source='raw')".to_string())).await {
+                    if let Ok(s) = row.try_get::<String>("","s") { symbols = s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(); }
+                }
+                if symbols.is_empty() {
+                    if let Ok(rows_db) = db.query_all(Statement::from_string(DbBackend::Sqlite, "SELECT DISTINCT symbol FROM klines WHERE timeframe='5m' AND source='raw'".to_string())).await {
+                        for r in rows_db { if let Ok(s) = r.try_get::<String>("","symbol") { symbols.push(s); } }
+                    }
+                }
+            }
+            if symbols.is_empty() { symbols.push("RB2501".into()); }
+            let engine = ReplayEngine::new(ReplayConfig::default());
+            let mut all_events = Vec::new();
+            for sym in &symbols {
+                let sql = if let Some(ref f) = from_arg {
+                    format!("SELECT ts, open, high, low, close, volume, hold FROM klines WHERE symbol='{}' AND timeframe='5m' AND source='raw' AND ts >= '{}' ORDER BY ts ASC", sym.replace("'","''"), f.replace("'","''"))
+                } else {
+                    format!("SELECT ts, open, high, low, close, volume, hold FROM klines WHERE symbol='{}' AND timeframe='5m' AND source='raw' ORDER BY ts ASC", sym.replace("'","''"))
+                };
+                let kline_rows = db.query_all(Statement::from_string(DbBackend::Sqlite, sql)).await.unwrap_or_default();
+                if kline_rows.is_empty() { continue; }
+                let mut raw5m: Vec<n_core::fetch::kline::Kline> = Vec::with_capacity(kline_rows.len());
+                for r in kline_rows {
+                    let ts: String = r.try_get("","ts").unwrap_or_default();
+                    let open: f64 = r.try_get("","open").unwrap_or(0.0);
+                    let high: f64 = r.try_get("","high").unwrap_or(0.0);
+                    let low: f64 = r.try_get("","low").unwrap_or(0.0);
+                    let close: f64 = r.try_get("","close").unwrap_or(0.0);
+                    let volume: f64 = r.try_get("","volume").unwrap_or(0.0);
+                    let hold: f64 = r.try_get("","hold").unwrap_or(0.0);
+                    raw5m.push(n_core::fetch::kline::Kline{ datetime: ts, open, high, low, close, volume, hold });
+                }
+                if let Ok(evts) = engine.replay_history(sym, &raw5m) {
+                    real_events_total += evts.len();
+                    all_events.extend(evts);
+                }
+            }
+            println!("real replay events total: {} symbols {}", real_events_total, symbols.len());
+            all_rows = builder.build(all_events);
+            let trig = all_rows.len();
+            println!("real dataset rows: {}", trig);
+            let (kept, dropped) = n_core::v2::dataset::DatasetBuilder::filter_missing(all_rows.clone());
+            if dropped>0 { println!("missing filter dropped {} rows", dropped); all_rows = kept; }
         }
     }
-
-    // Synthetic replay smoke
-    let engine = ReplayEngine::new(ReplayConfig::default());
-    let synthetic_raw: Vec<n_core::fetch::kline::Kline> = vec![];
-    let evts = engine.replay_history("RB2501", &synthetic_raw)?;
-    println!("Replay events on empty raw: {}", evts.len());
-
-    // Build rows (empty in CI)
-    let rows: Vec<DatasetRow> = builder.build(vec![]);
-    // Also extend with any all_rows from DB if we had loaded them (none in empty case)
-    let mut rows = rows;
-    rows.extend(all_rows);
+    let rows: Vec<DatasetRow> = if !all_rows.is_empty() { all_rows } else {
+        // Synthetic smoke fallback for CI when DB empty
+        let engine = ReplayEngine::new(ReplayConfig::default());
+        let synthetic_raw: Vec<n_core::fetch::kline::Kline> = vec![];
+        let _ = engine.replay_history("RB2501", &synthetic_raw).unwrap();
+        println!("WARN: no real rows — using synthetic empty for CI");
+        builder.build(vec![])
+    };
 
     if paranoid {
         n_core::v2::dataset::leakage::assert_no_leakage(&rows).expect("leakage check failed");
@@ -103,3 +142,5 @@ async fn main() -> Result<()> {
     println!("Wrote target/v2_reports/acceptance.md and report.md");
     Ok(())
 }
+
+

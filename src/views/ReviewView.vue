@@ -26,9 +26,17 @@ import {
   type StatsScopeKey,
 } from '../stores/review'
 import { notify } from '../utils/notify'
-import type { GroupStat, OpenReviewChartPayload, OutcomeDetail } from '../types'
+import type { GroupStat, OpenReviewChartPayload, OutcomeDetail, V2ModelRow } from '../types'
 
 const review = useReviewStore()
+const v2Columns: any = [
+  { title: "event", key: "event_id", width: 90 },
+  { title: "model", key: "model_id", width: 160, ellipsis: { tooltip: true } },
+  { title: "P(win)", key: "p_win", width: 90, render: (row: any) => row.p_win == null ? "—" : (row.p_win as number).toFixed(3) },
+  { title: "logit", key: "logit", width: 90, render: (row: any) => row.logit == null ? "—" : (row.logit as number).toFixed(2) },
+  { title: "predicted_at", key: "predicted_at", width: 160 },
+]
+
 const loading = ref(false)
 const rebuilding = ref(false)
 const error = ref('')
@@ -578,6 +586,39 @@ onBeforeUnmount(() => {
       </n-text>
     </n-card>
 
+    <n-card size="small" class="v2-card" style="margin-bottom: 16px">
+      <template #header>
+        <span style="font-weight: 600">V2 概率模型 <span style="font-weight:400;color:#97a0b3;font-size:12px">Setup 形态评分不含触发K · Trigger K 收盘冻结</span></span>
+      </template>
+      <n-space vertical :size="12">
+        <n-space align="center" :size="8" wrap>
+          <n-text depth="3" style="font-size:12px">模型</n-text>
+          <n-select
+            v-model:value="review.v2SelectedModel"
+            :options="review.v2Models.map(m => ({ label: `${m.model_id} (${m.name})`, value: m.model_id }))"
+            placeholder="选择模型查看预测"
+            clearable
+            style="width: 280px"
+            size="small"
+          />
+          <n-button size="small" type="primary" :disabled="!review.v2SelectedModel" @click="review.loadV2Predictions()">加载预测</n-button>
+          <n-tag v-if="review.v2Models.length" type="info" size="small">{{ review.v2Models.length }} 个模型</n-tag>
+          <n-tag v-else type="warning" size="small">暂无模型，请先运行 v2-train</n-tag>
+        </n-space>
+        <n-text v-if="review.v2Report" depth="3" style="font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;display:block;background:#f8f9fb;padding:8px;border-radius:6px">{{ (review.v2Report["logistic_report.md"] || review.v2Report["acceptance.md"] || "").slice(0, 4000) || "暂无报告" }}</n-text>
+        <n-data-table
+          v-if="review.v2Predictions.length"
+          :columns="v2Columns"
+          :data="review.v2Predictions"
+          :pagination="{ pageSize: 8 }"
+          size="small"
+          striped
+          style="margin-top: 4px"
+        />
+        <n-text depth="3" style="font-size:11px">说明：Setup 阶段只用警示K冻结的形态/A段/B段/回撤特征，不包含Trigger K；Trigger特征在K收盘时冻结，无未来泄漏；P(win)为纯Rust Logistic/GAM推理，详见docs/v2_spec.md</n-text>
+      </n-space>
+    </n-card>
+
     <div class="body">
       <n-card size="small" class="overall-card">
         <n-space size="large" wrap>
@@ -825,4 +866,5 @@ onBeforeUnmount(() => {
   color: #1f2329;
   font-variant-numeric: tabular-nums;
 }
+.v2-card { flex: none; }
 </style>

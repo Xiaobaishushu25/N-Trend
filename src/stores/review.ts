@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
-import type { OutcomeDetail, RecentOutcomeFilters, ReviewStats } from '../types'
+import type { OutcomeDetail, RecentOutcomeFilters, ReviewStats, V2ModelRow, V2PredictionRow, V2ReportBundle } from '../types'
 
 export const REVIEW_DIMENSIONS = [
   { key: 'score_band', label: '评分段' },
@@ -20,6 +20,7 @@ export const REVIEW_DIMENSIONS = [
   { key: 'b_a_speed', label: 'b/a速度比' },
   { key: 'dim_a', label: '评分·A腿' },
   { key: 'dim_b', label: '评分·B腿' },
+  { key: 'p_win_band', label: "P(win)" },
   { key: 'dim_warning', label: '评分·预警K线' },
 ] as const
 
@@ -48,6 +49,10 @@ export const useReviewStore = defineStore('review', {
       scoreMin: null,
       scoreMax: null,
     } as RecentOutcomeFilters,
+    v2Models: [] as V2ModelRow[],
+    v2Report: null as V2ReportBundle | null,
+    v2Predictions: [] as V2PredictionRow[],
+    v2SelectedModel: '' as string,
     loading: false,
     refreshing: false,
     recentLoading: false,
@@ -58,7 +63,9 @@ export const useReviewStore = defineStore('review', {
       this.statsScope = scope ?? this.statsScope
       this.loading = true
       try {
-        const [stats] = await Promise.all([
+        // 训练只登记模型；打开复盘页时补齐已有触发事件的预测记录。
+        await api.backfillV2Predictions().catch(() => null)
+        const [stats, v2Models, v2Report] = await Promise.all([
           api.getReviewStats(
             this.dimension,
             this.statsScope,
@@ -66,12 +73,27 @@ export const useReviewStore = defineStore('review', {
             this.recentFilters.scoreMin,
             this.recentFilters.scoreMax,
           ),
-          this.loadRecent(),
+          api.getV2Models().catch(() => [] as V2ModelRow[]),
+          api.getV2Report().catch(() => null as unknown as V2ReportBundle),
         ])
-        this.stats = stats
+        await this.loadRecent()
+        this.stats = stats as ReviewStats
+        this.v2Models = (v2Models as V2ModelRow[]) ?? []
+        this.v2Report = (v2Report as V2ReportBundle) ?? null
+        if (!this.v2Models.some((model) => model.model_id === this.v2SelectedModel)) {
+          this.v2SelectedModel =
+            this.v2Models.find((model) => model.model_id.startsWith('logistic-'))?.model_id
+            ?? this.v2Models[0]?.model_id
+            ?? ''
+        }
+        if (this.v2SelectedModel) await this.loadV2Predictions()
       } finally {
         this.loading = false
       }
+    },
+    async loadV2Predictions(modelId?: string) {
+      this.v2SelectedModel = modelId ?? this.v2SelectedModel
+      try { this.v2Predictions = await api.getV2Predictions(this.v2SelectedModel || null) } catch { this.v2Predictions = [] }
     },
     /** 只刷新明细（保留当前筛选） */
     async loadRecent() {

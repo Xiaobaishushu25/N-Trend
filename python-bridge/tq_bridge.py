@@ -33,7 +33,7 @@ logger = logging.getLogger("TqBridge")
 SERVER_STARTED_AT = time.time()
 SERVICE_NAME = "ntrend-tq-bridge"
 STREAM_ID = uuid.uuid4().hex
-MARKET_STALE_SECS = 10.0
+MARKET_STALE_SECS = 15.0
 
 
 class BridgeCommandTimeout(TimeoutError):
@@ -792,7 +792,7 @@ async def handle_quotes(request: web.Request) -> web.Response:
     tq_symbols = list(set(mapping.values()))
     try:
         quotes_dict = await asyncio.to_thread(
-            worker.exec_cmd, "subscribe_quotes", {"tq_symbols": tq_symbols}, 8.0
+            worker.exec_cmd, "subscribe_quotes", {"tq_symbols": tq_symbols}, 18.0
         )
     except Exception as e:
         logger.warning("Error subscribing quotes for %s: %s", symbols, e)
@@ -863,17 +863,15 @@ async def handle_kline(request: web.Request) -> web.Response:
 
     try:
         klines_df = await asyncio.to_thread(
-            worker.exec_cmd, "get_kline", {
-                "tq_symbol": tq_symbol,
-                "duration_seconds": duration_secs,
-                "data_length": count,
-            }, 10.0
+            worker.exec_cmd,
+            "get_kline",
+            {"tq_symbol": tq_symbol, "duration_seconds": duration_secs, "data_length": count},
+            15.0,
         )
     except Exception as e:
         logger.warning("Error fetching K-lines for %s (%s): %s", symbol, tq_symbol, e)
         status = 504 if isinstance(e, BridgeCommandTimeout) else 503
         return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=status)
-
     if klines_df is None or len(klines_df) == 0:
         return web.json_response({"symbol": symbol, "period": period, "klines": []})
 

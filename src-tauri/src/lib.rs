@@ -313,6 +313,10 @@ pub fn run() {
             commands::check_symbol_integrity,
             commands::check_all_symbols_integrity,
             commands::repair_symbol_integrity,
+            commands::get_v2_models,
+            commands::get_v2_predictions,
+            commands::backfill_v2_predictions,
+            commands::get_v2_dataset_report,
         ])
         .run(tauri::generate_context!())
         .expect("运行 N趋势 失败");
@@ -447,6 +451,7 @@ fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
 /// 入场触发继续由现有3秒实时行情轮询负责。
 fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
+        let mut is_first_subscribe = true;
         let mut after_id = 0u64;
         let mut stream_id = String::new();
         loop {
@@ -478,6 +483,13 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
                 continue;
             }
 
+            if is_first_subscribe {
+                is_first_subscribe = false;
+                // 冷启动错峰 30s：等 service::refresh_data 的 22*get_kline + subscribe_quotes 排空 worker 队列
+                // 否则单线程 TqDataWorker 会被 subscribe_klines(22*KQ.m@ 35s) 堵死，同期 quotes 12s 超时 queue=1->4
+                tracing::info!("[FAST_PATH] 冷启动错峰: 首轮订阅延迟 30s，避免与历史K线抢单线程 worker");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             let tq = state.services.data_source.tq_client().await;
             let subscription = match tq.subscribe_klines(&codes, "5m", 1000).await {
                 Ok(response) => response,

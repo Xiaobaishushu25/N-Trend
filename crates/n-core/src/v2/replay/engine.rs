@@ -138,16 +138,35 @@ impl ReplayEngine {
             i += step;
         }
         // second pass: for each event, scan forward to find trigger and outcome
+        // V2 scoring trigger = close beyond warning extreme (high for up, low for down); entry = warning extreme + tick.
+        // We scan from warning bar onward (fallback to s2 if warning missing) and require high/low touch + close beyond warning.
         for ev in events.iter_mut() {
-            // find s2 index then look ahead for first bar that closes beyond trigger_level
-            if let Some(s2_idx) = bars15.iter().position(|b| b.dt.to_bar_ts()==ev.s2_ts) {
-                let is_long = ev.direction == "up";
-                let mut trigger_idx: Option<usize> = None;
-                let end = (s2_idx + self.config.trigger_timeout_bars).min(bars15.len()-1);
-                for j in s2_idx+1..=end {
-                    let c = bars15[j].close;
-                    let touched = if is_long { c >= ev.trigger_level } else { c <= ev.trigger_level };
+            let warn_idx_opt = bars15.iter().position(|b| bar_ts_matches(&b.dt.to_bar_ts(), &ev.warning_ts));
+            let s2_idx_opt = bars15.iter().position(|b| bar_ts_matches(&b.dt.to_bar_ts(), &ev.s2_ts));
+            let Some(start_idx) = warn_idx_opt.or(s2_idx_opt) else { continue; };
+            // warning extreme approximated as trigger_level - tick (tick ~1.0)
+            let warn_level = ev.trigger_level - 1.0;
+            let is_long = ev.direction == "up";
+            // ensure stop/target orientation is sane for diagnostics; do not alter stored values
+            let mut trigger_idx: Option<usize> = None;
+            let end = (start_idx + self.config.trigger_timeout_bars).min(bars15.len().saturating_sub(1));
+            if start_idx + 1 <= end {
+                for j in start_idx+1..=end {
+                    let b = &bars15[j];
+                    let touched = if is_long {
+                        b.high >= warn_level - 1e-9 && b.close > warn_level + 1e-9
+                    } else {
+                        b.low <= warn_level + 1e-9 && b.close < warn_level - 1e-9
+                    };
                     if touched { trigger_idx = Some(j); break; }
+                }
+                // fallback: pure level touch without close beyond (keep some recall if scoring strict)
+                if trigger_idx.is_none() {
+                    for j in start_idx+1..=end {
+                        let b = &bars15[j];
+                        let touched2 = if is_long { b.high >= ev.trigger_level - 1e-9 } else { b.low <= ev.trigger_level + 1e-9 };
+                        if touched2 { trigger_idx = Some(j); break; }
+                    }
                 }
                 if let Some(ti) = trigger_idx {
                     let tb = &bars15[ti];
@@ -199,6 +218,11 @@ impl ReplayEngine {
     }
 }
 
+fn bar_ts_matches(bar_ts: &str, dto_ts: &str) -> bool {
+    // dto ts is "YYYY-MM-DD HH:MM" without seconds, bar_ts is "YYYY-MM-DD HH:MM:SS"
+    bar_ts == dto_ts || bar_ts.starts_with(dto_ts) || format!("{}:00", dto_ts) == bar_ts
+}
+
 fn kline_to_bar(klines: &[Kline]) -> Vec<Bar> {
     klines.iter().map(|k| {
         let dt = crate::analyze::model::DT::from_bar_ts(&k.datetime).unwrap_or(crate::analyze::model::DT{year:2024, month:1, day:1, hour:0, minute:0});
@@ -216,6 +240,9 @@ mod tests {
         assert!(v.is_empty());
     }
 }
+
+
+
 
 
 

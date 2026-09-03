@@ -21,6 +21,7 @@ import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
 import { useScansStore } from '../stores/scans'
 import { singleBarBadgeStyle, singleBarTitle } from '../utils/singleBar'
+import { useReviewStore } from "../stores/review"
 import { useSettingsStore } from '../stores/settings'
 import { useAppStore } from '../stores/app'
 import { fmtR } from '../stores/review'
@@ -78,6 +79,121 @@ function toggleTimeframe(t: Timeframe, checked: boolean) {
 }
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
+
+/** 完整性自检/补全：当前品种 5m 缺口检测与一键修复 */
+const integrityChecking = ref(false)
+const integrityRepairing = ref(false)
+const integrityReport = ref<any>(null)
+const lastRepairResult = ref<any>(null)
+const reviewStore = useReviewStore()
+const v2PwinByEvent = computed(() => {
+  const result = new Map<number, number>()
+  const rows = [...reviewStore.v2Predictions].sort((a, b) => {
+    const aLogistic = a.model_id.startsWith('logistic-') ? 0 : 1
+    const bLogistic = b.model_id.startsWith('logistic-') ? 0 : 1
+    return aLogistic - bLogistic
+  })
+  for (const row of rows) {
+    if (row.p_win != null && !result.has(row.event_id)) result.set(row.event_id, row.p_win)
+  }
+  return result
+})
+function pwinFor(eventId: number) {
+  return v2PwinByEvent.value.get(eventId) ?? null
+}
+async function refreshV2Predictions() {
+  try {
+    await api.backfillV2Predictions()
+    await reviewStore.loadV2Predictions()
+  } catch {
+    reviewStore.v2Predictions = []
+  }
+}
+const v2CurrentPwin = computed(() => {
+  const eid = (reviewOverlay as any)?.value?.event?.id
+    ?? visibleSignals.value[0]?.number
+  if (eid == null) return null
+  return pwinFor(eid)
+})
+
+
+async function handleCheckIntegrity() {
+  if (!symbol.value) return
+  integrityChecking.value = true
+  integrityReport.value = null
+  try {
+    const r = await api.checkSymbolIntegrity(symbol.value)
+    integrityReport.value = r
+    const gaps = (r && (r.missing_gaps || r.gaps || r.missingGaps)) || []
+    const gapsLen = gaps.length
+    const totalMissing = (r && (r.missing_count ?? r.missingCount ?? 0)) || gaps.reduce((a:number,g:any)=>a+(g.missing_count??g.missingCount??1),0)
+    if (gapsLen === 0) {
+      notify.success(symbol.value + " 5m 数据完整，无缺口")
+    } else {
+      const fmtGap = (g:any) => {
+        if (Array.isArray(g)) return g[0] + " ~ " + g[1]
+        if (g && typeof g === "object" && "start_ts" in g) return `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根${g.recoverable_by_api ? "可恢复" : "不可恢复"}`
+        if (g && typeof g === "object" && "startTs" in g) return `${(g as any).startTs} ~ ${(g as any).endTs} 缺${(g as any).missingCount}根`
+        return String(g)
+      }
+      const preview = gaps.slice(0,3).map(fmtGap).join(" | ")
+      const more = gapsLen > 3 ? ` 等${gapsLen}段` : ""
+      notify.warning(symbol.value + ` 发现 ${gapsLen}段缺口(共${totalMissing}根): ${preview}${more}`, { duration: 8000 } as any)
+      // 同时在控制台打印完整缺口明细
+      console.log(`[完整性检测] ${symbol.value}`, r)
+      gaps.forEach((g:any,i:number)=> console.log(`  缺口${i+1}:`, fmtGap(g)))
+    }
+  } catch (e) {
+    notify.error("检测失败: " + String(e))
+  } finally {
+    integrityChecking.value = false
+  }
+}
+
+async function handleRepairIntegrity() {
+  if (!symbol.value) return
+  if (!integrityReport.value) {
+    await handleCheckIntegrity()
+    const gaps = (integrityReport.value && (integrityReport.value.missing_gaps || integrityReport.value.gaps)) || []
+    if (gaps.length === 0) return
+  }
+  const ok = await confirmAction({
+    title: "补全缺口",
+    content: "确定为 " + symbol.value + " 补全缺口吗？将从天勤/新浪拉取缺失的 5m K线并重算 15m/60m 派生。",
+    positiveText: "开始补全",
+    negativeText: "取消",
+    type: "info",
+  })
+  if (!ok) return
+  integrityRepairing.value = true
+  try {
+    const res = await api.repairSymbolIntegrity(symbol.value)
+    lastRepairResult.value = res
+        const cnt = res ? (res.repaired_count ?? res.repairedCount ?? res.inserted ?? res.repaired ?? res.fixed ?? 0) : 0
+    const initMissing = res ? (res.initial_missing ?? (res as any).initialMissing ?? 0) : 0
+    const remainMissing = res ? (res.remaining_missing ?? (res as any).remainingMissing ?? 0) : 0
+    const msg = res ? (res.message ?? "") : ""
+    // 右下角通知写明：缺了哪些、补了哪些
+    if (cnt > 0) {
+      notify.success(`${symbol.value} 补全完成：${msg} | 初始缺${initMissing}根 → 补${cnt}根 → 剩余${remainMissing}根`, { duration: 8000 } as any)
+    } else if (res && res.is_fully_repaired) {
+      notify.success(`${symbol.value} ${msg}`, { duration: 6000 } as any)
+    } else {
+      notify.warning(`${symbol.value} 补全完成：${msg} | 初始缺${initMissing}根 补${cnt}根 剩余${remainMissing}根 (本次未新增，可能是接口未返回该区间)`, { duration: 9000 } as any)
+    }
+    console.log(`[补全结果] ${symbol.value}`, res)
+    if (integrityReport.value && (integrityReport.value as any).missing_gaps) {
+      console.log(`  补前缺口:`, (integrityReport.value as any).missing_gaps.map((g:any)=> `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根`))
+    }
+    integrityReport.value = null
+    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+    await loadTrendLine()
+  } catch (e) {
+    notify.error("补全失败: " + String(e))
+  } finally {
+    integrityRepairing.value = false
+  }
+}
 
 /** 复盘跳转模式：从 /chart/:symbol?review=<eventId> 进入时重绘该事件形态与进出场点位 */
 const reviewOverlay = ref<ReviewSignalDetail | null>(null)
@@ -1229,6 +1345,8 @@ watch([reviewIndex, reviewRows], async () => {
 })
 
 watch([symbol, timeframe], async () => {
+  integrityReport.value = null
+  lastRepairResult.value = null
   hiddenApplied.value = ''
   applyDefaultHidden()
   liveBars.value = []
@@ -1247,12 +1365,14 @@ watch(() => groupsStore.revision, () => loadGroupSymbols())
 
 onMounted(async () => {
   window.addEventListener('keydown', onReviewKeydown)
+  void refreshV2Predictions()
   unlisteners.push(
     await onScanCompleted((result) => {
       scansStore.ingest(result)
       loadSnapshots()
       scansStore.refreshLatestSignals()
       loadRecentPatterns()
+      void refreshV2Predictions()
     }),
   )
   unlisteners.push(
@@ -1402,6 +1522,14 @@ onBeforeUnmount(() => {
         >
           高低
         </button>
+        <div class="integrity-bar">
+          <n-button size="small" :loading="integrityChecking" :disabled="reviewMode" @click="handleCheckIntegrity" title="检测当前品种 5m 缺口">检测缺口</n-button>
+          <n-button size="small" type="primary" :loading="integrityRepairing" :disabled="reviewMode || integrityChecking" @click="handleRepairIntegrity" title="一键补全缺失的 5m 并重算 15m/60m">补全缺口</n-button>
+          <span v-if="integrityReport" class="integrity-badge" :class="{ 'has-gap': ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length>0) }">
+            {{ ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length===0) ? "完整" : ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length + "段缺口") }}
+          </span>
+          <span v-if="v2CurrentPwin != null" class="v2-pwin-badge" :style="{ background: v2CurrentPwin >= 0.55 ? '#e6f4ea' : v2CurrentPwin < 0.45 ? '#fce8e6' : '#fef7e0', color: v2CurrentPwin >= 0.55 ? '#137333' : v2CurrentPwin < 0.45 ? '#c5221f' : '#8a6d00' }">P(win) {{ (v2CurrentPwin*100).toFixed(1) }}%</span>
+        </div>
         <n-popover
           placement="bottom-end"
           trigger="click"
@@ -1870,6 +1998,11 @@ onBeforeUnmount(() => {
                   <span class="dot"></span>{{ sigLabel(s.state) }}
                 </div>
 
+                <div v-if="pwinFor(s.number) != null" class="pc-v2-pwin">
+                  <span>模型胜率</span>
+                  <b>{{ (pwinFor(s.number)! * 100).toFixed(1) }}%</b>
+                </div>
+
                 <div class="pc-history">
                   <span class="pc-history-label">预警</span>
                   <span>{{ s.warning_ts ? fmtRecentTime(s.warning_ts) : '—' }}</span>
@@ -1963,6 +2096,11 @@ onBeforeUnmount(() => {
                 <div class="pc-state" :class="stateType(r.state)">
                   <span class="dot"></span>{{ sigLabel(r.state) }}
                   <span v-if="r.trigger_ts" class="pc-state-time">{{ fmtRecentTime(r.trigger_ts) }}</span>
+                </div>
+
+                <div v-if="pwinFor(r.number) != null" class="pc-v2-pwin">
+                  <span>模型胜率</span>
+                  <b>{{ (pwinFor(r.number)! * 100).toFixed(1) }}%</b>
                 </div>
 
                 <div class="pc-history">
@@ -2182,6 +2320,32 @@ onBeforeUnmount(() => {
   border-color: rgba(180, 83, 9, 0.3);
   background: rgba(249, 168, 37, 0.1);
 }
+.integrity-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid #e8ecf1;
+}
+.integrity-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #e6f4ea;
+  color: #137333;
+  font-weight: 600;
+}
+.integrity-badge.has-gap { background: #fce8e6; color: #c5221f; }
+.v2-pwin-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-weight: 700;
+  background: #fce8e6;
+  color: #c5221f;
+}
+
 .tf-more {
   display: inline-flex;
   align-items: center;
@@ -3028,6 +3192,22 @@ onBeforeUnmount(() => {
   color: #e03131;
   background: rgba(224, 49, 49, 0.1);
 }
+.pc-v2-pwin {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(124, 92, 255, 0.08);
+  color: #64748b;
+  font-size: 12px;
+}
+.pc-v2-pwin b {
+  color: #7c5cff;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
 .pc-vol {
   display: flex;
   align-items: center;
@@ -3152,6 +3332,7 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
+
 
 
 

@@ -179,7 +179,7 @@ impl HybridDataSource {
         self.consecutive_successes.store(0, Ordering::Relaxed);
         let fails = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::warn!("天勤接口请求异常 (第{}次): {err:#}", fails);
-        if fails >= 2 && self.tq_available.swap(false, Ordering::Relaxed) {
+        if fails >= 3 && self.tq_available.swap(false, Ordering::Relaxed) {
             *self.failover_time.write().await = Instant::now();
             tracing::warn!("天勤数据源不可用，已自动切换为新浪数据源");
             let _ = self.event_tx.send(DataSourceEvent {
