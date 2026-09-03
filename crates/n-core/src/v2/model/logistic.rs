@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use crate::v2::dataset::DatasetRow;
 use crate::v2::model::scaler::{StandardScaler, get_feature};
-use crate::v2::model::metrics::{compute_metrics, Metrics};
+use crate::v2::model::metrics::{compute_metrics_with_baseline, Metrics};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogisticModel {
@@ -34,8 +34,12 @@ impl LogisticModel {
     pub fn predict_row_p(&self, row: &DatasetRow) -> f64 {
         let mut scaled = Vec::with_capacity(self.feature_names.len());
         for (j, name) in self.feature_names.iter().enumerate() {
-            let v = get_feature(row, name).unwrap_or(0.0);
-            let sv = (v - self.scaler_means[j]) / self.scaler_stds[j].max(1e-9);
+            let sv = match get_feature(row, name) {
+                Some(v) => (v - self.scaler_means[j]) / self.scaler_stds[j].max(1e-9),
+                // Match StandardScaler::transform_row: missing values are
+                // already represented by the scaled-space zero.
+                None => 0.0,
+            };
             scaled.push(sv);
         }
         self.predict_p(&scaled)
@@ -43,10 +47,10 @@ impl LogisticModel {
     pub fn feature_contributions(&self, row: &DatasetRow) -> Vec<FeatureContribution> {
         let mut out = Vec::new();
         for (j, name) in self.feature_names.iter().enumerate() {
-            let v = get_feature(row, name).unwrap_or(0.0);
-            let sv = (v - self.scaler_means[j]) / self.scaler_stds[j].max(1e-9);
+            let v = get_feature(row, name);
+            let sv = v.map(|value| (value - self.scaler_means[j]) / self.scaler_stds[j].max(1e-9)).unwrap_or(0.0);
             let contrib = self.coefficients[j] * sv;
-            out.push(FeatureContribution { feature: name.clone(), value: v, scaled_value: sv, coefficient: self.coefficients[j], contribution: contrib });
+            out.push(FeatureContribution { feature: name.clone(), value: v.unwrap_or(0.0), scaled_value: sv, coefficient: self.coefficients[j], contribution: contrib });
         }
         out
     }
@@ -93,7 +97,7 @@ pub fn train(rows: &[DatasetRow], feature_names: &[String], valid_rows: Option<&
     model.scaler_stds = scaler.stds.clone();
 
     if rows.is_empty() {
-        let metrics_train = compute_metrics(&y_train, &vec![0.5; y_train.len()]);
+        let metrics_train = compute_metrics_with_baseline(&y_train, &vec![0.5; y_train.len()], 0.5);
         return TrainOutput { model, scaler, metrics_train, metrics_valid: None, dataset_hash: String::new() };
     }
 
@@ -134,12 +138,12 @@ pub fn train(rows: &[DatasetRow], feature_names: &[String], valid_rows: Option<&
     }
 
     let p_train: Vec<f64> = x_train.iter().map(|x| model.predict_p(x)).collect();
-    let metrics_train = compute_metrics(&y_train, &p_train);
+    let metrics_train = compute_metrics_with_baseline(&y_train, &p_train, prior);
     let metrics_valid = if let Some(vr) = valid_rows {
         let x_valid: Vec<Vec<f64>> = vr.iter().map(|r| scaler.transform_row(r)).collect();
         let y_valid: Vec<i32> = vr.iter().map(|r| r.label_win).collect();
         let p_valid: Vec<f64> = x_valid.iter().map(|x| model.predict_p(x)).collect();
-        Some(compute_metrics(&y_valid, &p_valid))
+        Some(compute_metrics_with_baseline(&y_valid, &p_valid, prior))
     } else { None };
 
     TrainOutput { model: model.clone(), scaler, metrics_train, metrics_valid, dataset_hash: String::new() }
@@ -179,6 +183,22 @@ mod tests {
         let contribs = m.feature_contributions(&r);
         let sum: f64 = contribs.iter().map(|c| c.contribution).sum::<f64>() + m.intercept;
         assert!((sum - m.logit(&[1.0, 2.0])).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_inference_matches_training_transform() {
+        let rows = vec![mk_row(1.0, 0, "2024-01-01 10:00:00"), mk_row(3.0, 1, "2024-01-02 10:00:00")];
+        let feature_names = vec!["a_move_atr".into(), "trigger_volume_ratio".into()];
+        let scaler = StandardScaler::fit(&rows, &feature_names);
+        let mut model = LogisticModel::new(feature_names.clone());
+        model.intercept = 0.17;
+        model.coefficients = vec![0.4, -0.8];
+        model.scaler_means = scaler.means.clone();
+        model.scaler_stds = scaler.stds.clone();
+        let mut missing = rows[0].clone();
+        missing.trigger_volume_ratio = None;
+        let expected = model.predict_p(&scaler.transform_row(&missing));
+        assert!((model.predict_row_p(&missing) - expected).abs() < 1e-12);
     }
 }
 

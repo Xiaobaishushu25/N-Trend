@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use crate::v2::dataset::DatasetRow;
 use crate::v2::model::scaler::get_feature;
-use crate::v2::model::metrics::{compute_metrics, Metrics};
+use crate::v2::model::metrics::{compute_metrics_with_baseline, Metrics};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SplineTable {
@@ -133,7 +133,7 @@ impl Default for GamTrainConfig {
 pub fn train_gam(rows: &[DatasetRow], cfg: &GamTrainConfig) -> (GamModel, Metrics) {
     if rows.is_empty() {
         let m = GamModel::new();
-        let metrics = compute_metrics(&[], &[]);
+        let metrics = compute_metrics_with_baseline(&[], &[], 0.5);
         return (m, metrics);
     }
     let win_rate = rows.iter().filter(|r| r.label_win==1).count() as f64 / rows.len() as f64;
@@ -183,7 +183,7 @@ pub fn train_gam(rows: &[DatasetRow], cfg: &GamTrainConfig) -> (GamModel, Metric
 
     let y_true: Vec<i32> = rows.iter().map(|r| r.label_win).collect();
     let p_pred: Vec<f64> = rows.iter().map(|r| model.predict_p(r)).collect();
-    let metrics = compute_metrics(&y_true, &p_pred);
+    let metrics = compute_metrics_with_baseline(&y_true, &p_pred, win_rate);
     (model, metrics)
 }
 

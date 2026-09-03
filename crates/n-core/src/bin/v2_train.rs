@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use n_core::v2::dataset::{DatasetBuilder, DatasetRow};
-use n_core::v2::model::{train_logistic, TrainConfig, train_gam, GamTrainConfig, walk_forward_purge_aware, assert_purge, compute_metrics, InferenceBundle};
+use n_core::v2::model::{train_logistic, TrainConfig, train_gam, GamTrainConfig, walk_forward_purge_aware, assert_purge, compute_metrics_with_baseline, InferenceBundle};
 use n_core::v2::replay::{ReplayEngine, ReplayConfig};
 use n_core::storage;
 use std::path::PathBuf;
@@ -22,8 +22,9 @@ async fn main() -> Result<()> {
     let db_path = args.iter().find(|a| a.starts_with("--db=")).map(|s| s.trim_start_matches("--db=").to_string()).unwrap_or_else(|| "ntrend.db".to_string());
     let from = args.iter().find(|a| a.starts_with("--from=")).map(|s| s.trim_start_matches("--from=").to_string());
     let paranoid = args.iter().any(|a| a=="--paranoid");
+    let smoke_synth = args.iter().any(|a| a=="--smoke-synth");
     let symbol_filter = args.iter().find(|a| a.starts_with("--symbol=")).map(|s| s.trim_start_matches("--symbol=").to_string());
-    println!("V2 Train — db={} from={:?} paranoid={} symbol={:?}", db_path, from, paranoid, symbol_filter);
+    println!("V2 Train — db={} from={:?} paranoid={} smoke_synth={} symbol={:?}", db_path, from, paranoid, smoke_synth, symbol_filter);
     let db = if std::path::Path::new(&db_path).exists() {
         storage::connect(&PathBuf::from(db_path.clone())).await?
     } else {
@@ -32,7 +33,7 @@ async fn main() -> Result<()> {
     let kline_cnt: i64 = db.query_one(Statement::from_string(DbBackend::Sqlite, "SELECT COUNT(*) as c FROM klines".to_string())).await.ok().flatten().and_then(|r| r.try_get::<i64>("","c").ok()).unwrap_or(0);
     println!("klines in db: {}", kline_cnt);
     let builder = DatasetBuilder::new(DatasetBuilder::default_whitelist());
-    let mut rows: Vec<DatasetRow> = Vec::new();
+    let mut rows: Vec<DatasetRow>;
     let mut real_events = 0usize;
     if kline_cnt > 0 {
         let symbols: Vec<String> = if let Some(sf) = symbol_filter.clone() { if sf == "all" { vec![] } else { vec![sf] } } else { vec![] };
@@ -83,13 +84,19 @@ async fn main() -> Result<()> {
         rows = builder.build(all_events);
         println!("real dataset rows (trigger+outcome): {}", rows.len());
         if rows.is_empty() {
-            println!("WARN: real klines produced 0 trainable rows — falling back to synth smoke");
-            rows = synth_rows(200);
+            if smoke_synth {
+                println!("WARN: real klines produced 0 trainable rows — using explicit synth smoke mode");
+                rows = synth_rows(200);
+            } else {
+                bail!("zero real training rows; refusing to train. Fix the replay/data pipeline or pass --smoke-synth only for a synthetic smoke test");
+            }
         }
     } else {
-        let eng = ReplayEngine::new(ReplayConfig::default());
-        let _ = eng.replay_history("RB2501", &[]).unwrap();
-        rows = synth_rows(200);
+        if smoke_synth {
+            rows = synth_rows(200);
+        } else {
+            bail!("database contains no 5m klines; refusing to train. Load real data or pass --smoke-synth only for a synthetic smoke test");
+        }
     }
     rows.sort_by(|a,b| a.trigger_bar_ts.cmp(&b.trigger_bar_ts));
     if paranoid { n_core::v2::dataset::leakage::assert_no_leakage(&rows).unwrap(); }
@@ -108,16 +115,24 @@ async fn main() -> Result<()> {
     println!("split: train {} test {} (test_size {} for n={})", train_rows.len(), test_rows.len(), test_size, n);
     if train_rows.len() < 40 { println!("WARN: train set small (<40)"); }
     let cfg = TrainConfig::default();
+    let gam_cfg = GamTrainConfig::default();
+    let wf = evaluate_walk_forward(&rows, &folds, &whitelist, &cfg, &gam_cfg);
+    println!(
+        "walk-forward evaluated {} folds: Logistic AUC {:.3} Brier {:.3}; GAM AUC {:.3} Brier {:.3}",
+        wf.folds_used, wf.logistic_auc, wf.logistic_brier, wf.gam_auc, wf.gam_brier
+    );
     let log_out = train_logistic(train_rows, &whitelist, Some(test_rows), &cfg);
     println!("Logistic train AUC {:.3} Brier {:.3} logloss {:.3} lift {:.2}", log_out.metrics_train.auc, log_out.metrics_train.brier, log_out.metrics_train.logloss, log_out.metrics_train.top20_lift);
     if let Some(vm) = &log_out.metrics_valid { println!("Logistic valid AUC {:.3} Brier {:.3} lift {:.2} vs baseline Brier {:.3}", vm.auc, vm.brier, vm.top20_lift, vm.baseline_brier); }
-    let gam_cfg = GamTrainConfig::default();
     let (gam_model, gam_metrics) = train_gam(train_rows, &gam_cfg);
     let y_test: Vec<i32> = test_rows.iter().map(|r| r.label_win).collect();
     let p_gam_test: Vec<f64> = test_rows.iter().map(|r| gam_model.predict_p(r)).collect();
-    let gam_test_metrics = compute_metrics(&y_test, &p_gam_test);
+    let train_prior = train_rows.iter().filter(|r| r.label_win == 1).count() as f64 / train_rows.len().max(1) as f64;
+    let gam_test_metrics = compute_metrics_with_baseline(&y_test, &p_gam_test, train_prior);
     println!("GAM train AUC {:.3} Brier {:.3} ; test AUC {:.3} Brier {:.3} lift {:.2}", gam_metrics.auc, gam_metrics.brier, gam_test_metrics.auc, gam_test_metrics.brier, gam_test_metrics.top20_lift);
-    let champion = if let Some(vm) = &log_out.metrics_valid { if gam_test_metrics.auc > vm.auc + 0.02 && gam_test_metrics.brier < vm.brier { "gam" } else { "logistic" } } else { "logistic" };
+    // GAM remains a diagnostic challenger. Do not promote it from one
+    // holdout window; promotion requires a later, explicit OOT review.
+    let champion = "logistic";
     println!("Champion: {}", champion);
     let git_commit = std::process::Command::new("git").args(["rev-parse", "--short", "HEAD"]).output().ok().and_then(|o| String::from_utf8(o.stdout).ok()).unwrap_or_else(|| "unknown".into()).trim().to_string();
     let out_dir = PathBuf::from("target/v2_reports");
@@ -153,8 +168,9 @@ async fn main() -> Result<()> {
     md.push_str(&format!("- Splines: {}\n", gam_model.splines.iter().map(|s| format!("{} df={} knots={:?}", s.feature, s.df, s.knots)).collect::<Vec<_>>().join(", ")));
     md.push_str(&format!("- Train: AUC {:.3} Brier {:.3}\n", gam_metrics.auc, gam_metrics.brier));
     md.push_str(&format!("- Test:  AUC {:.3} Brier {:.3} lift {:.2} vs logistic valid AUC {:.3}\n", gam_test_metrics.auc, gam_test_metrics.brier, gam_test_metrics.top20_lift, log_out.metrics_valid.as_ref().map(|m| m.auc).unwrap_or(0.0)));
-    md.push_str(&format!("\n- Walk-forward folds: {} — purge PASS\n", folds.len()));
-    md.push_str("- Notes: GAM wins champion only if AUC > logistic +0.02 and Brier lower; else logistic remains champion. Pure Rust, no Python.\n");
+    md.push_str(&format!("\n- Walk-forward folds: {} (evaluated {}) — purge PASS\n", folds.len(), wf.folds_used));
+    md.push_str(&format!("- Walk-forward mean: Logistic AUC {:.3} Brier {:.3}; GAM AUC {:.3} Brier {:.3}\n", wf.logistic_auc, wf.logistic_brier, wf.gam_auc, wf.gam_brier));
+    md.push_str("- Notes: Logistic is the current champion by policy; GAM is diagnostic only until it passes a dedicated out-of-time review. Metrics use the training-window prior as baseline. Pure Rust, no Python.\n");
     let lift_ok = log_out.metrics_valid.as_ref().map(|m| m.top20_lift > 1.0).unwrap_or(true);
     md.push_str(&format!("\n- Acceptance: lift>1.0 is {} ({}), leakage PASS, hash reproducible PASS\n", if lift_ok {"PASS"} else {"WARN"}, log_out.metrics_valid.as_ref().map(|m| format!("{:.2}", m.top20_lift)).unwrap_or_else(|| "n/a".into())));
     if rows.iter().any(|r| r.event_id.starts_with("synth")) { md.push_str("- Data: SYNTH smoke (DB empty or 0 trainable rows)\n"); } else { md.push_str(&format!("- Data: REAL replay (events {}, kline_cnt {})\n", real_events, kline_cnt)); }
@@ -167,6 +183,58 @@ async fn main() -> Result<()> {
         backfill.events_scored, backfill.predictions_written
     );
     Ok(())
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct WalkForwardSummary {
+    folds_used: usize,
+    logistic_auc: f64,
+    logistic_brier: f64,
+    gam_auc: f64,
+    gam_brier: f64,
+}
+
+/// Evaluate both candidates only on forward validation windows. The final
+/// champion policy intentionally remains Logistic until GAM has comparable
+/// out-of-time evidence and a production-ready implementation.
+fn evaluate_walk_forward(
+    rows: &[DatasetRow],
+    folds: &[n_core::v2::model::Fold],
+    whitelist: &[String],
+    log_cfg: &TrainConfig,
+    gam_cfg: &GamTrainConfig,
+) -> WalkForwardSummary {
+    let mut out = WalkForwardSummary::default();
+    let mut log_auc = 0.0;
+    let mut log_brier = 0.0;
+    let mut gam_auc = 0.0;
+    let mut gam_brier = 0.0;
+    for f in folds {
+        let train_rows = &rows[f.train_start..f.train_end];
+        let valid_rows = &rows[f.valid_start..f.valid_end];
+        if train_rows.len() < 40 || valid_rows.len() < 20 { continue; }
+        let train_prior = train_rows.iter().filter(|r| r.label_win == 1).count() as f64 / train_rows.len() as f64;
+        let log = train_logistic(train_rows, whitelist, Some(valid_rows), log_cfg);
+        let (gam_model, _) = train_gam(train_rows, gam_cfg);
+        let y_valid: Vec<i32> = valid_rows.iter().map(|r| r.label_win).collect();
+        let p_gam: Vec<f64> = valid_rows.iter().map(|r| gam_model.predict_p(r)).collect();
+        let gam_metrics = compute_metrics_with_baseline(&y_valid, &p_gam, train_prior);
+        if let Some(metrics) = log.metrics_valid {
+            log_auc += metrics.auc;
+            log_brier += metrics.brier;
+            gam_auc += gam_metrics.auc;
+            gam_brier += gam_metrics.brier;
+            out.folds_used += 1;
+        }
+    }
+    if out.folds_used > 0 {
+        let n = out.folds_used as f64;
+        out.logistic_auc = log_auc / n;
+        out.logistic_brier = log_brier / n;
+        out.gam_auc = gam_auc / n;
+        out.gam_brier = gam_brier / n;
+    }
+    out
 }
 
 

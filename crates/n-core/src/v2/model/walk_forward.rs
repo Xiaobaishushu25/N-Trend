@@ -26,7 +26,9 @@ pub fn walk_forward(n: usize, n_splits: usize) -> Vec<Fold> {
     folds.into_iter().filter(|f| f.train_end - f.train_start >= 10 && f.valid_end > f.valid_start).collect()
 }
 
-/// Purge-aware walk-forward: adjusts fold boundaries so train_last_ts < valid_first_ts
+/// Purge-aware walk-forward: adjusts fold boundaries so no training label
+/// reaches into the validation window. The label horizon is exit_ts, not just
+/// the trigger timestamp.
 pub fn walk_forward_purge_aware(rows: &[DatasetRow], n_splits: usize) -> Vec<Fold> {
     let mut folds = walk_forward(rows.len(), n_splits);
     for f in folds.iter_mut() {
@@ -51,13 +53,30 @@ pub fn walk_forward_purge_aware(rows: &[DatasetRow], n_splits: usize) -> Vec<Fol
             let next_ts = rows.get(f.valid_end).and_then(|r| r.trigger_bar_ts.as_deref()).unwrap_or("");
             if !cur_ts.is_empty() && cur_ts == next_ts { f.valid_end += 1; } else { break; }
         }
+        // Purge every training row whose realized label horizon overlaps the
+        // first validation trigger. This prevents a trade opened before the
+        // split from leaking its future outcome into validation.
+        if f.valid_start < rows.len() {
+            if let Some(valid_ts) = rows[f.valid_start].trigger_bar_ts.as_deref() {
+                let first_overlapping = (f.train_start..f.train_end).find(|idx| {
+                    let row = &rows[*idx];
+                    let label_end = row.exit_ts.as_deref().or(row.trigger_bar_ts.as_deref());
+                    label_end.map(|ts| ts >= valid_ts).unwrap_or(true)
+                });
+                // Keep the training interval contiguous. If an earlier row
+                // has a longer label horizon than a later row, truncating
+                // only the suffix would leave an interior leakage row.
+                if let Some(idx) = first_overlapping { f.train_end = idx; }
+            }
+        }
     }
     // re-filter after adjustments (may have empty valid)
     folds.into_iter().filter(|f| f.valid_start < f.valid_end && f.train_end - f.train_start >= 5).collect()
 }
 
-/// Expanding walk-forward with purge gap: ensure train last trigger_bar_ts < valid first trigger_bar_ts
-/// Returns error if purge violated (time leakage).
+/// Expanding walk-forward with purge gap: ensure every training label ends
+/// before the first validation trigger (and preserve the trigger ordering
+/// invariant). Returns an error if purge is violated.
 pub fn assert_purge(rows: &[DatasetRow], folds: &[Fold]) -> Result<()> {
     for f in folds {
         if f.train_end == 0 { continue; }
@@ -66,8 +85,12 @@ pub fn assert_purge(rows: &[DatasetRow], folds: &[Fold]) -> Result<()> {
         if !train_last.is_empty() && !valid_first.is_empty() && train_last >= valid_first {
             return Err(anyhow!("purge violated: train_last {} >= valid_first {} in fold {:?}", train_last, valid_first, f));
         }
-        // also ensure no overlap in event_id
-        // outcome strictly after trigger already guaranteed by leakage test
+        for row in &rows[f.train_start..f.train_end] {
+            let label_end = row.exit_ts.as_deref().or(row.trigger_bar_ts.as_deref()).unwrap_or("");
+            if !label_end.is_empty() && !valid_first.is_empty() && label_end >= valid_first {
+                return Err(anyhow!("label horizon overlaps validation: exit {} >= valid {} in fold {:?}", label_end, valid_first, f));
+            }
+        }
     }
     Ok(())
 }
@@ -83,7 +106,7 @@ mod tests {
     use super::*;
     use crate::v2::dataset::DatasetRow;
     fn mk_row(ts: &str) -> DatasetRow {
-        DatasetRow { event_id: ts.into(), symbol: "RB".into(), direction: "up".into(), setup_quality: 3.0, a_move: 10.0, b_move: 5.0, a_move_atr: 2.0, b_move_atr: 1.0, a_speed: 1.0, retracement: 0.5, warning_volume_ratio: Some(1.0), trigger_close_overshoot_r: Some(0.2), trigger_close_location: Some(0.5), trigger_body_atr: Some(1.0), trigger_volume_ratio: Some(1.0), trigger_wick_atr: Some(0.1), internal_swing_margin_r: Some(0.2), chase_distance_r: Some(0.1), missing_mask: 0, label_win: 1, r_multiple: Some(1.0), is_1r_aux_win: Some(true), trigger_bar_ts: Some(ts.into()), exit_ts: Some("2025-01-02 10:00:00".into()), schema_version: "v2.1".into() }
+        DatasetRow { event_id: ts.into(), symbol: "RB".into(), direction: "up".into(), setup_quality: 3.0, a_move: 10.0, b_move: 5.0, a_move_atr: 2.0, b_move_atr: 1.0, a_speed: 1.0, retracement: 0.5, warning_volume_ratio: Some(1.0), trigger_close_overshoot_r: Some(0.2), trigger_close_location: Some(0.5), trigger_body_atr: Some(1.0), trigger_volume_ratio: Some(1.0), trigger_wick_atr: Some(0.1), internal_swing_margin_r: Some(0.2), chase_distance_r: Some(0.1), missing_mask: 0, label_win: 1, r_multiple: Some(1.0), is_1r_aux_win: Some(true), trigger_bar_ts: Some(ts.into()), exit_ts: Some("2024-01-01 11:00:00".into()), schema_version: "v2.1".into() }
     }
     #[test]
     fn walk_forward_basic() {
@@ -104,6 +127,19 @@ mod tests {
         let folds = vec![Fold{train_start:0,train_end:1,valid_start:1,valid_end:2}];
         // train_last = 2024-01-02, valid_first = 2024-01-01 => violation
         assert!(assert_purge(&rows, &folds).is_err());
+    }
+
+    #[test]
+    fn purge_reduces_training_end_for_overlapping_label() {
+        let mut rows = vec![
+            mk_row("2024-01-01 10:00:00"),
+            mk_row("2024-01-02 10:00:00"),
+            mk_row("2024-01-03 10:00:00"),
+            mk_row("2024-01-04 10:00:00"),
+        ];
+        rows[1].exit_ts = Some("2024-01-03 12:00:00".into());
+        let folds = walk_forward_purge_aware(&rows, 2);
+        assert!(folds.iter().all(|f| assert_purge(&rows, std::slice::from_ref(f)).is_ok()));
     }
 }
 

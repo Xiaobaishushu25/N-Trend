@@ -160,14 +160,6 @@ impl ReplayEngine {
                     };
                     if touched { trigger_idx = Some(j); break; }
                 }
-                // fallback: pure level touch without close beyond (keep some recall if scoring strict)
-                if trigger_idx.is_none() {
-                    for j in start_idx+1..=end {
-                        let b = &bars15[j];
-                        let touched2 = if is_long { b.high >= ev.trigger_level - 1e-9 } else { b.low <= ev.trigger_level + 1e-9 };
-                        if touched2 { trigger_idx = Some(j); break; }
-                    }
-                }
                 if let Some(ti) = trigger_idx {
                     let tb = &bars15[ti];
                     let risk = ev.risk.abs().max(1e-9);
@@ -188,11 +180,25 @@ impl ReplayEngine {
                     let look = (ti+1 + self.config.stop_target_lookahead).min(bars15.len());
                     for k in ti+1..look {
                         let b = &bars15[k];
-                        // check stop first
                         let hit_stop = if is_long { b.low <= ev.stop } else { b.high >= ev.stop };
                         let hit_target = if is_long { b.high >= ev.target } else { b.low <= ev.target };
-                        if hit_stop { exit = Some((k, ev.stop, "stop")); break; }
-                        if hit_target { exit = Some((k, ev.target, "target")); break; }
+                        match (hit_stop, hit_target) {
+                            (true, false) => { exit = Some((k, ev.stop, "stop")); break; }
+                            (false, true) => { exit = Some((k, ev.target, "target")); break; }
+                            (false, false) => {}
+                            (true, true) => {
+                                // A 15m OHLC bar cannot tell us which level
+                                // was reached first. Resolve it from the raw
+                                // 5m bars; if one 5m bar hits both levels,
+                                // leave the label unknown instead of forcing a
+                                // false loss/win into the training set.
+                                match resolve_intrabar_exit(raw5m, &b.dt, ev.stop, ev.target, is_long) {
+                                    IntrabarExit::Stop => { exit = Some((k, ev.stop, "stop")); break; }
+                                    IntrabarExit::Target => { exit = Some((k, ev.target, "target")); break; }
+                                    IntrabarExit::Ambiguous => { exit = None; break; }
+                                }
+                            }
+                        }
                     }
                     if let Some((ei, ep, reason)) = exit {
                         let r_mult = if is_long { (ep - entry_price)/risk } else { (entry_price - ep)/risk };
@@ -218,6 +224,30 @@ impl ReplayEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntrabarExit { Stop, Target, Ambiguous }
+
+/// Resolve a same-15m-bar stop/target collision in chronological 5m order.
+/// A missing or intrinsically ambiguous 5m sequence is deliberately treated
+/// as unknown so DatasetBuilder excludes it from supervised training labels.
+fn resolve_intrabar_exit(raw5m: &[Kline], bucket: &crate::analyze::model::DT, stop: f64, target: f64, is_long: bool) -> IntrabarExit {
+    for k in raw5m {
+        let Some(dt) = crate::analyze::model::DT::from_bar_ts(&k.datetime) else { continue; };
+        if dt.year != bucket.year || dt.month != bucket.month || dt.day != bucket.day || dt.hour != bucket.hour || dt.minute / 15 != bucket.minute / 15 {
+            continue;
+        }
+        let hit_stop = if is_long { k.low <= stop } else { k.high >= stop };
+        let hit_target = if is_long { k.high >= target } else { k.low <= target };
+        match (hit_stop, hit_target) {
+            (true, true) => return IntrabarExit::Ambiguous,
+            (true, false) => return IntrabarExit::Stop,
+            (false, true) => return IntrabarExit::Target,
+            (false, false) => {}
+        }
+    }
+    IntrabarExit::Ambiguous
+}
+
 fn bar_ts_matches(bar_ts: &str, dto_ts: &str) -> bool {
     // dto ts is "YYYY-MM-DD HH:MM" without seconds, bar_ts is "YYYY-MM-DD HH:MM:SS"
     bar_ts == dto_ts || bar_ts.starts_with(dto_ts) || format!("{}:00", dto_ts) == bar_ts
@@ -238,6 +268,25 @@ mod tests {
         let eng = ReplayEngine::default_engine();
         let v = eng.replay_history("test", &[]).unwrap();
         assert!(v.is_empty());
+    }
+
+    fn kline(ts: &str, high: f64, low: f64) -> Kline {
+        Kline { datetime: ts.into(), open: 100.0, high, low, close: 100.0, volume: 1.0, hold: 0.0 }
+    }
+
+    #[test]
+    fn same_15m_bar_is_resolved_by_5m_order() {
+        let bucket = crate::analyze::model::DT::from_bar_ts("2025-01-01 10:00:00").unwrap();
+        let raw = vec![kline("2025-01-01 10:00:00", 101.0, 99.0), kline("2025-01-01 10:05:00", 102.0, 100.5)];
+        assert_eq!(resolve_intrabar_exit(&raw, &bucket, 99.5, 101.5, true), IntrabarExit::Stop);
+        assert_eq!(resolve_intrabar_exit(&raw, &bucket, 98.5, 100.5, true), IntrabarExit::Target);
+    }
+
+    #[test]
+    fn same_5m_bar_is_ambiguous() {
+        let bucket = crate::analyze::model::DT::from_bar_ts("2025-01-01 10:00:00").unwrap();
+        let raw = vec![kline("2025-01-01 10:00:00", 102.0, 98.0)];
+        assert_eq!(resolve_intrabar_exit(&raw, &bucket, 99.5, 101.5, true), IntrabarExit::Ambiguous);
     }
 }
 

@@ -40,6 +40,7 @@ impl StandardScaler {
 
 pub fn get_feature(row: &DatasetRow, name: &str) -> Option<f64> {
     match name {
+        "direction_num" => Some(if row.direction == "up" { 1.0 } else { -1.0 }),
         "a_move_atr" => Some(row.a_move_atr),
         "b_move_atr" => Some(row.b_move_atr),
         "a_speed" => Some(row.a_speed),

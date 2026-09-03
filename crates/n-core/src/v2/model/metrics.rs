@@ -86,12 +86,24 @@ pub fn top20_lift(y_true: &[i32], p_pred: &[f64]) -> f64 {
 }
 
 pub fn compute_metrics(y_true: &[i32], p_pred: &[f64]) -> Metrics {
+    let observed_prior = if y_true.is_empty() { 0.5 } else {
+        y_true.iter().filter(|y| **y == 1).count() as f64 / y_true.len() as f64
+    };
+    compute_metrics_with_baseline(y_true, p_pred, observed_prior)
+}
+
+/// Compute metrics against an explicitly supplied baseline prior.
+///
+/// The model's validation/test baseline must come from the training window,
+/// not from the labels being evaluated. `compute_metrics` remains as a
+/// backwards-compatible convenience for standalone metric tests.
+pub fn compute_metrics_with_baseline(y_true: &[i32], p_pred: &[f64], baseline_prior: f64) -> Metrics {
     let n = y_true.len();
     let brier = brier_score(y_true, p_pred);
     let ll = logloss(y_true, p_pred);
     let auc_v = auc(y_true, p_pred);
     let acc = accuracy(y_true, p_pred);
-    let win_rate = if n>0 { y_true.iter().filter(|y| **y==1).count() as f64 / n as f64 } else { 0.5 };
+    let win_rate = if n > 0 { baseline_prior.clamp(1e-6, 1.0 - 1e-6) } else { 0.5 };
     let const_pred = vec![win_rate; n];
     let baseline_brier = brier_score(y_true, &const_pred);
     let baseline_logloss = logloss(y_true, &const_pred);
