@@ -56,6 +56,17 @@ async fn main() -> Result<()> {
             let engine = ReplayEngine::new(ReplayConfig::default());
             let mut all_events = Vec::new();
             for sym in &symbols {
+                let symbol_meta = db
+                    .query_one(Statement::from_string(
+                        DbBackend::Sqlite,
+                        format!("SELECT tick_size, variety FROM symbols WHERE code='{}'", sym.replace("'", "''")),
+                    ))
+                    .await
+                    .ok()
+                    .flatten();
+                let stored_tick = symbol_meta.as_ref().and_then(|r| r.try_get::<f64>("", "tick_size").ok()).unwrap_or(0.0);
+                let variety = symbol_meta.as_ref().and_then(|r| r.try_get::<String>("", "variety").ok()).unwrap_or_default();
+                let tick = n_core::precision::effective_tick(stored_tick, sym, &variety);
                 let sql = if let Some(ref f) = from_arg {
                     format!("SELECT ts, open, high, low, close, volume, hold FROM klines WHERE symbol='{}' AND timeframe='5m' AND source='raw' AND ts >= '{}' ORDER BY ts ASC", sym.replace("'","''"), f.replace("'","''"))
                 } else {
@@ -74,7 +85,7 @@ async fn main() -> Result<()> {
                     let hold: f64 = r.try_get("","hold").unwrap_or(0.0);
                     raw5m.push(n_core::fetch::kline::Kline{ datetime: ts, open, high, low, close, volume, hold });
                 }
-                if let Ok(evts) = engine.replay_history(sym, &raw5m) {
+                if let Ok(evts) = engine.replay_history(sym, &raw5m, tick) {
                     real_events_total += evts.len();
                     all_events.extend(evts);
                 }
@@ -91,7 +102,7 @@ async fn main() -> Result<()> {
         // Synthetic smoke fallback for CI when DB empty
         let engine = ReplayEngine::new(ReplayConfig::default());
         let synthetic_raw: Vec<n_core::fetch::kline::Kline> = vec![];
-        let _ = engine.replay_history("RB2501", &synthetic_raw).unwrap();
+        let _ = engine.replay_history("RB2501", &synthetic_raw, 1.0).unwrap();
         println!("WARN: no real rows — using synthetic empty for CI");
         builder.build(vec![])
     };

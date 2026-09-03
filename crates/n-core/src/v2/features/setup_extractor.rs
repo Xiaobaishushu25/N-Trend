@@ -57,11 +57,11 @@ pub fn extract_setup_features(
         let upper = b.high - b.open.max(b.close);
         let lower = b.open.min(b.close) - b.low;
         let wick = if body > 1e-9 { upper.max(lower) / body } else { 0.0 };
-        // volume ratio vs simple 20-bar mean
-        let start = pattern.s2.index.saturating_sub(20);
-        let mean_vol: f64 = bars15[start..pattern.s2.index].iter().map(|x| x.volume).sum::<f64>() / 20.0_f64.max(1.0);
-        let vr = if mean_vol > 1e-9 { b.volume / mean_vol } else { 1.0 };
-        (Some(cl), Some(ba), Some(wick), Some(vr))
+        // Keep live/replay volume semantics in one place.  In particular,
+        // do not divide by a fixed 20 when the window contains missing
+        // volume observations.
+        let vr = crate::analyze::outcome::vol_ratio_at(bars15, pattern.s2.index);
+        (Some(cl), Some(ba), Some(wick), vr)
     } else { (None, None, None, None) };
 
     let mut mask = 0u32;

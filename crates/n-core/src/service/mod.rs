@@ -240,6 +240,12 @@ async fn insert_warning_event(
         "dim_warning": candidate.dim_warning,
         "trend_state": candidate.trend_state,
         "trend_bonus": candidate.trend_bonus,
+        // Persist provenance so retrospective predictions can be separated
+        // from events created by older logic/feature/execution contracts.
+        "event_logic_version": EVENT_LOGIC_VERSION,
+        "pattern_version": crate::v2::PATTERN_LOGIC_VERSION,
+        "execution_version": crate::v2::EXECUTION_VERSION,
+        "feature_schema_version": crate::v2::FEATURE_SCHEMA_VERSION,
     })
     .to_string();
     let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);

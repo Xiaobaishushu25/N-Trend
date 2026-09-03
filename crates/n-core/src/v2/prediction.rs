@@ -27,6 +27,8 @@ pub struct BackfillResult {
     pub events_seen: usize,
     pub events_scored: usize,
     pub predictions_written: usize,
+    pub current_cohort_events: usize,
+    pub legacy_cohort_events: usize,
 }
 
 fn json_f64_array(value: &serde_json::Value, key: &str) -> Option<Vec<f64>> {
@@ -135,6 +137,24 @@ fn find_bar_index(bars: &[Bar], ts: &str) -> Option<usize> {
     })
 }
 
+fn event_dim_string(event: &pattern_events::Model, key: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(&event.entry_score_dims)
+        .ok()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn is_current_event_cohort(event: &pattern_events::Model) -> bool {
+    event_dim_string(event, "event_logic_version").as_deref() == Some("5")
+        && event_dim_string(event, "pattern_version").as_deref()
+            == Some(crate::v2::PATTERN_LOGIC_VERSION)
+        && event_dim_string(event, "execution_version").as_deref()
+            == Some(crate::v2::EXECUTION_VERSION)
+        && event_dim_string(event, "feature_schema_version").as_deref()
+            == Some(crate::v2::FEATURE_SCHEMA_VERSION)
+}
+
 /// Convert a persisted forward event into the exact feature shape consumed by
 /// the trained models.  Trigger features are calculated only from the closed
 /// trigger bar and bars before it.
@@ -142,9 +162,8 @@ pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Op
     let trigger_ts = event.trigger_bar_ts.as_deref()?;
     let trigger_index = find_bar_index(bars, trigger_ts)?;
     let trigger_bar = bars.get(trigger_index)?;
-    let atr = indicators::atr(bars, ATR_PERIOD)
-        .get(trigger_index)
-        .and_then(|value| *value);
+    let atr_series = indicators::atr(bars, ATR_PERIOD);
+    let atr = atr_series.get(trigger_index).and_then(|value| *value);
     let trigger_volume = event
         .trigger_volume_ratio
         .or_else(|| outcome::vol_ratio_at(bars, trigger_index));
@@ -160,11 +179,29 @@ pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Op
     );
 
     let s1_index = find_bar_index(bars, &event.s1_ts);
+    let s2_index = find_bar_index(bars, &event.s2_ts);
+    let warning_index = find_bar_index(bars, &event.warning_ts).or(s2_index);
     let a_atr = s1_index
-        .and_then(|index| indicators::atr(bars, ATR_PERIOD).get(index).and_then(|value| *value))
+        .and_then(|index| atr_series.get(index).and_then(|value| *value))
         .unwrap_or(0.0);
-    let warning_volume = find_bar_index(bars, &event.warning_ts)
-        .and_then(|index| outcome::vol_ratio_at(bars, index));
+    let b_atr = s2_index
+        .and_then(|index| atr_series.get(index).and_then(|value| *value))
+        .unwrap_or(0.0);
+    let warning_volume = warning_index.and_then(|index| outcome::vol_ratio_at(bars, index));
+    let (warning_close_location, warning_body_atr, warning_wick_ratio) =
+        warning_index
+            .and_then(|index| bars.get(index).map(|bar| {
+                let range = (bar.high - bar.low).max(1e-9);
+                let body = (bar.close - bar.open).abs();
+                let upper = bar.high - bar.open.max(bar.close);
+                let lower = bar.open.min(bar.close) - bar.low;
+                (
+                    Some((bar.close - bar.low) / range),
+                    Some(body / b_atr.max(1e-9)),
+                    Some(if body > 1e-9 { upper.max(lower) / body } else { 0.0 }),
+                )
+            }))
+            .unwrap_or((None, None, None));
     let mut setup = SetupFeatures {
         a_move: event.a_move,
         b_move: event.b_move,
@@ -181,18 +218,16 @@ pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Op
         } else {
             0.0
         },
-        // Keep this aligned with the current replay trainer, which leaves the
-        // B-leg ATR feature at zero for replay-built rows.
-        b_move_atr: 0.0,
+        b_move_atr: if b_atr > 1e-9 { event.b_move / b_atr } else { 0.0 },
         grade: event.grade.clone(),
         level: event.level.clone(),
         direction: event.direction.clone(),
         a_strong_count: 0,
         setup_quality: event.entry_score,
-        trend60_state: String::new(),
-        warning_close_location: None,
-        warning_body_atr: None,
-        warning_wick_ratio: None,
+        trend60_state: event_dim_string(event, "trend_state").unwrap_or_default(),
+        warning_close_location,
+        warning_body_atr,
+        warning_wick_ratio,
         warning_volume_ratio: warning_volume,
         normalized: false,
         missing_mask: 0,
@@ -305,14 +340,26 @@ pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
     }
 
     let mut by_symbol: HashMap<String, Vec<pattern_events::Model>> = HashMap::new();
+    let mut current_cohort_events = 0usize;
+    let mut legacy_cohort_events = 0usize;
     for event in events {
         if event.trigger_bar_ts.is_some() {
+            if is_current_event_cohort(&event) {
+                // Keep these counts visible to callers so application
+                // retrospective stats can report current and legacy cohorts
+                // separately instead of silently mixing them.
+                current_cohort_events += 1;
+            } else {
+                legacy_cohort_events += 1;
+            }
             by_symbol.entry(event.symbol.clone()).or_default().push(event);
         }
     }
 
     let mut result = BackfillResult {
         models: bundles.len(),
+        current_cohort_events,
+        legacy_cohort_events,
         ..Default::default()
     };
     for (symbol, events) in by_symbol {

@@ -53,6 +53,17 @@ async fn main() -> Result<()> {
         let engine = ReplayEngine::new(ReplayConfig::default());
         let mut all_events = Vec::new();
         for sym in &symbols_to_run {
+            let symbol_meta = db
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT tick_size, variety FROM symbols WHERE code='{}'", sym.replace("'", "''")),
+                ))
+                .await
+                .ok()
+                .flatten();
+            let stored_tick = symbol_meta.as_ref().and_then(|r| r.try_get::<f64>("", "tick_size").ok()).unwrap_or(0.0);
+            let variety = symbol_meta.as_ref().and_then(|r| r.try_get::<String>("", "variety").ok()).unwrap_or_default();
+            let tick = n_core::precision::effective_tick(stored_tick, sym, &variety);
             let sql = if let Some(ref f) = from {
                 format!("SELECT ts, open, high, low, close, volume, hold FROM klines WHERE symbol='{}' AND timeframe='5m' AND source='raw' AND ts >= '{}' ORDER BY ts ASC", sym.replace("'","''"), f.replace("'","''"))
             } else {
@@ -71,7 +82,7 @@ async fn main() -> Result<()> {
                 let hold: f64 = r.try_get("","hold").unwrap_or(0.0);
                 raw5m.push(n_core::fetch::kline::Kline{ datetime: ts, open, high, low, close, volume, hold });
             }
-            if let Ok(evts) = engine.replay_history(sym, &raw5m) {
+            if let Ok(evts) = engine.replay_history(sym, &raw5m, tick) {
                 real_events += evts.len();
                 all_events.extend(evts);
             }
@@ -118,8 +129,16 @@ async fn main() -> Result<()> {
     let gam_cfg = GamTrainConfig::default();
     let wf = evaluate_walk_forward(&rows, &folds, &whitelist, &cfg, &gam_cfg);
     println!(
-        "walk-forward evaluated {} folds: Logistic AUC {:.3} Brier {:.3}; GAM AUC {:.3} Brier {:.3}",
-        wf.folds_used, wf.logistic_auc, wf.logistic_brier, wf.gam_auc, wf.gam_brier
+        "walk-forward evaluated {} folds: Logistic pooled AUC {:.3} Brier {:.3} (median {:.3}, worst {:.3}); GAM pooled AUC {:.3} Brier {:.3} (median {:.3}, worst {:.3})",
+        wf.folds_used,
+        wf.logistic_auc,
+        wf.logistic_brier,
+        wf.logistic_median_auc,
+        wf.logistic_worst_auc,
+        wf.gam_auc,
+        wf.gam_brier,
+        wf.gam_median_auc,
+        wf.gam_worst_auc
     );
     let log_out = train_logistic(train_rows, &whitelist, Some(test_rows), &cfg);
     println!("Logistic train AUC {:.3} Brier {:.3} logloss {:.3} lift {:.2}", log_out.metrics_train.auc, log_out.metrics_train.brier, log_out.metrics_train.logloss, log_out.metrics_train.top20_lift);
@@ -169,7 +188,7 @@ async fn main() -> Result<()> {
     md.push_str(&format!("- Train: AUC {:.3} Brier {:.3}\n", gam_metrics.auc, gam_metrics.brier));
     md.push_str(&format!("- Test:  AUC {:.3} Brier {:.3} lift {:.2} vs logistic valid AUC {:.3}\n", gam_test_metrics.auc, gam_test_metrics.brier, gam_test_metrics.top20_lift, log_out.metrics_valid.as_ref().map(|m| m.auc).unwrap_or(0.0)));
     md.push_str(&format!("\n- Walk-forward folds: {} (evaluated {}) — purge PASS\n", folds.len(), wf.folds_used));
-    md.push_str(&format!("- Walk-forward mean: Logistic AUC {:.3} Brier {:.3}; GAM AUC {:.3} Brier {:.3}\n", wf.logistic_auc, wf.logistic_brier, wf.gam_auc, wf.gam_brier));
+    md.push_str(&format!("- Walk-forward pooled OOF: Logistic AUC {:.3} Brier {:.3} (median fold AUC {:.3}, worst fold AUC {:.3}); GAM AUC {:.3} Brier {:.3} (median fold AUC {:.3}, worst fold AUC {:.3})\n", wf.logistic_auc, wf.logistic_brier, wf.logistic_median_auc, wf.logistic_worst_auc, wf.gam_auc, wf.gam_brier, wf.gam_median_auc, wf.gam_worst_auc));
     md.push_str("- Notes: Logistic is the current champion by policy; GAM is diagnostic only until it passes a dedicated out-of-time review. Metrics use the training-window prior as baseline. Pure Rust, no Python.\n");
     let lift_ok = log_out.metrics_valid.as_ref().map(|m| m.top20_lift > 1.0).unwrap_or(true);
     md.push_str(&format!("\n- Acceptance: lift>1.0 is {} ({}), leakage PASS, hash reproducible PASS\n", if lift_ok {"PASS"} else {"WARN"}, log_out.metrics_valid.as_ref().map(|m| format!("{:.2}", m.top20_lift)).unwrap_or_else(|| "n/a".into())));
@@ -179,8 +198,11 @@ async fn main() -> Result<()> {
     println!("Wrote target/v2_reports/logistic_report.md and gam_report.md");
     let backfill = n_core::v2::prediction::backfill(&db).await?;
     println!(
-        "V2 predictions: {} events scored, {} rows written",
-        backfill.events_scored, backfill.predictions_written
+        "V2 predictions: {} events scored, {} rows written; cohort current={} legacy={}",
+        backfill.events_scored,
+        backfill.predictions_written,
+        backfill.current_cohort_events,
+        backfill.legacy_cohort_events
     );
     Ok(())
 }
@@ -192,6 +214,18 @@ struct WalkForwardSummary {
     logistic_brier: f64,
     gam_auc: f64,
     gam_brier: f64,
+    logistic_median_auc: f64,
+    logistic_worst_auc: f64,
+    gam_median_auc: f64,
+    gam_worst_auc: f64,
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.5;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    values[values.len() / 2]
 }
 
 /// Evaluate both candidates only on forward validation windows. The final
@@ -205,10 +239,12 @@ fn evaluate_walk_forward(
     gam_cfg: &GamTrainConfig,
 ) -> WalkForwardSummary {
     let mut out = WalkForwardSummary::default();
-    let mut log_auc = 0.0;
-    let mut log_brier = 0.0;
-    let mut gam_auc = 0.0;
-    let mut gam_brier = 0.0;
+    let mut oof_y = Vec::new();
+    let mut oof_log = Vec::new();
+    let mut oof_gam = Vec::new();
+    let mut oof_prior_weight = 0.0;
+    let mut log_fold_auc = Vec::new();
+    let mut gam_fold_auc = Vec::new();
     for f in folds {
         let train_rows = &rows[f.train_start..f.train_end];
         let valid_rows = &rows[f.valid_start..f.valid_end];
@@ -220,19 +256,32 @@ fn evaluate_walk_forward(
         let p_gam: Vec<f64> = valid_rows.iter().map(|r| gam_model.predict_p(r)).collect();
         let gam_metrics = compute_metrics_with_baseline(&y_valid, &p_gam, train_prior);
         if let Some(metrics) = log.metrics_valid {
-            log_auc += metrics.auc;
-            log_brier += metrics.brier;
-            gam_auc += gam_metrics.auc;
-            gam_brier += gam_metrics.brier;
+            let valid_n = y_valid.len() as f64;
+            oof_y.extend_from_slice(&y_valid);
+            oof_log.extend(valid_rows.iter().map(|r| log.model.predict_row_p(r)));
+            oof_gam.extend(p_gam);
+            oof_prior_weight += train_prior * valid_n;
+            log_fold_auc.push(metrics.auc);
+            gam_fold_auc.push(gam_metrics.auc);
             out.folds_used += 1;
         }
     }
     if out.folds_used > 0 {
-        let n = out.folds_used as f64;
-        out.logistic_auc = log_auc / n;
-        out.logistic_brier = log_brier / n;
-        out.gam_auc = gam_auc / n;
-        out.gam_brier = gam_brier / n;
+        let prior = if oof_y.is_empty() {
+            0.5
+        } else {
+            (oof_prior_weight / oof_y.len() as f64).clamp(1e-6, 1.0 - 1e-6)
+        };
+        let log_oof = compute_metrics_with_baseline(&oof_y, &oof_log, prior);
+        let gam_oof = compute_metrics_with_baseline(&oof_y, &oof_gam, prior);
+        out.logistic_auc = log_oof.auc;
+        out.logistic_brier = log_oof.brier;
+        out.gam_auc = gam_oof.auc;
+        out.gam_brier = gam_oof.brier;
+        out.logistic_median_auc = median(&mut log_fold_auc);
+        out.logistic_worst_auc = log_fold_auc.iter().copied().fold(1.0, f64::min);
+        out.gam_median_auc = median(&mut gam_fold_auc);
+        out.gam_worst_auc = gam_fold_auc.iter().copied().fold(1.0, f64::min);
     }
     out
 }
