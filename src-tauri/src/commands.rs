@@ -1,6 +1,7 @@
 use std::time::Instant;
 use std::sync::Arc;
 
+use chrono::Local;
 use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
@@ -851,7 +852,10 @@ pub async fn get_v2_predictions(state: State<'_, Arc<AppState>>, model_id: Optio
     let sql = if let Some(mid) = model_id.filter(|s| !s.is_empty()) {
         format!("SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode FROM v2_model_predictions WHERE model_id='{}' ORDER BY predicted_at DESC LIMIT 2000", mid.replace("'","''"))
     } else {
-        "SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode FROM v2_model_predictions ORDER BY predicted_at DESC LIMIT 2000".to_string()
+        // Chart cards use the active champion only.  Keeping historical
+        // challenger rows out of this path prevents the 2000-row cap from
+        // hiding an older active event after page-open backfill is removed.
+        "SELECT p.id, p.event_id, p.model_id, p.p_win, p.logit, p.feature_hash, p.predicted_at, p.prediction_mode FROM v2_model_predictions p INNER JOIN v2_model_registry r ON r.model_id = p.model_id WHERE r.status='champion' ORDER BY p.predicted_at DESC LIMIT 2000".to_string()
     };
     let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, sql)).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -868,6 +872,31 @@ pub async fn get_v2_predictions(state: State<'_, Arc<AppState>>, model_id: Optio
         });
     }
     Ok(out)
+}
+
+/// 读取独立的收盘前预检测信号，不触发扫描。
+#[tauri::command]
+pub async fn get_active_preclose_signals(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<n_core::storage::entities::preclose_signals::Model>, String> {
+    // 页面加载/恢复时主动补结算，避免结算依赖行情轮询或定时扫描恰好成功。
+    state
+        .services
+        .reconcile_preclose_signals(Local::now().naive_local())
+        .await
+        .map_err(|e| e.to_string())?;
+    n_core::storage::repo::active_preclose_signals(&state.services.db)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_preclose_signals(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<n_core::storage::entities::preclose_signals::Model>, String> {
+    n_core::storage::repo::all_preclose_signals(&state.services.db)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

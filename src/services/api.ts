@@ -13,6 +13,7 @@ import type {
   GroupRow,
   KlineRow,
   PatternEvent,
+  PrecloseSignal,
   MarketSnapshot,
   NewNotificationHistoryItem,
   NotificationHistoryItem,
@@ -75,6 +76,8 @@ export const api = {
 
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
   getActiveEvents: () => invoke<PatternEvent[]>('get_active_events'),
+  getActivePrecloseSignals: () => invoke<PrecloseSignal[]>('get_active_preclose_signals'),
+  getPrecloseSignals: () => invoke<PrecloseSignal[]>('get_preclose_signals'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
   runScanNow: () => invoke<ScanResult>('run_scan_now'),
   runScanFastNow: () => invoke<ScanResult>('run_scan_fast_now'),
@@ -154,6 +157,10 @@ export function onEntryTrigger(cb: (hits: EntryTriggerHit[]) => void) {
   return listen<EntryTriggerHit[]>('entry-trigger', (e) => cb(e.payload))
 }
 
+export function onPrecloseSignal(cb: (signals: PrecloseSignal[]) => void) {
+  return listen<PrecloseSignal[]>('preclose-signal', (e) => cb(e.payload))
+}
+
 export function onNotificationHistoryUpdated(
   cb: (items: NotificationHistoryItem[]) => void,
 ) {
@@ -161,5 +168,4 @@ export function onNotificationHistoryUpdated(
     cb(e.payload),
   )
 }
-
 

@@ -64,6 +64,10 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
             .create_table_from_entity(entities::signal_decisions::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::preclose_signals::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     for table in tables {
@@ -77,7 +81,19 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
          ON signal_annotations(event_id)",
     )
     .await
-    .context("创建批注索引失败")?;
+        .context("创建批注索引失败")?;
+    db.execute_unprepared(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_preclose_symbol_close_event \
+         ON preclose_signals(symbol, session_close_ts, parent_event_id)",
+    )
+    .await
+    .context("创建收盘前预检测唯一索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_preclose_state_close \
+         ON preclose_signals(state, session_close_ts)",
+    )
+    .await
+    .context("创建收盘前预检测状态索引失败")?;
 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
@@ -431,6 +447,14 @@ mod tests {
                 .unwrap();
             assert!(found.is_some(), "pattern_events.{column} 应已迁移");
         }
+        let preclose = db
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='preclose_signals'",
+            ))
+            .await
+            .unwrap();
+        assert!(preclose.is_some(), "preclose_signals 应已创建");
     }
 
     #[tokio::test]

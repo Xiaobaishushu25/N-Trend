@@ -32,6 +32,12 @@ pub struct BackfillResult {
     pub legacy_cohort_events: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChampionWinRate {
+    pub model_id: String,
+    pub p_win: f64,
+}
+
 fn json_f64_array(value: &serde_json::Value, key: &str) -> Option<Vec<f64>> {
     value
         .get(key)?
@@ -373,6 +379,62 @@ pub async fn predict_event(
     Ok(written)
 }
 
+/// Return whether the event is missing a non-null prediction for any current
+/// champion model.  This is intentionally a lightweight check used by the
+/// live scan retry path; it must not trigger a historical full backfill.
+pub async fn needs_prediction(db: &DatabaseConnection, event_id: i64) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM v2_model_registry r WHERE r.status='champion' AND NOT EXISTS (SELECT 1 FROM v2_model_predictions p WHERE p.event_id={} AND p.model_id=r.model_id AND p.p_win IS NOT NULL)) AS missing",
+        event_id
+    );
+    let row = db
+        .query_one(Statement::from_string(DbBackend::Sqlite, sql))
+        .await?;
+    Ok(row
+        .and_then(|r| r.try_get::<i64>("", "missing").ok())
+        .unwrap_or(0)
+        != 0)
+}
+
+/// Read the same champion probability preferred by the signal card: logistic
+/// first when multiple scoring slots have champions, otherwise the newest row.
+pub async fn champion_win_rate(
+    db: &DatabaseConnection,
+    event_id: i64,
+) -> Result<Option<ChampionWinRate>> {
+    let sql = format!(
+        "SELECT p.model_id, p.p_win FROM v2_model_predictions p \
+         INNER JOIN v2_model_registry r ON r.model_id = p.model_id \
+         WHERE p.event_id = {} AND r.status = 'champion' AND p.p_win IS NOT NULL \
+         ORDER BY CASE WHEN p.model_id LIKE 'logistic-%' THEN 0 ELSE 1 END, \
+                  p.predicted_at DESC LIMIT 1",
+        event_id
+    );
+    let row = db
+        .query_one(Statement::from_string(DbBackend::Sqlite, sql))
+        .await?;
+    Ok(row.and_then(|row| {
+        Some(ChampionWinRate {
+            model_id: row.try_get("", "model_id").ok()?,
+            p_win: row.try_get("", "p_win").ok()?,
+        })
+    }))
+}
+
+pub async fn has_champion_model(db: &DatabaseConnection) -> Result<bool> {
+    let row = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT EXISTS(SELECT 1 FROM v2_model_registry WHERE status = 'champion') AS present"
+                .to_string(),
+        ))
+        .await?;
+    Ok(row
+        .and_then(|row| row.try_get::<i64>("", "present").ok())
+        .unwrap_or(0)
+        != 0)
+}
+
 /// Backfill missing predictions for all persisted events that have triggered.
 /// It is idempotent and only scores event/model pairs that are not present yet.
 pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
@@ -453,4 +515,38 @@ pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn champion_win_rate_matches_logistic_first_card_preference() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO v2_model_registry \
+             (model_id,name,schema_version,feature_whitelist,train_window,dataset_hash,coefficients,spline_knots,metrics,created_at,status,scoring_slot) VALUES \
+             ('gam-new','gam-v1','v1','[]','all','h1','{}',NULL,'{}','2026-09-07 10:00:00','champion','aux'), \
+             ('logistic-old','logistic-v1','v1','[]','all','h2','{}',NULL,'{}','2026-09-07 09:00:00','champion','default')",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO v2_model_predictions \
+             (event_id,model_id,p_win,logit,feature_hash,predicted_at,prediction_mode) VALUES \
+             (42,'gam-new',0.81,1.4,'f1','2026-09-07T10:00:00Z','live'), \
+             (42,'logistic-old',0.64,0.6,'f2','2026-09-07T09:00:00Z','live')",
+        )
+        .await
+        .unwrap();
+
+        assert!(has_champion_model(&db).await.unwrap());
+        let rate = champion_win_rate(&db, 42).await.unwrap().unwrap();
+        assert_eq!(rate.model_id, "logistic-old");
+        assert_eq!(rate.p_win, 0.64);
+        assert!(champion_win_rate(&db, 7).await.unwrap().is_none());
+    }
 }

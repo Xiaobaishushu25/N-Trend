@@ -191,6 +191,48 @@ pub mod pattern_events {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 收盘前预检测事件。独立于正式 pattern_events，避免污染正式信号统计。
+pub mod preclose_signals {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "preclose_signals")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub direction: String,
+        pub session_close_ts: String,
+        pub emitted_at: String,
+        pub reference_price: f64,
+        pub parent_event_id: i64,
+        pub entry: f64,
+        pub stop: f64,
+        pub target: f64,
+        pub risk: f64,
+        /// precheck / confirmed / invalidated / superseded / observed
+        pub state: String,
+        pub confirmed_at: Option<String>,
+        pub invalid_reason: Option<String>,
+        pub next_open_ts: Option<String>,
+        pub next_open_price: Option<f64>,
+        pub gap_pct: Option<f64>,
+        pub mfe_r: Option<f64>,
+        pub mae_r: Option<f64>,
+        pub outcome: Option<String>,
+        pub outcome_ts: Option<String>,
+        pub horizon_minutes: i64,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// 连续合约换月记录：5m 断点时间为主键，确认后标记断点后第一根 bar 为换月。
 pub mod rollovers {
     use sea_orm::entity::prelude::*;

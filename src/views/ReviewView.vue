@@ -9,6 +9,7 @@ import {
   NEmpty,
   NInput,
   NInputNumber,
+  NIcon,
   NSelect,
   NSpace,
   NTag,
@@ -26,6 +27,7 @@ import {
   type StatsScopeKey,
 } from '../stores/review'
 import { notify } from '../utils/notify'
+import { ChevronDown, ChevronUp } from '@vicons/tabler'
 import type { GroupStat, OpenReviewChartPayload, OutcomeDetail, V2ModelRow } from '../types'
 
 const review = useReviewStore()
@@ -40,6 +42,8 @@ const v2Columns: any = [
 const loading = ref(false)
 const rebuilding = ref(false)
 const error = ref('')
+/** V2 预测表属于诊断明细，默认收起，避免挤压下方复盘统计和最近信号明细 */
+const showV2Details = ref(false)
 /** 品种筛选本地输入（防抖后再生效） */
 const symbolInput = ref('')
 /** 评分区间筛选：上下限为空表示不限制 */
@@ -586,9 +590,26 @@ onBeforeUnmount(() => {
       </n-text>
     </n-card>
 
-    <n-card size="small" class="v2-card" style="margin-bottom: 16px">
+    <n-card size="small" class="v2-card">
       <template #header>
-        <span style="font-weight: 600">V2 概率模型 <span style="font-weight:400;color:#97a0b3;font-size:12px">Setup 形态评分不含触发K · Trigger K 收盘冻结</span></span>
+        <div class="v2-header">
+          <div>
+            <span class="v2-title">V2 概率模型</span>
+            <span class="v2-subtitle">根据信号特征估计单个信号的 P(win)，不是复盘总胜率</span>
+          </div>
+          <n-button
+            v-if="review.v2Predictions.length || review.v2Report"
+            secondary
+            size="small"
+            class="v2-toggle"
+            @click="showV2Details = !showV2Details"
+          >
+            <template #icon>
+              <n-icon :component="showV2Details ? ChevronUp : ChevronDown" />
+            </template>
+            {{ showV2Details ? '收起模型明细' : '展开模型明细' }}
+          </n-button>
+        </div>
       </template>
       <n-space vertical :size="12">
         <n-space align="center" :size="8" wrap>
@@ -605,17 +626,23 @@ onBeforeUnmount(() => {
           <n-tag v-if="review.v2Models.length" type="info" size="small">{{ review.v2Models.length }} 个模型</n-tag>
           <n-tag v-else type="warning" size="small">暂无模型，请先运行 v2-train</n-tag>
         </n-space>
-        <n-text v-if="review.v2Report" depth="3" style="font-size:12px;white-space:pre-wrap;max-height:220px;overflow:auto;display:block;background:#f8f9fb;padding:8px;border-radius:6px">{{ (review.v2Report["logistic_report.md"] || review.v2Report["acceptance.md"] || "").slice(0, 4000) || "暂无报告" }}</n-text>
-        <n-data-table
-          v-if="review.v2Predictions.length"
-          :columns="v2Columns"
-          :data="review.v2Predictions"
-          :pagination="{ pageSize: 8 }"
-          size="small"
-          striped
-          style="margin-top: 4px"
-        />
-        <n-text depth="3" style="font-size:11px">说明：Setup 阶段只用警示K冻结的形态/A段/B段/回撤特征，不包含Trigger K；Trigger特征在K收盘时冻结，无未来泄漏；P(win)为纯Rust Logistic/GAM推理，详见docs/v2_spec.md</n-text>
+        <div v-if="showV2Details" class="v2-details">
+          <n-text v-if="review.v2Report" depth="3" class="v2-report">
+            {{ (review.v2Report["logistic_report.md"] || review.v2Report["acceptance.md"] || "").slice(0, 4000) || "暂无报告" }}
+          </n-text>
+          <n-data-table
+            v-if="review.v2Predictions.length"
+            :columns="v2Columns"
+            :data="review.v2Predictions"
+            :pagination="{ pageSize: 5 }"
+            size="small"
+            striped
+          />
+          <n-empty v-else description="暂无模型预测" />
+          <n-text depth="3" class="v2-help">
+            Setup 阶段只使用警示K冻结的形态、A段、B段和回撤特征；Trigger K 收盘后才冻结触发特征，不使用未来数据。P(win) 是模型对单个信号的概率推理，模型报告仅用于训练/验收诊断。
+          </n-text>
+        </div>
       </n-space>
     </n-card>
 
@@ -819,6 +846,12 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 .overall-card {
   flex: none;
@@ -834,8 +867,8 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 .details-card {
-  flex: 1;
-  min-height: 0;
+  flex: 1 1 260px;
+  min-height: 220px;
   display: flex;
   flex-direction: column;
 }
@@ -867,4 +900,46 @@ onBeforeUnmount(() => {
   font-variant-numeric: tabular-nums;
 }
 .v2-card { flex: none; }
+.v2-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.v2-title {
+  font-weight: 600;
+}
+.v2-subtitle {
+  margin-left: 8px;
+  color: #97a0b3;
+  font-size: 12px;
+  font-weight: 400;
+}
+.v2-toggle {
+  flex: none;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.v2-details {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 2px;
+}
+.v2-report {
+  display: block;
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: #f8f9fb;
+  white-space: pre-wrap;
+  font-size: 12px;
+  scrollbar-width: thin;
+}
+.v2-help {
+  font-size: 11px;
+  line-height: 1.6;
+}
 </style>

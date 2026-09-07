@@ -18,4 +18,6 @@ tmp_*.csv
 temp_stats2.py
 read_zhihu.mjs
 zhihu_screenshot.png
+*.db
+ntrend.db
 

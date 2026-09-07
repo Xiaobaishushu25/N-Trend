@@ -211,6 +211,12 @@ mod tests {
         assert!(is_valid_5m_slot("RB0", &dt("2026-08-28 23:00:00")));
         assert!(!is_valid_5m_slot("RB0", &dt("2026-08-28 23:05:00")));
 
+        // 01:00 收盘品种（不锈钢 SS0）：23:05 后仍属于正常夜盘
+        assert!(is_valid_5m_slot("SS0", &dt("2026-08-28 23:05:00")));
+        assert!(is_valid_5m_slot("SS0", &dt("2026-08-29 00:55:00")));
+        assert!(is_valid_5m_slot("SS0", &dt("2026-08-29 01:00:00")));
+        assert!(!is_valid_5m_slot("SS0", &dt("2026-08-29 01:05:00")));
+
         // 02:30 收盘品种（黄金 AU0）
         assert!(is_valid_5m_slot("AU0", &dt("2026-08-28 23:30:00")));
         assert!(is_valid_5m_slot("AU0", &dt("2026-08-29 01:00:00"))); // 周六凌晨 01:00

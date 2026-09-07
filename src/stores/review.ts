@@ -63,8 +63,6 @@ export const useReviewStore = defineStore('review', {
       this.statsScope = scope ?? this.statsScope
       this.loading = true
       try {
-        // 训练只登记模型；打开复盘页时补齐已有触发事件的预测记录。
-        await api.backfillV2Predictions().catch(() => null)
         const [stats, v2Models, v2Report] = await Promise.all([
           api.getReviewStats(
             this.dimension,

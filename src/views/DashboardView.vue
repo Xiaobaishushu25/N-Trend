@@ -24,7 +24,7 @@ import {
   Settings,
   Trash,
 } from '@vicons/tabler'
-import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataUpdated, onPrecloseSignal, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useGroupsStore } from '../stores/groups'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
@@ -33,7 +33,8 @@ import { useActionsStore } from '../stores/actions'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
-import type { GroupRow, MarketSnapshot, PatternEvent, SymbolRow } from '../types'
+import ReorderToggle from '../components/ReorderToggle.vue'
+import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseSignal, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
 defineOptions({ name: 'DashboardView' })
@@ -56,6 +57,15 @@ interface WatchRow {
 }
 
 const rows = ref<WatchRow[]>([])
+const precloseSignals = ref<PrecloseSignal[]>([])
+const precloseClock = ref(Date.now())
+const visiblePrecloseSignals = computed(() => precloseSignals.value.filter((signal) => {
+  if (signal.state === 'confirmed') return true
+  if (signal.state !== 'precheck') return false
+  const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
+  return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
+}))
+let precloseTimer: ReturnType<typeof setInterval> | null = null
 const loading = ref(false)
 const groupModal = ref<'create' | 'manage' | null>(null)
 const newGroupName = ref('')
@@ -134,10 +144,12 @@ async function loadAll() {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
     }
     // 信号（缓存秒级）与行情快照并行，互不阻塞
-    const [signals, snapshots] = await Promise.all([
+    const [signals, snapshots, preclose] = await Promise.all([
       scansStore.refreshLatestSignals().then(() => scansStore.latestSignals),
       api.getMarketSnapshot().catch(() => [] as MarketSnapshot[]),
+      api.getActivePrecloseSignals().catch(() => [] as PrecloseSignal[]),
     ])
+    precloseSignals.value = preclose
     const bySymbol = new Map<string, PatternEvent[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
@@ -626,6 +638,13 @@ function patternLabel(s: PatternEvent) {
   return `${dirLabel(s)} ${levelLabel(s)}${s.level === 'box' ? '' : 'N'}`
 }
 
+function precloseCountdown(signal: PrecloseSignal) {
+  if (signal.state !== 'precheck') return signal.session_close_ts.slice(11, 16)
+  const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
+  const seconds = Math.max(0, Math.floor((closeMs - precloseClock.value) / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
 /** 状态胶囊的短标签（与 K 线图左侧品种列表一致） */
 function stateLabel(state: string) {
   switch (state) {
@@ -828,6 +847,7 @@ const columns: DataTableColumns<WatchRow> = [
 ]
 
 onMounted(async () => {
+  precloseTimer = setInterval(() => { precloseClock.value = Date.now() }, 1000)
   // 设置与分组并行加载，不串行阻塞首绘
   const settingsP = settingsStore.load().catch(() => {})
   const groupsP = groupsStore.load().catch(() => {})
@@ -843,6 +863,21 @@ onMounted(async () => {
     }),
   )
   unlisteners.push(await onQuotesUpdated(applyQuotes))
+  unlisteners.push(await onPrecloseSignal((updates) => {
+    const byId = new Map(precloseSignals.value.map((x) => [x.id, x]))
+    for (const update of updates) {
+      const old = byId.get(update.id)
+      if (update.state === 'precheck' || update.state === 'confirmed') {
+        byId.set(update.id, update)
+      } else {
+        byId.delete(update.id)
+      }
+      if (!old && update.state === 'precheck' && settingsStore.settings.preclose.in_app_notify) {
+        notify.info(`${update.symbol} 收盘前预检测：${update.direction === 'up' ? '做多' : '做空'}，来源正式候选 #${update.parent_event_id}`, { duration: 8000 })
+      }
+    }
+    precloseSignals.value = [...byId.values()].sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
+  }))
   // 扫描完成时同步更新内存里的最新扫描结果，避免图表页「全部N形态」停留在旧扫描
   unlisteners.push(
     await onScanCompleted((result) => {
@@ -891,6 +926,8 @@ onActivated(() => {
 })
 
 onBeforeUnmount(() => {
+  if (precloseTimer) clearInterval(precloseTimer)
+  precloseTimer = null
   tableSortable?.destroy()
   tableSortable = null
   for (const timer of flashTimers.values()) clearTimeout(timer)
@@ -901,6 +938,18 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="page">
+    <div v-if="visiblePrecloseSignals.length" class="preclose-strip">
+      <span class="preclose-strip-title">收盘前预检测</span>
+      <span
+        v-for="signal in visiblePrecloseSignals.slice(0, 4)"
+        :key="signal.id"
+        class="preclose-chip"
+        :class="`is-${signal.state}`"
+      >
+        {{ signal.symbol }} {{ signal.direction === 'up' ? '多' : '空' }} ·
+        {{ signal.state === 'precheck' ? `距收盘 ${precloseCountdown(signal)} · 预检测` : signal.state === 'confirmed' ? '已确认' : signal.state === 'observed' ? `开盘${signal.outcome || '已观察'}` : signal.state }}
+      </span>
+    </div>
     <div class="group-bar">
       <n-tabs
         :value="groupsStore.selectedId == null ? 'all' : String(groupsStore.selectedId)"
@@ -915,15 +964,10 @@ onBeforeUnmount(() => {
         </template>
       </n-tabs>
       <n-space align="center" :size="8">
-        <div class="reorder-control-dash" :class="{ 'is-enabled': tableReorderEnabled }" :title="tableReorderEnabled ? '已开启拖拽排序 · 拖动行可重排' : '已关闭拖拽 · 开启后可拖动表格行排序'">
-          <n-icon :component="GripVertical" class="reorder-icon-dash" :size="14" />
-          <span class="reorder-label-dash">拖拽排序</span>
-          <n-switch v-model:value="tableReorderEnabled" size="small" :rail-style="() => ({ background: tableReorderEnabled ? '#3b82f6' : undefined })">
-            <template #checked>开</template>
-            <template #unchecked>关</template>
-          </n-switch>
-          <span class="reorder-state-dash" :class="{ on: tableReorderEnabled }">{{ tableReorderEnabled ? '已开启' : '已关闭' }}</span>
-        </div>
+        <ReorderToggle
+          v-model="tableReorderEnabled"
+          title="拖拽排序开关；开启后可拖动表格行排序"
+        />
         <n-text depth="3" style="font-size: 12px">双击行打开K线图</n-text>
         <n-button size="small" type="primary" ghost @click="openCreateGroup">
           <template #icon>
@@ -1087,6 +1131,35 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.preclose-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 12px;
+  margin-bottom: 8px;
+  border: 1px solid rgba(22, 119, 255, 0.14);
+  border-radius: 8px;
+  background: linear-gradient(90deg, rgba(22, 119, 255, 0.06), rgba(15, 157, 88, 0.04));
+  overflow: hidden;
+}
+.preclose-strip-title {
+  color: #1677ff;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.preclose-chip {
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #475569;
+  background: rgba(148, 163, 184, 0.12);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.preclose-chip.is-precheck { color: #b45309; background: rgba(245, 158, 11, 0.13); }
+.preclose-chip.is-confirmed { color: #1677ff; background: rgba(22, 119, 255, 0.12); }
+.preclose-chip.is-observed { color: #0f9d58; background: rgba(15, 157, 88, 0.12); }
 .page {
   display: flex;
   flex-direction: column;
@@ -1095,54 +1168,6 @@ onBeforeUnmount(() => {
   min-height: 0;
 }
 
-.reorder-control-dash {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 5px 10px 5px 9px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 999px;
-  transition: all 0.2s ease;
-  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
-}
-.reorder-control-dash:hover {
-  border-color: #cbd5e1;
-  background: #f1f5f9;
-}
-.reorder-control-dash.is-enabled {
-  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-  border-color: #93c5fd;
-  box-shadow: 0 1px 6px rgba(59,130,246,0.18);
-}
-.reorder-control-dash .reorder-icon-dash {
-  color: #94a3b8;
-  transition: color 0.2s;
-  flex: none;
-}
-.reorder-control-dash.is-enabled .reorder-icon-dash {
-  color: #3b82f6;
-}
-.reorder-label-dash {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: #475569;
-  white-space: nowrap;
-  letter-spacing: 0.2px;
-}
-.reorder-control-dash.is-enabled .reorder-label-dash {
-  color: #1e40af;
-}
-.reorder-state-dash {
-  font-size: 11px;
-  font-weight: 600;
-  color: #94a3b8;
-  white-space: nowrap;
-  min-width: 36px;
-}
-.reorder-state-dash.on {
-  color: #2563eb;
-}
 .group-bar {
   display: flex;
   align-items: center;

@@ -180,6 +180,7 @@ class TqDataWorker:
         self.cmd_queue = queue.Queue(maxsize=256)
         self.command_ids = itertools.count(1)
         self.connected = False
+        self.startup_error: Optional[str] = None
         self.last_update_time = 0.0
         self.last_market_event_at = 0.0
         self.events = deque(maxlen=2048)
@@ -205,7 +206,11 @@ class TqDataWorker:
             self.connected = True
             logger.info("TqApi WebSocket connection established successfully!")
         except Exception as e:
-            logger.error("Failed to initialize TqApi: %s", e)
+            error_message = f"{type(e).__name__}: {e}"
+            if self.password:
+                error_message = error_message.replace(self.password, "***")
+            self.startup_error = error_message
+            logger.error("Failed to initialize TqApi: %s", error_message)
             self.connected = False
             return
 
@@ -605,13 +610,34 @@ worker: Optional[TqDataWorker] = None
 
 async def handle_health(request: web.Request) -> web.Response:
     global worker
-    if not worker or not worker.running or not worker.connected:
+    if not worker or not worker.running:
         return web.json_response({
             "service": SERVICE_NAME,
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "fatal": False,
             "reason": "TianQin worker is not initialized or connected"
+        }, status=503)
+
+    if worker.startup_error:
+        return web.json_response({
+            "service": SERVICE_NAME,
+            "pid": os.getpid(),
+            "status": "error",
+            "tq_connected": False,
+            "fatal": True,
+            "reason": f"TqApi initialization failed: {worker.startup_error}"
+        }, status=503)
+
+    if not worker.connected:
+        return web.json_response({
+            "service": SERVICE_NAME,
+            "pid": os.getpid(),
+            "status": "starting",
+            "tq_connected": False,
+            "fatal": False,
+            "reason": "TqApi connection is still initializing"
         }, status=503)
 
     if not worker.thread or not worker.thread.is_alive():
@@ -620,6 +646,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "fatal": True,
             "reason": "TianQin worker thread is dead"
         }, status=503)
 
@@ -673,6 +700,7 @@ async def handle_health(request: web.Request) -> web.Response:
         "stream_id": STREAM_ID,
         "status": "stale" if stale else "ok",
         "tq_connected": True,
+        "fatal": False,
         "worker_alive": True,
         "quotes_cached": len(worker.quotes),
         "klines_cached": len(worker.klines),

@@ -1,8 +1,8 @@
 //! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
 use anyhow::{anyhow, Result};
-use chrono::{NaiveDateTime, Timelike};
-use sea_orm::{DatabaseConnection, Set};
+use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
+use sea_orm::{DatabaseConnection, NotSet, Set};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use crate::fetch::kline::Kline;
 use crate::fetch::{ClosedBarEvent, HybridDataSource, MarketDataSource, SinaClient, TqBridgeClient};
 use crate::process::SidecarManager;
 use crate::scheduler::SchedulerConfig;
-use crate::storage::entities::{klines, pattern_events, symbols};
+use crate::storage::entities::{klines, pattern_events, preclose_signals, symbols};
 use crate::storage::repo;
 
 pub mod pipeline;
@@ -710,6 +710,19 @@ fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn parse_local_ts(value: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
+        .ok()
+}
+
+fn preclose_horizon_covered(bars: &[klines::Model], horizon_end: NaiveDateTime) -> bool {
+    bars.last()
+        .and_then(|bar| parse_local_ts(&bar.ts))
+        .map(|ts| ts >= horizon_end)
+        .unwrap_or(false)
+}
+
 fn bar_ts(bar: &Bar) -> String {
     bar.dt.to_bar_ts()
 }
@@ -1155,6 +1168,12 @@ pub struct EntryTriggerHit {
     pub latest: f64,
 }
 
+/// 收盘前预检测状态变更。payload 直接使用独立表模型，前端可按 state 渲染。
+#[derive(Debug, Clone, Serialize)]
+pub struct PrecloseSignalUpdate {
+    pub signal: preclose_signals::Model,
+}
+
 /// 计算综合新浪接口限流参数：综合历史K线抓取与实时行情轮询的最小间隔和分钟预算。
 pub fn coordinator_limits_from_config(config: &Config) -> (u64, usize) {
     let interval_ms = config
@@ -1177,6 +1196,8 @@ pub struct Services {
     config_path: std::path::PathBuf,
     /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
+    /// 收盘前检测节流：复用3秒行情快照，但最多每10秒扫描一次候选事件。
+    preclose_last_tick: Mutex<Option<Instant>>,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
     /// 月合约 5m K 线缓存：同一品种换月确认短时间不重复抓取
@@ -1249,6 +1270,7 @@ impl Services {
             config: config_arc,
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
+            preclose_last_tick: Mutex::new(None),
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
@@ -1357,13 +1379,17 @@ impl Services {
 
     /// 每次行情轮询后对比最新价与形态入场点：做空最新价跌破入场点、做多最新价突破入场点
     /// 即视为命中；同一形态只通知一次（跨轮询、跨扫描都不重复）。
-    /// 两个触发价通知开关都关闭时不检测。
+    /// 应用内、系统和邮件触发通知都关闭时不检测。
     pub async fn entry_trigger_hits(
         &self,
         snapshots: &[MarketSnapshot],
     ) -> Result<Vec<EntryTriggerHit>> {
         let cfg = self.config().await;
-        if !cfg.notify.in_app_entry_trigger && !cfg.notify.system_entry_trigger {
+        let email_trigger_enabled = cfg.email.enabled && cfg.email.sendable();
+        if !cfg.notify.in_app_entry_trigger
+            && !cfg.notify.system_entry_trigger
+            && !email_trigger_enabled
+        {
             return Ok(Vec::new());
         }
         let min_score = cfg.notify.new_pattern_min_score;
@@ -1407,8 +1433,31 @@ impl Services {
                 next.trigger_ts = Some(now.clone());
                 next.trigger_price = Some(row.entry);
                 next.updated_at = now;
-                if let Err(e) = repo::update_pattern_event(&self.db, next).await {
+                // The quote path can be the first path that confirms a
+                // trigger.  Advance the event against the latest closed 15m
+                // bars so trigger features are frozen consistently with the
+                // scan path, then score it immediately when a trigger bar is
+                // available.  If the current 15m bar is not closed yet, the
+                // next closed-bar scan retries the missing prediction.
+                let bars = match self.bars_for(&row.symbol, "15m").await {
+                    Ok(bars) => Some(bars),
+                    Err(e) => {
+                        tracing::warn!("实时触发读取15m K线失败 {} {}: {e}", row.symbol, row.id);
+                        None
+                    }
+                };
+                if let Some(bars) = bars.as_deref() {
+                    let _ = advance_event_model(&mut next, bars);
+                }
+                next.updated_at = now_ts();
+                if let Err(e) = repo::update_pattern_event(&self.db, next.clone()).await {
                     tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
+                } else if let Some(bars) = bars.as_deref() {
+                    if next.trigger_bar_ts.is_some() {
+                        if let Err(e) = crate::v2::prediction::predict_event(&self.db, &next, bars).await {
+                            tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {e:#}");
+                        }
+                    }
                 }
                 hits.push(EntryTriggerHit {
                     event_id: row.id,
@@ -1423,6 +1472,281 @@ impl Services {
             }
         }
         Ok(hits)
+    }
+
+    /// 在品种所属交易时段收盘前，对已有 pending 候选做一次轻量预检测。
+    /// 不读取未收盘15m K线，不触发完整扫描；数据库唯一索引负责跨轮询去重。
+    pub async fn preclose_tick(
+        &self,
+        snapshots: &[MarketSnapshot],
+    ) -> Result<Vec<preclose_signals::Model>> {
+        let cfg = self.config().await;
+        {
+            let mut last_tick = self.preclose_last_tick.lock().await;
+            if last_tick.map(|value| value.elapsed() < Duration::from_secs(10)).unwrap_or(false) {
+                return Ok(Vec::new());
+            }
+            *last_tick = Some(Instant::now());
+        }
+        let now = Local::now();
+        let now_naive = now.naive_local();
+        let lead_secs = match cfg.preclose.lead_secs {
+            120 | 180 => cfg.preclose.lead_secs,
+            _ => 180,
+        } as i64;
+        let mut changed = self.reconcile_preclose_signals(now_naive).await?;
+        // 关闭开关只禁止生成新预检测；已有记录仍需完成确认、失效和观察结算。
+        if !cfg.preclose.enabled {
+            return Ok(changed);
+        }
+        let latest_by_symbol: HashMap<&str, f64> = snapshots
+            .iter()
+            .filter_map(|s| s.latest.map(|price| (s.code.as_str(), price)))
+            .collect();
+        if latest_by_symbol.is_empty() {
+            return Ok(changed);
+        }
+
+        let min_score = cfg.notify.new_pattern_min_score;
+        let events = repo::all_pattern_events(&self.db).await?;
+        let mut selected: HashMap<(String, String), pattern_events::Model> = HashMap::new();
+        for event in events.into_iter().filter(|e| {
+            e.state == "pending" && e.trigger_ts.is_none() && e.entry_score >= min_score
+        }) {
+            let Some(&_latest) = latest_by_symbol.get(event.symbol.as_str()) else {
+                continue;
+            };
+            if !crate::session::SessionCalendar::is_trading_time(&event.symbol, &now) {
+                continue;
+            }
+            let Some(close) = crate::session::SessionCalendar::next_session_close(
+                &event.symbol,
+                &now_naive,
+            ) else {
+                continue;
+            };
+            let remaining = (close - now_naive).num_seconds();
+            if !(0..=lead_secs).contains(&remaining) {
+                continue;
+            }
+            let key = (event.symbol.clone(), close.format("%Y-%m-%d %H:%M:%S").to_string());
+            let replace = selected
+                .get(&key)
+                .map(|old| event.entry_score > old.entry_score)
+                .unwrap_or(true);
+            if replace {
+                selected.insert(key, event);
+            }
+        }
+
+        for ((symbol, close_ts), event) in selected {
+            let Some(reference_price) = latest_by_symbol.get(symbol.as_str()).copied() else {
+                continue;
+            };
+            if repo::preclose_signal_by_key(&self.db, &symbol, &close_ts, event.id)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let timestamp = now_ts();
+            let model = preclose_signals::ActiveModel {
+                id: NotSet,
+                symbol: Set(symbol.clone()),
+                direction: Set(event.direction.clone()),
+                session_close_ts: Set(close_ts.clone()),
+                emitted_at: Set(timestamp.clone()),
+                reference_price: Set(reference_price),
+                parent_event_id: Set(event.id),
+                entry: Set(event.entry),
+                stop: Set(event.stop),
+                target: Set(event.target),
+                risk: Set(event.risk),
+                state: Set("precheck".to_string()),
+                confirmed_at: Set(None),
+                invalid_reason: Set(None),
+                next_open_ts: Set(None),
+                next_open_price: Set(None),
+                gap_pct: Set(None),
+                mfe_r: Set(None),
+                mae_r: Set(None),
+                outcome: Set(None),
+                outcome_ts: Set(None),
+                horizon_minutes: Set(cfg.preclose.horizon_minutes.clamp(5, 240) as i64),
+                created_at: Set(timestamp.clone()),
+                updated_at: Set(timestamp),
+            };
+            match repo::insert_preclose_signal(&self.db, model).await {
+                Ok(id) => {
+                    if let Some(row) = repo::preclose_signal_by_key(
+                        &self.db,
+                        &symbol,
+                        &close_ts,
+                        event.id,
+                    )
+                    .await?
+                    {
+                        tracing::info!(symbol, event_id = event.id, preclose_id = id, "收盘前预检测信号已生成");
+                        changed.push(row);
+                    }
+                }
+                Err(error) => {
+                    // 多个行情/调度路径并发时，唯一索引冲突等价于已生成，不能阻断行情轮询。
+                    tracing::debug!(symbol, event_id = event.id, "收盘前预检测写入跳过: {error:#}");
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// 收盘结算后确认/失效预检测，并在下一交易时段数据到齐后记录开盘观察结果。
+    pub async fn reconcile_preclose_signals(
+        &self,
+        now: NaiveDateTime,
+    ) -> Result<Vec<preclose_signals::Model>> {
+        let mut changed = Vec::new();
+        for mut row in repo::active_preclose_signals(&self.db).await? {
+            let Some(close) = parse_local_ts(&row.session_close_ts) else {
+                continue;
+            };
+            let parent = repo::pattern_event_by_id(&self.db, row.parent_event_id).await?;
+            let Some(parent) = parent else {
+                row.state = "invalidated".to_string();
+                row.invalid_reason = Some("关联正式候选已不存在".to_string());
+                row.updated_at = now_ts();
+                repo::update_preclose_signal(&self.db, row.clone()).await?;
+                changed.push(row);
+                continue;
+            };
+            let next_state = if parent.state == "triggered"
+                && parent
+                    .trigger_ts
+                    .as_deref()
+                    .and_then(parse_local_ts)
+                    .map(|ts| ts <= close)
+                    .unwrap_or(false)
+            {
+                Some(("superseded", Some("正式信号已提前触发".to_string())))
+            } else if parent.state == "expired" || parent.state == "closed" {
+                Some(("invalidated", Some(format!("正式候选状态为 {}", parent.state))))
+            } else if row.state == "precheck" && now >= close + ChronoDuration::seconds(80) {
+                row.confirmed_at = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
+                Some(("confirmed", None))
+            } else {
+                None
+            };
+            if let Some((state, reason)) = next_state {
+                row.state = state.to_string();
+                row.invalid_reason = reason;
+                row.updated_at = now_ts();
+                repo::update_preclose_signal(&self.db, row.clone()).await?;
+                changed.push(row.clone());
+            }
+            if row.state == "confirmed" {
+                if self.observe_preclose_outcome(&mut row, now).await? {
+                    repo::update_preclose_signal(&self.db, row.clone()).await?;
+                    changed.push(row);
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn observe_preclose_outcome(
+        &self,
+        row: &mut preclose_signals::Model,
+        now: NaiveDateTime,
+    ) -> Result<bool> {
+        let before = (
+            row.next_open_ts.clone(),
+            row.next_open_price,
+            row.gap_pct,
+            row.mfe_r,
+            row.mae_r,
+            row.outcome.clone(),
+            row.state.clone(),
+        );
+        let bars = repo::klines(&self.db, &row.symbol, "5m", Some(500), None).await?;
+        let Some(close) = parse_local_ts(&row.session_close_ts) else {
+            return Ok(false);
+        };
+        let Some(open_idx) = bars.iter().position(|bar| {
+            parse_local_ts(&bar.ts).map(|ts| ts > close).unwrap_or(false)
+        }) else {
+            return Ok(false);
+        };
+        let open_bar = &bars[open_idx];
+        let Some(open_ts) = parse_local_ts(&open_bar.ts) else {
+            return Ok(false);
+        };
+        let horizon_end = open_ts + ChronoDuration::minutes(row.horizon_minutes.max(5));
+        let window: Vec<&klines::Model> = bars[open_idx..]
+            .iter()
+            .filter(|bar| parse_local_ts(&bar.ts).map(|ts| ts < horizon_end).unwrap_or(false))
+            .collect();
+        if window.is_empty() {
+            return Ok(false);
+        }
+        row.next_open_ts = Some(open_bar.ts.clone());
+        row.next_open_price = Some(open_bar.open);
+        if row.reference_price.abs() > f64::EPSILON {
+            row.gap_pct = Some((open_bar.open - row.reference_price) / row.reference_price * 100.0);
+        }
+        let (mfe, mae) = if row.direction == "down" {
+            let favorable = window.iter().map(|bar| row.entry - bar.low).fold(0.0, f64::max);
+            let adverse = window.iter().map(|bar| bar.high - row.entry).fold(0.0, f64::max);
+            (favorable, adverse)
+        } else {
+            let favorable = window.iter().map(|bar| bar.high - row.entry).fold(0.0, f64::max);
+            let adverse = window.iter().map(|bar| row.entry - bar.low).fold(0.0, f64::max);
+            (favorable, adverse)
+        };
+        if row.risk.abs() > f64::EPSILON {
+            row.mfe_r = Some(mfe / row.risk.abs());
+            row.mae_r = Some(mae / row.risk.abs());
+        }
+        // window 刻意只包含 horizon_end 之前的观察 K 线，因此不能用 window.last()
+        // 判断数据是否已覆盖完整窗口；应检查完整取数结果中的最新 K 线。
+        let horizon_covered = preclose_horizon_covered(&bars, horizon_end);
+        if row.outcome.is_none() && now >= horizon_end && horizon_covered {
+            let mut outcome = "timeout";
+            for bar in &window {
+                let (hit_target, hit_stop) = if row.direction == "down" {
+                    (bar.low <= row.target, bar.high >= row.stop)
+                } else {
+                    (bar.high >= row.target, bar.low <= row.stop)
+                };
+                if hit_target && hit_stop {
+                    outcome = "ambiguous";
+                    break;
+                }
+                if hit_target {
+                    outcome = "win";
+                    break;
+                }
+                if hit_stop {
+                    outcome = "loss";
+                    break;
+                }
+            }
+            row.outcome = Some(outcome.to_string());
+            row.outcome_ts = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
+            row.state = "observed".to_string();
+        }
+        let after = (
+            row.next_open_ts.clone(),
+            row.next_open_price,
+            row.gap_pct,
+            row.mfe_r,
+            row.mae_r,
+            row.outcome.clone(),
+            row.state.clone(),
+        );
+        let values_changed = before != after;
+        if values_changed {
+            row.updated_at = now_ts();
+        }
+        Ok(values_changed)
     }
 
     /// 更新启用的K线周期列表：去重并过滤未知周期，为空时回退为全部；仅落盘不重建限速器。
@@ -2462,15 +2786,36 @@ impl Services {
             let events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
             for mut e in events {
                 let was_triggered = e.trigger_ts.is_some();
+                let had_trigger_bar = e.trigger_bar_ts.is_some();
                 let changed = advance_event_model(&mut e, &bars15);
                 if changed {
                     repo::update_pattern_event(&self.db, e.clone()).await?;
                 }
-                if !was_triggered && e.trigger_ts.is_some() {
+                // Quote-triggered events may already have trigger_ts before
+                // the first closed 15m bar is available.  Retry only this
+                // event when its trigger bar becomes available or its
+                // champion prediction is missing; never run a full backfill
+                // from the scan/UI hot path.
+                let needs_prediction = if e.state == "triggered"
+                    && e.trigger_ts.is_some()
+                    && e.trigger_bar_ts.is_some()
+                {
+                    crate::v2::prediction::needs_prediction(&self.db, e.id).await.unwrap_or(false)
+                } else {
+                    false
+                };
+                if e.trigger_ts.is_some()
+                    && e.trigger_bar_ts.is_some()
+                    && ((!was_triggered && e.trigger_ts.is_some())
+                        || (!had_trigger_bar && e.trigger_bar_ts.is_some())
+                        || needs_prediction)
+                {
                     if let Err(error) = crate::v2::prediction::predict_event(&self.db, &e, &bars15).await {
                         tracing::warn!(event_id = e.id, "V2 实时预测写入失败: {error:#}");
                     }
-                    newly_triggered.push(e.clone());
+                    if !was_triggered {
+                        newly_triggered.push(e.clone());
+                    }
                 }
                 signals.push(e);
             }
@@ -3486,6 +3831,18 @@ mod tests {
             failed: Vec::new(),
             single_bars: Vec::new(),
         }
+    }
+
+    #[test]
+    fn preclose_observation_waits_until_horizon_is_covered() {
+        let horizon_end = parse_local_ts("2026-09-07 10:00:00").unwrap();
+        let before_end = vec![kline_model("2026-09-07 09:55:00")];
+        let at_end = vec![
+            kline_model("2026-09-07 09:55:00"),
+            kline_model("2026-09-07 10:00:00"),
+        ];
+        assert!(!preclose_horizon_covered(&before_end, horizon_end));
+        assert!(preclose_horizon_covered(&at_end, horizon_end));
     }
 
     #[test]

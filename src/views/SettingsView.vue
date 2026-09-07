@@ -451,6 +451,39 @@ onMounted(async () => {
             </div>
           </div>
 
+          <label class="section-title">收盘前预检测</label>
+          <div class="setting-card">
+            <div class="setting-card-row">
+              <div class="row-label">
+                启用收盘前预检测
+                <Tip text="仅对已有 pending 正式候选提前提醒，不生成新的多空方向，也不计入正式信号胜率。" />
+              </div>
+              <n-switch v-model:value="form.preclose.enabled" />
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">提前检测时间</div>
+              <n-radio-group v-model:value="form.preclose.lead_secs">
+                <n-radio-button :value="120">提前2分钟</n-radio-button>
+                <n-radio-button :value="180">提前3分钟</n-radio-button>
+              </n-radio-group>
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">开盘观察窗口</div>
+              <n-input-number
+                v-model:value="form.preclose.horizon_minutes"
+                :min="5"
+                :max="240"
+                :step="5"
+                style="width: 160px"
+              />
+              <n-text depth="3">分钟</n-text>
+            </div>
+            <div class="setting-card-row">
+              <div class="row-label">应用内预检测提醒</div>
+              <n-switch v-model:value="form.preclose.in_app_notify" />
+            </div>
+          </div>
+
           <label class="section-title">邮件通知</label>
           <div class="setting-card">
             <div class="setting-card-row">

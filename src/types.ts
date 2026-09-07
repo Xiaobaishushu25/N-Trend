@@ -179,6 +179,33 @@ export interface PatternEvent {
   updated_at: string
 }
 
+export interface PrecloseSignal {
+  id: number
+  symbol: string
+  direction: string
+  session_close_ts: string
+  emitted_at: string
+  reference_price: number
+  parent_event_id: number
+  entry: number
+  stop: number
+  target: number
+  risk: number
+  state: 'precheck' | 'confirmed' | 'invalidated' | 'superseded' | 'observed' | string
+  confirmed_at: string | null
+  invalid_reason: string | null
+  next_open_ts: string | null
+  next_open_price: number | null
+  gap_pct: number | null
+  mfe_r: number | null
+  mae_r: number | null
+  outcome: 'win' | 'loss' | 'timeout' | 'ambiguous' | string | null
+  outcome_ts: string | null
+  horizon_minutes: number
+  created_at: string
+  updated_at: string
+}
+
 export interface SymbolFailure {
   symbol: string
   reason: string
@@ -262,6 +289,14 @@ export interface NotifyConfig {
   system_entry_trigger: boolean
 }
 
+export interface PrecloseConfig {
+  schema_version: number
+  enabled: boolean
+  lead_secs: number
+  horizon_minutes: number
+  in_app_notify: boolean
+}
+
 export interface LogConfig {
   level: string
 }
@@ -309,6 +344,7 @@ export interface Config {
   quote: QuoteConfig
   email: EmailSettings
   notify: NotifyConfig
+  preclose: PrecloseConfig
   log: LogConfig
   ui: UiConfig
   data_source: DataSourceConfig

@@ -10,8 +10,8 @@ use sea_orm::{
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
-    bar_finality_trials, bar_observations, groups, klines, pattern_events, rollovers, settings,
-    signal_annotations, signal_decisions, symbol_groups, symbols,
+    bar_finality_trials, bar_observations, groups, klines, pattern_events, preclose_signals,
+    rollovers, settings, signal_annotations, signal_decisions, symbol_groups, symbols,
 };
 
 /// Move a trained model through the lifecycle registry.  Promotion is
@@ -796,6 +796,86 @@ pub async fn insert_pattern_event(
     Ok(res.last_insert_id)
 }
 
+pub async fn insert_preclose_signal(
+    db: &DatabaseConnection,
+    row: preclose_signals::ActiveModel,
+) -> Result<i64> {
+    let res = preclose_signals::Entity::insert(row)
+        .exec(db)
+        .await
+        .context("写入收盘前预检测事件失败")?;
+    Ok(res.last_insert_id)
+}
+
+pub async fn preclose_signal_by_key(
+    db: &DatabaseConnection,
+    symbol: &str,
+    session_close_ts: &str,
+    parent_event_id: i64,
+) -> Result<Option<preclose_signals::Model>> {
+    Ok(preclose_signals::Entity::find()
+        .filter(preclose_signals::Column::Symbol.eq(symbol))
+        .filter(preclose_signals::Column::SessionCloseTs.eq(session_close_ts))
+        .filter(preclose_signals::Column::ParentEventId.eq(parent_event_id))
+        .one(db)
+        .await
+        .context("查询收盘前预检测事件失败")?)
+}
+
+pub async fn active_preclose_signals(
+    db: &DatabaseConnection,
+) -> Result<Vec<preclose_signals::Model>> {
+    Ok(preclose_signals::Entity::find()
+        .filter(preclose_signals::Column::State.is_in(["precheck", "confirmed"]))
+        .order_by_desc(preclose_signals::Column::EmittedAt)
+        .all(db)
+        .await
+        .context("查询有效收盘前预检测事件失败")?)
+}
+
+pub async fn all_preclose_signals(
+    db: &DatabaseConnection,
+) -> Result<Vec<preclose_signals::Model>> {
+    Ok(preclose_signals::Entity::find()
+        .order_by_desc(preclose_signals::Column::EmittedAt)
+        .all(db)
+        .await
+        .context("查询收盘前预检测事件失败")?)
+}
+
+pub async fn update_preclose_signal(
+    db: &DatabaseConnection,
+    row: preclose_signals::Model,
+) -> Result<()> {
+    // Model -> ActiveModel 会把所有字段标记为 Unchanged；若直接 update，SeaORM
+    // 会把它当作 no-op 并返回数据库里的旧值。显式 Set 所有会被状态机修改的字段。
+    let state = row.state.clone();
+    let confirmed_at = row.confirmed_at.clone();
+    let invalid_reason = row.invalid_reason.clone();
+    let next_open_ts = row.next_open_ts.clone();
+    let next_open_price = row.next_open_price;
+    let gap_pct = row.gap_pct;
+    let mfe_r = row.mfe_r;
+    let mae_r = row.mae_r;
+    let outcome = row.outcome.clone();
+    let outcome_ts = row.outcome_ts.clone();
+    let updated_at = row.updated_at.clone();
+    let mut model: preclose_signals::ActiveModel = row.into();
+    model.state = Set(state);
+    model.confirmed_at = Set(confirmed_at);
+    model.invalid_reason = Set(invalid_reason);
+    model.next_open_ts = Set(next_open_ts);
+    model.next_open_price = Set(next_open_price);
+    model.gap_pct = Set(gap_pct);
+    model.mfe_r = Set(mfe_r);
+    model.mae_r = Set(mae_r);
+    model.outcome = Set(outcome);
+    model.outcome_ts = Set(outcome_ts);
+    model.updated_at = Set(updated_at);
+    model.update(db).await.context("更新收盘前预检测事件失败")?;
+    Ok(())
+}
+
 /// 全部信号事件（复盘统计用）。
 pub async fn all_pattern_events(db: &DatabaseConnection) -> Result<Vec<pattern_events::Model>> {
     Ok(pattern_events::Entity::find()
@@ -1463,6 +1543,71 @@ mod tests {
         let limited = klines(&db, "RB0", "5m", Some(1), None).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].ts, "2026-08-03 09:05:00");
+    }
+
+    #[tokio::test]
+    async fn update_preclose_signal_persists_state_machine_fields() {
+        let db = test_db().await;
+        let id = insert_preclose_signal(
+            &db,
+            preclose_signals::ActiveModel {
+                id: sea_orm::NotSet,
+                symbol: Set("SA0".to_string()),
+                direction: Set("up".to_string()),
+                session_close_ts: Set("2026-09-04 23:30:00".to_string()),
+                emitted_at: Set("2026-09-04 23:27:00".to_string()),
+                reference_price: Set(1200.0),
+                parent_event_id: Set(1559),
+                entry: Set(1201.0),
+                stop: Set(1191.0),
+                target: Set(1221.0),
+                risk: Set(10.0),
+                state: Set("precheck".to_string()),
+                confirmed_at: Set(None),
+                invalid_reason: Set(None),
+                next_open_ts: Set(None),
+                next_open_price: Set(None),
+                gap_pct: Set(None),
+                mfe_r: Set(None),
+                mae_r: Set(None),
+                outcome: Set(None),
+                outcome_ts: Set(None),
+                horizon_minutes: Set(60),
+                created_at: Set("2026-09-04 23:27:00".to_string()),
+                updated_at: Set("2026-09-04 23:27:00".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut row = preclose_signals::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        row.state = "observed".to_string();
+        row.confirmed_at = Some("2026-09-04 23:31:20".to_string());
+        row.next_open_ts = Some("2026-09-07 09:00:00".to_string());
+        row.next_open_price = Some(1205.0);
+        row.gap_pct = Some(0.5);
+        row.mfe_r = Some(1.2);
+        row.mae_r = Some(0.3);
+        row.outcome = Some("win".to_string());
+        row.outcome_ts = Some("2026-09-07 10:00:00".to_string());
+        row.updated_at = "2026-09-07 10:00:00".to_string();
+        update_preclose_signal(&db, row).await.unwrap();
+
+        let saved = preclose_signals::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, "observed");
+        assert_eq!(saved.confirmed_at.as_deref(), Some("2026-09-04 23:31:20"));
+        assert_eq!(saved.next_open_ts.as_deref(), Some("2026-09-07 09:00:00"));
+        assert_eq!(saved.next_open_price, Some(1205.0));
+        assert_eq!(saved.outcome.as_deref(), Some("win"));
+        assert_eq!(saved.outcome_ts.as_deref(), Some("2026-09-07 10:00:00"));
     }
 
     #[tokio::test]

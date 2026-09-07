@@ -16,6 +16,8 @@ use crate::notify::email::EmailSettings;
 use crate::scheduler::SchedulerConfig;
 use crate::storage::repo;
 
+const PRECLOSE_CONFIG_SCHEMA_VERSION: u32 = 2;
+
 /// 全部支持的K线周期（顺序即展示顺序）。
 pub const DEFAULT_TIMEFRAMES: [&str; 7] = ["5m", "15m", "30m", "60m", "120m", "240m", "1d"];
 
@@ -54,6 +56,8 @@ pub struct Config {
     pub email: EmailSettings,
     /// 通知开关
     pub notify: NotifyConfig,
+    /// 收盘前预检测策略配置
+    pub preclose: PrecloseConfig,
     /// 日志
     pub log: LogConfig,
     /// 界面细节
@@ -71,6 +75,7 @@ impl Default for Config {
             quote: QuoteConfig::default(),
             email: EmailSettings::default(),
             notify: NotifyConfig::default(),
+            preclose: PrecloseConfig::default(),
             log: LogConfig::default(),
             ui: UiConfig::default(),
             data_source: DataSourceConfig::default(),
@@ -87,7 +92,27 @@ impl Config {
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(text) => match serde_json::from_str::<Config>(&text) {
-                    Ok(config) => return Ok(config),
+                    Ok(mut config) => {
+                        let stored_preclose_version = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("preclose")?
+                                    .get("schema_version")?
+                                    .as_u64()
+                            })
+                            .unwrap_or(1) as u32;
+                        if stored_preclose_version < PRECLOSE_CONFIG_SCHEMA_VERSION {
+                            // v1 的 30 分钟是旧默认值；升级为新的 60 分钟默认。
+                            // schema_version 落盘后，用户日后主动改回 30 分钟不会再被覆盖。
+                            if config.preclose.horizon_minutes == 30 {
+                                config.preclose.horizon_minutes = 60;
+                            }
+                            config.preclose.schema_version = PRECLOSE_CONFIG_SCHEMA_VERSION;
+                            config.save(path)?;
+                        }
+                        return Ok(config);
+                    }
                     Err(e) => {
                         let bak = backup_path(path);
                         tracing::warn!("配置文件解析失败({e})，已备份到 {}", bak.display());
@@ -171,6 +196,7 @@ impl Config {
                 smtp_password: get_str(map, "email.smtp_password", &d.email.smtp_password),
             },
             notify: NotifyConfig::default(),
+            preclose: PrecloseConfig::default(),
             log: LogConfig {
                 level: get_str(map, "log_level", &d.log.level),
             },
@@ -191,6 +217,33 @@ pub struct NotifyConfig {
     pub in_app_entry_trigger: bool,
     /// 系统级触发价通知：入场价提醒同时发送系统通知
     pub system_entry_trigger: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrecloseConfig {
+    /// 配置迁移版本；仅用于一次性升级旧默认值。
+    pub schema_version: u32,
+    /// 收盘前预检测总开关。仅提醒、不自动下单。
+    pub enabled: bool,
+    /// 提前检测秒数，只允许 120 或 180。
+    pub lead_secs: u64,
+    /// 下一交易时段开盘后的观察窗口。
+    pub horizon_minutes: u64,
+    /// 是否发送应用内预检测通知。
+    pub in_app_notify: bool,
+}
+
+impl Default for PrecloseConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: PRECLOSE_CONFIG_SCHEMA_VERSION,
+            enabled: true,
+            lead_secs: 180,
+            horizon_minutes: 60,
+            in_app_notify: true,
+        }
+    }
 }
 
 impl Default for NotifyConfig {
@@ -493,6 +546,10 @@ mod tests {
         assert_eq!(back.notify.new_pattern_min_score, 0.0);
         assert_eq!(back.notify.in_app_entry_trigger, true);
         assert_eq!(back.notify.system_entry_trigger, false);
+        assert_eq!(back.preclose.enabled, true);
+        assert_eq!(back.preclose.schema_version, PRECLOSE_CONFIG_SCHEMA_VERSION);
+        assert_eq!(back.preclose.lead_secs, 180);
+        assert_eq!(back.preclose.horizon_minutes, 60);
         assert_eq!(back.log.level, "info");
         assert_eq!(back.ui.flash_ms, 900);
         assert_eq!(back.ui.breathe_hold_ms, 5000);
@@ -520,6 +577,9 @@ mod tests {
         assert_eq!(config.quote.poll_interval_ms, 3000);
         assert_eq!(config.log.level, "info");
         assert_eq!(config.notify.new_pattern_min_score, 0.0);
+        assert_eq!(config.preclose.lead_secs, 180);
+        assert_eq!(config.preclose.horizon_minutes, 60);
+        assert_eq!(config.preclose.schema_version, PRECLOSE_CONFIG_SCHEMA_VERSION);
         assert_eq!(config.ui.score_pill_full_score, 3.5);
     }
 
@@ -539,6 +599,39 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.notify.new_pattern_min_score, 3.5);
+    }
+
+    #[tokio::test]
+    async fn upgrades_old_preclose_default_to_one_hour_only_once() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "ntrend-config-test-{}-preclose-v2",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"preclose":{"enabled":true,"lead_secs":180,"horizon_minutes":30,"in_app_notify":true}}"#,
+        )
+        .unwrap();
+
+        let mut upgraded = Config::load(&path, &db).await.unwrap();
+        assert_eq!(upgraded.preclose.horizon_minutes, 60);
+        assert_eq!(
+            upgraded.preclose.schema_version,
+            PRECLOSE_CONFIG_SCHEMA_VERSION
+        );
+
+        // 版本标记已落盘后，30 分钟可作为用户的显式选择被保留。
+        upgraded.preclose.horizon_minutes = 30;
+        upgraded.save(&path).unwrap();
+        let reloaded = Config::load(&path, &db).await.unwrap();
+        assert_eq!(reloaded.preclose.horizon_minutes, 30);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

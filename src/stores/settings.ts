@@ -38,6 +38,13 @@ const defaultConfig = (): Config => ({
     in_app_entry_trigger: true,
     system_entry_trigger: false,
   },
+  preclose: {
+    schema_version: 2,
+    enabled: true,
+    lead_secs: 180,
+    horizon_minutes: 60,
+    in_app_notify: true,
+  },
   log: {
     level: 'info',
   },

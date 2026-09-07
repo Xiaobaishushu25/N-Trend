@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::entities::pattern_events;
+use crate::storage::entities::{pattern_events, preclose_signals};
 
 pub const DEFAULT_RECIPIENT: &str = "2055761346@qq.com";
 
@@ -176,6 +176,15 @@ fn fmt_opt_f64(v: Option<f64>) -> String {
 
 /// 生成单条信号事件的邮件主题与正文（纯文本），预警与触发共用一套字段。
 pub fn event_email_payload(kind: EventEmailKind, e: &pattern_events::Model) -> (String, String) {
+    event_email_payload_with_model(kind, e, None)
+}
+
+/// 触发邮件可附带冠军模型胜率；预警邮件传 None。
+pub fn event_email_payload_with_model(
+    kind: EventEmailKind,
+    e: &pattern_events::Model,
+    model_win_rate: Option<(&str, f64)>,
+) -> (String, String) {
     let kind_label = match kind {
         EventEmailKind::Warning => "预警",
         EventEmailKind::Trigger => "触发",
@@ -254,8 +263,41 @@ pub fn event_email_payload(kind: EventEmailKind, e: &pattern_events::Model) -> (
             fmt_opt_f64(e.trigger_score),
             fmt_opt_f64(e.hold_score),
         ));
+        match model_win_rate {
+            Some((model_id, p_win)) => body.push_str(&format!(
+                "\n冠军模型胜率：{:.1}%（{}）",
+                p_win.clamp(0.0, 1.0) * 100.0,
+                model_id
+            )),
+            None => body.push_str("\n冠军模型胜率：暂无可用结果"),
+        }
     }
 
+    (subject, body)
+}
+
+/// 收盘前预检测沿用正式信号模板，并补充预检测时点、预计收盘和参考现价。
+pub fn preclose_email_payload(
+    signal: &preclose_signals::Model,
+    parent: &pattern_events::Model,
+) -> (String, String) {
+    let subject = format!(
+        "N趋势收盘前预检测【{}】{} {} {:.2}分",
+        signal.symbol,
+        event_dir_label(parent),
+        parent.grade,
+        parent.entry_score,
+    );
+    let (_, event_body) = event_email_payload(EventEmailKind::Warning, parent);
+    let body = format!(
+        "预检测时间：{}\n预计收盘：{}\n参考现价：{:.1}\n来源正式候选：#{}\n观察窗口：{}分钟\n\n{}\n\n说明：这是收盘前预检测提醒，仅供提前关注；最终状态以收盘结算和正式触发为准。",
+        signal.emitted_at,
+        signal.session_close_ts,
+        signal.reference_price,
+        signal.parent_event_id,
+        signal.horizon_minutes,
+        event_body,
+    );
     (subject, body)
 }
 
@@ -373,5 +415,45 @@ mod tests {
         assert!(body.contains("追价深度：0.02R"));
         assert!(body.contains("触发K线质量：3.90"));
         assert!(body.contains("当前持仓评分：4.10"));
+        assert!(body.contains("冠军模型胜率：暂无可用结果"));
+
+        let (_, body) =
+            event_email_payload_with_model(EventEmailKind::Trigger, &e, Some(("logistic-v2", 0.684)));
+        assert!(body.contains("冠军模型胜率：68.4%（logistic-v2）"));
+
+        let preclose = preclose_signals::Model {
+            id: 7,
+            symbol: "BU0".to_string(),
+            direction: "up".to_string(),
+            session_close_ts: "2026-08-14 15:00:00".to_string(),
+            emitted_at: "2026-08-14 14:57:00".to_string(),
+            reference_price: 4210.0,
+            parent_event_id: e.id,
+            entry: e.entry,
+            stop: e.stop,
+            target: e.target,
+            risk: e.risk,
+            state: "precheck".to_string(),
+            confirmed_at: None,
+            invalid_reason: None,
+            next_open_ts: None,
+            next_open_price: None,
+            gap_pct: None,
+            mfe_r: None,
+            mae_r: None,
+            outcome: None,
+            outcome_ts: None,
+            horizon_minutes: 60,
+            created_at: "2026-08-14 14:57:00".to_string(),
+            updated_at: "2026-08-14 14:57:00".to_string(),
+        };
+        let (subject, body) = preclose_email_payload(&preclose, &e);
+        assert!(subject.contains("收盘前预检测【BU0】做多"));
+        assert!(body.contains("预检测时间：2026-08-14 14:57:00"));
+        assert!(body.contains("预计收盘：2026-08-14 15:00:00"));
+        assert!(body.contains("参考现价：4210.0"));
+        assert!(body.contains("来源正式候选：#1"));
+        assert!(body.contains("观察窗口：60分钟"));
+        assert!(body.contains("入场评分：3.60"));
     }
 }

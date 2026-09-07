@@ -68,6 +68,8 @@ pub struct NewNotificationHistoryItem {
 pub struct AppState {
     pub services: Services,
     pub scheduler: RwLock<SchedulerState>,
+    /// 本进程已安排发送的触发邮件，防止实时行情与定时扫描重复发送。
+    pub trigger_email_scheduled: tokio::sync::Mutex<std::collections::HashSet<i64>>,
     pub notification_history: std::sync::Mutex<Vec<NotificationHistoryItem>>,
     pub next_notification_id: std::sync::atomic::AtomicU64,
 }

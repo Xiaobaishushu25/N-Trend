@@ -5,15 +5,15 @@ import draggable from 'vuedraggable'
 import {
   NButton,
   NCheckbox,
-  NSwitch,
   NEmpty,
   NIcon,
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, GripVertical, List, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, List, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
-import { api, onDataUpdated, onQuotesUpdated, onScanCompleted } from '../services/api'
+import ReorderToggle from '../components/ReorderToggle.vue'
+import { api, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
 import { useGroupsStore } from '../stores/groups'
@@ -103,33 +103,62 @@ function pwinFor(eventId: number) {
 }
 async function refreshV2Predictions() {
   try {
-    await api.backfillV2Predictions()
     await reviewStore.loadV2Predictions()
   } catch {
     reviewStore.v2Predictions = []
   }
 }
-const v2CurrentPwin = computed(() => {
-  const eid = (reviewOverlay as any)?.value?.event?.id
-    ?? visibleSignals.value[0]?.number
-  if (eid == null) return null
-  return pwinFor(eid)
+function integrityGapsOf(report: any): any[] {
+  const gaps = report?.missing_gaps ?? report?.gaps ?? report?.missingGaps ?? []
+  return Array.isArray(gaps) ? gaps : []
+}
+
+const integrityCheckSeq = ref(0)
+const integrityGaps = computed(() => integrityGapsOf(integrityReport.value))
+const integrityHasGaps = computed(() => integrityGaps.value.length > 0)
+const integrityUnexpectedCount = computed(() => integrityReport.value?.unexpected_bars?.length ?? 0)
+const integrityCorruptedCount = computed(() => integrityReport.value?.corrupted_bars?.length ?? 0)
+const integrityHasIssues = computed(() =>
+  integrityReport.value != null &&
+  (integrityHasGaps.value || integrityUnexpectedCount.value > 0 || integrityCorruptedCount.value > 0 || integrityReport.value.is_clean === false),
+)
+const integrityStatusText = computed(() => {
+  if (!integrityReport.value) return ''
+  if (integrityHasGaps.value) return `${integrityGaps.value.length}段缺口`
+  if (integrityHasIssues.value) {
+    const parts = []
+    if (integrityUnexpectedCount.value) parts.push(`非法时段 ${integrityUnexpectedCount.value}`)
+    if (integrityCorruptedCount.value) parts.push(`坏数据 ${integrityCorruptedCount.value}`)
+    return parts.length ? `异常 · ${parts.join(' / ')}` : '有异常'
+  }
+  return '完整'
 })
 
-
-async function handleCheckIntegrity() {
+async function handleCheckIntegrity(showNotice = true) {
   if (!symbol.value) return
+  const checkedSymbol = symbol.value
+  const checkSeq = ++integrityCheckSeq.value
   integrityChecking.value = true
   integrityReport.value = null
   try {
-    const r = await api.checkSymbolIntegrity(symbol.value)
+    const r = await api.checkSymbolIntegrity(checkedSymbol)
+    if (checkSeq !== integrityCheckSeq.value || checkedSymbol !== symbol.value) return
     integrityReport.value = r
-    const gaps = (r && (r.missing_gaps || r.gaps || r.missingGaps)) || []
+    const gaps = integrityGapsOf(r)
     const gapsLen = gaps.length
     const totalMissing = (r && (r.missing_count ?? r.missingCount ?? 0)) || gaps.reduce((a:number,g:any)=>a+(g.missing_count??g.missingCount??1),0)
-    if (gapsLen === 0) {
-      notify.success(symbol.value + " 5m 数据完整，无缺口")
-    } else {
+    const unexpectedCount = r?.unexpected_bars?.length ?? 0
+    const corruptedCount = r?.corrupted_bars?.length ?? 0
+    if (showNotice && gapsLen === 0 && r?.is_clean === false) {
+      const details = [
+        unexpectedCount ? `非法时段 ${unexpectedCount} 条` : '',
+        corruptedCount ? `坏数据 ${corruptedCount} 条` : '',
+      ].filter(Boolean).join('，')
+      notify.warning(`${checkedSymbol} 未发现时间缺口，但发现${details || '数据异常'}，请查看完整性状态`, { duration: 8000 } as any)
+      console.log(`[完整性检测] ${checkedSymbol}`, r)
+    } else if (showNotice && gapsLen === 0) {
+      notify.success(checkedSymbol + " 5m 数据完整，无缺口")
+    } else if (showNotice) {
       const fmtGap = (g:any) => {
         if (Array.isArray(g)) return g[0] + " ~ " + g[1]
         if (g && typeof g === "object" && "start_ts" in g) return `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根${g.recoverable_by_api ? "可恢复" : "不可恢复"}`
@@ -138,23 +167,23 @@ async function handleCheckIntegrity() {
       }
       const preview = gaps.slice(0,3).map(fmtGap).join(" | ")
       const more = gapsLen > 3 ? ` 等${gapsLen}段` : ""
-      notify.warning(symbol.value + ` 发现 ${gapsLen}段缺口(共${totalMissing}根): ${preview}${more}`, { duration: 8000 } as any)
+      notify.warning(checkedSymbol + ` 发现 ${gapsLen}段缺口(共${totalMissing}根): ${preview}${more}`, { duration: 8000 } as any)
       // 同时在控制台打印完整缺口明细
-      console.log(`[完整性检测] ${symbol.value}`, r)
+      console.log(`[完整性检测] ${checkedSymbol}`, r)
       gaps.forEach((g:any,i:number)=> console.log(`  缺口${i+1}:`, fmtGap(g)))
     }
   } catch (e) {
-    notify.error("检测失败: " + String(e))
+    if (checkSeq === integrityCheckSeq.value && showNotice) notify.error("检测失败: " + String(e))
   } finally {
-    integrityChecking.value = false
+    if (checkSeq === integrityCheckSeq.value) integrityChecking.value = false
   }
 }
 
 async function handleRepairIntegrity() {
   if (!symbol.value) return
   if (!integrityReport.value) {
-    await handleCheckIntegrity()
-    const gaps = (integrityReport.value && (integrityReport.value.missing_gaps || integrityReport.value.gaps)) || []
+    await handleCheckIntegrity(true)
+    const gaps = integrityGapsOf(integrityReport.value)
     if (gaps.length === 0) return
   }
   const ok = await confirmAction({
@@ -182,12 +211,13 @@ async function handleRepairIntegrity() {
       notify.warning(`${symbol.value} 补全完成：${msg} | 初始缺${initMissing}根 补${cnt}根 剩余${remainMissing}根 (本次未新增，可能是接口未返回该区间)`, { duration: 9000 } as any)
     }
     console.log(`[补全结果] ${symbol.value}`, res)
-    if (integrityReport.value && (integrityReport.value as any).missing_gaps) {
-      console.log(`  补前缺口:`, (integrityReport.value as any).missing_gaps.map((g:any)=> `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根`))
+    if (integrityReport.value) {
+      console.log(`  补前缺口:`, integrityGapsOf(integrityReport.value).map((g:any)=> `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根`))
     }
     integrityReport.value = null
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
     await loadTrendLine()
+    await handleCheckIntegrity(false)
   } catch (e) {
     notify.error("补全失败: " + String(e))
   } finally {
@@ -1345,7 +1375,6 @@ watch([reviewIndex, reviewRows], async () => {
 })
 
 watch([symbol, timeframe], async () => {
-  integrityReport.value = null
   lastRepairResult.value = null
   hiddenApplied.value = ''
   applyDefaultHidden()
@@ -1360,6 +1389,12 @@ watch([symbol, timeframe], async () => {
   }
 }, { immediate: true })
 
+// 完整性检测只针对当前品种的 Raw 5m 数据；切换品种进入图表后异步检测，
+// 不阻塞K线加载，也不在每次切换派生周期时重复发起同一检测。
+watch(symbol, () => {
+  void handleCheckIntegrity(false)
+}, { immediate: true })
+
 // 分组/组内顺序在别处被改动（如列表页表格拖拽）时，重拉本页列表
 watch(() => groupsStore.revision, () => loadGroupSymbols())
 
@@ -1372,6 +1407,14 @@ onMounted(async () => {
       loadSnapshots()
       scansStore.refreshLatestSignals()
       loadRecentPatterns()
+      void refreshV2Predictions()
+    }),
+  )
+  unlisteners.push(
+    await onEntryTrigger(() => {
+      // The backend scores quote-confirmed events immediately.  Refresh only
+      // the prediction rows; historical backfill is a separate maintenance
+      // operation and must not delay the live card.
       void refreshV2Predictions()
     }),
   )
@@ -1488,15 +1531,11 @@ onBeforeUnmount(() => {
         </span>
       </div>
 
-            <div class="reorder-control" :class="{ 'is-enabled': reorderEnabled && !reviewMode, disabled: reviewMode }" :title="reviewMode ? '复盘模式下不可排序' : (reorderEnabled ? '已开启拖拽排序 · 拖动左侧品种可重排' : '已关闭拖拽 · 开启后可拖动左侧品种排序')">
-              <n-icon :component="GripVertical" class="reorder-icon" :size="14" />
-              <span class="reorder-label">拖拽排序</span>
-              <n-switch v-model:value="reorderEnabled" size="small" :disabled="reviewMode" :rail-style="() => ({ background: reorderEnabled && !reviewMode ? '#3b82f6' : undefined })">
-                <template #checked>开</template>
-                <template #unchecked>关</template>
-              </n-switch>
-              <span class="reorder-state" :class="{ on: reorderEnabled && !reviewMode }">{{ reorderEnabled && !reviewMode ? '已开启' : '已关闭' }}</span>
-            </div>
+            <ReorderToggle
+              v-model="reorderEnabled"
+              :disabled="reviewMode"
+              :title="reviewMode ? '复盘模式下不可排序' : '拖拽排序开关；开启后可拖动左侧品种重排'"
+            />
 
       <div class="topbar-timeframes">
         <div class="tf-group">
@@ -1512,6 +1551,37 @@ onBeforeUnmount(() => {
           >
             {{ t }}
           </button>
+          <n-popover
+            placement="bottom-end"
+            trigger="click"
+            :show-arrow="false"
+            style="padding: 0"
+          >
+            <template #trigger>
+              <button
+                type="button"
+                class="tf-more"
+                :disabled="reviewMode"
+                title="切换周期"
+                aria-label="切换周期"
+              >
+                <n-icon :component="Adjustments" />
+              </button>
+            </template>
+            <div class="tf-settings">
+              <div class="tf-settings-title">更多周期选择</div>
+              <div class="tf-settings-list">
+                <label v-for="t in allTimeframes" :key="t" class="tf-check">
+                  <n-checkbox
+                    :checked="settingsStore.settings.ui.timeframes.includes(t)"
+                    @update:checked="(v: boolean) => toggleTimeframe(t, v)"
+                  />
+                  <span>{{ t }}</span>
+                </label>
+              </div>
+              <div class="tf-settings-hint">勾选后立即生效，切换栏只显示勾选的周期</div>
+            </div>
+          </n-popover>
         </div>
         <button
           type="button"
@@ -1523,43 +1593,18 @@ onBeforeUnmount(() => {
           高低
         </button>
         <div class="integrity-bar">
-          <n-button size="small" :loading="integrityChecking" :disabled="reviewMode" @click="handleCheckIntegrity" title="检测当前品种 5m 缺口">检测缺口</n-button>
-          <n-button size="small" type="primary" :loading="integrityRepairing" :disabled="reviewMode || integrityChecking" @click="handleRepairIntegrity" title="一键补全缺失的 5m 并重算 15m/60m">补全缺口</n-button>
-          <span v-if="integrityReport" class="integrity-badge" :class="{ 'has-gap': ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length>0) }">
-            {{ ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length===0) ? "完整" : ((integrityReport.missing_gaps ?? integrityReport.gaps ?? []).length + "段缺口") }}
+          <button type="button" class="tf-btn integrity-btn" :class="{ 'is-loading': integrityChecking }" :disabled="reviewMode || integrityChecking" @click="handleCheckIntegrity(true)" title="检测当前品种 5m 缺口">
+            <span v-if="integrityChecking" class="integrity-spinner" aria-hidden="true" />
+            检测缺口
+          </button>
+          <button v-if="integrityHasGaps" type="button" class="tf-btn integrity-btn repair-btn" :class="{ 'is-loading': integrityRepairing }" :disabled="reviewMode || integrityRepairing || integrityChecking" @click="handleRepairIntegrity" title="一键补全缺失的 5m 并重算 15m/60m">
+            <span v-if="integrityRepairing" class="integrity-spinner" aria-hidden="true" />
+            补全缺口
+          </button>
+          <span v-if="integrityReport" class="integrity-badge" :class="{ 'has-issue': integrityHasIssues }" :title="`缺口 ${integrityReport.missing_count ?? 0}，非法时段 ${integrityUnexpectedCount}，坏数据 ${integrityCorruptedCount}`">
+            {{ integrityStatusText }}
           </span>
-          <span v-if="v2CurrentPwin != null" class="v2-pwin-badge" :style="{ background: v2CurrentPwin >= 0.55 ? '#e6f4ea' : v2CurrentPwin < 0.45 ? '#fce8e6' : '#fef7e0', color: v2CurrentPwin >= 0.55 ? '#137333' : v2CurrentPwin < 0.45 ? '#c5221f' : '#8a6d00' }">P(win) {{ (v2CurrentPwin*100).toFixed(1) }}%</span>
         </div>
-        <n-popover
-          placement="bottom-end"
-          trigger="click"
-          :show-arrow="false"
-          style="padding: 0"
-        >
-          <template #trigger>
-            <button
-              type="button"
-              class="tf-more"
-              :disabled="reviewMode"
-              title="周期显示设置"
-            >
-              <n-icon :component="Adjustments" />
-            </button>
-          </template>
-          <div class="tf-settings">
-            <div class="tf-settings-title">更多周期选择</div>
-            <div class="tf-settings-list">
-              <label v-for="t in allTimeframes" :key="t" class="tf-check">
-                <n-checkbox
-                  :checked="settingsStore.settings.ui.timeframes.includes(t)"
-                  @update:checked="(v: boolean) => toggleTimeframe(t, v)"
-                />
-                <span>{{ t }}</span>
-              </label>
-            </div>
-            <div class="tf-settings-hint">勾选后立即生效，切换栏只显示勾选的周期</div>
-          </div>
-        </n-popover>
       </div>
     </div>
 
@@ -2215,59 +2260,6 @@ onBeforeUnmount(() => {
   padding: 2px 8px;
   border-radius: 999px;
 }
-.reorder-control {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  flex: none;
-  padding: 5px 10px 5px 9px;
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 999px;
-  transition: all 0.2s ease;
-  box-shadow: 0 1px 2px rgba(15,23,42,0.04);
-}
-.reorder-control:hover {
-  border-color: #cbd5e1;
-  background: #f1f5f9;
-}
-.reorder-control.is-enabled {
-  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-  border-color: #93c5fd;
-  box-shadow: 0 1px 6px rgba(59,130,246,0.18);
-}
-.reorder-control.disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-.reorder-control .reorder-icon {
-  color: #94a3b8;
-  transition: color 0.2s;
-  flex: none;
-}
-.reorder-control.is-enabled .reorder-icon {
-  color: #3b82f6;
-}
-.reorder-label {
-  font-size: 12.5px;
-  font-weight: 600;
-  color: #475569;
-  white-space: nowrap;
-  letter-spacing: 0.2px;
-}
-.reorder-control.is-enabled .reorder-label {
-  color: #1e40af;
-}
-.reorder-state {
-  font-size: 11px;
-  font-weight: 600;
-  color: #94a3b8;
-  white-space: nowrap;
-  min-width: 36px;
-}
-.reorder-state.on {
-  color: #2563eb;
-}
 .topbar-timeframes {
   display: flex;
   align-items: center;
@@ -2328,6 +2320,42 @@ onBeforeUnmount(() => {
   padding-left: 8px;
   border-left: 1px solid #e8ecf1;
 }
+.integrity-btn {
+  min-width: 72px;
+  border: 1px solid #dbe3ec;
+  background: #f8fafc;
+  color: #475569;
+}
+.integrity-btn:hover {
+  border-color: #b8c5d4;
+  background: #eef2f7;
+  color: #1f2937;
+}
+.integrity-btn.repair-btn {
+  border-color: #b7dfc3;
+  background: #eaf7ef;
+  color: #16803c;
+}
+.integrity-btn.repair-btn:hover {
+  border-color: #8fc99f;
+  background: #dff1e6;
+  color: #137333;
+}
+.integrity-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.integrity-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: integrity-spin 0.7s linear infinite;
+}
+@keyframes integrity-spin {
+  to { transform: rotate(360deg); }
+}
 .integrity-badge {
   font-size: 11px;
   padding: 2px 6px;
@@ -2336,16 +2364,7 @@ onBeforeUnmount(() => {
   color: #137333;
   font-weight: 600;
 }
-.integrity-badge.has-gap { background: #fce8e6; color: #c5221f; }
-.v2-pwin-badge {
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 999px;
-  font-weight: 700;
-  background: #fce8e6;
-  color: #c5221f;
-}
-
+.integrity-badge.has-issue { background: #fce8e6; color: #c5221f; }
 .tf-more {
   display: inline-flex;
   align-items: center;
