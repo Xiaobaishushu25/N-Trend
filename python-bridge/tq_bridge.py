@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from aiohttp import web
 import pandas as pd
 from tqsdk import TqApi, TqAuth
+from tqsdk.exceptions import TqTimeoutError
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,8 @@ SERVER_STARTED_AT = time.time()
 SERVICE_NAME = "ntrend-tq-bridge"
 STREAM_ID = uuid.uuid4().hex
 MARKET_STALE_SECS = 15.0
+RECONNECT_INITIAL_DELAY_SECS = 1.0
+RECONNECT_MAX_DELAY_SECS = 30.0
 
 
 class BridgeCommandTimeout(TimeoutError):
@@ -180,9 +183,14 @@ class TqDataWorker:
         self.cmd_queue = queue.Queue(maxsize=256)
         self.command_ids = itertools.count(1)
         self.connected = False
+        self.reconnecting = False
+        self.reconnect_requested = threading.Event()
+        self.last_transport_error: Optional[str] = None
         self.startup_error: Optional[str] = None
         self.last_update_time = 0.0
         self.last_market_event_at = 0.0
+        self.quote_symbols = set()
+        self.subscription_specs = {}
         self.events = deque(maxlen=2048)
         self.events_lock = threading.Lock()
         self.next_event_id = itertools.count(1)
@@ -196,26 +204,20 @@ class TqDataWorker:
 
     def stop(self):
         self.running = False
+        self.reconnect_requested.set()
         if self.thread:
             self.thread.join(timeout=3.0)
 
     def _run(self):
-        logger.info("Starting TqApi connection with account: %s", self.account)
-        try:
-            self.api = TqApi(auth=TqAuth(self.account, self.password))
-            self.connected = True
-            logger.info("TqApi WebSocket connection established successfully!")
-        except Exception as e:
-            error_message = f"{type(e).__name__}: {e}"
-            if self.password:
-                error_message = error_message.replace(self.password, "***")
-            self.startup_error = error_message
-            logger.error("Failed to initialize TqApi: %s", error_message)
-            self.connected = False
+        if not self._connect_and_restore(initial=True):
             return
 
         while self.running:
             try:
+                if self.reconnect_requested.is_set():
+                    self._reconnect_until_ready()
+                    continue
+
                 # 每轮最多处理少量命令，随后必须泵一次 TqApi；否则一波 HTTP 请求会
                 # 长时间饿死 WebSocket，健康检查误判为心跳超时。
                 for _ in range(8):
@@ -233,22 +235,209 @@ class TqDataWorker:
                             resp_q.put_nowait((True, res))
                     except Exception as ex:
                         logger.exception("Error executing command id=%s cmd=%s", request_id, cmd)
+                        if self._is_transport_error(ex):
+                            self._request_reconnect(
+                                f"{type(ex).__name__}: {self._safe_error(ex)}"
+                            )
                         if not cancelled.is_set():
                             resp_q.put_nowait((False, f"{type(ex).__name__}: {ex}"))
+
+                if self.reconnect_requested.is_set():
+                    continue
 
                 # Pump TqApi event loop
                 self._pump_update(time.time() + 0.05)
                 self._expire_session_candidates()
             except Exception as e:
                 logger.error("Error in TqApi worker loop: %s", e)
-                time.sleep(0.1)
+                self._request_reconnect(f"{type(e).__name__}: {self._safe_error(e)}")
 
-        if self.api:
+        self._close_api()
+
+    @staticmethod
+    def _safe_error(error: Exception) -> str:
+        return str(error).replace("\n", " ")[:500]
+
+    @staticmethod
+    def _is_transport_error(error: Exception) -> bool:
+        if isinstance(error, TqTimeoutError):
+            return True
+        text = str(error).lower()
+        return any(
+            marker in text
+            for marker in (
+                "websocket",
+                "connection",
+                "disconnected",
+                "timed out",
+                "timeout",
+                "连接失败",
+                "连接断开",
+                "超时",
+            )
+        )
+
+    def _request_reconnect(self, reason: str):
+        if not self.reconnect_requested.is_set():
+            logger.warning("TqApi connection is unhealthy; scheduling reconnect: %s", reason)
+        self.last_transport_error = reason
+        self.connected = False
+        self.reconnecting = True
+        self.reconnect_requested.set()
+
+    def _close_api(self):
+        api = self.api
+        self.api = None
+        self.connected = False
+        if api:
             try:
-                self.api.close()
-                logger.info("TqApi closed cleanly.")
-            except Exception:
-                pass
+                api.close()
+            except Exception as error:
+                logger.debug("TqApi close failed during reconnect: %s", error)
+
+    def _clear_runtime_state(self):
+        # 旧 TqApi 的对象不能跨 WebSocket 会话复用，否则会把失效序列当成有效缓存。
+        self.quotes.clear()
+        self.klines.clear()
+        self.kline_meta.clear()
+        self.trading_statuses.clear()
+        self.last_market_event_at = 0.0
+        self.last_update_time = time.time()
+
+    def _connect_and_restore(self, initial: bool = False) -> bool:
+        if not initial:
+            self._close_api()
+            self._clear_runtime_state()
+
+        try:
+            logger.info("Starting TqApi connection with account: %s", self.account)
+            self.api = TqApi(auth=TqAuth(self.account, self.password))
+            self._restore_subscriptions()
+            self.connected = True
+            self.reconnecting = False
+            self.reconnect_requested.clear()
+            self.startup_error = None
+            self.last_transport_error = None
+            logger.info(
+                "TqApi WebSocket connection established and subscriptions restored "
+                "(quotes=%d klines=%d)",
+                len(self.quote_symbols),
+                len(self.subscription_specs),
+            )
+            return True
+        except Exception as error:
+            message = f"{type(error).__name__}: {self._safe_error(error)}"
+            if self.password:
+                message = message.replace(self.password, "***")
+            self.startup_error = message
+            self.last_transport_error = message
+            self.connected = False
+            self.reconnecting = not initial
+            self._close_api()
+            logger.error("Failed to initialize/reconnect TqApi: %s", message)
+            return False
+
+    def _reconnect_until_ready(self):
+        self.reconnect_requested.clear()
+        delay = RECONNECT_INITIAL_DELAY_SECS
+        while self.running:
+            if self._connect_and_restore(initial=False):
+                return
+            logger.warning("TqApi reconnect failed; retrying in %.1fs", delay)
+            if self.reconnect_requested.wait(delay) and not self.running:
+                return
+            self.reconnect_requested.clear()
+            delay = min(delay * 2.0, RECONNECT_MAX_DELAY_SECS)
+
+    def _restore_subscriptions(self):
+        for tq_symbol in sorted(self.quote_symbols):
+            self.quotes[tq_symbol] = self.api.get_quote(tq_symbol)
+
+        created = []
+        for key, spec in list(self.subscription_specs.items()):
+            try:
+                self._prepare_subscription(spec)
+                created.append(key)
+            except Exception as error:
+                if self._is_transport_error(error):
+                    raise
+                self.subscription_specs.pop(key, None)
+                logger.warning(
+                    "Skip restoring subscription %s -> %s: %s",
+                    spec["symbol"],
+                    spec["tq_symbol"],
+                    self._safe_error(error),
+                )
+
+        if created:
+            self._finalize_subscriptions(created)
+
+    def _prepare_subscription(self, spec: dict):
+        key = (spec["tq_symbol"], spec["duration_seconds"])
+        self.klines[key] = self.api.get_kline_serial(
+            spec["tq_symbol"],
+            duration_seconds=spec["duration_seconds"],
+            data_length=max(spec["data_length"], 1000),
+        )
+        if spec["tq_symbol"] not in self.quotes:
+            self.quotes[spec["tq_symbol"]] = self.api.get_quote(spec["tq_symbol"])
+        self.kline_meta[key] = {
+            "symbol": spec["symbol"],
+            "tq_symbol": spec["tq_symbol"],
+            "period": spec["period"],
+            "duration": spec["duration_seconds"],
+            "initialized": False,
+            "last_datetime": None,
+            "last_trade_status": None,
+            "session_candidate": None,
+            "status_symbol": None,
+        }
+
+    def _finalize_subscriptions(self, created):
+        # 全部序列创建后统一驱动，避免逐品种冷启动时重复等待。
+        adaptive_deadline = max(8.0, min(30.0, 0.9 * len(created) + 8.0))
+        deadline = time.time() + adaptive_deadline
+        while time.time() < deadline:
+            ready = all(
+                len(self.klines[key]) > 1
+                and not pd.isna(self.klines[key].iloc[-1]["close"])
+                for key in created
+            )
+            if ready:
+                break
+            self._pump_update(time.time() + 0.05)
+
+        ready_symbols = []
+        for key in created:
+            klines = self.klines.get(key)
+            meta = self.kline_meta.get(key)
+            if klines is None or meta is None:
+                continue
+            quote = self.quotes.get(meta["tq_symbol"])
+            underlying = str(getattr(quote, "underlying_symbol", "") or "")
+            status_symbol = underlying or meta["tq_symbol"]
+            if status_symbol not in self.trading_statuses:
+                try:
+                    self.trading_statuses[status_symbol] = self.api.get_trading_status(status_symbol)
+                except Exception as error:
+                    logger.warning(
+                        "Trading status unavailable for %s (%s)",
+                        meta["symbol"],
+                        status_symbol,
+                    )
+            meta["status_symbol"] = status_symbol if status_symbol in self.trading_statuses else None
+            if (
+                not meta.get("initialized")
+                and len(klines) > 1
+                and not pd.isna(klines.iloc[-1]["datetime"])
+            ):
+                meta["last_datetime"] = int(klines.iloc[-1]["datetime"])
+                status = self.trading_statuses.get(meta.get("status_symbol"))
+                meta["last_trade_status"] = getattr(status, "trade_status", None)
+                meta["initialized"] = True
+            if meta.get("initialized"):
+                ready_symbols.append(meta["symbol"])
+        return ready_symbols
 
     def _pump_update(self, deadline: float) -> bool:
         """推进一次 TqApi，并保证任何调用点都不会绕过闭合事件检测。"""
@@ -262,6 +451,7 @@ class TqDataWorker:
     def _handle_cmd(self, cmd: str, args: dict):
         if cmd == "subscribe_quotes":
             tq_symbols = args["tq_symbols"]
+            self.quote_symbols.update(tq_symbols)
             new_sub = False
             for sym in tq_symbols:
                 if sym not in self.quotes:
@@ -314,33 +504,31 @@ class TqDataWorker:
                 duration = sub["duration_seconds"]
                 period = sub["period"]
                 key = (tq_symbol, duration)
+                spec = {
+                    "symbol": generic_symbol,
+                    "tq_symbol": tq_symbol,
+                    "duration_seconds": duration,
+                    "period": period,
+                    "data_length": data_length,
+                }
+                self.subscription_specs[key] = spec
                 try:
                     if key not in self.klines:
-                        self.klines[key] = self.api.get_kline_serial(
-                            tq_symbol,
-                            duration_seconds=duration,
-                            data_length=max(data_length, 1000),
-                        )
-                    if tq_symbol not in self.quotes:
-                        self.quotes[tq_symbol] = self.api.get_quote(tq_symbol)
-                    if key not in self.kline_meta:
-                        self.kline_meta[key] = {
-                            "symbol": generic_symbol,
-                            "tq_symbol": tq_symbol,
-                            "period": period,
-                            "duration": duration,
-                            "initialized": False,
-                            "last_datetime": None,
-                            "last_trade_status": None,
-                        "session_candidate": None,
-                        "status_symbol": None,
-                        }
+                        self._prepare_subscription(spec)
                     created.append(key)
                 except Exception as error:
+                    is_transport_error = self._is_transport_error(error)
+                    if is_transport_error:
+                        self._request_reconnect(
+                            f"{type(error).__name__}: {self._safe_error(error)}"
+                        )
+                    else:
+                        # 无效合约不应被永久带入后续重连恢复列表。
+                        self.subscription_specs.pop(key, None)
                     # 单品种异常仅记为 subscription_missing，不污染整批。
                     logger.warning(
                         "Skip invalid subscription %s -> %s: %s",
-                        generic_symbol, tq_symbol, error,
+                        generic_symbol, tq_symbol, self._safe_error(error),
                     )
                     failed.append(generic_symbol)
                     # 清理半初始化状态，避免残留 key 影响后续重试
@@ -348,55 +536,7 @@ class TqDataWorker:
                     self.kline_meta.pop(key, None)
                     continue
 
-            # 全部序列创建完后统一驱动，避免逐品种冷启动等待。
-            # 超时按品种数自适应：22 品种冷启动需更长时间。
-            adaptive_deadline = max(8.0, min(30.0, 0.9 * len(created) + 8.0))
-            deadline = time.time() + adaptive_deadline
-            while time.time() < deadline:
-                if not created:
-                    break
-                ready = all(
-                    len(self.klines[key]) > 1
-                    and not pd.isna(self.klines[key].iloc[-1]["close"])
-                    for key in created
-                )
-                if ready:
-                    break
-                self._pump_update(time.time() + 0.05)
-
-            ready_symbols = []
-            for key in created:
-                try:
-                    klines = self.klines[key]
-                    meta = self.kline_meta[key]
-                except KeyError:
-                    continue
-                quote = self.quotes.get(meta["tq_symbol"])
-                underlying = str(getattr(quote, "underlying_symbol", "") or "")
-                status_symbol = underlying or meta["tq_symbol"]
-                # 主连 KQ.m 本身没有交易状态；必须订阅其当前实际合约。
-                if status_symbol not in self.trading_statuses:
-                    try:
-                        self.trading_statuses[status_symbol] = self.api.get_trading_status(status_symbol)
-                    except Exception as error:
-                        # 休市快速证明不可用时保持 None，自动交给75秒安全路径。
-                        logger.warning(
-                            "Trading status unavailable for %s (%s): %s",
-                            meta["symbol"], status_symbol, error,
-                        )
-                meta["status_symbol"] = status_symbol if status_symbol in self.trading_statuses else None
-                if (
-                    not meta.get("initialized")
-                    and len(klines) > 1
-                    and not pd.isna(klines.iloc[-1]["datetime"])
-                ):
-                    # 建立基线后才启用检测，初始化历史绝不产生事件。
-                    meta["last_datetime"] = int(klines.iloc[-1]["datetime"])
-                    status = self.trading_statuses.get(meta.get("status_symbol"))
-                    meta["last_trade_status"] = getattr(status, "trade_status", None)
-                    meta["initialized"] = True
-                if meta.get("initialized"):
-                    ready_symbols.append(meta["symbol"])
+            ready_symbols = self._finalize_subscriptions(created) if created else []
             if failed:
                 logger.warning(
                     "[FAST_PATH] subscription_missing=%s fallback=legacy (invalid instrument isolated)",
@@ -620,12 +760,24 @@ async def handle_health(request: web.Request) -> web.Response:
             "reason": "TianQin worker is not initialized or connected"
         }, status=503)
 
+    if worker.reconnecting or worker.reconnect_requested.is_set():
+        return web.json_response({
+            "service": SERVICE_NAME,
+            "pid": os.getpid(),
+            "status": "reconnecting",
+            "tq_connected": False,
+            "worker_alive": bool(worker.thread and worker.thread.is_alive()),
+            "reconnecting": True,
+            "last_transport_error": worker.last_transport_error,
+        }, status=503)
+
     if worker.startup_error:
         return web.json_response({
             "service": SERVICE_NAME,
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "reconnecting": False,
             "fatal": True,
             "reason": f"TqApi initialization failed: {worker.startup_error}"
         }, status=503)
@@ -636,6 +788,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "pid": os.getpid(),
             "status": "starting",
             "tq_connected": False,
+            "reconnecting": False,
             "fatal": False,
             "reason": "TqApi connection is still initializing"
         }, status=503)
@@ -646,6 +799,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "reconnecting": False,
             "fatal": True,
             "reason": "TianQin worker thread is dead"
         }, status=503)
@@ -658,6 +812,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "reconnecting": False,
             "reason": f"TianQin worker heartbeat timed out ({heartbeat_age:.1f}s ago)"
         }, status=503)
 
@@ -670,6 +825,7 @@ async def handle_health(request: web.Request) -> web.Response:
                 "pid": os.getpid(),
                 "status": "error",
                 "tq_connected": False,
+                "reconnecting": False,
                 "reason": "Worker ping response mismatch"
             }, status=503)
     except Exception as e:
@@ -678,6 +834,7 @@ async def handle_health(request: web.Request) -> web.Response:
             "pid": os.getpid(),
             "status": "error",
             "tq_connected": False,
+            "reconnecting": False,
             "reason": f"Worker unresponsive to ping: {e}"
         }, status=503)
 
@@ -700,8 +857,11 @@ async def handle_health(request: web.Request) -> web.Response:
         "stream_id": STREAM_ID,
         "status": "stale" if stale else "ok",
         "tq_connected": True,
+        "reconnecting": False,
         "fatal": False,
         "worker_alive": True,
+        "data_ready": bool(worker.quotes or worker.klines),
+        "subscriptions": len(worker.subscription_specs),
         "quotes_cached": len(worker.quotes),
         "klines_cached": len(worker.klines),
         "queue_size": worker.cmd_queue.qsize(),

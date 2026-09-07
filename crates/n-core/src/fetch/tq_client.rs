@@ -17,6 +17,7 @@ struct HealthResponse {
     status: Option<String>,
     tq_connected: Option<bool>,
     worker_alive: Option<bool>,
+    reconnecting: Option<bool>,
     stale: Option<bool>,
     stream_id: Option<String>,
 }
@@ -201,11 +202,18 @@ impl TqBridgeClient {
 
     pub async fn health_stream_id(&self) -> Option<String> {
         let url = format!("{}/health", self.base_url);
-        let response = self.http.get(url).timeout(Duration::from_millis(1500)).send().await.ok()?;
+        let response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_millis(1500))
+            .send()
+            .await
+            .ok()?;
         let health = response.json::<HealthResponse>().await.ok()?;
         if health.status.as_deref() == Some("ok")
             && health.tq_connected.unwrap_or(false)
             && health.worker_alive.unwrap_or(false)
+            && !health.reconnecting.unwrap_or(false)
             && !health.stale.unwrap_or(false)
         {
             health.stream_id
@@ -270,15 +278,12 @@ impl MarketDataSource for TqBridgeClient {
         Ok(out)
     }
 
-    async fn fetch_minute(
-        &self,
-        symbol: &str,
-        period: &str,
-        count: usize,
-    ) -> Result<Vec<Kline>> {
+    async fn fetch_minute(&self, symbol: &str, period: &str, count: usize) -> Result<Vec<Kline>> {
         // TqSdk 序列最后一行始终是进行中 K 线。没有闭合事件证明时生产接口
         // 必须无条件排除它；休市最后一根由 ClosedBarEvent 单独入库。
-        let raw = self.fetch_minute_raw(symbol, period, count.saturating_add(1)).await?;
+        let raw = self
+            .fetch_minute_raw(symbol, period, count.saturating_add(1))
+            .await?;
         Ok(exclude_current_kline(raw.klines, count))
     }
 
@@ -352,12 +357,19 @@ impl MarketDataSource for TqBridgeClient {
 
     async fn is_healthy(&self) -> bool {
         let url = format!("{}/health", self.base_url);
-        match self.http.get(&url).timeout(Duration::from_millis(1500)).send().await {
+        match self
+            .http
+            .get(&url)
+            .timeout(Duration::from_millis(1500))
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if let Ok(health) = resp.json::<HealthResponse>().await {
                     health.status.as_deref() == Some("ok")
                         && health.tq_connected.unwrap_or(false)
                         && health.worker_alive.unwrap_or(false)
+                        && !health.reconnecting.unwrap_or(false)
                         && !health.stale.unwrap_or(false)
                 } else {
                     false
