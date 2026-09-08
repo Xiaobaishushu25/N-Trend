@@ -10,7 +10,7 @@ import {
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, List, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, List, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import { api, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -804,7 +804,7 @@ function onSymbolRowClick(code: string) {
 }
 
 /** 左侧品种行右键菜单：与表格行一致（分组操作 + 彻底删除） */
-async function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
+async function onSymbolContextMenu(row: { code: string; is_followed?: boolean }, e: MouseEvent) {
   if (reviewMode.value) {
     e.preventDefault()
     return
@@ -821,12 +821,28 @@ async function onSymbolContextMenu(row: { code: string }, e: MouseEvent) {
     groups: groupsStore.groups,
     selectedGroupId: groupsStore.selectedId,
     symbol: row.code,
+    isFollowed: !!row.is_followed,
     memberGroupIds: new Set(memberGroups.map((g) => g.id)),
+    onToggleFollow: () => handleToggleFollow(row),
     onRemoveFromGroup: () => handleRemoveFromGroup(row.code),
     onCopyToGroup: (g) => handleCopyToGroup(row.code, g),
     onMoveToGroup: (g) => handleMoveToGroup(row.code, g),
     onDeleteSymbol: () => handleDeleteSymbol(row.code),
   })
+}
+
+async function handleToggleFollow(row: { code: string; is_followed?: boolean }) {
+  const code = row.code
+  const next = !row.is_followed
+  row.is_followed = next
+  try {
+    await symbolsStore.setFollowed(code, next)
+    groupsStore.bumpRevision()
+    notify.success(next ? `已关注 ${code}` : `已取消关注 ${code}`)
+  } catch (err) {
+    row.is_followed = !next
+    notify.error(String(err))
+  }
 }
 
 async function reloadSymbolList() {
@@ -1634,6 +1650,7 @@ onBeforeUnmount(() => {
                 :data-code="element.code"
                 :class="[
                   { active: element.code === symbol },
+                  { 'is-followed': element.is_followed },
                   { 'insert-before': insertBeforeCode === element.code },
                   { 'is-flash-up': rowFlash[element.code] === 'up' },
                   { 'is-flash-down': rowFlash[element.code] === 'down' },
@@ -1645,10 +1662,13 @@ onBeforeUnmount(() => {
                 @contextmenu="onSymbolContextMenu(element, $event)"
               >
                 <div class="sl-main">
-                  <OverflowText
-                    class="sl-name"
-                    :text="element.name !== element.code ? element.name : element.code"
-                  />
+                  <div class="sl-name-wrap">
+                    <NIcon v-if="element.is_followed" class="sl-star-icon" :size="13"><Star /></NIcon>
+                    <OverflowText
+                      class="sl-name"
+                      :text="element.name !== element.code ? element.name : element.code"
+                    />
+                  </div>
                   <span class="sl-code">{{ element.code }}</span>
                 </div>
                 <span
@@ -2428,8 +2448,8 @@ onBeforeUnmount(() => {
 }
 .symbol-list {
   /* 字号整体放大一档后，容器同步加宽，避免文字挤在一起 */
-  flex: 0 0 230px;
-  width: 230px;
+  flex: 0 0 250px;
+  width: 250px;
   min-width: 0;
   background: #fff;
   border-radius: 10px;
@@ -2439,7 +2459,7 @@ onBeforeUnmount(() => {
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.06);
 }
 .sl-title {
-  padding: 12px 14px 8px;
+  padding: 12px 10px 8px;
   font-size: 14px;
   font-weight: 600;
   color: #334155;
@@ -2448,8 +2468,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 8px 14px;
+  gap: 6px;
+  padding: 8px 14px 8px 10px;
   cursor: pointer;
   user-select: none;
   border-left: 3px solid transparent;
@@ -2476,7 +2496,7 @@ onBeforeUnmount(() => {
   content: '';
   display: block;
   height: 2px;
-  margin: 0 14px;
+  margin: 0 10px;
   background: #1677ff;
 }
 .sl-row:hover {
@@ -2508,15 +2528,41 @@ onBeforeUnmount(() => {
   background: rgba(22, 119, 255, 0.06);
   border-left-color: #1677ff;
 }
+.sl-row.is-followed {
+  background-color: rgba(245, 158, 11, 0.08);
+}
+.sl-row.is-followed:hover {
+  background-color: rgba(245, 158, 11, 0.14);
+}
+.sl-row.is-followed.active {
+  background: rgba(245, 158, 11, 0.16);
+  border-left-color: #f59e0b;
+}
+.sl-name-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  max-width: 100%;
+}
+.sl-name {
+  font-size: 14px;
+  color: #1f2329;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sl-star-icon {
+  color: #f59e0b;
+  flex-shrink: 0;
+}
+.sl-star-icon svg {
+  fill: #f59e0b;
+}
 .sl-main {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-width: 0;
-}
-.sl-name {
-  font-size: 14px;
-  color: #1f2329;
 }
 .sl-code {
   font-size: 12px;
@@ -2545,12 +2591,12 @@ onBeforeUnmount(() => {
   background: rgba(249, 168, 37, 0.08);
 }
 .sl-sig {
-  --sl-font: 12px;
-  --sl-font-weight: 600;
-  --sl-gap: 4px;
-  --sl-pad-y: 3px;
-  --sl-pad-x: 8px;
-  --sl-dot: 6px;
+  --sl-font: 11px;
+  --sl-font-weight: 550;
+  --sl-gap: 3px;
+  --sl-pad-y: 1.5px;
+  --sl-pad-x: 5.5px;
+  --sl-dot: 4px;
   --sl-opacity: 1;
   flex: 0 0 auto;
   display: inline-flex;
@@ -2588,57 +2634,57 @@ onBeforeUnmount(() => {
   background: rgba(148, 163, 184, 0.14);
 }
 .sl-sig.is-score-0 {
-  --sl-font: 6.5px;
+  --sl-font: 6px;
   --sl-font-weight: 500;
-  --sl-gap: 2.5px;
-  --sl-pad-y: 2px;
-  --sl-pad-x: 5px;
-  --sl-dot: 3px;
+  --sl-gap: 1.5px;
+  --sl-pad-y: 1px;
+  --sl-pad-x: 3px;
+  --sl-dot: 2px;
   --sl-opacity: 0.5;
 }
 .sl-sig.is-score-1 {
-  --sl-font: 7.8px;
-  --sl-font-weight: 550;
-  --sl-gap: 3px;
-  --sl-pad-y: 2.4px;
-  --sl-pad-x: 6px;
-  --sl-dot: 3.6px;
+  --sl-font: 7px;
+  --sl-font-weight: 500;
+  --sl-gap: 1.8px;
+  --sl-pad-y: 1.2px;
+  --sl-pad-x: 3.5px;
+  --sl-dot: 2.5px;
   --sl-opacity: 0.6;
 }
 .sl-sig.is-score-2 {
-  --sl-font: 9.1px;
-  --sl-font-weight: 600;
-  --sl-gap: 3.5px;
-  --sl-pad-y: 2.8px;
-  --sl-pad-x: 7px;
-  --sl-dot: 4.2px;
+  --sl-font: 8px;
+  --sl-font-weight: 550;
+  --sl-gap: 2px;
+  --sl-pad-y: 1.5px;
+  --sl-pad-x: 4px;
+  --sl-dot: 3px;
   --sl-opacity: 0.7;
 }
 .sl-sig.is-score-3 {
-  --sl-font: 10.4px;
-  --sl-font-weight: 650;
-  --sl-gap: 4px;
-  --sl-pad-y: 3.2px;
-  --sl-pad-x: 8px;
-  --sl-dot: 4.8px;
+  --sl-font: 9px;
+  --sl-font-weight: 550;
+  --sl-gap: 2.5px;
+  --sl-pad-y: 1.8px;
+  --sl-pad-x: 4.5px;
+  --sl-dot: 3.5px;
   --sl-opacity: 0.8;
 }
 .sl-sig.is-score-4 {
-  --sl-font: 11.7px;
-  --sl-font-weight: 700;
-  --sl-gap: 4.5px;
-  --sl-pad-y: 3.6px;
-  --sl-pad-x: 9px;
-  --sl-dot: 5.4px;
+  --sl-font: 10px;
+  --sl-font-weight: 600;
+  --sl-gap: 3px;
+  --sl-pad-y: 1.8px;
+  --sl-pad-x: 5px;
+  --sl-dot: 4px;
   --sl-opacity: 0.9;
 }
 .sl-sig.is-score-5 {
-  --sl-font: 13px;
-  --sl-font-weight: 600;
-  --sl-gap: 5px;
-  --sl-pad-y: 4px;
-  --sl-pad-x: 10px;
-  --sl-dot: 6px;
+  --sl-font: 11px;
+  --sl-font-weight: 550;
+  --sl-gap: 3px;
+  --sl-pad-y: 2px;
+  --sl-pad-x: 6px;
+  --sl-dot: 4.5px;
   --sl-opacity: 1;
 }
 .chart-col {

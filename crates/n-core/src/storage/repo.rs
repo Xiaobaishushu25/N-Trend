@@ -517,6 +517,24 @@ pub async fn set_symbol_tick(db: &DatabaseConnection, code: &str, tick: f64) -> 
     Ok(())
 }
 
+/// 更新品种的关注状态。
+pub async fn set_symbol_followed(
+    db: &DatabaseConnection,
+    code: &str,
+    is_followed: bool,
+) -> Result<()> {
+    let row = symbols::Entity::find_by_id(code)
+        .one(db)
+        .await
+        .context("查询品种失败")?
+        .ok_or_else(|| anyhow!("品种不存在: {code}"))?;
+    let mut model: symbols::ActiveModel = row.into();
+    model.is_followed = Set(is_followed);
+    model.updated_at = Set(crate::analyze::time::now_display());
+    model.save(db).await.context("更新品种关注状态失败")?;
+    Ok(())
+}
+
 pub async fn remove_symbol(db: &DatabaseConnection, code: &str) -> Result<()> {
     // 删除品种的同时清理它在所有分组中的关联
     symbol_groups::Entity::delete_many()
@@ -1507,6 +1525,38 @@ mod tests {
         crate::storage::connect(std::path::Path::new(":memory:"))
             .await
             .expect("in-memory db")
+    }
+
+    #[tokio::test]
+    async fn symbol_followed_roundtrip() {
+        let db = test_db().await;
+        let sym = symbols::ActiveModel {
+            code: Set("RB2410".to_string()),
+            name: Set("螺纹钢".to_string()),
+            variety: Set("rb".to_string()),
+            exchange: Set("SHFE".to_string()),
+            node: Set("steel".to_string()),
+            watchlist: Set(true),
+            enabled: Set(true),
+            sort_index: Set(1),
+            tick_size: Set(1.0),
+            is_followed: Set(false),
+            created_at: Set("2026-08-01 00:00:00".to_string()),
+            updated_at: Set("2026-08-01 00:00:00".to_string()),
+        };
+        upsert_symbols(&db, vec![sym]).await.unwrap();
+
+        let list = list_symbols(&db, false).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].is_followed);
+
+        set_symbol_followed(&db, "RB2410", true).await.unwrap();
+        let list_after = list_symbols(&db, false).await.unwrap();
+        assert!(list_after[0].is_followed);
+
+        set_symbol_followed(&db, "RB2410", false).await.unwrap();
+        let list_after_cancel = list_symbols(&db, false).await.unwrap();
+        assert!(!list_after_cancel[0].is_followed);
     }
 
     #[tokio::test]

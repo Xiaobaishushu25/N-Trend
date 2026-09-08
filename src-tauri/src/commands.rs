@@ -266,6 +266,26 @@ pub async fn set_symbol_tick(
     }
 }
 
+/// 更新品种关注状态。
+#[tauri::command]
+pub async fn set_symbol_followed(
+    state: State<'_, Arc<AppState>>,
+    code: String,
+    followed: bool,
+) -> Result<(), String> {
+    tracing::info!("👆 更新品种关注 | {} followed={}", code, followed);
+    match n_core::storage::repo::set_symbol_followed(&state.services.db, &code, followed).await {
+        Ok(()) => {
+            tracing::info!("✅ 品种关注已更新 | {} -> {}", code, followed);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("❌ 更新品种关注失败 | {} | {e}", code);
+            Err(e.to_string())
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn enrich_symbol_names(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
     let t0 = Instant::now();

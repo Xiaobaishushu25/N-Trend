@@ -10,6 +10,8 @@ export interface SymbolRow {
   enabled: boolean
   /** 最小变动价位（tick）；0 表示未显式设置，扫描时用内置默认表兜底 */
   tick_size: number
+  /** 是否关注该品种 */
+  is_followed?: boolean
   created_at: string
   updated_at: string
 }

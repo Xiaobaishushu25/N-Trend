@@ -32,6 +32,12 @@ export const useSymbolsStore = defineStore('symbols', {
       await api.setSymbolFlags(code, watchlist, enabled)
       await this.load()
     },
+    async setFollowed(code: string, followed: boolean) {
+      await api.setSymbolFollowed(code, followed)
+      const found = this.symbols.find((s) => s.code === code)
+      if (found) found.is_followed = followed
+      await this.load()
+    },
     async enrichNames() {
       const count = await api.enrichSymbolNames()
       await this.load()

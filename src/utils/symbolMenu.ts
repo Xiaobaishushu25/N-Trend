@@ -1,5 +1,5 @@
 import { h } from 'vue'
-import { Trash } from '@vicons/tabler'
+import { Star, StarOff, Trash } from '@vicons/tabler'
 import { openContextMenu, type ContextMenuItem } from './contextMenu'
 import type { GroupRow } from '../types'
 
@@ -7,8 +7,11 @@ export interface SymbolMenuContext {
   groups: GroupRow[]
   selectedGroupId: number | null
   symbol: string
+  /** 是否已被关注 */
+  isFollowed?: boolean
   /** 该品种当前已加入的分组 id 集合：子菜单里打勾标识“已在此组” */
   memberGroupIds: ReadonlySet<number>
+  onToggleFollow?: () => void
   onRemoveFromGroup: () => void
   onCopyToGroup: (group: GroupRow) => void
   onMoveToGroup: (group: GroupRow) => void
@@ -41,9 +44,18 @@ export function openSymbolContextMenu(e: MouseEvent, ctx: SymbolMenuContext) {
       }))
     : [{ label: emptyPlaceholder, disabled: true }]
   const items: ContextMenuItem[] = []
+  // 关注 / 取消关注操作区
+  if (ctx.onToggleFollow) {
+    items.push({
+      label: ctx.isFollowed ? '取消关注' : '关注品种',
+      icon: h(ctx.isFollowed ? StarOff : Star),
+      onClick: ctx.onToggleFollow,
+    })
+  }
   // 分组操作区
   items.push({
     label: '复制自选至',
+    divided: ctx.onToggleFollow ? 'up' : undefined,
     children: copyChildren,
   })
   if (inGroup) {

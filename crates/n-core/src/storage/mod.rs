@@ -76,6 +76,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     }
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
+    ensure_column(db, "symbols", "is_followed", "BOOLEAN NOT NULL DEFAULT 0").await?;
     db.execute_unprepared(
         "CREATE INDEX IF NOT EXISTS idx_signal_annotations_event_id \
          ON signal_annotations(event_id)",

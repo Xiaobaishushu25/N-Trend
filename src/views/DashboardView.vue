@@ -22,6 +22,7 @@ import {
   GripVertical,
   Lock,
   Settings,
+  Star,
   Trash,
 } from '@vicons/tabler'
 import { api, onDataUpdated, onPrecloseSignal, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -225,6 +226,7 @@ function rowProps(row: WatchRow): Record<string, unknown> {
     style: `cursor: ${!tableReorderEnabled.value ? 'pointer' : listDragging.value ? 'grabbing' : 'grab'}`,
     class: [
       row.flash ? (row.flash === 'up' ? 'row-flash-up' : 'row-flash-down') : '',
+      row.symbol.is_followed ? 'row-followed' : '',
       { 'insert-before': listDragging.value && insertBeforeCode.value === row.symbol.code },
     ],
     'data-code': row.symbol.code,
@@ -372,12 +374,29 @@ async function onRowContextMenu(row: WatchRow, e: MouseEvent) {
     groups: groupsStore.groups,
     selectedGroupId: groupsStore.selectedId,
     symbol: row.symbol.code,
+    isFollowed: !!row.symbol.is_followed,
     memberGroupIds: new Set(memberGroups.map((g) => g.id)),
+    onToggleFollow: () => handleToggleFollow(row),
     onRemoveFromGroup: () => handleRemoveFromGroup(row),
     onCopyToGroup: (g) => handleCopyToGroup(row, g),
     onMoveToGroup: (g) => handleMoveToGroup(row, g),
     onDeleteSymbol: () => handleDelete(row),
   })
+}
+
+/** 切换品种关注状态 */
+async function handleToggleFollow(row: WatchRow) {
+  const code = row.symbol.code
+  const next = !row.symbol.is_followed
+  row.symbol.is_followed = next
+  try {
+    await symbolsStore.setFollowed(code, next)
+    groupsStore.bumpRevision()
+    notify.success(next ? `已关注 ${code}` : `已取消关注 ${code}`)
+  } catch (err) {
+    row.symbol.is_followed = !next
+    notify.error(String(err))
+  }
 }
 
 /** 删除品种：先弹确认框，确认后再删除并刷新表格 */
@@ -686,8 +705,12 @@ const columns: DataTableColumns<WatchRow> = [
   {
     title: '代码',
     key: 'code',
-    width: 84,
-    render: (r) => h('span', { class: 'cell-code' }, r.symbol.code),
+    width: 96,
+    render: (r) =>
+      h('div', { class: 'cell-code-wrap' }, [
+        r.symbol.is_followed ? h(Star, { class: 'cell-star-icon' }) : null,
+        h('span', { class: 'cell-code' }, r.symbol.code),
+      ]),
   },
   {
     title: '名称',
@@ -1532,6 +1555,26 @@ onBeforeUnmount(() => {
   --tb-pad-x: 10px;
   --tb-dot: 6px;
   --tb-opacity: 1;
+}
+
+/* 关注品种高亮：温润的琥珀金底色 */
+.watch-table tr.row-followed td {
+  background-color: rgba(245, 158, 11, 0.08) !important;
+}
+.watch-table tr.row-followed:hover td {
+  background-color: rgba(245, 158, 11, 0.16) !important;
+}
+.cell-code-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.cell-star-icon {
+  width: 14px;
+  height: 14px;
+  color: #f59e0b;
+  fill: #f59e0b;
+  flex-shrink: 0;
 }
 
 /* 行情跳动时的行闪烁：上涨红、下跌绿，透明背景淡入淡出 */

@@ -281,6 +281,7 @@ pub fn run() {
             commands::remove_symbol,
             commands::set_symbol_flags,
             commands::set_symbol_tick,
+            commands::set_symbol_followed,
             commands::refresh_symbol_list,
             commands::enrich_symbol_names,
             commands::get_klines,

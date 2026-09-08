@@ -1905,6 +1905,11 @@ impl Services {
         }
         Ok(updated)
     }
+
+    /// 更新品种关注状态。
+    pub async fn set_symbol_followed(&self, code: &str, is_followed: bool) -> Result<()> {
+        repo::set_symbol_followed(&self.db, code, is_followed).await
+    }
     /// 新品种一次性回填历史 5m 并原子化派生 15m/60m。
     pub async fn backfill_symbol(&self, symbol: &str, count: usize) -> Result<usize> {
         let rows = self.data_source.fetch_minute(symbol, "5", count).await?;

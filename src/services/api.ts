@@ -66,6 +66,8 @@ export const api = {
     invoke<void>('set_symbol_flags', { code, watchlist, enabled }),
   setSymbolTick: (code: string, tick: number) =>
     invoke<void>('set_symbol_tick', { code, tick }),
+  setSymbolFollowed: (code: string, followed: boolean) =>
+    invoke<void>('set_symbol_followed', { code, followed }),
   refreshSymbolList: () => invoke<number>('refresh_symbol_list'),
   enrichSymbolNames: () => invoke<number>('enrich_symbol_names'),
 

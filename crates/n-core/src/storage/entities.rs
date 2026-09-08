@@ -19,6 +19,9 @@ pub mod symbols {
         pub sort_index: i64,
         /// 最小变动价位（tick）；0 表示未显式设置，查询时用内置默认表
         pub tick_size: f64,
+        /// 是否关注该品种
+        #[sea_orm(default_value = false)]
+        pub is_followed: bool,
         pub created_at: String,
         pub updated_at: String,
     }
