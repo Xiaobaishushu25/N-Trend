@@ -2,13 +2,15 @@
 import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
 import type { NotifyItem } from '../utils/notify'
 import router from '../router'
+import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 
 /** 点击信号通知跳转到对应品种的K线图，并顺手关闭该通知 */
 function openSignalChart(item: NotifyItem) {
-  const code = item.signal?.code ?? item.entryTrigger?.symbol ?? item.singleBar?.symbol
+  const code = item.signal?.code ?? item.entryTrigger?.symbol ?? item.singleBar?.symbol ?? item.manualLevel?.symbol
   if (!code) return
   dismiss(item.id)
-  router.push({ name: 'chart', params: { symbol: code } })
+  const timeframe = item.manualLevel?.timeframe
+  router.push({ name: 'chart', params: { symbol: code }, query: timeframe ? { tf: timeframe } : undefined })
 }
 
 /** 价格显示：整数不带小数，否则保留 1 位 */
@@ -24,7 +26,7 @@ function fmtPrice(v: number): string {
         v-for="item in notifyItems"
         :key="item.id"
         class="notify-item"
-        :class="[`is-${item.type}`, { 'is-clickable': item.signal || item.entryTrigger || item.singleBar }]"
+        :class="[`is-${item.type}`, { 'is-clickable': item.signal || item.entryTrigger || item.singleBar || item.manualLevel }]"
         @click="openSignalChart(item)"
         @mouseenter="item.keepAliveOnHover && suspend(item.id)"
         @mouseleave="item.keepAliveOnHover && resume(item.id)"
@@ -96,6 +98,21 @@ function fmtPrice(v: number): string {
                   最新 <b>{{ fmtPrice(item.entryTrigger.latest) }}</b>
                 </span>
               </div>
+            </div>
+          </template>
+          <template v-else-if="item.manualLevel">
+            <div class="ns-box-alert">
+              <div class="ns-entry-head">
+                <span class="ns-entry-name">#K{{ item.manualLevel.level_id }} · {{ item.manualLevel.symbol }}</span>
+                <span class="ns-entry-dir" :class="item.manualLevel.event_type.includes('down') || item.manualLevel.role === 'resistance' ? 'is-down' : 'is-up'">
+                  {{ manualLevelEventLabel(item.manualLevel.event_type) }}
+                </span>
+              </div>
+              <div class="ns-box-meta">
+                {{ manualLevelRoleLabel(item.manualLevel.role) }} · {{ manualLevelPhaseLabel(item.manualLevel.phase) }} · {{ item.manualLevel.timeframe }}
+                <span v-if="item.manualLevel.price != null"> · 价 {{ fmtPrice(item.manualLevel.price) }}</span>
+              </div>
+              <div class="ns-box-reason">{{ item.manualLevel.reason }}</div>
             </div>
           </template>
           <template v-else-if="item.singleBar">
@@ -178,6 +195,20 @@ function fmtPrice(v: number): string {
 }
 .notify-list::-webkit-scrollbar-track {
   background: transparent;
+}
+.ns-box-meta {
+  max-width: 360px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 4px;
+}
+.ns-box-reason {
+  max-width: 360px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 2px;
 }
 .notify-item {
   display: flex;

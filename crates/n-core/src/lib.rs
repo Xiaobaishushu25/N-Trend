@@ -18,4 +18,3 @@ pub mod v2;
 pub use sea_orm;
 
 pub use derive::Timeframe;
-

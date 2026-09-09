@@ -9,7 +9,6 @@ pub struct Fold {
     pub valid_start: usize,
     pub valid_end: usize,
 }
-
 pub fn walk_forward(n: usize, n_splits: usize) -> Vec<Fold> {
     if n == 0 || n_splits == 0 { return vec![]; }
     let fold_size = (n as f64 / n_splits as f64).ceil() as usize;
@@ -149,4 +148,3 @@ mod tests {
         assert!(folds.iter().all(|f| assert_purge(&rows, std::slice::from_ref(f)).is_ok()));
     }
 }
-

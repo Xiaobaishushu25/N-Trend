@@ -10,8 +10,9 @@ use sea_orm::{
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
-    bar_finality_trials, bar_observations, groups, klines, pattern_events, preclose_signals,
-    rollovers, settings, signal_annotations, signal_decisions, symbol_groups, symbols,
+    bar_finality_trials, bar_observations, groups, klines, manual_level_events, manual_levels,
+    pattern_events, preclose_candidates, preclose_signals, rollovers, settings, signal_annotations, signal_decisions,
+    symbol_groups, symbols,
 };
 
 /// Move a trained model through the lifecycle registry.  Promotion is
@@ -313,7 +314,12 @@ pub async fn claim_scan_watermark(
             DbBackend::Sqlite,
             "SELECT fingerprint, status FROM scan_watermarks \
              WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 AND logic_version=?4",
-            vec![symbol.into(), timeframe.into(), bar_end.into(), logic_version.into()],
+            vec![
+                symbol.into(),
+                timeframe.into(),
+                bar_end.into(),
+                logic_version.into(),
+            ],
         ))
         .await?;
     if let Some(row) = existing {
@@ -353,8 +359,12 @@ pub async fn complete_scan_watermark(
         "UPDATE scan_watermarks SET status='completed',updated_at=?6 \
          WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 AND logic_version=?4 AND fingerprint=?5",
         vec![
-            symbol.into(), timeframe.into(), bar_end.into(), logic_version.into(),
-            fingerprint.into(), now.into(),
+            symbol.into(),
+            timeframe.into(),
+            bar_end.into(),
+            logic_version.into(),
+            fingerprint.into(),
+            now.into(),
         ],
     ))
     .await?;
@@ -374,7 +384,10 @@ pub async fn release_scan_watermark(
         "DELETE FROM scan_watermarks WHERE symbol=?1 AND timeframe=?2 AND bar_end=?3 \
          AND logic_version=?4 AND fingerprint=?5 AND status='processing'",
         vec![
-            symbol.into(), timeframe.into(), bar_end.into(), logic_version.into(),
+            symbol.into(),
+            timeframe.into(),
+            bar_end.into(),
+            logic_version.into(),
             fingerprint.into(),
         ],
     ))
@@ -391,24 +404,32 @@ mod scan_watermark_tests {
         let db = crate::storage::connect(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
-            .await
-            .unwrap());
+        assert!(
+            claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
+                .await
+                .unwrap()
+        );
         complete_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
             .await
             .unwrap();
-        assert!(!claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
-            .await
-            .unwrap());
-        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
-            .await
-            .unwrap());
+        assert!(
+            !claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
+                .await
+                .unwrap()
+        );
         release_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
             .await
             .unwrap();
-        assert!(claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
-            .await
-            .unwrap());
+        assert!(
+            claim_scan_watermark(&db, "FG0", "15m", "2026-09-02 11:00:00", "5", "b")
+                .await
+                .unwrap()
+        );
     }
 }
 
@@ -825,6 +846,137 @@ pub async fn insert_preclose_signal(
     Ok(res.last_insert_id)
 }
 
+pub async fn insert_preclose_candidate(
+    db: &DatabaseConnection,
+    row: preclose_candidates::ActiveModel,
+) -> Result<i64> {
+    let res = preclose_candidates::Entity::insert(row)
+        .exec(db)
+        .await
+        .context("写入临时未收盘候选失败")?;
+    Ok(res.last_insert_id)
+}
+
+pub async fn preclose_candidate_by_key(
+    db: &DatabaseConnection,
+    symbol: &str,
+    direction: &str,
+    warning_ts: &str,
+    session_close_ts: &str,
+) -> Result<Option<preclose_candidates::Model>> {
+    Ok(preclose_candidates::Entity::find()
+        .filter(preclose_candidates::Column::Symbol.eq(symbol))
+        .filter(preclose_candidates::Column::Direction.eq(direction))
+        .filter(preclose_candidates::Column::WarningTs.eq(warning_ts))
+        .filter(preclose_candidates::Column::SessionCloseTs.eq(session_close_ts))
+        .one(db)
+        .await
+        .context("查询临时未收盘候选失败")?)
+}
+
+pub async fn active_preclose_candidates(
+    db: &DatabaseConnection,
+) -> Result<Vec<preclose_candidates::Model>> {
+    Ok(preclose_candidates::Entity::find()
+        .filter(preclose_candidates::Column::State.eq("provisional"))
+        .order_by_desc(preclose_candidates::Column::EmittedAt)
+        .all(db)
+        .await
+        .context("查询有效临时未收盘候选失败")?)
+}
+
+pub async fn all_preclose_candidates(
+    db: &DatabaseConnection,
+) -> Result<Vec<preclose_candidates::Model>> {
+    Ok(preclose_candidates::Entity::find()
+        .order_by_desc(preclose_candidates::Column::EmittedAt)
+        .all(db)
+        .await
+        .context("查询临时未收盘候选失败")?)
+}
+
+pub async fn update_preclose_candidate(
+    db: &DatabaseConnection,
+    row: preclose_candidates::Model,
+) -> Result<()> {
+    let preclose_candidates::Model {
+        id,
+        symbol,
+        direction,
+        level,
+        grade,
+        warning_ts,
+        session_close_ts,
+        emitted_at,
+        last_seen_at,
+        reference_price,
+        entry_score,
+        entry_score_dims,
+        warning_kind,
+        s0_ts,
+        s0_price,
+        s1_ts,
+        s1_price,
+        s2_ts,
+        s2_price,
+        a_move,
+        b_move,
+        a_bars,
+        b_bars,
+        retracement,
+        entry,
+        stop,
+        target,
+        risk,
+        rr,
+        provisional_fingerprint,
+        state,
+        parent_event_id,
+        invalid_reason,
+        created_at,
+        updated_at,
+    } = row;
+    let model = preclose_candidates::ActiveModel {
+        id: sea_orm::ActiveValue::Unchanged(id),
+        symbol: Set(symbol),
+        direction: Set(direction),
+        level: Set(level),
+        grade: Set(grade),
+        warning_ts: Set(warning_ts),
+        session_close_ts: Set(session_close_ts),
+        emitted_at: Set(emitted_at),
+        last_seen_at: Set(last_seen_at),
+        reference_price: Set(reference_price),
+        entry_score: Set(entry_score),
+        entry_score_dims: Set(entry_score_dims),
+        warning_kind: Set(warning_kind),
+        s0_ts: Set(s0_ts),
+        s0_price: Set(s0_price),
+        s1_ts: Set(s1_ts),
+        s1_price: Set(s1_price),
+        s2_ts: Set(s2_ts),
+        s2_price: Set(s2_price),
+        a_move: Set(a_move),
+        b_move: Set(b_move),
+        a_bars: Set(a_bars),
+        b_bars: Set(b_bars),
+        retracement: Set(retracement),
+        entry: Set(entry),
+        stop: Set(stop),
+        target: Set(target),
+        risk: Set(risk),
+        rr: Set(rr),
+        provisional_fingerprint: Set(provisional_fingerprint),
+        state: Set(state),
+        parent_event_id: Set(parent_event_id),
+        invalid_reason: Set(invalid_reason),
+        created_at: Set(created_at),
+        updated_at: Set(updated_at),
+    };
+    model.update(db).await.context("更新临时未收盘候选失败")?;
+    Ok(())
+}
+
 pub async fn preclose_signal_by_key(
     db: &DatabaseConnection,
     symbol: &str,
@@ -851,9 +1003,7 @@ pub async fn active_preclose_signals(
         .context("查询有效收盘前预检测事件失败")?)
 }
 
-pub async fn all_preclose_signals(
-    db: &DatabaseConnection,
-) -> Result<Vec<preclose_signals::Model>> {
+pub async fn all_preclose_signals(db: &DatabaseConnection) -> Result<Vec<preclose_signals::Model>> {
     Ok(preclose_signals::Entity::find()
         .order_by_desc(preclose_signals::Column::EmittedAt)
         .all(db)
@@ -1079,6 +1229,148 @@ pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()
         return Err(anyhow!("删除信号事件失败: 影响行数 {}", res.rows_affected));
     }
     Ok(())
+}
+
+pub async fn manual_levels(
+    db: &DatabaseConnection,
+    symbol: Option<&str>,
+    timeframe: Option<&str>,
+    active_only: bool,
+) -> Result<Vec<manual_levels::Model>> {
+    let mut query = manual_levels::Entity::find().order_by_asc(manual_levels::Column::CreatedAt);
+    if let Some(symbol) = symbol {
+        query = query.filter(manual_levels::Column::Symbol.eq(symbol));
+    }
+    if let Some(timeframe) = timeframe {
+        query = query.filter(manual_levels::Column::Timeframe.eq(timeframe));
+    }
+    if active_only {
+        query = query.filter(manual_levels::Column::Status.is_in(["active", "broken"]));
+    }
+    Ok(query.all(db).await.context("查询关键区域失败")?)
+}
+
+pub async fn manual_level_by_id(
+    db: &DatabaseConnection,
+    id: i64,
+) -> Result<Option<manual_levels::Model>> {
+    Ok(manual_levels::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .context("查询关键区域失败")?)
+}
+
+pub async fn insert_manual_level(
+    db: &DatabaseConnection,
+    row: manual_levels::ActiveModel,
+) -> Result<manual_levels::Model> {
+    db.transaction::<_, manual_levels::Model, anyhow::Error>(|txn| {
+        Box::pin(async move {
+            Ok(row.insert(txn).await?)
+        })
+    })
+    .await
+    .context("创建关键区域失败")
+}
+
+pub async fn update_manual_level(
+    db: &DatabaseConnection,
+    row: manual_levels::Model,
+) -> Result<manual_levels::Model> {
+    db.transaction::<_, manual_levels::Model, anyhow::Error>(|txn| {
+        Box::pin(async move {
+            let level_id = row.id;
+            let role_override = row.role_override.clone();
+            let active: manual_levels::ActiveModel = row.clone().into();
+            let _ = active.update(txn).await?;
+            // role_override was added to existing installations after the original
+            // table definition.  Write it explicitly as well as through the
+            // generated ActiveModel so old SQLite schemas cannot silently retain
+            // the default `auto` value.
+            txn.execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE manual_levels SET role_override=?1 WHERE id=?2",
+                vec![role_override.into(), level_id.into()],
+            ))
+            .await?;
+            manual_levels::Entity::find_by_id(level_id)
+                .one(txn)
+                .await?
+                .ok_or_else(|| anyhow!("更新后的关键区域不存在: {level_id}"))
+        })
+    })
+    .await
+    .context("更新关键区域失败")
+}
+
+pub async fn set_manual_level_monitoring(
+    db: &DatabaseConnection,
+    id: i64,
+    enabled: bool,
+) -> Result<manual_levels::Model> {
+    let Some(mut row) = manual_level_by_id(db, id).await? else {
+        return Err(anyhow!("关键区域不存在: {id}"));
+    };
+    row.monitor_enabled = enabled;
+    if enabled && row.status == "paused" {
+        row.status = "active".to_string();
+    }
+    if !enabled && row.status == "active" {
+        row.status = "paused".to_string();
+    }
+    row.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    update_manual_level(db, row).await
+}
+
+pub async fn archive_manual_level(db: &DatabaseConnection, id: i64) -> Result<()> {
+    let Some(row) = manual_level_by_id(db, id).await? else {
+        return Err(anyhow!("关键区域不存在: {id}"));
+    };
+    let mut row = row;
+    row.status = "archived".to_string();
+    row.monitor_enabled = false;
+    row.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    update_manual_level(db, row).await?;
+    Ok(())
+}
+
+pub async fn delete_manual_level(db: &DatabaseConnection, id: i64) -> Result<()> {
+    manual_level_events::Entity::delete_many()
+        .filter(manual_level_events::Column::LevelId.eq(id))
+        .exec(db)
+        .await
+        .context("删除关键区域事件失败")?;
+    let result = manual_levels::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .context("删除关键区域失败")?;
+    if result.rows_affected != 1 {
+        return Err(anyhow!("删除关键区域失败: 影响行数 {}", result.rows_affected));
+    }
+    Ok(())
+}
+
+pub async fn manual_level_events(
+    db: &DatabaseConnection,
+    level_id: i64,
+) -> Result<Vec<manual_level_events::Model>> {
+    Ok(manual_level_events::Entity::find()
+        .filter(manual_level_events::Column::LevelId.eq(level_id))
+        .order_by_desc(manual_level_events::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("查询关键区域事件失败")?)
+}
+
+pub async fn insert_manual_level_event(
+    db: &DatabaseConnection,
+    row: manual_level_events::ActiveModel,
+) -> Result<Option<manual_level_events::Model>> {
+    match row.insert(db).await {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.to_string().contains("UNIQUE constraint failed") => Ok(None),
+        Err(error) => Err(error).context("保存关键区域事件失败"),
+    }
 }
 
 /// 按 (symbol, direction, warning_ts) 查已有事件，避免同一预警K线重复建事件。
@@ -1374,10 +1666,7 @@ pub async fn insert_bar_observation(
 }
 
 /// 写入或更新一根 Bar 的 Finality 判定试验状态。
-pub async fn upsert_finality_trial(
-    db: &DatabaseConnection,
-    trial: &FinalityTrial,
-) -> Result<()> {
+pub async fn upsert_finality_trial(db: &DatabaseConnection, trial: &FinalityTrial) -> Result<()> {
     let active = bar_finality_trials::ActiveModel {
         id: sea_orm::NotSet,
         symbol: Set(trial.symbol.clone()),
@@ -1445,9 +1734,7 @@ pub async fn load_observations_for_bar(
 }
 
 /// 查询全部 finality trials 记录。
-pub async fn load_all_finality_trials(
-    db: &DatabaseConnection,
-) -> Result<Vec<FinalityTrial>> {
+pub async fn load_all_finality_trials(db: &DatabaseConnection) -> Result<Vec<FinalityTrial>> {
     let rows = bar_finality_trials::Entity::find()
         .order_by_asc(bar_finality_trials::Column::BarTs)
         .order_by_asc(bar_finality_trials::Column::Symbol)
@@ -1458,9 +1745,7 @@ pub async fn load_all_finality_trials(
 }
 
 /// 查询全部观测记录。
-pub async fn load_all_observations(
-    db: &DatabaseConnection,
-) -> Result<Vec<ObservationRecord>> {
+pub async fn load_all_observations(db: &DatabaseConnection) -> Result<Vec<ObservationRecord>> {
     let rows = bar_observations::Entity::find()
         .order_by_asc(bar_observations::Column::BarTs)
         .order_by_asc(bar_observations::Column::Symbol)
@@ -2054,7 +2339,9 @@ mod tests {
         let id = insert_bar_observation(&db, &obs).await.unwrap();
         assert!(id > 0);
 
-        let records = load_observations_for_bar(&db, "RB0", "2026-08-28 10:45:00").await.unwrap();
+        let records = load_observations_for_bar(&db, "RB0", "2026-08-28 10:45:00")
+            .await
+            .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].fingerprint, obs.fingerprint);
         assert_eq!(records[0].raw_response.as_deref(), Some("var _test=..."));
@@ -2128,7 +2415,9 @@ mod tests {
         // 首次写入：1 根 raw 5m，1 根 derived 15m
         let raw1 = vec![make_raw("2026-08-28 10:45:00", 102.0)];
         let derived1 = vec![make_derived("15m", "2026-08-28 10:45:00", 102.0)];
-        atomically_save_raw_and_derived(&db, "RB0", raw1, derived1).await.unwrap();
+        atomically_save_raw_and_derived(&db, "RB0", raw1, derived1)
+            .await
+            .unwrap();
 
         let raw_rows = klines(&db, "RB0", "5m", None, None).await.unwrap();
         assert_eq!(raw_rows.len(), 1);
@@ -2146,7 +2435,9 @@ mod tests {
             make_derived("15m", "2026-08-28 10:45:00", 104.0),
             make_derived("15m", "2026-08-28 11:00:00", 106.0),
         ];
-        atomically_save_raw_and_derived(&db, "RB0", raw2, derived2).await.unwrap();
+        atomically_save_raw_and_derived(&db, "RB0", raw2, derived2)
+            .await
+            .unwrap();
 
         let raw_rows2 = klines(&db, "RB0", "5m", None, None).await.unwrap();
         assert_eq!(raw_rows2.len(), 2);

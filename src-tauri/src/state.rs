@@ -1,4 +1,4 @@
-use n_core::service::Services;
+use n_core::service::{ManualLevelAlert, Services};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -52,6 +52,7 @@ pub struct NotificationHistoryItem {
     pub signal: Option<NotificationSignal>,
     pub entry_trigger: Option<NotificationEntryTrigger>,
     pub single_bar: Option<NotificationSingleBar>,
+    pub manual_level: Option<ManualLevelAlert>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +64,8 @@ pub struct NewNotificationHistoryItem {
     pub entry_trigger: Option<NotificationEntryTrigger>,
     #[serde(default)]
     pub single_bar: Option<NotificationSingleBar>,
+    #[serde(default)]
+    pub manual_level: Option<ManualLevelAlert>,
 }
 
 pub struct AppState {
@@ -101,6 +104,7 @@ impl AppState {
             signal: input.signal,
             entry_trigger: input.entry_trigger,
             single_bar: input.single_bar,
+            manual_level: input.manual_level,
         };
         let mut list = self.notification_history.lock().expect("通知历史锁可用");
         list.insert(0, item);

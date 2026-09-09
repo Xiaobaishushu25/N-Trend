@@ -12,7 +12,12 @@ import type {
   EntryTriggerHit,
   GroupRow,
   KlineRow,
+  ManualLevelAlert,
+  ManualLevelDto,
+  ManualLevelEvent,
+  ManualLevelInput,
   PatternEvent,
+  PrecloseCandidate,
   PrecloseSignal,
   MarketSnapshot,
   NewNotificationHistoryItem,
@@ -79,8 +84,26 @@ export const api = {
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
   getActiveEvents: () => invoke<PatternEvent[]>('get_active_events'),
   getActivePrecloseSignals: () => invoke<PrecloseSignal[]>('get_active_preclose_signals'),
+  getActivePrecloseCandidates: () => invoke<PrecloseCandidate[]>('get_active_preclose_candidates'),
   getPrecloseSignals: () => invoke<PrecloseSignal[]>('get_preclose_signals'),
+  getPrecloseCandidates: () => invoke<PrecloseCandidate[]>('get_preclose_candidates'),
   getMarketSnapshot: () => invoke<MarketSnapshot[]>('get_market_snapshot'),
+  listManualLevels: (symbol?: string, timeframe?: string, activeOnly = false) =>
+    invoke<ManualLevelDto[]>('list_manual_levels', {
+      symbol: symbol || null,
+      timeframe: timeframe || null,
+      activeOnly,
+    }),
+  createManualLevel: (input: ManualLevelInput) =>
+    invoke<ManualLevelDto>('create_manual_level', { input }),
+  updateManualLevel: (id: number, input: ManualLevelInput) =>
+    invoke<ManualLevelDto>('update_manual_level', { id, input }),
+  setManualLevelMonitoring: (id: number, enabled: boolean) =>
+    invoke<ManualLevelDto>('set_manual_level_monitoring', { id, enabled }),
+  archiveManualLevel: (id: number) => invoke<void>('archive_manual_level', { id }),
+  deleteManualLevel: (id: number) => invoke<void>('delete_manual_level', { id }),
+  getManualLevelEvents: (id: number) =>
+    invoke<ManualLevelEvent[]>('get_manual_level_events', { id }),
   runScanNow: () => invoke<ScanResult>('run_scan_now'),
   runScanFastNow: () => invoke<ScanResult>('run_scan_fast_now'),
   rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),
@@ -159,8 +182,16 @@ export function onEntryTrigger(cb: (hits: EntryTriggerHit[]) => void) {
   return listen<EntryTriggerHit[]>('entry-trigger', (e) => cb(e.payload))
 }
 
+export function onManualLevelAlert(cb: (alerts: ManualLevelAlert[]) => void) {
+  return listen<ManualLevelAlert[]>('manual-level-alert', (e) => cb(e.payload))
+}
+
 export function onPrecloseSignal(cb: (signals: PrecloseSignal[]) => void) {
   return listen<PrecloseSignal[]>('preclose-signal', (e) => cb(e.payload))
+}
+
+export function onPrecloseCandidate(cb: (candidates: PrecloseCandidate[]) => void) {
+  return listen<PrecloseCandidate[]>('preclose-candidate', (e) => cb(e.payload))
 }
 
 export function onNotificationHistoryUpdated(
@@ -170,4 +201,3 @@ export function onNotificationHistoryUpdated(
     cb(e.payload),
   )
 }
-

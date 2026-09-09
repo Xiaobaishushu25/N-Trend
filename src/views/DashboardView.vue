@@ -25,7 +25,7 @@ import {
   Star,
   Trash,
 } from '@vicons/tabler'
-import { api, onDataUpdated, onPrecloseSignal, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataUpdated, onPrecloseCandidate, onPrecloseSignal, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useGroupsStore } from '../stores/groups'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
@@ -35,7 +35,7 @@ import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseSignal, SymbolRow } from '../types'
+import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, PrecloseSignal, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
 defineOptions({ name: 'DashboardView' })
@@ -59,13 +59,22 @@ interface WatchRow {
 
 const rows = ref<WatchRow[]>([])
 const precloseSignals = ref<PrecloseSignal[]>([])
+const precloseCandidates = ref<PrecloseCandidate[]>([])
 const precloseClock = ref(Date.now())
-const visiblePrecloseSignals = computed(() => precloseSignals.value.filter((signal) => {
-  if (signal.state === 'confirmed') return true
-  if (signal.state !== 'precheck') return false
-  const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
-  return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
-}))
+const visiblePrecloseSignals = computed<Array<PrecloseSignal | PrecloseCandidate>>(() => [
+  ...precloseSignals.value.filter((signal) => {
+    if (signal.state === 'confirmed') return true
+    if (signal.state !== 'precheck') return false
+    const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
+    return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
+  }),
+  ...precloseCandidates.value.filter((candidate) => {
+    if (candidate.state === 'confirmed') return true
+    if (candidate.state !== 'provisional') return false
+    const closeMs = new Date(candidate.session_close_ts.replace(' ', 'T')).getTime()
+    return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
+  }),
+])
 let precloseTimer: ReturnType<typeof setInterval> | null = null
 const loading = ref(false)
 const groupModal = ref<'create' | 'manage' | null>(null)
@@ -145,12 +154,14 @@ async function loadAll() {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
     }
     // 信号（缓存秒级）与行情快照并行，互不阻塞
-    const [signals, snapshots, preclose] = await Promise.all([
+    const [signals, snapshots, preclose, candidates] = await Promise.all([
       scansStore.refreshLatestSignals().then(() => scansStore.latestSignals),
       api.getMarketSnapshot().catch(() => [] as MarketSnapshot[]),
       api.getActivePrecloseSignals().catch(() => [] as PrecloseSignal[]),
+      api.getActivePrecloseCandidates().catch(() => [] as PrecloseCandidate[]),
     ])
     precloseSignals.value = preclose
+    precloseCandidates.value = candidates
     const bySymbol = new Map<string, PatternEvent[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
@@ -657,11 +668,15 @@ function patternLabel(s: PatternEvent) {
   return `${dirLabel(s)} ${levelLabel(s)}${s.level === 'box' ? '' : 'N'}`
 }
 
-function precloseCountdown(signal: PrecloseSignal) {
-  if (signal.state !== 'precheck') return signal.session_close_ts.slice(11, 16)
+function precloseCountdown(signal: { session_close_ts: string; state: string }) {
+  if (signal.state !== 'precheck' && signal.state !== 'provisional') return signal.session_close_ts.slice(11, 16)
   const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
   const seconds = Math.max(0, Math.floor((closeMs - precloseClock.value) / 1000))
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+function precloseOutcome(signal: PrecloseSignal | PrecloseCandidate) {
+  return 'outcome' in signal && signal.outcome ? signal.outcome : '已观察'
 }
 
 /** 状态胶囊的短标签（与 K 线图左侧品种列表一致） */
@@ -901,6 +916,21 @@ onMounted(async () => {
     }
     precloseSignals.value = [...byId.values()].sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
   }))
+  unlisteners.push(await onPrecloseCandidate((updates) => {
+    const byId = new Map(precloseCandidates.value.map((x) => [x.id, x]))
+    for (const update of updates) {
+      const old = byId.get(update.id)
+      if (update.state === 'provisional' || update.state === 'confirmed') {
+        byId.set(update.id, update)
+      } else {
+        byId.delete(update.id)
+      }
+      if (!old && update.state === 'provisional' && settingsStore.settings.preclose.in_app_notify) {
+        notify.info(`${update.symbol} 临时未收盘扫描：${update.direction === 'up' ? '预做多' : '预做空'}，评分 ${update.entry_score.toFixed(2)}，待收盘确认`, { duration: 8000 })
+      }
+    }
+    precloseCandidates.value = [...byId.values()].sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
+  }))
   // 扫描完成时同步更新内存里的最新扫描结果，避免图表页「全部N形态」停留在旧扫描
   unlisteners.push(
     await onScanCompleted((result) => {
@@ -970,7 +1000,7 @@ onBeforeUnmount(() => {
         :class="`is-${signal.state}`"
       >
         {{ signal.symbol }} {{ signal.direction === 'up' ? '多' : '空' }} ·
-        {{ signal.state === 'precheck' ? `距收盘 ${precloseCountdown(signal)} · 预检测` : signal.state === 'confirmed' ? '已确认' : signal.state === 'observed' ? `开盘${signal.outcome || '已观察'}` : signal.state }}
+        {{ signal.state === 'precheck' ? `距收盘 ${precloseCountdown(signal)} · 预检测` : signal.state === 'provisional' ? `距收盘 ${precloseCountdown(signal)} · 临时预判` : signal.state === 'confirmed' ? '已确认' : signal.state === 'observed' ? `开盘${precloseOutcome(signal)}` : signal.state }}
       </span>
     </div>
     <div class="group-bar">
@@ -1181,6 +1211,7 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 .preclose-chip.is-precheck { color: #b45309; background: rgba(245, 158, 11, 0.13); }
+.preclose-chip.is-provisional { color: #b45309; background: rgba(245, 158, 11, 0.13); }
 .preclose-chip.is-confirmed { color: #1677ff; background: rgba(22, 119, 255, 0.12); }
 .preclose-chip.is-observed { color: #0f9d58; background: rgba(15, 157, 88, 0.12); }
 .page {
@@ -1602,10 +1633,5 @@ onBeforeUnmount(() => {
 }
 
 </style>
-
-
-
-
-
 
 

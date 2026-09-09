@@ -373,6 +373,9 @@ pub struct BareSignal {
     pub low: f64,
 }
 
+
+
+
 fn calc_atr14(bars: &[crate::analyze::model::Bar]) -> Option<f64> {
     if bars.len() < 15 { return None; }
     let start = bars.len() - 14;
@@ -490,6 +493,3 @@ mod tests {
         assert_eq!(ma[20], Some(11.5));
     }
 }
-
-
-

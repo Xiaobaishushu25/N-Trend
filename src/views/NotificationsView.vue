@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { api, onNotificationHistoryUpdated } from '../services/api'
 import type { NotificationHistoryItem } from '../types'
+import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 
 const items = ref<NotificationHistoryItem[]>([])
 const loading = ref(true)
@@ -24,6 +25,7 @@ function fmtPrice(v: number): string {
 
 function kindLabel(item: NotificationHistoryItem): string {
   if (item.entry_trigger) return '入场提醒'
+  if (item.manual_level) return '关键区域'
   // 信号卡片本身已有完整信息，历史列表里不再重复显示“信号”
   if (item.signal) return ''
   switch (item.kind) {
@@ -154,6 +156,17 @@ onBeforeUnmount(() => {
             </span>
             <span class="signal-score">评分 {{ item.signal.score.toFixed(2) }}</span>
             <span v-if="item.signal.time" class="signal-time">{{ item.signal.time }}</span>
+          </div>
+
+          <div v-else-if="item.manual_level" class="signal-line">
+            <span class="signal-code">#K{{ item.manual_level.level_id }}</span>
+            <span class="signal-name">{{ item.manual_level.symbol }}</span>
+            <span class="signal-level">{{ manualLevelEventLabel(item.manual_level.event_type) }}</span>
+            <span class="signal-score manual-history-role-badge">{{ manualLevelRoleLabel(item.manual_level.role) }}</span>
+            <span class="signal-time">{{ item.manual_level.timeframe }} · {{ manualLevelPhaseLabel(item.manual_level.phase) }}</span>
+            <span v-if="item.manual_level.bar_ts" class="signal-time">{{ item.manual_level.bar_ts }}</span>
+            <span v-if="item.manual_level.price != null" class="signal-time">价 {{ fmtPrice(item.manual_level.price) }}</span>
+            <div class="manual-history-reason">{{ item.manual_level.reason }}</div>
           </div>
 
           <template v-else>
@@ -331,6 +344,17 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: #94a3b8;
   font-variant-numeric: tabular-nums;
+}
+.manual-history-role-badge {
+  color: #0f766e;
+  background: rgba(20, 184, 166, 0.1);
+}
+.manual-history-reason {
+  flex: 1 1 100%;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.45;
+  word-break: break-word;
 }
 .entry-price {
   font-size: 13px;

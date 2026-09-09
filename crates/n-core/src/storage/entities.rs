@@ -236,6 +236,129 @@ pub mod preclose_signals {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+/// 收盘前基于未收盘15m K线临时推演出的潜在预警。
+/// 不写入 pattern_events，收盘后由最终15m K线扫描结果确认或失效。
+pub mod preclose_candidates {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "preclose_candidates")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub direction: String,
+        pub level: String,
+        pub grade: String,
+        pub warning_ts: String,
+        pub session_close_ts: String,
+        pub emitted_at: String,
+        pub last_seen_at: String,
+        pub reference_price: f64,
+        pub entry_score: f64,
+        pub entry_score_dims: String,
+        pub warning_kind: String,
+        pub s0_ts: String,
+        pub s0_price: f64,
+        pub s1_ts: String,
+        pub s1_price: f64,
+        pub s2_ts: String,
+        pub s2_price: f64,
+        pub a_move: f64,
+        pub b_move: f64,
+        pub a_bars: i64,
+        pub b_bars: i64,
+        pub retracement: f64,
+        pub entry: f64,
+        pub stop: f64,
+        pub target: f64,
+        pub risk: f64,
+        pub rr: f64,
+        pub provisional_fingerprint: String,
+        /// provisional / confirmed / invalidated
+        pub state: String,
+        pub parent_event_id: Option<i64>,
+        pub invalid_reason: Option<String>,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// 用户手工绘制的单一价格区域。
+pub mod manual_levels {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "manual_levels")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub symbol: String,
+        pub timeframe: String,
+        pub name: String,
+        pub start_ts: String,
+        pub end_ts: Option<String>,
+        pub zone_low: f64,
+        pub zone_high: f64,
+        /// unknown / support / resistance
+        pub role: String,
+        /// auto / support / resistance；用户手动指定时覆盖自动识别
+        pub role_override: String,
+        pub role_confidence: f64,
+        /// active / paused / broken / archived
+        pub status: String,
+        pub monitor_enabled: bool,
+        /// pending / approaching / testing / rejection_confirmed / breakout_confirmed /
+        /// retest_confirmed / invalidated
+        pub current_phase: String,
+        pub last_event_ts: Option<String>,
+        pub created_at: String,
+        pub updated_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+/// 关键区域的状态变化与提醒历史。
+pub mod manual_level_events {
+    use sea_orm::entity::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+    #[sea_orm(table_name = "manual_level_events")]
+    pub struct Model {
+        #[sea_orm(primary_key)]
+        pub id: i64,
+        pub level_id: i64,
+        pub symbol: String,
+        pub timeframe: String,
+        pub event_type: String,
+        pub role: Option<String>,
+        pub bar_ts: Option<String>,
+        pub price: Option<f64>,
+        pub reason: String,
+        pub phase: String,
+        pub role_confidence: f64,
+        pub volume_ratio: Option<f64>,
+        pub created_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 /// 连续合约换月记录：5m 断点时间为主键，确认后标记断点后第一根 bar 为换月。
 pub mod rollovers {
     use sea_orm::entity::prelude::*;
@@ -367,7 +490,6 @@ pub mod bar_finality_trials {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
-
 
 pub mod v2_trade_events {
     use sea_orm::entity::prelude::*;

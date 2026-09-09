@@ -70,6 +70,70 @@ export interface BoxDto {
   last_ts: string
 }
 
+/** 用户手工绘制的单一价位区域。 */
+export interface ManualLevelDto {
+  id: number
+  symbol: string
+  timeframe: string
+  name: string
+  start_ts: string
+  end_ts: string | null
+  zone_low: number
+  zone_high: number
+  role: 'unknown' | 'support' | 'resistance' | string
+  role_override: 'auto' | 'support' | 'resistance' | string
+  role_confidence: number
+  status: 'active' | 'paused' | 'broken' | 'archived' | string
+  monitor_enabled: boolean
+  current_phase: string
+  last_event_ts: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ManualLevelEvent {
+  id: number
+  level_id: number
+  symbol: string
+  timeframe: string
+  event_type: string
+  role: string | null
+  bar_ts: string | null
+  price: number | null
+  reason: string
+  phase: string
+  role_confidence: number
+  volume_ratio: number | null
+  created_at: string
+}
+
+export interface ManualLevelAlert {
+  level_id: number
+  symbol: string
+  timeframe: string
+  name: string
+  event_type: string
+  role: string
+  role_confidence: number
+  bar_ts: string | null
+  price: number | null
+  reason: string
+  phase: string
+  volume_ratio: number | null
+}
+
+export interface ManualLevelInput {
+  symbol: string
+  timeframe: string
+  name: string
+  start_ts: string
+  end_ts: string | null
+  zone_low: number
+  zone_high: number
+  role_override: 'auto' | 'support' | 'resistance'
+  monitor_enabled: boolean
+}
+
 export interface PatternDto {
   number: number
   level: string
@@ -204,6 +268,45 @@ export interface PrecloseSignal {
   outcome: 'win' | 'loss' | 'timeout' | 'ambiguous' | string | null
   outcome_ts: string | null
   horizon_minutes: number
+  created_at: string
+  updated_at: string
+}
+
+/** 基于当前未收盘15m K线临时推演的潜在预警候选 */
+export interface PrecloseCandidate {
+  id: number
+  symbol: string
+  direction: string
+  level: string
+  grade: string
+  warning_ts: string
+  session_close_ts: string
+  emitted_at: string
+  last_seen_at: string
+  reference_price: number
+  entry_score: number
+  entry_score_dims: string
+  warning_kind: string
+  s0_ts: string
+  s0_price: number
+  s1_ts: string
+  s1_price: number
+  s2_ts: string
+  s2_price: number
+  a_move: number
+  b_move: number
+  a_bars: number
+  b_bars: number
+  retracement: number
+  entry: number
+  stop: number
+  target: number
+  risk: number
+  rr: number
+  provisional_fingerprint: string
+  state: 'provisional' | 'confirmed' | 'invalidated' | string
+  parent_event_id: number | null
+  invalid_reason: string | null
   created_at: string
   updated_at: string
 }
@@ -592,6 +695,7 @@ export interface NewNotificationHistoryItem {
   signal?: NotificationSignal | null
   entry_trigger?: NotificationEntryTrigger | null
   single_bar?: NotificationSingleBar | null
+  manual_level?: ManualLevelAlert | null
 }
 
 export interface NotificationHistoryItem {
@@ -603,6 +707,7 @@ export interface NotificationHistoryItem {
   signal?: NotificationSignal | null
   entry_trigger?: NotificationEntryTrigger | null
   single_bar?: NotificationSingleBar | null
+  manual_level?: ManualLevelAlert | null
 }
 
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const

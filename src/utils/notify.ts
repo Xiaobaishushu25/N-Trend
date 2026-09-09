@@ -5,6 +5,7 @@ import { createApp, reactive } from 'vue'
 import AppNotificationHost from '../components/AppNotificationHost.vue'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { api } from '../services/api'
+import type { ManualLevelAlert } from '../types'
 
 export type NotifyType = 'success' | 'info' | 'warning' | 'error'
 
@@ -23,6 +24,8 @@ export interface NotifyOptions {
   entryTrigger?: NotifyItem['entryTrigger']
   /** 单K锤形态结构化通知 */
   singleBar?: NotifyItem['singleBar']
+  /** 关键区域结构化通知 */
+  manualLevel?: ManualLevelAlert
   /** 仅写入历史通知，不弹出应用内卡片 */
   recordOnly?: boolean
 }
@@ -69,6 +72,7 @@ export interface NotifyItem {
     time: string // HH:mm
     price: number
   }
+  manualLevel?: ManualLevelAlert
 }
 
 export const notifyItems = reactive<NotifyItem[]>([])
@@ -121,6 +125,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
     signal: options?.signal,
     entryTrigger: options?.entryTrigger,
     singleBar: options?.singleBar,
+    manualLevel: options?.manualLevel,
   }
   if (!recordOnly) {
     notifyItems.push(item)
@@ -136,6 +141,7 @@ function push(type: NotifyType, content: string, options?: NotifyOptions): numbe
         : null,
       entry_trigger: item.entryTrigger ?? null,
       single_bar: item.singleBar ?? null,
+      manual_level: item.manualLevel ?? null,
     }).catch(() => {
       // 浏览器预览或后端未包含新命令时，历史功能静默降级
     })
@@ -207,6 +213,8 @@ export const notify = {
     push('info', '', { duration: 4000, singleBar: data }),
   entryTrigger: (data: NonNullable<NotifyItem['entryTrigger']>) =>
     push('info', '', { duration: 0, entryTrigger: data }),
+  manualLevel: (data: ManualLevelAlert) =>
+    push('info', '', { duration: 0, manualLevel: data }),
 }
 
 

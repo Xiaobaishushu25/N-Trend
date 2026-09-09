@@ -5,11 +5,12 @@ import {
   requestPermission,
   sendNotification,
 } from '@tauri-apps/plugin-notification'
-import { onDataUpdated, onScanCompleted, onEntryTrigger, api } from '../services/api'
+import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, api } from '../services/api'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import { isMainWindow, notify } from '../utils/notify'
-import type { AppInfo, RecentOutcomeFilters } from '../types'
+import { manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
+import type { AppInfo, ManualLevelAlert, RecentOutcomeFilters } from '../types'
 
 /** 通过 Tauri 官方通知插件发送系统级通知（自动申请权限；非 Tauri 环境忽略） */
 async function sendSystemNotification(title: string, body: string) {
@@ -31,19 +32,47 @@ function fmtPrice(v: number): string {
   return Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)
 }
 
+function manualLevelTitle(alert: ManualLevelAlert): string {
+  if (alert.event_type === 'breakout_up') return '价位向上突破 · 关注做多'
+  if (alert.event_type === 'breakout_down') return '价位向下突破 · 关注做空'
+  if (alert.event_type === 'rejection') {
+    return alert.role === 'resistance' ? '压力拒绝 · 关注做空' : '支撑拒绝 · 关注做多'
+  }
+  if (alert.event_type === 'approach') return '接近关键区域'
+  if (alert.event_type === 'testing') return '测试关键区域'
+  return '关键区域状态变化'
+}
+
 export const useAppStore = defineStore('app', {
   state: () => ({
     info: { name: 'ntrend', version: '0.1.0' } as AppInfo,
     listeners: [] as (() => void)[],
+    initialized: false,
+    /** 当前进程收到的关键区域最新动态，供品种列表和K线卡片同步展示。 */
+    manualLevelAlerts: [] as ManualLevelAlert[],
     /** 复盘窗口点击明细行时带入的筛选上下文；K线页复盘模式据此拉取信号列表 */
     reviewJumpFilters: null as RecentOutcomeFilters | null,
   }),
   actions: {
     async init() {
+      if (this.initialized) return
+      this.initialized = true
       try {
         this.info = await api.appInfo()
       } catch {
         // 浏览器预览环境下无后端命令，忽略
+      }
+      try {
+        const history = await api.getNotificationHistory()
+        const latestByLevel = new Map<number, ManualLevelAlert>()
+        for (const item of history) {
+          if (item.manual_level && !latestByLevel.has(item.manual_level.level_id)) {
+            latestByLevel.set(item.manual_level.level_id, item.manual_level)
+          }
+        }
+        this.manualLevelAlerts = [...latestByLevel.values()].slice(0, 80)
+      } catch {
+        // 历史通知不可用时不影响实时事件监听
       }
       this.listeners.push(
         await onDataUpdated((stats) => {
@@ -80,6 +109,26 @@ export const useAppStore = defineStore('app', {
               sendSystemNotification(
                 `${hit.name || hit.symbol} ${dirLabel}`,
                 `入场价 ${fmtPrice(hit.entry)} · 最新 ${fmtPrice(hit.latest)}`,
+              )
+            }
+          }
+        }),
+      )
+      this.listeners.push(
+        await onManualLevelAlert((alerts) => {
+          if (!isMainWindow()) return
+          const latestByLevel = new Map<number, ManualLevelAlert>()
+          for (const alert of [...alerts, ...this.manualLevelAlerts]) {
+            if (!latestByLevel.has(alert.level_id)) latestByLevel.set(alert.level_id, alert)
+          }
+          this.manualLevelAlerts = [...latestByLevel.values()].slice(0, 80)
+          const cfg = useSettingsStore().settings.notify
+          for (const alert of alerts) {
+            if (cfg.in_app_new_pattern) notify.manualLevel(alert)
+            if (cfg.system_entry_trigger) {
+              sendSystemNotification(
+                `${alert.symbol} ${manualLevelTitle(alert)}`,
+                `#K${alert.level_id} · ${manualLevelRoleLabel(alert.role)} · ${manualLevelPhaseLabel(alert.phase)} · ${alert.timeframe} · ${alert.reason}`,
               )
             }
           }

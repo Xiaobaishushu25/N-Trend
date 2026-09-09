@@ -14,7 +14,6 @@ pub struct LogisticModel {
     pub scaler_means: Vec<f64>,
     pub scaler_stds: Vec<f64>,
 }
-
 impl LogisticModel {
     pub fn new(feature_names: Vec<String>) -> Self {
         let n = feature_names.len();
@@ -201,6 +200,4 @@ mod tests {
         assert!((model.predict_row_p(&missing) - expected).abs() < 1e-12);
     }
 }
-
-
 

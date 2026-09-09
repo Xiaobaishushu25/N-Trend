@@ -32,7 +32,6 @@ pub struct SetupFeatures {
     pub normalized: bool,
     pub missing_mask: u32,
 }
-
 use crate::analyze::model::{Bar, Dir, NPattern, Trend60};
 
 /// Extract setup features from a detected N pattern.
@@ -111,4 +110,3 @@ mod tests {
         assert!((f.a_speed - 1.666).abs() < 0.01);
     }
 }
-

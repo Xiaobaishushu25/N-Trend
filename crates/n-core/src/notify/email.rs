@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::storage::entities::{pattern_events, preclose_signals};
+use crate::storage::entities::{pattern_events, preclose_candidates, preclose_signals};
 
 pub const DEFAULT_RECIPIENT: &str = "2055761346@qq.com";
 
@@ -297,6 +297,31 @@ pub fn preclose_email_payload(
         signal.parent_event_id,
         signal.horizon_minutes,
         event_body,
+    );
+    (subject, body)
+}
+
+/// 临时未收盘候选邮件：不依赖正式 pattern_event，明确标注为待收盘确认。
+pub fn preclose_candidate_email_payload(
+    candidate: &preclose_candidates::Model,
+) -> (String, String) {
+    let direction = if candidate.direction == "up" { "预做多" } else { "预做空" };
+    let subject = format!(
+        "N趋势临时未收盘扫描【{}】{} {} {:.2}分",
+        candidate.symbol, direction, candidate.grade, candidate.entry_score,
+    );
+    let body = format!(
+        "扫描时间：{}\n预计收盘：{}\n参考现价：{:.1}\n临时预警K线：{}\n形态方向：{} {}\n入场价：{:.1}\n止损价：{:.1}\n目标价：{:.1}\n风险收益比：{:.2}\n\n说明：这是基于未收盘15m K线的临时预判，不写入正式信号；收盘后的最终15m K线满足正式预警条件时才确认，否则失效。",
+        candidate.emitted_at,
+        candidate.session_close_ts,
+        candidate.reference_price,
+        candidate.warning_ts,
+        direction,
+        candidate.level,
+        candidate.entry,
+        candidate.stop,
+        candidate.target,
+        candidate.rr,
     );
     (subject, body)
 }

@@ -3,6 +3,7 @@ pub mod dto;
 pub mod event;
 pub mod indicators;
 pub mod io;
+pub mod manual_level;
 pub mod model;
 pub mod outcome;
 pub mod pattern;

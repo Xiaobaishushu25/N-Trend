@@ -10,7 +10,7 @@ import {
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, List, Star, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, Eye, EyeOff, List, Plus, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import { api, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -23,14 +23,18 @@ import { useScansStore } from '../stores/scans'
 import { singleBarBadgeStyle, singleBarTitle } from '../utils/singleBar'
 import { useReviewStore } from "../stores/review"
 import { useSettingsStore } from '../stores/settings'
+import { useManualLevelsStore } from '../stores/manualLevels'
 import { useAppStore } from '../stores/app'
 import { fmtR } from '../stores/review'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
+import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
 import type {
   GroupRow,
   KlineRow,
+  ManualLevelAlert,
+  ManualLevelDto,
   MarketSnapshot,
   OutcomeDetail,
   PatternEvent,
@@ -40,6 +44,7 @@ import type {
   SymbolRow,
   Timeframe,
   TrendPointDto,
+  ManualLevelInput,
 } from '../types'
 
 const route = useRoute()
@@ -49,14 +54,16 @@ const symbolsStore = useSymbolsStore()
 const klinesStore = useKlinesStore()
 const scansStore = useScansStore()
 const groupsStore = useGroupsStore()
+const manualLevelsStore = useManualLevelsStore()
 
 const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
 const getSingleBar = (code: string) => scansStore.singleBars.get(code) ?? null
 const chartSingleBars = computed(() => { const sb = scansStore.singleBars.get(symbol.value); return sb ? [sb] : [] })
-const timeframe = ref<Timeframe>('15m')
 const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
+const routeTimeframe = String(route.query.tf || '') as Timeframe
+const timeframe = ref<Timeframe>(allTimeframes.includes(routeTimeframe) ? routeTimeframe : '15m')
 const settingsStore = useSettingsStore()
 /** 图表加载的历史K线根数：至少保留现有 1200 根窗口，展示根数调大时同步扩容 */
 const chartLoadLimit = computed(() => Math.max(1200, settingsStore.settings.ui.chart_display_bars))
@@ -79,6 +86,27 @@ function toggleTimeframe(t: Timeframe, checked: boolean) {
 }
 
 const currentSymbol = computed(() => symbolsStore.symbols.find((s) => s.code === symbol.value))
+const manualLevelChartPreviews = ref<Record<number, ManualLevelInput>>({})
+const editingManualLevelId = ref<number | null>(null)
+const manualLevelDraft = ref<ManualLevelInput | null>(null)
+/** 图表拖拽和右侧表单共用同一份显示数据，实现双向实时联动。 */
+const manualLevels = computed(() => manualLevelsStore.forChart(symbol.value, timeframe.value).map((level) => {
+  const chartPreview = manualLevelChartPreviews.value[level.id]
+  const editPreview = editingManualLevelId.value === level.id ? manualLevelDraft.value : null
+  const preview = editPreview ?? chartPreview
+  if (!preview) return level
+  const low = Number(preview.zone_low)
+  const high = Number(preview.zone_high)
+  return {
+    ...level,
+    ...preview,
+    zone_low: Number.isFinite(low) ? low : level.zone_low,
+    zone_high: Number.isFinite(high) ? high : level.zone_high,
+  }
+}))
+const hiddenManualLevelIds = ref<Set<number>>(new Set())
+const visibleManualLevels = computed(() => manualLevels.value.filter((level) => !hiddenManualLevelIds.value.has(level.id)))
+const manualLevelDrawMode = ref(false)
 
 /** 完整性自检/补全：当前品种 5m 缺口检测与一键修复 */
 const integrityChecking = ref(false)
@@ -587,7 +615,10 @@ function applyDefaultHidden() {
 
 /** 左侧品种列表开关与行情快照 */
 const showList = ref(true)
-const chartRef = ref<{ stepCandles: (dir: number) => void } | null>(null)
+const chartRef = ref<{
+  stepCandles: (dir: number) => void
+  toggleManualLevelDraw: () => boolean
+} | null>(null)
 const snapshots = ref<Record<string, MarketSnapshot>>({})
 /** 品种行闪烁方向：up=上涨(红) / down=下跌(绿)，由实时行情跳动驱动 */
 const rowFlash = ref<Record<string, 'up' | 'down'>>({})
@@ -913,6 +944,26 @@ async function handleDeleteSymbol(code: string) {
 const snapshot = computed(() => snapshots.value[symbol.value] ?? null)
 /** 信息卡主价格：优先用实时快照，缺失时回退到K线最新收盘 */
 const quotePrice = computed(() => snapshot.value?.latest ?? latestClose.value)
+function distanceToManualLevel(level: ManualLevelDto, price: number | null) {
+  if (price == null || !Number.isFinite(price)) return Number.POSITIVE_INFINITY
+  if (price < level.zone_low) return level.zone_low - price
+  if (price > level.zone_high) return price - level.zone_high
+  return 0
+}
+const nearestManualLevel = computed<ManualLevelDto | null>(() => {
+  const levels = manualLevels.value.slice()
+  if (!levels.length) return null
+  const price = quotePrice.value
+  return levels.sort((a, b) => {
+    const distance = distanceToManualLevel(a, price) - distanceToManualLevel(b, price)
+    return distance || a.id - b.id
+  })[0] ?? null
+})
+const activeManualLevels = computed(() => nearestManualLevel.value ? [nearestManualLevel.value] : [])
+const recentManualLevels = computed(() => {
+  const nearestId = nearestManualLevel.value?.id
+  return manualLevels.value.filter((level) => level.id !== nearestId)
+})
 /** 涨跌颜色：与左侧品种列表一致，取自快照涨跌幅 */
 const quoteColor = computed(() => trendColor(snapshot.value?.change_pct ?? null))
 /** 涨跌点数：由最新价与涨跌幅反推上一根收盘价再相减，保证与涨跌幅口径一致 */
@@ -963,6 +1014,31 @@ const signalBySymbol = computed<Record<string, PatternEvent | null>>(() => {
   }
   return out
 })
+
+/** 每个品种最近一次关键区域动态，供左侧列表显示简短状态。 */
+const manualAlertBySymbol = computed<Record<string, ManualLevelAlert | null>>(() => {
+  const out: Record<string, ManualLevelAlert | null> = {}
+  for (const alert of appStore.manualLevelAlerts) {
+    if (!out[alert.symbol]) out[alert.symbol] = alert
+  }
+  return out
+})
+
+const manualAlertByLevel = computed<Record<number, ManualLevelAlert>>(() => {
+  const out: Record<number, ManualLevelAlert> = {}
+  for (const alert of appStore.manualLevelAlerts) {
+    if (!out[alert.level_id]) out[alert.level_id] = alert
+  }
+  return out
+})
+
+function manualAlertForLevel(levelId: number) {
+  return manualAlertByLevel.value[levelId] ?? null
+}
+
+function manualAlertTitle(alert: ManualLevelAlert) {
+  return `#K${alert.level_id} · ${manualLevelEventLabel(alert.event_type)} · ${manualLevelRoleLabel(alert.role)} · ${manualLevelPhaseLabel(alert.phase)}${alert.price == null ? '' : ` · 价 ${alert.price.toFixed(1)}`}\n${alert.reason}`
+}
 
 /** 信号状态 → 列表里的短标签 */
 function sigLabel(state: string) {
@@ -1059,6 +1135,17 @@ const visibleSignals = computed<PatternDto[]>(() => {
 
 function isHidden(num: number) {
   return hiddenNumbers.value.has(num)
+}
+
+function isManualLevelHidden(id: number) {
+  return hiddenManualLevelIds.value.has(id)
+}
+
+function toggleManualLevelVisibility(id: number) {
+  const next = new Set(hiddenManualLevelIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  hiddenManualLevelIds.value = next
 }
 
 function isRecentShown(num: number) {
@@ -1321,6 +1408,53 @@ function stateType(state: string): 'info' | 'success' | 'warning' | 'default' | 
   return 'default'
 }
 
+function manualLevelRoleText(role: string) {
+  if (role === 'support') return '支撑'
+  if (role === 'resistance') return '压力'
+  return '待确认'
+}
+
+function manualLevelEffectiveRole(level: ManualLevelDto) {
+  return level.role_override === 'support' || level.role_override === 'resistance'
+    ? level.role_override
+    : level.role
+}
+
+function manualLevelPhaseDisplay(level: ManualLevelDto) {
+  if (level.current_phase === 'pending' && (level.role_override === 'support' || level.role_override === 'resistance')) {
+    return `${manualLevelRoleText(level.role_override)}已指定`
+  }
+  return manualLevelPhaseText(level.current_phase)
+}
+
+function manualLevelDisplayName(name: string) {
+  return name === '手工价位' || name === '手工关键区' || name === '手工' ? '关键区域' : name || '关键区域'
+}
+
+function manualLevelOverrideText(role: string) {
+  if (role === 'support') return '支撑'
+  if (role === 'resistance') return '压力'
+  return '自动识别'
+}
+
+function manualLevelPhaseText(phase: string) {
+  switch (phase) {
+    case 'approaching': return '接近区域'
+    case 'testing': return '测试中'
+    case 'rejection_confirmed': return '拒绝确认'
+    case 'breakout_confirmed': return '突破确认'
+    case 'retest_confirmed': return '回踩确认'
+    case 'pending': return '待确认'
+    default: return phase || '待确认'
+  }
+}
+
+function manualLevelStateType(phase: string): 'info' | 'success' | 'warning' | 'default' | 'error' {
+  if (phase === 'pending' || phase === 'approaching' || phase === 'testing') return 'info'
+  if (phase.includes('confirmed')) return 'success'
+  return 'default'
+}
+
 const VOL_CONFIRM_RATIO = 2.0
 
 function volStatusText(s: PatternDto): string {
@@ -1355,6 +1489,155 @@ function fmtDelta(delta: number) {
 /** 最近活跃信号时间显示：MM-DD HH:mm */
 function fmtRecentTime(t: string) {
   return t.length >= 16 ? t.slice(5, 16) : t
+}
+
+async function handleCreateManualLevel(input: ManualLevelInput) {
+  try {
+    await manualLevelsStore.create(input)
+    notify.success(`${input.symbol} ${input.timeframe} 关键区域已保存并开始监控`)
+  } catch (error) {
+    notify.error(`保存关键区域失败：${String(error)}`, { duration: 8000 })
+  }
+}
+
+function toggleManualLevelDraw() {
+  manualLevelDrawMode.value = chartRef.value?.toggleManualLevelDraw() ?? false
+}
+
+function onManualLevelDrawMode(active: boolean) {
+  manualLevelDrawMode.value = active
+}
+
+function handleManualLevelPreview(id: number, input: ManualLevelInput | null) {
+  if (input) {
+    manualLevelChartPreviews.value = { ...manualLevelChartPreviews.value, [id]: input }
+  } else {
+    const next = { ...manualLevelChartPreviews.value }
+    delete next[id]
+    manualLevelChartPreviews.value = next
+  }
+}
+
+function normalizeManualLevelDraft() {
+  const draft = manualLevelDraft.value
+  if (!draft) return
+  draft.zone_low = Number(Number(draft.zone_low).toFixed(2))
+  draft.zone_high = Number(Number(draft.zone_high).toFixed(2))
+  if (draft.zone_low > draft.zone_high) {
+    const swap = draft.zone_low
+    draft.zone_low = draft.zone_high
+    draft.zone_high = swap
+  }
+}
+
+async function handleUpdateManualLevel(
+  id: number,
+  input: ManualLevelInput,
+  settled: (saved: ManualLevelDto | null) => void,
+) {
+  try {
+    const saved = await manualLevelsStore.update(id, input)
+    settled(saved)
+  } catch (error) {
+    settled(null)
+    notify.error(`更新关键区域失败：${String(error)}`, { duration: 8000 })
+  }
+}
+
+async function toggleManualLevel(level: import('../types').ManualLevelDto) {
+  try {
+    await manualLevelsStore.setMonitoring(level.id, !level.monitor_enabled)
+    notify.success(level.monitor_enabled ? '关键区域已暂停监控' : '关键区域已恢复监控')
+  } catch (error) {
+    notify.error(`更新关键区域失败：${String(error)}`)
+  }
+}
+
+function editManualLevel(level: ManualLevelDto) {
+  editingManualLevelId.value = level.id
+  manualLevelDraft.value = {
+    symbol: level.symbol,
+    timeframe: level.timeframe,
+    name: level.name,
+    start_ts: level.start_ts,
+    end_ts: level.end_ts,
+    zone_low: level.zone_low,
+    zone_high: level.zone_high,
+    role_override: level.role_override === 'support' || level.role_override === 'resistance' ? level.role_override : 'auto',
+    monitor_enabled: level.monitor_enabled,
+  }
+}
+
+async function changeManualLevelRole(level: ManualLevelDto, event: Event) {
+  const roleOverride = (event.target as HTMLSelectElement | null)?.value
+  if (roleOverride !== 'auto' && roleOverride !== 'support' && roleOverride !== 'resistance') return
+  try {
+    const updated = await manualLevelsStore.update(level.id, {
+      symbol: level.symbol,
+      timeframe: level.timeframe,
+      name: manualLevelDisplayName(level.name),
+      start_ts: level.start_ts,
+      end_ts: level.end_ts,
+      zone_low: level.zone_low,
+      zone_high: level.zone_high,
+      role_override: roleOverride,
+      monitor_enabled: level.monitor_enabled,
+    })
+    let savedRoleOverride: string | undefined = updated?.role_override
+    if (savedRoleOverride !== roleOverride) {
+      // 某些旧的运行实例可能在更新响应中遗漏新字段；重新读取一次，
+      // 以数据库中的最终值为准，避免把“响应字段缺失”误报成版本问题。
+      await manualLevelsStore.load(level.symbol, level.timeframe)
+      savedRoleOverride = manualLevelsStore.levels.find((item) => item.id === level.id)?.role_override
+    }
+    if (savedRoleOverride !== roleOverride) {
+      throw new Error(`保存后端返回的角色仍是${manualLevelRoleText(savedRoleOverride || 'auto')}，请查看后端日志中的“关键区域角色更新完成”记录`)
+    }
+    notify.success(roleOverride === 'auto' ? '已恢复自动识别' : `已手动指定为${manualLevelRoleText(roleOverride)}`)
+  } catch (error) {
+    notify.error(`更新关键区域角色失败：${String(error)}`)
+  }
+}
+
+function cancelEditManualLevel() {
+  editingManualLevelId.value = null
+  manualLevelDraft.value = null
+}
+
+async function saveEditManualLevel() {
+  if (editingManualLevelId.value == null || !manualLevelDraft.value) return
+  try {
+    await manualLevelsStore.update(editingManualLevelId.value, manualLevelDraft.value)
+    notify.success('关键区域已更新')
+    cancelEditManualLevel()
+  } catch (error) {
+    notify.error(`更新关键区域失败：${String(error)}`, { duration: 8000 })
+  }
+}
+
+async function archiveManualLevel(level: import('../types').ManualLevelDto) {
+  try {
+    await manualLevelsStore.archive(level.id)
+    notify.success('关键区域已归档')
+  } catch (error) {
+    notify.error(`归档关键区域失败：${String(error)}`)
+  }
+}
+
+async function deleteManualLevel(level: import('../types').ManualLevelDto) {
+  const ok = await confirmAction({
+    title: '删除关键区域',
+    content: `确定删除“${level.name || '关键区域'}”吗？删除后事件记录也会被移除。`,
+    positiveText: '删除',
+    type: 'error',
+  })
+  if (!ok) return
+  try {
+    await manualLevelsStore.remove(level.id)
+    notify.success('关键区域已删除')
+  } catch (error) {
+    notify.error(`删除关键区域失败：${String(error)}`)
+  }
 }
 
 let unlisteners: (() => void)[] = []
@@ -1392,6 +1675,10 @@ watch([reviewIndex, reviewRows], async () => {
 
 watch([symbol, timeframe], async () => {
   lastRepairResult.value = null
+  manualLevelChartPreviews.value = {}
+  editingManualLevelId.value = null
+  manualLevelDraft.value = null
+  hiddenManualLevelIds.value = new Set()
   hiddenApplied.value = ''
   applyDefaultHidden()
   liveBars.value = []
@@ -1399,6 +1686,7 @@ watch([symbol, timeframe], async () => {
   trendPoints.value = []
   loadRecentPatterns()
   if (symbol.value) {
+    void manualLevelsStore.load(symbol.value, timeframe.value)
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
     await loadTrendLine()
     scansStore.refreshLatestSignals()
@@ -1601,6 +1889,17 @@ onBeforeUnmount(() => {
         </div>
         <button
           type="button"
+          class="tf-btn manual-level-create-btn"
+          :class="{ active: manualLevelDrawMode }"
+          title="在K线图上拖拽创建关键区域"
+          aria-label="新建关键区域"
+          @click="toggleManualLevelDraw"
+        >
+          <n-icon :component="Plus" />
+          <span>{{ manualLevelDrawMode ? '取消绘制' : '新建关键区域' }}</span>
+        </button>
+        <button
+          type="button"
           class="tf-btn hl-btn"
           :class="{ active: showExtremes }"
           :title="showExtremes ? '隐藏最高/最低点标记' : '标记当前视图最高/最低点'"
@@ -1682,6 +1981,13 @@ onBeforeUnmount(() => {
                 >
                   {{ sigLabel(signalBySymbol[element.code]?.state ?? '') }}
                 </span>
+                <span
+                  v-if="manualAlertBySymbol[element.code]"
+                  class="sl-manual-sig"
+                  :title="manualAlertTitle(manualAlertBySymbol[element.code]!)"
+                >
+                  {{ manualLevelEventLabel(manualAlertBySymbol[element.code]!.event_type) }}
+                </span>
                 <span v-if="getSingleBar(element.code)" :style="singleBarBadgeStyle(getSingleBar(element.code)!.kind) + 'margin-left:6px;padding:0 6px;font-size:10px;line-height:16px;display:inline-flex;align-items:center'" :title="singleBarTitle(getSingleBar(element.code)!)" >{{ getSingleBar(element.code)!.label }}</span>
                 <div class="sl-quote">
                   <span
@@ -1716,7 +2022,12 @@ onBeforeUnmount(() => {
           :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
            :trend-points="trendPoints"
           :single-bars="chartSingleBars"
-          :loading="klinesStore.loading"
+           :manual-levels="visibleManualLevels"
+           @create-manual-level="handleCreateManualLevel"
+           @update-manual-level="handleUpdateManualLevel"
+           @preview-manual-level="handleManualLevelPreview"
+           @manual-level-draw-mode="onManualLevelDrawMode"
+           :loading="klinesStore.loading"
         />
         <n-empty
           v-else
@@ -2025,9 +2336,105 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else class="patterns-card">
-          <div class="patterns-title">全部信号（{{ signals.length }}）</div>
+          <div class="patterns-title">全部信号（{{ signals.length + activeManualLevels.length }}）</div>
           <n-scrollbar style="flex: 1">
-            <div v-if="signals.length" class="patterns-list">
+            <div v-if="activeManualLevels.length || signals.length" class="patterns-list">
+              <div
+                v-for="level in activeManualLevels"
+                :key="`manual-${level.id}`"
+                class="pattern-card manual-pattern-card"
+                :class="[
+                  manualLevelEffectiveRole(level) === 'support' ? 'manual-role-support' : manualLevelEffectiveRole(level) === 'resistance' ? 'manual-role-resistance' : 'manual-role-unknown',
+                  { 'is-paused': !level.monitor_enabled, 'is-hidden': isManualLevelHidden(level.id) },
+                ]"
+                :title="isManualLevelHidden(level.id) ? '点击在K线图上显示该关键区域' : '点击在K线图上隐藏该关键区域'"
+                @click="toggleManualLevelVisibility(level.id)"
+              >
+                <div class="pc-head">
+                  <div class="pc-badges">
+                    <span class="pc-num">#K{{ level.id }}</span>
+                    <span v-if="manualLevelDisplayName(level.name) !== '关键区域'" class="pc-dir">{{ manualLevelDisplayName(level.name) }}</span>
+                    <span class="pc-grade">{{ manualLevelRoleText(manualLevelEffectiveRole(level)) }}</span>
+                    <span class="pc-warning">{{ level.monitor_enabled ? '监控中' : '已暂停' }}</span>
+                  </div>
+                  <n-icon
+                    :component="isManualLevelHidden(level.id) ? EyeOff : Eye"
+                    size="17"
+                    :color="isManualLevelHidden(level.id) ? '#cbd5e1' : '#94a3b8'"
+                    style="margin-top: 2px"
+                  />
+                </div>
+
+                <div class="pc-state" :class="manualLevelStateType(level.current_phase)">
+                  <span class="dot"></span>{{ manualLevelPhaseDisplay(level) }}
+                </div>
+
+                <div v-if="manualAlertForLevel(level.id)" class="pc-manual-event" :title="manualAlertTitle(manualAlertForLevel(level.id)!)">
+                  <span class="pc-manual-event-badge">{{ manualLevelEventLabel(manualAlertForLevel(level.id)!.event_type) }}</span>
+                  <span>{{ manualLevelPhaseLabel(manualAlertForLevel(level.id)!.phase) }}</span>
+                  <span v-if="manualAlertForLevel(level.id)!.price != null">价 {{ manualAlertForLevel(level.id)!.price!.toFixed(1) }}</span>
+                  <span class="pc-manual-event-time">{{ manualAlertForLevel(level.id)!.bar_ts || '最新事件' }}</span>
+                </div>
+                <div v-if="manualAlertForLevel(level.id)" class="pc-manual-event-reason">{{ manualAlertForLevel(level.id)!.reason }}</div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">区域</span>
+                  <span>{{ level.zone_low.toFixed(2) }}–{{ level.zone_high.toFixed(2) }}</span>
+                  <span class="pc-history-label manual-history-role">角色</span>
+                  <span>{{ manualLevelRoleText(manualLevelEffectiveRole(level)) }}</span>
+                  <select
+                    class="manual-role-select"
+                    :value="level.role_override === 'support' || level.role_override === 'resistance' ? level.role_override : 'auto'"
+                    aria-label="关键区域角色识别方式"
+                    @click.stop
+                    @change.stop="changeManualLevelRole(level, $event)"
+                  >
+                    <option value="auto">自动识别</option>
+                    <option value="support">支撑</option>
+                    <option value="resistance">压力</option>
+                  </select>
+                </div>
+
+                <div class="pc-prices manual-level-prices">
+                  <div class="pc-price">
+                    <span>区域低</span>
+                    <b>{{ level.zone_low.toFixed(2) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>区域高</span>
+                    <b>{{ level.zone_high.toFixed(2) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>判定方式</span>
+                    <b>{{ manualLevelOverrideText(level.role_override) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>监控</span>
+                    <b>{{ level.monitor_enabled ? '开启' : '暂停' }}</b>
+                  </div>
+                </div>
+
+                <div v-if="editingManualLevelId === level.id && manualLevelDraft" class="manual-level-edit" @click.stop>
+                  <input v-model="manualLevelDraft.name" class="manual-level-input manual-level-input-wide" placeholder="价位名称" />
+                  <div class="manual-level-edit-grid">
+                    <label>区域低<input v-model.number="manualLevelDraft.zone_low" type="number" step="0.01" @blur="normalizeManualLevelDraft" /></label>
+                    <label>区域高<input v-model.number="manualLevelDraft.zone_high" type="number" step="0.01" @blur="normalizeManualLevelDraft" /></label>
+                  </div>
+                  <div class="manual-level-actions">
+                    <button type="button" @click.stop="saveEditManualLevel">保存</button>
+                    <button type="button" @click.stop="cancelEditManualLevel">取消</button>
+                  </div>
+                </div>
+
+                <div class="pc-note manual-level-note">{{ level.start_ts }} · {{ manualLevelPhaseDisplay(level) }}</div>
+                <div class="manual-level-actions pc-actions">
+                  <button type="button" @click.stop="editManualLevel(level)">编辑</button>
+                  <button type="button" @click.stop="toggleManualLevel(level)">{{ level.monitor_enabled ? '暂停' : '监控' }}</button>
+                  <button type="button" @click.stop="archiveManualLevel(level)">归档</button>
+                  <button type="button" @click.stop="deleteManualLevel(level)">删除</button>
+                </div>
+              </div>
+
               <div
                 v-for="s in signals"
                 :key="s.number"
@@ -2120,9 +2527,93 @@ onBeforeUnmount(() => {
             </div>
             <div v-else class="patterns-empty">当前品种暂无识别出的信号</div>
 
-            <div class="patterns-title recent-title">最近 5 个形态（{{ recentHistorySignals.length }}）</div>
+            <div class="patterns-title recent-title">最近形态（{{ recentHistorySignals.length + recentManualLevels.length }}）</div>
             <div v-if="recentLoading" class="patterns-empty">正在加载历史形态...</div>
-            <div v-else-if="recentHistorySignals.length" class="patterns-list recent-list">
+            <div v-else-if="recentManualLevels.length || recentHistorySignals.length" class="patterns-list recent-list">
+              <div
+                v-for="level in recentManualLevels"
+                :key="`recent-manual-${level.id}`"
+                class="pattern-card manual-pattern-card is-recent"
+                :class="[
+                  manualLevelEffectiveRole(level) === 'support' ? 'manual-role-support' : manualLevelEffectiveRole(level) === 'resistance' ? 'manual-role-resistance' : 'manual-role-unknown',
+                  { 'is-paused': !level.monitor_enabled, 'is-hidden': isManualLevelHidden(level.id) },
+                ]"
+                :title="isManualLevelHidden(level.id) ? '点击在K线图上显示该关键区域' : '点击在K线图上隐藏该关键区域'"
+                @click="toggleManualLevelVisibility(level.id)"
+              >
+                <div class="pc-head">
+                  <div class="pc-badges">
+                    <span class="pc-num">#K{{ level.id }}</span>
+                    <span v-if="manualLevelDisplayName(level.name) !== '关键区域'" class="pc-dir">{{ manualLevelDisplayName(level.name) }}</span>
+                    <span class="pc-grade">{{ manualLevelRoleText(manualLevelEffectiveRole(level)) }}</span>
+                    <span class="pc-warning">{{ level.monitor_enabled ? '监控中' : '已暂停' }}</span>
+                  </div>
+                  <n-icon
+                    :component="isManualLevelHidden(level.id) ? EyeOff : Eye"
+                    size="17"
+                    :color="isManualLevelHidden(level.id) ? '#cbd5e1' : '#94a3b8'"
+                    style="margin-top: 2px"
+                  />
+                </div>
+
+                <div class="pc-state" :class="manualLevelStateType(level.current_phase)">
+                  <span class="dot"></span>{{ manualLevelPhaseDisplay(level) }}
+                </div>
+
+                <div v-if="manualAlertForLevel(level.id)" class="pc-manual-event" :title="manualAlertTitle(manualAlertForLevel(level.id)!)">
+                  <span class="pc-manual-event-badge">{{ manualLevelEventLabel(manualAlertForLevel(level.id)!.event_type) }}</span>
+                  <span>{{ manualLevelPhaseLabel(manualAlertForLevel(level.id)!.phase) }}</span>
+                  <span v-if="manualAlertForLevel(level.id)!.price != null">价 {{ manualAlertForLevel(level.id)!.price!.toFixed(1) }}</span>
+                  <span class="pc-manual-event-time">{{ manualAlertForLevel(level.id)!.bar_ts || '最新事件' }}</span>
+                </div>
+                <div v-if="manualAlertForLevel(level.id)" class="pc-manual-event-reason">{{ manualAlertForLevel(level.id)!.reason }}</div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">区域</span>
+                  <span>{{ level.zone_low.toFixed(2) }}–{{ level.zone_high.toFixed(2) }}</span>
+                  <span class="pc-history-label manual-history-role">角色</span>
+                  <span>{{ manualLevelRoleText(manualLevelEffectiveRole(level)) }}</span>
+                  <select
+                    class="manual-role-select"
+                    :value="level.role_override === 'support' || level.role_override === 'resistance' ? level.role_override : 'auto'"
+                    aria-label="关键区域角色识别方式"
+                    @click.stop
+                    @change.stop="changeManualLevelRole(level, $event)"
+                  >
+                    <option value="auto">自动识别</option>
+                    <option value="support">支撑</option>
+                    <option value="resistance">压力</option>
+                  </select>
+                </div>
+
+                <div class="pc-prices manual-level-prices">
+                  <div class="pc-price"><span>区域低</span><b>{{ level.zone_low.toFixed(2) }}</b></div>
+                  <div class="pc-price"><span>区域高</span><b>{{ level.zone_high.toFixed(2) }}</b></div>
+                  <div class="pc-price"><span>判定方式</span><b>{{ manualLevelOverrideText(level.role_override) }}</b></div>
+                  <div class="pc-price"><span>监控</span><b>{{ level.monitor_enabled ? '开启' : '暂停' }}</b></div>
+                </div>
+
+                <div v-if="editingManualLevelId === level.id && manualLevelDraft" class="manual-level-edit" @click.stop>
+                  <input v-model="manualLevelDraft.name" class="manual-level-input manual-level-input-wide" placeholder="区域名称" />
+                  <div class="manual-level-edit-grid">
+                    <label>区域低<input v-model.number="manualLevelDraft.zone_low" type="number" step="0.01" @blur="normalizeManualLevelDraft" /></label>
+                    <label>区域高<input v-model.number="manualLevelDraft.zone_high" type="number" step="0.01" @blur="normalizeManualLevelDraft" /></label>
+                  </div>
+                  <div class="manual-level-actions">
+                    <button type="button" @click.stop="saveEditManualLevel">保存</button>
+                    <button type="button" @click.stop="cancelEditManualLevel">取消</button>
+                  </div>
+                </div>
+
+                <div class="pc-note manual-level-note">{{ level.start_ts }} · {{ manualLevelPhaseDisplay(level) }}</div>
+                <div class="manual-level-actions pc-actions">
+                  <button type="button" @click.stop="editManualLevel(level)">编辑</button>
+                  <button type="button" @click.stop="toggleManualLevel(level)">{{ level.monitor_enabled ? '暂停' : '监控' }}</button>
+                  <button type="button" @click.stop="archiveManualLevel(level)">归档</button>
+                  <button type="button" @click.stop="deleteManualLevel(level)">删除</button>
+                </div>
+              </div>
+
               <div
                 v-for="r in recentHistorySignals"
                 :key="`recent-${r.number}`"
@@ -2207,6 +2698,7 @@ onBeforeUnmount(() => {
             <div v-else class="patterns-empty">该品种暂无历史形态</div>
           </n-scrollbar>
         </div>
+
       </div>
     </div>
   </div>
@@ -2321,6 +2813,23 @@ onBeforeUnmount(() => {
 }
 .hl-btn {
   background: #f1f5f9;
+}
+.manual-level-create-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #2563eb;
+  background: rgba(239, 246, 255, 0.9);
+  border: 1px solid rgba(37, 99, 235, 0.18);
+}
+.manual-level-create-btn:hover {
+  color: #1d4ed8;
+  background: rgba(219, 234, 254, 0.9);
+}
+.manual-level-create-btn.active {
+  color: #1d4ed8;
+  background: #dbeafe;
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.16);
 }
 .tf-btn:disabled,
 .tf-more:disabled {
@@ -2687,6 +3196,19 @@ onBeforeUnmount(() => {
   --sl-dot: 4.5px;
   --sl-opacity: 1;
 }
+.sl-manual-sig {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #7c3aed;
+  background: rgba(124, 58, 237, 0.1);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
 .chart-col {
   flex: 1 1 auto;
   min-width: 0;
@@ -2708,6 +3230,56 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 10px;
   overflow: hidden;
+}
+.manual-level-edit {
+  margin-top: 7px;
+  padding: 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.82);
+}
+.manual-level-input,
+.manual-level-edit-grid input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 5px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 4px;
+  background: #fff;
+  color: #334155;
+  font-size: 11px;
+}
+.manual-level-input-wide {
+  margin-bottom: 6px;
+}
+.manual-level-edit-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+.manual-level-edit-grid label {
+  color: #64748b;
+  font-size: 10px;
+}
+.manual-level-edit-grid input {
+  display: block;
+  margin-top: 2px;
+}
+.manual-level-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 6px;
+}
+.manual-level-actions button {
+  padding: 2px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 4px;
+  background: #fff;
+  color: #475569;
+  font-size: 11px;
+  cursor: pointer;
 }
 .info-card {
   background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
@@ -3135,6 +3707,105 @@ onBeforeUnmount(() => {
 .pattern-card.is-down {
   border-left-color: #0f9d58;
 }
+.manual-pattern-card {
+  cursor: default;
+}
+.manual-pattern-card.manual-role-support {
+  border-left-color: #0f9d58;
+}
+.manual-pattern-card.manual-role-resistance {
+  border-left-color: #e03131;
+}
+.manual-pattern-card.manual-role-unknown {
+  border-left-color: #94a3b8;
+}
+.manual-pattern-card.is-paused {
+  opacity: 0.72;
+}
+.manual-pattern-card .pc-dir {
+  color: #475569;
+  background: #f1f5f9;
+}
+.manual-pattern-card.manual-role-support .pc-grade {
+  color: #15803d;
+  background: rgba(15, 157, 88, 0.08);
+}
+.manual-pattern-card.manual-role-resistance .pc-grade {
+  color: #dc2626;
+  background: rgba(224, 49, 49, 0.08);
+}
+.manual-pattern-card.manual-role-unknown .pc-grade {
+  color: #b45309;
+  background: rgba(249, 168, 37, 0.16);
+}
+.manual-pattern-card .pc-warning {
+  color: #64748b;
+  background: #f1f5f9;
+}
+.manual-history-role {
+  margin-left: 10px;
+}
+.manual-role-select {
+  min-width: 68px;
+  margin-left: 4px;
+  padding: 2px 4px;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  background: #fff;
+  color: #475569;
+  font-size: 10px;
+  cursor: pointer;
+}
+.manual-level-prices .pc-price b {
+  font-size: 12px;
+}
+.manual-level-note {
+  color: #64748b;
+}
+.pc-manual-event {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.pc-manual-event-badge {
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #7c3aed;
+  background: rgba(124, 58, 237, 0.1);
+  font-weight: 700;
+}
+.pc-manual-event-time {
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+}
+.pc-manual-event-reason {
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+.pc-actions {
+  justify-content: flex-end;
+}
+.pc-actions button {
+  padding: 3px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  background: #fff;
+  color: #475569;
+  font-size: 11px;
+  cursor: pointer;
+}
+.pc-actions button:hover {
+  border-color: #94a3b8;
+  color: #1f2937;
+}
 .pattern-card.is-active {
   box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
 }
@@ -3397,13 +4068,3 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 </style>
-
-
-
-
-
-
-
-
-
-

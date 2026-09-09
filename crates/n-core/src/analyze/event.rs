@@ -82,6 +82,8 @@ fn warning_kind_at(
     None
 }
 
+
+
 fn pattern_for_current_bar(
     level: &'static str,
     dir: Dir,
@@ -701,5 +703,3 @@ mod tests {
         assert_eq!(warning_kind_at(&bars, &atr20, &trend_k, &short_b, 2), None);
     }
 }
-
-

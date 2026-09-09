@@ -68,12 +68,42 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
             .create_table_from_entity(entities::preclose_signals::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::preclose_candidates::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::manual_levels::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::manual_level_events::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
+    db.execute_unprepared("DROP TABLE IF EXISTS manual_box_events")
+        .await
+        .context("删除旧手工箱体事件表失败")?;
+    db.execute_unprepared("DROP TABLE IF EXISTS manual_boxes")
+        .await
+        .context("删除旧手工箱体表失败")?;
     for table in tables {
         let stmt = backend.build(&table);
         db.execute(stmt).await.context("创建数据表失败")?;
     }
+    db.execute_unprepared(
+        "UPDATE manual_levels SET zone_low = ROUND(zone_low, 2), zone_high = ROUND(zone_high, 2)",
+    )
+    .await
+    .context("归一化关键区域精度失败")?;
+    ensure_column(
+        db,
+        "manual_levels",
+        "role_override",
+        "TEXT NOT NULL DEFAULT 'auto'",
+    )
+    .await?;
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
     ensure_column(db, "symbols", "is_followed", "BOOLEAN NOT NULL DEFAULT 0").await?;
@@ -82,7 +112,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
          ON signal_annotations(event_id)",
     )
     .await
-        .context("创建批注索引失败")?;
+    .context("创建批注索引失败")?;
     db.execute_unprepared(
         "CREATE UNIQUE INDEX IF NOT EXISTS uniq_preclose_symbol_close_event \
          ON preclose_signals(symbol, session_close_ts, parent_event_id)",
@@ -95,6 +125,36 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     )
     .await
     .context("创建收盘前预检测状态索引失败")?;
+    db.execute_unprepared(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_preclose_candidate_key \
+         ON preclose_candidates(symbol, direction, warning_ts, session_close_ts)",
+    )
+    .await
+    .context("创建临时未收盘候选唯一索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_preclose_candidate_state_close \
+         ON preclose_candidates(state, session_close_ts)",
+    )
+    .await
+    .context("创建临时未收盘候选状态索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_manual_levels_symbol_tf \
+         ON manual_levels(symbol, timeframe, status)",
+    )
+    .await
+    .context("创建关键区域索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_manual_level_events_level_created \
+         ON manual_level_events(level_id, created_at)",
+    )
+    .await
+    .context("创建关键区域事件索引失败")?;
+    db.execute_unprepared(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_manual_level_event \
+         ON manual_level_events(level_id, event_type, COALESCE(bar_ts, ''))",
+    )
+    .await
+    .context("创建关键区域事件去重索引失败")?;
 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
@@ -456,6 +516,14 @@ mod tests {
             .await
             .unwrap();
         assert!(preclose.is_some(), "preclose_signals 应已创建");
+        let provisional = db
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='preclose_candidates'",
+            ))
+            .await
+            .unwrap();
+        assert!(provisional.is_some(), "preclose_candidates 应已创建");
     }
 
     #[tokio::test]
@@ -572,16 +640,33 @@ mod tests {
     }
 }
 
-
 async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
     let schema = Schema::new(DbBackend::Sqlite);
     let v2_tables = [
-        schema.create_table_from_entity(entities::v2_trade_events::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(entities::v2_setup_features::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(entities::v2_trigger_features::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(entities::v2_model_predictions::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(entities::v2_trade_outcomes::Entity).if_not_exists().to_owned(),
-        schema.create_table_from_entity(entities::v2_model_registry::Entity).if_not_exists().to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_trade_events::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_setup_features::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_trigger_features::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_model_predictions::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_trade_outcomes::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::v2_model_registry::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     for table in v2_tables {
@@ -591,16 +676,44 @@ async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
     // Existing installations predate the lifecycle columns.  Keep old
     // models archived by default, then retain only the latest historical
     // logistic as the fallback champion for the default scoring slot.
-    db.execute_unprepared("ALTER TABLE v2_model_registry ADD COLUMN status TEXT NOT NULL DEFAULT 'archived'").await.ok();
-    db.execute_unprepared("ALTER TABLE v2_model_registry ADD COLUMN scoring_slot TEXT NOT NULL DEFAULT 'default'").await.ok();
-    db.execute_unprepared("ALTER TABLE v2_model_predictions ADD COLUMN prediction_mode TEXT NOT NULL DEFAULT 'live'").await.ok();
+    db.execute_unprepared(
+        "ALTER TABLE v2_model_registry ADD COLUMN status TEXT NOT NULL DEFAULT 'archived'",
+    )
+    .await
+    .ok();
+    db.execute_unprepared(
+        "ALTER TABLE v2_model_registry ADD COLUMN scoring_slot TEXT NOT NULL DEFAULT 'default'",
+    )
+    .await
+    .ok();
+    db.execute_unprepared(
+        "ALTER TABLE v2_model_predictions ADD COLUMN prediction_mode TEXT NOT NULL DEFAULT 'live'",
+    )
+    .await
+    .ok();
     db.execute_unprepared("UPDATE v2_model_registry SET status='champion' WHERE status='archived' AND model_id=(SELECT model_id FROM v2_model_registry WHERE name='logistic-v1' ORDER BY created_at DESC LIMIT 1)").await.ok();
     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_registry_one_champion_per_slot ON v2_model_registry(scoring_slot) WHERE status='champion'").await.ok();
-    db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)").await.context("创建 V2 索引失败")?;
-    db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_v2_events_warning_ts ON v2_trade_events(warning_ts)").await.context("创建 V2 索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)",
+    )
+    .await
+    .context("创建 V2 索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_v2_events_warning_ts ON v2_trade_events(warning_ts)",
+    )
+    .await
+    .context("创建 V2 索引失败")?;
     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_predictions_event_model ON v2_model_predictions(event_id, model_id)").await.context("创建 V2 预测唯一索引失败")?;
     // mark migrated to 4
-    db.execute_unprepared("INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_migrated', '4')").await.ok();
-    db.execute_unprepared("UPDATE settings SET value='4' WHERE key=''schema_migrated'' AND value IN ('2','3')").await.ok();
+    db.execute_unprepared(
+        "INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_migrated', '4')",
+    )
+    .await
+    .ok();
+    db.execute_unprepared(
+        "UPDATE settings SET value='4' WHERE key=''schema_migrated'' AND value IN ('2','3')",
+    )
+    .await
+    .ok();
     Ok(())
 }

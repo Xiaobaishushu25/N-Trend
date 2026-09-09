@@ -15,10 +15,15 @@ use crate::analyze::outcome;
 use crate::config::Config;
 use crate::derive::{aggregate, rollover, Timeframe};
 use crate::fetch::kline::Kline;
-use crate::fetch::{ClosedBarEvent, HybridDataSource, MarketDataSource, SinaClient, TqBridgeClient};
+use crate::fetch::{
+    ClosedBarEvent, HybridDataSource, MarketDataSource, SinaClient, TqBridgeClient,
+};
 use crate::process::SidecarManager;
 use crate::scheduler::SchedulerConfig;
-use crate::storage::entities::{klines, pattern_events, preclose_signals, symbols};
+use crate::storage::entities::{
+    klines, manual_level_events, manual_levels, pattern_events, preclose_candidates,
+    preclose_signals, symbols,
+};
 use crate::storage::repo;
 
 pub mod pipeline;
@@ -27,6 +32,8 @@ pub use pipeline::{RawPipeline, SymbolLocks};
 const MONTH_KLINE_CACHE_TTL: Duration = Duration::from_secs(900);
 const ROLLOVER_SCAN_SETTING_PREFIX: &str = "rollover_scanned::";
 const ROLLOVER_PENDING_RETENTION_DAYS: i64 = 30;
+/// 临时未收盘扫描沿用正式预警的有效门槛，避免把低分噪声显示成预做多/预做空。
+const PRECLOSE_CANDIDATE_MIN_SCORE: f64 = 3.0;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RefreshStats {
@@ -710,6 +717,38 @@ fn now_ts() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn validate_manual_level_input(input: &ManualLevelInput) -> Result<()> {
+    if input.symbol.trim().is_empty() || input.timeframe.trim().is_empty() {
+        return Err(anyhow!("关键区域必须指定品种和周期"));
+    }
+    if input.start_ts.trim().is_empty() {
+        return Err(anyhow!("关键区域必须指定起始时间"));
+    }
+    if input
+        .end_ts
+        .as_deref()
+        .is_some_and(|end| end < input.start_ts.as_str())
+    {
+        return Err(anyhow!("关键区域结束时间不能早于起始时间"));
+    }
+    if !matches!(input.role_override.as_str(), "auto" | "support" | "resistance") {
+        return Err(anyhow!("关键区域角色只能是自动识别、支撑或压力"));
+    }
+    if input.zone_low.is_nan()
+        || input.zone_high.is_nan()
+        || input.zone_low == input.zone_high
+        || !input.zone_low.is_finite()
+        || !input.zone_high.is_finite()
+    {
+        return Err(anyhow!("关键区域必须具有有效厚度"));
+    }
+    Ok(())
+}
+
+fn round_manual_price(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 fn parse_local_ts(value: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M"))
@@ -737,6 +776,122 @@ fn scan_bar_fingerprint(bar: &Bar) -> String {
         bar.volume.to_bits(),
         bar.hold.to_bits(),
     )
+}
+
+fn provisional_5m_bucket_ts(now: NaiveDateTime) -> NaiveDateTime {
+    let elapsed = now.hour() * 60 + now.minute();
+    // 原始5m时间戳是桶末语义：14:57~14:59仍属于14:55这根未收盘5m，
+    // 它聚合后才会形成15:00收盘的临时15m，而不是误放进15:15桶。
+    let end_minute = (elapsed / 5) * 5;
+    now.date()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid midnight")
+        + ChronoDuration::minutes(end_minute as i64)
+}
+
+fn preclose_candidate_model(
+    symbol: &str,
+    bars: &[Bar],
+    candidate: &event::WarningCandidate,
+    session_close_ts: &str,
+    reference_price: f64,
+    provisional_fingerprint: &str,
+    timestamp: &str,
+) -> preclose_candidates::Model {
+    let direction = if candidate.direction == Dir::Up { "up" } else { "down" };
+    let warning_ts = bar_ts(&bars[candidate.warning_index]);
+    let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);
+    let entry_score_dims = serde_json::json!({
+        "dim_a": candidate.dim_a,
+        "dim_b": candidate.dim_b,
+        "dim_warning": candidate.dim_warning,
+        "trend_state": candidate.trend_state,
+        "trend_bonus": candidate.trend_bonus,
+        "event_logic_version": EVENT_LOGIC_VERSION,
+        "pattern_version": crate::v2::PATTERN_LOGIC_VERSION,
+        "execution_version": crate::v2::EXECUTION_VERSION,
+        "feature_schema_version": crate::v2::FEATURE_SCHEMA_VERSION,
+    })
+    .to_string();
+    preclose_candidates::Model {
+        id: 0,
+        symbol: symbol.to_string(),
+        direction: direction.to_string(),
+        level: candidate.level.to_string(),
+        grade: candidate.grade.clone(),
+        warning_ts,
+        session_close_ts: session_close_ts.to_string(),
+        emitted_at: timestamp.to_string(),
+        last_seen_at: timestamp.to_string(),
+        reference_price,
+        entry_score: candidate.entry_score,
+        entry_score_dims,
+        warning_kind: candidate.warning_kind.to_string(),
+        s0_ts: bar_ts(&bars[candidate.s0_index]),
+        s0_price,
+        s1_ts: bar_ts(&bars[candidate.s1_index]),
+        s1_price,
+        s2_ts: bar_ts(&bars[candidate.s2_index]),
+        s2_price,
+        a_move: candidate.a_move,
+        b_move: candidate.b_move,
+        a_bars: candidate.a_bars as i64,
+        b_bars: candidate.b_bars as i64,
+        retracement: candidate.retracement,
+        entry: candidate.entry,
+        stop: candidate.stop,
+        target: candidate.target,
+        risk: candidate.risk,
+        rr: candidate.rr,
+        provisional_fingerprint: provisional_fingerprint.to_string(),
+        state: "provisional".to_string(),
+        parent_event_id: None,
+        invalid_reason: None,
+        created_at: timestamp.to_string(),
+        updated_at: timestamp.to_string(),
+    }
+}
+
+fn preclose_candidate_active_model(
+    row: preclose_candidates::Model,
+) -> preclose_candidates::ActiveModel {
+    preclose_candidates::ActiveModel {
+        id: NotSet,
+        symbol: Set(row.symbol),
+        direction: Set(row.direction),
+        level: Set(row.level),
+        grade: Set(row.grade),
+        warning_ts: Set(row.warning_ts),
+        session_close_ts: Set(row.session_close_ts),
+        emitted_at: Set(row.emitted_at),
+        last_seen_at: Set(row.last_seen_at),
+        reference_price: Set(row.reference_price),
+        entry_score: Set(row.entry_score),
+        entry_score_dims: Set(row.entry_score_dims),
+        warning_kind: Set(row.warning_kind),
+        s0_ts: Set(row.s0_ts),
+        s0_price: Set(row.s0_price),
+        s1_ts: Set(row.s1_ts),
+        s1_price: Set(row.s1_price),
+        s2_ts: Set(row.s2_ts),
+        s2_price: Set(row.s2_price),
+        a_move: Set(row.a_move),
+        b_move: Set(row.b_move),
+        a_bars: Set(row.a_bars),
+        b_bars: Set(row.b_bars),
+        retracement: Set(row.retracement),
+        entry: Set(row.entry),
+        stop: Set(row.stop),
+        target: Set(row.target),
+        risk: Set(row.risk),
+        rr: Set(row.rr),
+        provisional_fingerprint: Set(row.provisional_fingerprint),
+        state: Set(row.state),
+        parent_event_id: Set(row.parent_event_id),
+        invalid_reason: Set(row.invalid_reason),
+        created_at: Set(row.created_at),
+        updated_at: Set(row.updated_at),
+    }
 }
 
 fn event_dir(e: &pattern_events::Model) -> Dir {
@@ -1168,6 +1323,35 @@ pub struct EntryTriggerHit {
     pub latest: f64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManualLevelInput {
+    pub symbol: String,
+    pub timeframe: String,
+    pub name: String,
+    pub start_ts: String,
+    pub end_ts: Option<String>,
+    pub zone_low: f64,
+    pub zone_high: f64,
+    pub role_override: String,
+    pub monitor_enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManualLevelAlert {
+    pub level_id: i64,
+    pub symbol: String,
+    pub timeframe: String,
+    pub name: String,
+    pub event_type: String,
+    pub role: String,
+    pub role_confidence: f64,
+    pub bar_ts: Option<String>,
+    pub price: Option<f64>,
+    pub reason: String,
+    pub phase: String,
+    pub volume_ratio: Option<f64>,
+}
+
 /// 收盘前预检测状态变更。payload 直接使用独立表模型，前端可按 state 渲染。
 #[derive(Debug, Clone, Serialize)]
 pub struct PrecloseSignalUpdate {
@@ -1198,6 +1382,8 @@ pub struct Services {
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
     /// 收盘前检测节流：复用3秒行情快照，但最多每10秒扫描一次候选事件。
     preclose_last_tick: Mutex<Option<Instant>>,
+    /// 临时未收盘扫描节流：不写入正式事件，最多每10秒推演一次。
+    preclose_candidate_last_tick: Mutex<Option<Instant>>,
     /// 本次进程内已完成整段深度回填的品种，避免每轮都拉几百根再去重
     deep_backfilled: RwLock<HashSet<String>>,
     /// 月合约 5m K 线缓存：同一品种换月确认短时间不重复抓取
@@ -1235,7 +1421,8 @@ impl Services {
             if !wants_tq_initial {
                 let ds2 = data_source.clone();
                 tokio::spawn(async move {
-                    ds2.mark_tq_unavailable("天勤主力数据源未启用，当前使用新浪数据源", false).await;
+                    ds2.mark_tq_unavailable("天勤主力数据源未启用，当前使用新浪数据源", false)
+                        .await;
                 });
             } else {
                 let ds_for_spawn = data_source.clone();
@@ -1246,19 +1433,31 @@ impl Services {
                         Ok(()) => true,
                         Err(e) => {
                             tracing::warn!("天勤桥接服务启动异常，将使用备用数据源: {e:#}");
-                            ds_for_spawn.mark_tq_unavailable(&format!("天勤桥接服务启动失败（{e:#}），当前使用新浪备用数据源"), true).await;
+                            ds_for_spawn
+                                .mark_tq_unavailable(
+                                    &format!(
+                                        "天勤桥接服务启动失败（{e:#}），当前使用新浪备用数据源"
+                                    ),
+                                    true,
+                                )
+                                .await;
                             false
                         }
                     };
                     if sidecar_started {
-                        if !ds_for_spawn.probe_and_activate("天勤桥接服务启动并通过健康检查", true).await {
+                        if !ds_for_spawn
+                            .probe_and_activate("天勤桥接服务启动并通过健康检查", true)
+                            .await
+                        {
                             tracing::warn!("天勤桥接服务未通过健康检查，当前使用新浪备用数据源");
                         } else {
                             tracing::info!("✅ 天勤桥接服务后台就绪，已切回主力天勤数据源");
                         }
                     }
                 });
-                ds_for_mark.mark_tq_unavailable("天勤桥接服务后台启动中，暂用新浪数据源", false).await;
+                ds_for_mark
+                    .mark_tq_unavailable("天勤桥接服务后台启动中，暂用新浪数据源", false)
+                    .await;
             }
         }
 
@@ -1271,6 +1470,7 @@ impl Services {
             config_path,
             entry_notified: RwLock::new(HashSet::new()),
             preclose_last_tick: Mutex::new(None),
+            preclose_candidate_last_tick: Mutex::new(None),
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
             scan_lock: Mutex::new(()),
@@ -1313,7 +1513,9 @@ impl Services {
         // 2. 应用数据源配置。进程启动成功不代表服务可用，必须通过真实健康探测。
         if ds_changed {
             tracing::info!("🔄 数据源配置发生变更，正在后台平滑更新服务与客户端连接...");
-            self.data_source.update_bridge_port(c.data_source.bridge_port).await;
+            self.data_source
+                .update_bridge_port(c.data_source.bridge_port)
+                .await;
         }
 
         if c.data_source.primary_source != "tqsdk" {
@@ -1321,8 +1523,7 @@ impl Services {
             self.data_source
                 .mark_tq_unavailable("已切换为新浪主力数据源", false)
                 .await;
-        } else if c.data_source.tq_account.trim().is_empty()
-            || c.data_source.tq_password.is_empty()
+        } else if c.data_source.tq_account.trim().is_empty() || c.data_source.tq_password.is_empty()
         {
             SidecarManager::stop();
             self.data_source
@@ -1344,15 +1545,14 @@ impl Services {
                 Ok(()) => {
                     if self
                         .data_source
-                        .probe_and_activate(
-                            "天勤账号配置已更新，已自动连接主力天勤数据源",
-                            true,
-                        )
+                        .probe_and_activate("天勤账号配置已更新，已自动连接主力天勤数据源", true)
                         .await
                     {
                         tracing::info!("✅ 天勤桥接服务健康检查通过，已切回主力数据源");
                     } else {
-                        tracing::warn!("天勤桥接进程已处理，但健康检查失败，继续使用新浪备用数据源");
+                        tracing::warn!(
+                            "天勤桥接进程已处理，但健康检查失败，继续使用新浪备用数据源"
+                        );
                     }
                 }
                 Err(e) => {
@@ -1454,7 +1654,9 @@ impl Services {
                     tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
                 } else if let Some(bars) = bars.as_deref() {
                     if next.trigger_bar_ts.is_some() {
-                        if let Err(e) = crate::v2::prediction::predict_event(&self.db, &next, bars).await {
+                        if let Err(e) =
+                            crate::v2::prediction::predict_event(&self.db, &next, bars).await
+                        {
                             tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {e:#}");
                         }
                     }
@@ -1474,6 +1676,289 @@ impl Services {
         Ok(hits)
     }
 
+    async fn refresh_manual_level_state(
+        &self,
+        row: manual_levels::Model,
+    ) -> Result<manual_levels::Model> {
+        let bars = self.bars_for(&row.symbol, &row.timeframe).await?;
+        if bars.is_empty() {
+            return Ok(row);
+        }
+        let definition = crate::analyze::manual_level::ManualLevelDefinition {
+            zone_low: row.zone_low,
+            zone_high: row.zone_high,
+            start_ts: row.start_ts.clone(),
+        };
+        let evaluation = crate::analyze::manual_level::evaluate(
+            &definition,
+            &bars,
+            None,
+            &row.current_phase,
+            &row.role,
+            &row.role_override,
+        );
+        let Some(mut persisted) = repo::manual_level_by_id(&self.db, row.id).await? else {
+            return Ok(row);
+        };
+        persisted.current_phase = evaluation.phase;
+        persisted.role = if persisted.role_override == "auto" {
+            evaluation.role.as_str().to_string()
+        } else {
+            persisted.role_override.clone()
+        };
+        persisted.role_confidence = if persisted.role_override == "auto" {
+            evaluation.role_confidence
+        } else {
+            1.0
+        };
+        persisted.updated_at = now_ts();
+        repo::update_manual_level(&self.db, persisted).await
+    }
+
+    pub async fn list_manual_levels(
+        &self,
+        symbol: Option<&str>,
+        timeframe: Option<&str>,
+        active_only: bool,
+    ) -> Result<Vec<manual_levels::Model>> {
+        let rows = repo::manual_levels(&self.db, symbol, timeframe, active_only).await?;
+        let mut refreshed = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.monitor_enabled && matches!(row.status.as_str(), "active" | "broken") {
+                refreshed.push(self.refresh_manual_level_state(row).await?);
+            } else {
+                refreshed.push(row);
+            }
+        }
+        Ok(refreshed)
+    }
+
+    pub async fn create_manual_level(&self, input: ManualLevelInput) -> Result<manual_levels::Model> {
+        validate_manual_level_input(&input)?;
+        let now = now_ts();
+        let role_override = input.role_override.clone();
+        let zone_low = round_manual_price(input.zone_low.min(input.zone_high));
+        let zone_high = round_manual_price(input.zone_low.max(input.zone_high));
+        if zone_low >= zone_high {
+            return Err(anyhow!("关键区域精度不能低于 0.01"));
+        }
+        let created = repo::insert_manual_level(
+            &self.db,
+            manual_levels::ActiveModel {
+                id: NotSet,
+                symbol: Set(input.symbol),
+                timeframe: Set(input.timeframe),
+                name: Set(if input.name.trim().is_empty() {
+                    "关键区域".to_string()
+                } else {
+                    input.name
+                }),
+                start_ts: Set(input.start_ts),
+                end_ts: Set(input.end_ts),
+                zone_low: Set(zone_low),
+                zone_high: Set(zone_high),
+                role: Set("unknown".to_string()),
+                role_override: Set(role_override),
+                role_confidence: Set(0.0),
+                status: Set("active".to_string()),
+                monitor_enabled: Set(input.monitor_enabled),
+                current_phase: Set("pending".to_string()),
+                last_event_ts: NotSet,
+                created_at: Set(now.clone()),
+                updated_at: Set(now),
+            },
+        )
+        .await?;
+        self.refresh_manual_level_state(created).await
+    }
+
+    pub async fn update_manual_level(
+        &self,
+        id: i64,
+        input: ManualLevelInput,
+    ) -> Result<manual_levels::Model> {
+        validate_manual_level_input(&input)?;
+        tracing::info!(
+            level_id = id,
+            role_override = %input.role_override,
+            "收到关键区域角色更新请求"
+        );
+        let Some(mut row) = repo::manual_level_by_id(&self.db, id).await? else {
+            return Err(anyhow!("关键区域不存在: {id}"));
+        };
+        let zone_low = round_manual_price(input.zone_low.min(input.zone_high));
+        let zone_high = round_manual_price(input.zone_low.max(input.zone_high));
+        let role_override = input.role_override.clone();
+        if zone_low >= zone_high {
+            return Err(anyhow!("关键区域精度不能低于 0.01"));
+        }
+        row.symbol = input.symbol;
+        row.timeframe = input.timeframe;
+        row.name = if input.name.trim().is_empty() {
+            "关键区域".to_string()
+        } else {
+            input.name
+        };
+        row.start_ts = input.start_ts;
+        row.end_ts = input.end_ts;
+        let role_override_changed = row.role_override != role_override;
+        row.role_override = role_override;
+        let zone_changed = row.zone_low != zone_low || row.zone_high != zone_high;
+        row.zone_low = zone_low;
+        row.zone_high = zone_high;
+        if zone_changed || role_override_changed {
+            row.role = "unknown".to_string();
+            row.role_confidence = 0.0;
+            row.current_phase = "pending".to_string();
+        }
+        row.monitor_enabled = input.monitor_enabled;
+        if row.monitor_enabled && row.status == "paused" {
+            row.status = "active".to_string();
+        }
+        row.updated_at = now_ts();
+        let updated = repo::update_manual_level(&self.db, row).await?;
+        let result = if zone_changed || role_override_changed {
+            self.refresh_manual_level_state(updated).await?
+        } else {
+            updated
+        };
+        tracing::info!(
+            level_id = result.id,
+            role_override = %result.role_override,
+            role = %result.role,
+            phase = %result.current_phase,
+            "关键区域角色更新完成"
+        );
+        Ok(result)
+    }
+
+    pub async fn set_manual_level_monitoring(
+        &self,
+        id: i64,
+        enabled: bool,
+    ) -> Result<manual_levels::Model> {
+        repo::set_manual_level_monitoring(&self.db, id, enabled).await
+    }
+
+    pub async fn archive_manual_level(&self, id: i64) -> Result<()> {
+        repo::archive_manual_level(&self.db, id).await
+    }
+
+    pub async fn delete_manual_level(&self, id: i64) -> Result<()> {
+        repo::delete_manual_level(&self.db, id).await
+    }
+
+    pub async fn manual_level_events(&self, id: i64) -> Result<Vec<manual_level_events::Model>> {
+        repo::manual_level_events(&self.db, id).await
+    }
+
+    /// 每次实时行情轮询调用一次。盘中只产生接近/测试提醒；
+    /// 收盘后的角色、拒绝、突破判定使用已收盘K线完成。
+    pub async fn manual_level_alerts(
+        &self,
+        snapshots: &[MarketSnapshot],
+    ) -> Result<Vec<ManualLevelAlert>> {
+        let levels = repo::manual_levels(&self.db, None, None, false).await?;
+        let latest: HashMap<&str, f64> = snapshots
+            .iter()
+            .filter_map(|s| s.latest.map(|v| (s.code.as_str(), v)))
+            .collect();
+        let mut alerts = Vec::new();
+        for row in levels {
+            if !row.monitor_enabled || row.status != "active" {
+                continue;
+            }
+            let bars = match self.bars_for(&row.symbol, &row.timeframe).await {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(level_id = row.id, "读取关键区域K线失败: {error:#}");
+                    continue;
+                }
+            };
+            if bars.is_empty() {
+                continue;
+            }
+            let definition = crate::analyze::manual_level::ManualLevelDefinition {
+                zone_low: row.zone_low,
+                zone_high: row.zone_high,
+                start_ts: row.start_ts.clone(),
+            };
+            let evaluation = crate::analyze::manual_level::evaluate(
+                &definition,
+                &bars,
+                latest.get(row.symbol.as_str()).copied(),
+                &row.current_phase,
+                &row.role,
+                &row.role_override,
+            );
+            let event = evaluation.event;
+            // 拖拽编辑可能与本轮行情轮询并发发生。重新读取最新行，
+            // 只把分析状态写回，避免用轮询开始时的旧区域边界覆盖用户刚保存的修改。
+            let Some(mut persisted) = repo::manual_level_by_id(&self.db, row.id).await? else {
+                continue;
+            };
+            if !persisted.monitor_enabled || persisted.status != "active" {
+                continue;
+            }
+            persisted.current_phase = evaluation.phase.clone();
+            let effective_role = if persisted.role_override == "auto" {
+                evaluation.role.as_str().to_string()
+            } else {
+                persisted.role_override.clone()
+            };
+            persisted.role = effective_role.clone();
+            persisted.role_confidence = if persisted.role_override == "auto" {
+                evaluation.role_confidence
+            } else {
+                1.0
+            };
+            persisted.updated_at = now_ts();
+            if event.is_some() {
+                persisted.last_event_ts = Some(persisted.updated_at.clone());
+            }
+            if let Some(event_kind) = event {
+                let event_type = event_kind.as_str().to_string();
+                let bar_ts = bars.last().map(bar_ts);
+                let event_row = manual_level_events::ActiveModel {
+                    id: NotSet,
+                    level_id: Set(persisted.id),
+                    symbol: Set(persisted.symbol.clone()),
+                    timeframe: Set(persisted.timeframe.clone()),
+                    event_type: Set(event_type.clone()),
+                    role: Set(Some(effective_role.clone())),
+                    bar_ts: Set(bar_ts.clone()),
+                    price: Set(evaluation.price),
+                    reason: Set(evaluation.reason.clone()),
+                    phase: Set(evaluation.phase.clone()),
+                    role_confidence: Set(evaluation.role_confidence),
+                    volume_ratio: Set(evaluation.volume_ratio),
+                    created_at: Set(persisted.updated_at.clone()),
+                };
+                if repo::insert_manual_level_event(&self.db, event_row)
+                    .await?
+                    .is_some()
+                {
+                    alerts.push(ManualLevelAlert {
+                        level_id: persisted.id,
+                        symbol: persisted.symbol.clone(),
+                        timeframe: persisted.timeframe.clone(),
+                        name: persisted.name.clone(),
+                        event_type,
+                        role: effective_role,
+                        role_confidence: evaluation.role_confidence,
+                        bar_ts,
+                        price: evaluation.price,
+                        reason: evaluation.reason,
+                        phase: evaluation.phase,
+                        volume_ratio: evaluation.volume_ratio,
+                    });
+                }
+            }
+            repo::update_manual_level(&self.db, persisted).await?;
+        }
+        Ok(alerts)
+    }
+
     /// 在品种所属交易时段收盘前，对已有 pending 候选做一次轻量预检测。
     /// 不读取未收盘15m K线，不触发完整扫描；数据库唯一索引负责跨轮询去重。
     pub async fn preclose_tick(
@@ -1483,7 +1968,10 @@ impl Services {
         let cfg = self.config().await;
         {
             let mut last_tick = self.preclose_last_tick.lock().await;
-            if last_tick.map(|value| value.elapsed() < Duration::from_secs(10)).unwrap_or(false) {
+            if last_tick
+                .map(|value| value.elapsed() < Duration::from_secs(10))
+                .unwrap_or(false)
+            {
                 return Ok(Vec::new());
             }
             *last_tick = Some(Instant::now());
@@ -1519,17 +2007,19 @@ impl Services {
             if !crate::session::SessionCalendar::is_trading_time(&event.symbol, &now) {
                 continue;
             }
-            let Some(close) = crate::session::SessionCalendar::next_session_close(
-                &event.symbol,
-                &now_naive,
-            ) else {
+            let Some(close) =
+                crate::session::SessionCalendar::next_session_close(&event.symbol, &now_naive)
+            else {
                 continue;
             };
             let remaining = (close - now_naive).num_seconds();
             if !(0..=lead_secs).contains(&remaining) {
                 continue;
             }
-            let key = (event.symbol.clone(), close.format("%Y-%m-%d %H:%M:%S").to_string());
+            let key = (
+                event.symbol.clone(),
+                close.format("%Y-%m-%d %H:%M:%S").to_string(),
+            );
             let replace = selected
                 .get(&key)
                 .map(|old| event.entry_score > old.entry_score)
@@ -1578,21 +2068,258 @@ impl Services {
             };
             match repo::insert_preclose_signal(&self.db, model).await {
                 Ok(id) => {
-                    if let Some(row) = repo::preclose_signal_by_key(
-                        &self.db,
-                        &symbol,
-                        &close_ts,
-                        event.id,
-                    )
-                    .await?
+                    if let Some(row) =
+                        repo::preclose_signal_by_key(&self.db, &symbol, &close_ts, event.id).await?
                     {
-                        tracing::info!(symbol, event_id = event.id, preclose_id = id, "收盘前预检测信号已生成");
+                        tracing::info!(
+                            symbol,
+                            event_id = event.id,
+                            preclose_id = id,
+                            "收盘前预检测信号已生成"
+                        );
                         changed.push(row);
                     }
                 }
                 Err(error) => {
                     // 多个行情/调度路径并发时，唯一索引冲突等价于已生成，不能阻断行情轮询。
-                    tracing::debug!(symbol, event_id = event.id, "收盘前预检测写入跳过: {error:#}");
+                    tracing::debug!(
+                        symbol,
+                        event_id = event.id,
+                        "收盘前预检测写入跳过: {error:#}"
+                    );
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// 在收盘前用已落库 raw 5m 与实时现价构造临时15m序列。
+    /// 临时5m只存在于内存，不进入 RawPipeline，避免未收盘数据污染正式行情。
+    async fn provisional_bars_for(
+        &self,
+        symbol: &str,
+        now: NaiveDateTime,
+        latest: f64,
+    ) -> Result<Vec<Bar>> {
+        let current_ts = provisional_5m_bucket_ts(now);
+        let mut raw: Vec<Kline> = repo::raw_klines(&self.db, symbol)
+            .await?
+            .iter()
+            .map(model_to_fetch)
+            .filter(|bar| parse_local_ts(&bar.datetime).is_some_and(|ts| ts <= current_ts))
+            .collect();
+        raw.sort_by(|a, b| a.datetime.cmp(&b.datetime));
+
+        let current_ts_string = current_ts.format("%Y-%m-%d %H:%M:%S").to_string();
+        let same_index = raw
+            .iter()
+            .position(|bar| bar.datetime == current_ts_string);
+        let previous = raw
+            .iter()
+            .rev()
+            .find(|bar| bar.datetime.as_str() < current_ts_string.as_str());
+        let existing = same_index.map(|index| &raw[index]);
+        let open = existing
+            .map(|bar| bar.open)
+            .or_else(|| previous.map(|bar| bar.close))
+            .unwrap_or(latest);
+        let high = existing
+            .map(|bar| bar.high.max(latest))
+            .unwrap_or_else(|| open.max(latest));
+        let low = existing
+            .map(|bar| bar.low.min(latest))
+            .unwrap_or_else(|| open.min(latest));
+        let volume = existing.map(|bar| bar.volume).unwrap_or(0.0);
+        let hold = existing
+            .map(|bar| bar.hold)
+            .or_else(|| previous.map(|bar| bar.hold))
+            .unwrap_or(0.0);
+        let live = Kline {
+            datetime: current_ts_string,
+            open,
+            high,
+            low,
+            close: latest,
+            volume,
+            hold,
+        };
+        if let Some(index) = same_index {
+            raw[index] = live;
+        } else {
+            raw.push(live);
+        }
+
+        let mut bars: Vec<Bar> = aggregate(&raw, Timeframe::M15)
+            .iter()
+            .filter_map(fetch_to_bar)
+            .collect();
+        let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
+        mark_rollover_bars(&mut bars, &rollovers, "15m");
+        Ok(bars)
+    }
+
+    /// 对当前未收盘15m桶运行正式预警算法，但只取最后一根临时15m候选。
+    /// 结果只写入 preclose_candidates，不创建正式 pattern_events。
+    pub async fn preclose_candidate_tick(
+        &self,
+        snapshots: &[MarketSnapshot],
+    ) -> Result<Vec<preclose_candidates::Model>> {
+        let cfg = self.config().await;
+        {
+            let mut last_tick = self.preclose_candidate_last_tick.lock().await;
+            if last_tick
+                .map(|value| value.elapsed() < Duration::from_secs(10))
+                .unwrap_or(false)
+            {
+                return Ok(Vec::new());
+            }
+            *last_tick = Some(Instant::now());
+        }
+
+        let now = Local::now();
+        let now_naive = now.naive_local();
+        let lead_secs = match cfg.preclose.lead_secs {
+            120 | 180 => cfg.preclose.lead_secs,
+            _ => 180,
+        } as i64;
+        if !cfg.preclose.enabled {
+            return Ok(Vec::new());
+        }
+        let latest_by_symbol: HashMap<&str, f64> = snapshots
+            .iter()
+            .filter_map(|s| s.latest.map(|price| (s.code.as_str(), price)))
+            .collect();
+        if latest_by_symbol.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut changed = Vec::new();
+        let min_score = PRECLOSE_CANDIDATE_MIN_SCORE;
+        for symbol_row in repo::list_symbols(&self.db, true).await? {
+            let Some(&latest) = latest_by_symbol.get(symbol_row.code.as_str()) else {
+                continue;
+            };
+            if !crate::session::SessionCalendar::is_trading_time(&symbol_row.code, &now) {
+                continue;
+            }
+            let Some(close) = crate::session::SessionCalendar::next_session_close(
+                &symbol_row.code,
+                &now_naive,
+            ) else {
+                continue;
+            };
+            let remaining = (close - now_naive).num_seconds();
+            if !(0..=lead_secs).contains(&remaining) {
+                continue;
+            }
+
+            let bars = match self
+                .provisional_bars_for(&symbol_row.code, now_naive, latest)
+                .await
+            {
+                Ok(bars) => bars,
+                Err(error) => {
+                    tracing::debug!(symbol = symbol_row.code, "临时未收盘扫描读取K线失败: {error:#}");
+                    continue;
+                }
+            };
+            let Some(last_index) = bars.len().checked_sub(1) else {
+                continue;
+            };
+            let tick = crate::precision::effective_tick(
+                symbol_row.tick_size,
+                &symbol_row.code,
+                &symbol_row.variety,
+            );
+            let candidates = event::replay_warnings(&symbol_row.code, &bars, tick);
+            let close_ts = close.format("%Y-%m-%d %H:%M:%S").to_string();
+            for candidate in candidates
+                .into_iter()
+                .filter(|candidate| candidate.warning_index == last_index)
+                .filter(|candidate| candidate.entry_score >= min_score)
+            {
+                let direction = if candidate.direction == Dir::Up { "up" } else { "down" };
+                let warning_ts = bar_ts(&bars[candidate.warning_index]);
+                if repo::pattern_event_by_warning(
+                    &self.db,
+                    &symbol_row.code,
+                    direction,
+                    &warning_ts,
+                )
+                .await?
+                .is_some()
+                {
+                    continue;
+                }
+                let fingerprint = scan_bar_fingerprint(&bars[last_index]);
+                let now_ts_value = now_ts();
+                let model = preclose_candidate_model(
+                    &symbol_row.code,
+                    &bars,
+                    &candidate,
+                    &close_ts,
+                    latest,
+                    &fingerprint,
+                    &now_ts_value,
+                );
+                if let Some(mut old) = repo::preclose_candidate_by_key(
+                    &self.db,
+                    &symbol_row.code,
+                    direction,
+                    &warning_ts,
+                    &close_ts,
+                )
+                .await?
+                {
+                    old.last_seen_at = now_ts_value.clone();
+                    old.reference_price = model.reference_price;
+                    old.entry_score = model.entry_score;
+                    old.entry_score_dims = model.entry_score_dims;
+                    old.warning_kind = model.warning_kind;
+                    old.s0_ts = model.s0_ts;
+                    old.s0_price = model.s0_price;
+                    old.s1_ts = model.s1_ts;
+                    old.s1_price = model.s1_price;
+                    old.s2_ts = model.s2_ts;
+                    old.s2_price = model.s2_price;
+                    old.a_move = model.a_move;
+                    old.b_move = model.b_move;
+                    old.a_bars = model.a_bars;
+                    old.b_bars = model.b_bars;
+                    old.retracement = model.retracement;
+                    old.entry = model.entry;
+                    old.stop = model.stop;
+                    old.target = model.target;
+                    old.risk = model.risk;
+                    old.rr = model.rr;
+                    old.provisional_fingerprint = model.provisional_fingerprint;
+                    old.updated_at = now_ts_value;
+                    repo::update_preclose_candidate(&self.db, old.clone()).await?;
+                    changed.push(old);
+                } else {
+                    let id = repo::insert_preclose_candidate(
+                        &self.db,
+                        preclose_candidate_active_model(model),
+                    )
+                    .await?;
+                    if let Some(row) = repo::preclose_candidate_by_key(
+                        &self.db,
+                        &symbol_row.code,
+                        direction,
+                        &warning_ts,
+                        &close_ts,
+                    )
+                    .await?
+                    {
+                        tracing::info!(
+                            symbol = symbol_row.code,
+                            candidate_id = id,
+                            direction,
+                            warning_ts,
+                            "临时未收盘预警候选已生成"
+                        );
+                        changed.push(row);
+                    }
                 }
             }
         }
@@ -1628,7 +2355,10 @@ impl Services {
             {
                 Some(("superseded", Some("正式信号已提前触发".to_string())))
             } else if parent.state == "expired" || parent.state == "closed" {
-                Some(("invalidated", Some(format!("正式候选状态为 {}", parent.state))))
+                Some((
+                    "invalidated",
+                    Some(format!("正式候选状态为 {}", parent.state)),
+                ))
             } else if row.state == "precheck" && now >= close + ChronoDuration::seconds(80) {
                 row.confirmed_at = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
                 Some(("confirmed", None))
@@ -1652,6 +2382,56 @@ impl Services {
         Ok(changed)
     }
 
+    /// 收盘后用最终15m扫描结果结算临时未收盘候选。
+    pub async fn reconcile_preclose_candidates(
+        &self,
+        now: NaiveDateTime,
+    ) -> Result<Vec<preclose_candidates::Model>> {
+        let mut changed = Vec::new();
+        for mut row in repo::active_preclose_candidates(&self.db).await? {
+            if row.state != "provisional" {
+                continue;
+            }
+            let Some(close) = parse_local_ts(&row.session_close_ts) else {
+                continue;
+            };
+            // 与正式扫描的收盘结算等待保持一致：给收盘终态补拉和正式扫描留出约80秒。
+            if now < close + ChronoDuration::seconds(80) {
+                continue;
+            }
+            let parent = repo::pattern_event_by_warning(
+                &self.db,
+                &row.symbol,
+                &row.direction,
+                &row.warning_ts,
+            )
+            .await?;
+            row.updated_at = now_ts();
+            if let Some(parent) = parent {
+                row.state = "confirmed".to_string();
+                row.parent_event_id = Some(parent.id);
+                row.invalid_reason = None;
+                tracing::info!(
+                    symbol = row.symbol,
+                    candidate_id = row.id,
+                    event_id = parent.id,
+                    "临时未收盘预警候选已由正式扫描确认"
+                );
+            } else {
+                row.state = "invalidated".to_string();
+                row.invalid_reason = Some("收盘后的最终15m K线未满足正式预警条件".to_string());
+                tracing::info!(
+                    symbol = row.symbol,
+                    candidate_id = row.id,
+                    "临时未收盘预警候选收盘后失效"
+                );
+            }
+            repo::update_preclose_candidate(&self.db, row.clone()).await?;
+            changed.push(row);
+        }
+        Ok(changed)
+    }
+
     async fn observe_preclose_outcome(
         &self,
         row: &mut preclose_signals::Model,
@@ -1671,7 +2451,9 @@ impl Services {
             return Ok(false);
         };
         let Some(open_idx) = bars.iter().position(|bar| {
-            parse_local_ts(&bar.ts).map(|ts| ts > close).unwrap_or(false)
+            parse_local_ts(&bar.ts)
+                .map(|ts| ts > close)
+                .unwrap_or(false)
         }) else {
             return Ok(false);
         };
@@ -1682,7 +2464,11 @@ impl Services {
         let horizon_end = open_ts + ChronoDuration::minutes(row.horizon_minutes.max(5));
         let window: Vec<&klines::Model> = bars[open_idx..]
             .iter()
-            .filter(|bar| parse_local_ts(&bar.ts).map(|ts| ts < horizon_end).unwrap_or(false))
+            .filter(|bar| {
+                parse_local_ts(&bar.ts)
+                    .map(|ts| ts < horizon_end)
+                    .unwrap_or(false)
+            })
             .collect();
         if window.is_empty() {
             return Ok(false);
@@ -1693,12 +2479,24 @@ impl Services {
             row.gap_pct = Some((open_bar.open - row.reference_price) / row.reference_price * 100.0);
         }
         let (mfe, mae) = if row.direction == "down" {
-            let favorable = window.iter().map(|bar| row.entry - bar.low).fold(0.0, f64::max);
-            let adverse = window.iter().map(|bar| bar.high - row.entry).fold(0.0, f64::max);
+            let favorable = window
+                .iter()
+                .map(|bar| row.entry - bar.low)
+                .fold(0.0, f64::max);
+            let adverse = window
+                .iter()
+                .map(|bar| bar.high - row.entry)
+                .fold(0.0, f64::max);
             (favorable, adverse)
         } else {
-            let favorable = window.iter().map(|bar| bar.high - row.entry).fold(0.0, f64::max);
-            let adverse = window.iter().map(|bar| row.entry - bar.low).fold(0.0, f64::max);
+            let favorable = window
+                .iter()
+                .map(|bar| bar.high - row.entry)
+                .fold(0.0, f64::max);
+            let adverse = window
+                .iter()
+                .map(|bar| row.entry - bar.low)
+                .fold(0.0, f64::max);
             (favorable, adverse)
         };
         if row.risk.abs() > f64::EPSILON {
@@ -1926,11 +2724,8 @@ impl Services {
         if !repo::symbol_exists(&self.db, &code).await? {
             // 新代码先向行情接口确认存在并取中文名：
             // 无效代码在这里就给出明确提示，避免建档后回填时报「接口没有返回K线数据」这类模糊错误
-            let names = crate::fetch::symbols::fetch_quote_names(
-                &self.client,
-                &[code.clone()],
-            )
-            .await?;
+            let names =
+                crate::fetch::symbols::fetch_quote_names(&self.client, &[code.clone()]).await?;
             let Some(name) = names.get(&code) else {
                 return Err(anyhow!(
                     "未找到品种「{code}」，请检查代码（示例：RB0、AU0、IF0）"
@@ -2077,7 +2872,9 @@ impl Services {
                 // 若仍在结算期内，精准调度等待至 Finality 确认时刻补拉
                 if remaining > 0 {
                     let delay_secs = (remaining as u64).max(2);
-                    let is_session_close = judger.required_settle_secs(code, bar_dt.hour(), bar_dt.minute()) > judger.policy().ordinary_settle_secs;
+                    let is_session_close =
+                        judger.required_settle_secs(code, bar_dt.hour(), bar_dt.minute())
+                            > judger.policy().ordinary_settle_secs;
                     let pipeline = self.pipeline.clone();
                     let code_owned = code.to_string();
                     // 没有天勤闭合证明时，安全兜底必须明确走新浪30/75秒定版过滤。
@@ -2093,23 +2890,48 @@ impl Services {
                             let client = client.clone();
                             let label = label.to_string();
                             async move {
-                                match crate::fetch::kline::fetch_minute(&client, &code_owned, "5", 10).await {
+                                match crate::fetch::kline::fetch_minute(
+                                    &client,
+                                    &code_owned,
+                                    "5",
+                                    10,
+                                )
+                                .await
+                                {
                                     Ok(fetched) => {
-                                        if let Err(e) = pipeline.process_raw_batch(&code_owned, &fetched).await {
-                                            tracing::warn!("Finality 延迟补拉更新失败 {} ({}): {e:?}", code_owned, label);
+                                        if let Err(e) =
+                                            pipeline.process_raw_batch(&code_owned, &fetched).await
+                                        {
+                                            tracing::warn!(
+                                                "Finality 延迟补拉更新失败 {} ({}): {e:?}",
+                                                code_owned,
+                                                label
+                                            );
                                         } else {
-                                            tracing::info!("Finality 延迟补拉完成 {} ({})", code_owned, label);
+                                            tracing::info!(
+                                                "Finality 延迟补拉完成 {} ({})",
+                                                code_owned,
+                                                label
+                                            );
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Finality 延迟补拉抓取失败 {} ({}): {e:?}", code_owned, label);
+                                        tracing::warn!(
+                                            "Finality 延迟补拉抓取失败 {} ({}): {e:?}",
+                                            code_owned,
+                                            label
+                                        );
                                     }
                                 }
                             }
                         }
                     };
                     {
-                        let fut = do_refetch(if is_session_close { "收盘终态补拉" } else { "普通终态补拉" });
+                        let fut = do_refetch(if is_session_close {
+                            "收盘终态补拉"
+                        } else {
+                            "普通终态补拉"
+                        });
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                             fut.await;
@@ -2574,7 +3396,9 @@ impl Services {
     }
 
     /// 订阅数据源降级/恢复事件通知。
-    pub fn subscribe_data_source_events(&self) -> tokio::sync::broadcast::Receiver<crate::fetch::DataSourceEvent> {
+    pub fn subscribe_data_source_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::fetch::DataSourceEvent> {
         self.data_source.subscribe_events()
     }
 
@@ -2615,7 +3439,10 @@ impl Services {
 
     /// 手工快速扫描：跳过换月、try_lock防排队，定时任务会后台补换月
     pub async fn run_scan_fast(&self) -> Result<ScanResult> {
-        let _guard = self.scan_lock.try_lock().map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
+        let _guard = self
+            .scan_lock
+            .try_lock()
+            .map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
         let _cycle_guard = self
             .data_cycle_lock
             .try_lock()
@@ -2651,7 +3478,9 @@ impl Services {
         let _guard = self.scan_lock.lock().await;
         let bars15 = self.bars_for(symbol, "15m").await?;
         let Some(bar) = bars15.iter().find(|bar| bar.dt.to_bar_ts() == bar_end) else {
-            return Err(anyhow!("闭合事件入库后未生成目标15m K线: {symbol}/{bar_end}"));
+            return Err(anyhow!(
+                "闭合事件入库后未生成目标15m K线: {symbol}/{bar_end}"
+            ));
         };
         let fingerprint = scan_bar_fingerprint(bar);
         if !repo::claim_scan_watermark(
@@ -2805,7 +3634,9 @@ impl Services {
                     && e.trigger_ts.is_some()
                     && e.trigger_bar_ts.is_some()
                 {
-                    crate::v2::prediction::needs_prediction(&self.db, e.id).await.unwrap_or(false)
+                    crate::v2::prediction::needs_prediction(&self.db, e.id)
+                        .await
+                        .unwrap_or(false)
                 } else {
                     false
                 };
@@ -2815,7 +3646,9 @@ impl Services {
                         || (!had_trigger_bar && e.trigger_bar_ts.is_some())
                         || needs_prediction)
                 {
-                    if let Err(error) = crate::v2::prediction::predict_event(&self.db, &e, &bars15).await {
+                    if let Err(error) =
+                        crate::v2::prediction::predict_event(&self.db, &e, &bars15).await
+                    {
                         tracing::warn!(event_id = e.id, "V2 实时预测写入失败: {error:#}");
                     }
                     if !was_triggered {
@@ -3138,7 +3971,11 @@ impl Services {
                 ))
             })
             .collect();
-        rows.sort_by(|a, b| b.warning_ts.cmp(&a.warning_ts).then_with(|| b.event_id.cmp(&a.event_id)));
+        rows.sort_by(|a, b| {
+            b.warning_ts
+                .cmp(&a.warning_ts)
+                .then_with(|| b.event_id.cmp(&a.event_id))
+        });
         rows.truncate(limit);
         let mut annotations_by_event: HashMap<i64, Vec<SignalAnnotationDto>> = HashMap::new();
         for ann in repo::all_signal_annotations(&self.db).await? {
@@ -3851,6 +4688,18 @@ mod tests {
     }
 
     #[test]
+    fn provisional_5m_bucket_keeps_last_unclosed_bar_in_close_bucket() {
+        assert_eq!(
+            provisional_5m_bucket_ts(parse_local_ts("2026-09-07 14:57:30").unwrap()),
+            parse_local_ts("2026-09-07 14:55:00").unwrap()
+        );
+        assert_eq!(
+            provisional_5m_bucket_ts(parse_local_ts("2026-09-07 10:12:30").unwrap()),
+            parse_local_ts("2026-09-07 10:10:00").unwrap()
+        );
+    }
+
+    #[test]
     fn pattern_endpoint_prices_use_swing_extremes_not_closes() {
         let bars = vec![
             bar_model("2026-08-12 22:15:00", 2222.0, 2223.0, 2221.0, 2222.0),
@@ -4387,15 +5236,3 @@ fn kline_model(ts: &str) -> klines::Model {
         source: "derived".to_string(),
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-

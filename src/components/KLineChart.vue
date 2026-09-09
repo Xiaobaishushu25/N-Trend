@@ -25,7 +25,7 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
-import type { KlineRow, PatternDto, ReviewExitOverlay, TrendPointDto, SingleBarEvent } from '../types'
+import type { KlineRow, ManualLevelDto, ManualLevelInput, PatternDto, ReviewExitOverlay, TrendPointDto, SingleBarEvent } from '../types'
 import { SINGLE_BAR_COLORS } from '../utils/singleBar'
 import { useSettingsStore } from '../stores/settings'
 
@@ -46,6 +46,14 @@ const props = defineProps<{
   focusKey?: number | string | null
   /** 当前周期 MA20 长期趋势线数据点 */
   trendPoints?: TrendPointDto[]
+  manualLevels?: ManualLevelDto[]
+}>()
+
+const emit = defineEmits<{
+  (e: 'create-manual-level', input: ManualLevelInput): void
+  (e: 'update-manual-level', id: number, input: ManualLevelInput, settled: (saved: ManualLevelDto | null) => void): void
+  (e: 'preview-manual-level', id: number, input: ManualLevelInput | null): void
+  (e: 'manual-level-draw-mode', active: boolean): void
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
@@ -250,6 +258,78 @@ class GapPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
+class ManualLevelPaneRenderer implements IPrimitivePaneRenderer {
+  constructor(
+    private chart: IChartApi,
+    private source: ISeriesApi<'Candlestick'>,
+    private levels: ManualLevelDto[],
+    private rows: KlineRow[],
+  ) {}
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.levels.length || !this.rows.length) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const timeScale = this.chart.timeScale()
+      for (const level of this.levels) {
+        const start = toTs(level.start_ts) as Time
+        const end = toTs(this.rows[this.rows.length - 1].ts) as Time
+        const x1 = timeScale.timeToCoordinate(start)
+        const x2 = timeScale.timeToCoordinate(end)
+        const top = this.source.priceToCoordinate(level.zone_high)
+        const bottom = this.source.priceToCoordinate(level.zone_low)
+        if (x1 == null || x2 == null || top == null || bottom == null) continue
+        const left = Math.min(x1, x2)
+        const right = Math.max(x1, x2, mediaSize.width - (this.chart.priceScale('right').width() || 64))
+        const width = Math.max(2, right - left)
+        const active = level.status === 'active' && level.monitor_enabled
+        const color = level.role_override === 'support' || level.role === 'support'
+          ? '#16a34a'
+          : level.role_override === 'resistance' || level.role === 'resistance'
+            ? '#dc2626'
+            : '#7c3aed'
+        context.fillStyle = active ? `${color}0d` : 'rgba(148, 163, 184, 0.045)'
+        context.fillRect(left, Math.min(top, bottom), width, Math.abs(bottom - top))
+        context.strokeStyle = active ? `${color}80` : `${color}55`
+        context.lineWidth = active ? 0.9 : 0.75
+        context.setLineDash(active ? [] : [5, 4])
+        for (const y of [top, bottom]) {
+          context.beginPath()
+          context.moveTo(left, y)
+          context.lineTo(left + width, y)
+          context.stroke()
+        }
+        context.setLineDash([])
+        context.fillStyle = active ? `${color}b0` : '#94a3b8'
+        context.font = '500 10px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+        const role = level.role_override === 'support' || level.role === 'support'
+          ? '支撑'
+          : level.role_override === 'resistance' || level.role === 'resistance'
+            ? '压力'
+            : '待确认'
+        context.fillText(`#K${level.id} · ${role}`, Math.max(4, left + 4), Math.max(14, Math.min(mediaSize.height - 6, Math.min(top, bottom) - 4)))
+      }
+    })
+  }
+}
+
+class ManualLevelPaneView implements IPrimitivePaneView {
+  private paneRenderer: ManualLevelPaneRenderer
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, levels: ManualLevelDto[], rows: KlineRow[]) {
+    this.paneRenderer = new ManualLevelPaneRenderer(chart, source, levels, rows)
+  }
+  renderer(): IPrimitivePaneRenderer | null { return this.paneRenderer }
+  zOrder(): PrimitivePaneViewZOrder { return 'bottom' }
+}
+
+class ManualLevelPrimitive implements ISeriesPrimitive<Time> {
+  private view: ManualLevelPaneView
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, levels: ManualLevelDto[], rows: KlineRow[]) {
+    this.view = new ManualLevelPaneView(chart, source, levels, rows)
+  }
+  paneViews(): readonly IPrimitivePaneView[] { return [this.view] }
+}
+
 class RolloverPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
   private times: Time[]
@@ -321,6 +401,24 @@ let markersApi: ISeriesMarkersPluginApi<Time> | null = null
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
 let eventLabelPrimitive: EventLabelPrimitive | null = null
+let manualLevelPrimitive: ManualLevelPrimitive | null = null
+const drawMode = ref(false)
+const drawing = ref<{ x: number; y: number; x2: number; y2: number } | null>(null)
+const selectedManualLevelId = ref<number | null>(null)
+const levelDrag = ref<{
+  id: number
+  handle: 'move' | 'top' | 'bottom' | 'left' | 'right' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
+  startX: number
+  startY: number
+  pointerId: number
+  original: ManualLevelDto
+  grabIndex: number
+  originalStartIndex: number
+  originalEndIndex: number
+  startPrice: number | null
+  hasMoved: boolean
+} | null>(null)
+let levelDragPointerTarget: (Element & { releasePointerCapture?: (pointerId: number) => void }) | null = null
 let focusIndex = -1
 let focusFollowsLatest = true
 /** 键盘或复盘定位后，鼠标移出图表时仍把十字光标留在焦点K线上 */
@@ -678,6 +776,7 @@ function syncExtremes() {
 /** 可视区间变化时重算最高/最低点 */
 function onVisibleRangeChange() {
   syncFocusFollowWithView()
+  refreshManualLevelOverlay()
   if (!props.showExtremes) return
   syncExtremes()
   markersApi?.setMarkers(buildMarkers())
@@ -1146,6 +1245,18 @@ function syncGaps() {
   candleSeries.attachPrimitive(gapPrimitive)
 }
 
+function syncManualLevels() {
+  if (!chart || !candleSeries) return
+  if (manualLevelPrimitive) {
+    candleSeries.detachPrimitive(manualLevelPrimitive)
+    manualLevelPrimitive = null
+  }
+  const levels = drawableManualLevels()
+  if (!levels.length || !props.rows.length) return
+  manualLevelPrimitive = new ManualLevelPrimitive(chart, candleSeries, levels, props.rows)
+  candleSeries.attachPrimitive(manualLevelPrimitive)
+}
+
 function computeRollovers(): Time[] {
   return props.rows.filter((r) => !!r.rollover).map((r) => toTs(r.ts) as Time)
 }
@@ -1380,6 +1491,8 @@ function renderData() {
   lastDataCount = props.rows.length
   syncGaps()
   syncRollovers()
+  syncManualLevels()
+  refreshManualLevelOverlay()
   if (isSwitch) {
     dropStaleView(props.rows.length)
     const span = lastView
@@ -1450,6 +1563,8 @@ function renderOverlays() {
   syncPatternLines()
   syncTrendSeries()
   syncEventLabels()
+  syncManualLevels()
+  refreshManualLevelOverlay()
 }
 
 /** Ctrl+滚轮缩放：向上(deltaY<0)放大、向下(deltaY>0)缩小；时间轴与价格轴按光标位置同步缩放。
@@ -1505,8 +1620,402 @@ function handleWheel(e: WheelEvent) {
   priceApi.setVisibleRange({ from: fromP, to: fromP + spanP })
 }
 
+function rowIndexAtCoordinate(x: number): number {
+  if (!chart || !props.rows.length) return -1
+  const logical = chart.timeScale().coordinateToLogical(x)
+  if (logical == null) return -1
+  return Math.max(0, Math.min(props.rows.length - 1, Math.round(logical)))
+}
+
+function rowIndexAtTimestamp(ts: string | null | undefined, fallback: number): number {
+  if (!ts || !props.rows.length) return fallback
+  const exact = props.rows.findIndex((row) => row.ts === ts)
+  if (exact >= 0) return exact
+  const target = Number(toTs(ts))
+  if (!Number.isFinite(target)) return fallback
+  let nearest = fallback
+  let nearestDistance = Number.POSITIVE_INFINITY
+  props.rows.forEach((row, index) => {
+    const distance = Math.abs(Number(toTs(row.ts)) - target)
+    if (distance < nearestDistance) {
+      nearest = index
+      nearestDistance = distance
+    }
+  })
+  return nearest
+}
+
+function manualLevelDragLog(phase: string, detail: Record<string, unknown>) {
+  if (!import.meta.env.DEV) return
+  console.info(`[manual-level-drag:${phase}]`, detail)
+}
+
+interface ManualLevelOverlayRect {
+  level: ManualLevelDto
+  x: number
+  anchorX: number
+  y: number
+  width: number
+  height: number
+}
+
+const overlayRects = ref<ManualLevelOverlayRect[]>([])
+const dragPreview = ref<ManualLevelInput | null>(null)
+const pendingLevelUpdates = ref(new Map<number, ManualLevelInput>())
+
+function roundManualPrice(value: number) {
+  return Number(value.toFixed(2))
+}
+
+function levelInput(level: ManualLevelDto): ManualLevelInput {
+  return {
+    symbol: level.symbol,
+    timeframe: level.timeframe,
+    name: level.name,
+    start_ts: level.start_ts,
+    end_ts: level.end_ts,
+    zone_low: roundManualPrice(level.zone_low),
+    zone_high: roundManualPrice(level.zone_high),
+    role_override: level.role_override === 'support' || level.role_override === 'resistance' ? level.role_override : 'auto',
+    monitor_enabled: level.monitor_enabled,
+  }
+}
+
+function activeOverlayLevels(): ManualLevelDto[] {
+  const levels = props.manualLevels ?? []
+  return levels.map((level) => {
+    const pending = pendingLevelUpdates.value.get(level.id)
+    const dragging = levelDrag.value?.id === level.id ? dragPreview.value : null
+    return pending || dragging ? { ...level, ...(pending ?? {}), ...(dragging ?? {}) } : level
+  })
+}
+
+/** 拖动中的区域由 SVG 编辑层独占绘制，避免 Canvas 旧位置与预览位置同时出现双影。 */
+function drawableManualLevels(): ManualLevelDto[] {
+  const draggingId = levelDrag.value?.id
+  return activeOverlayLevels().filter((level) => level.id !== draggingId)
+}
+
+function refreshManualLevelOverlay() {
+  if (!chart || !candleSeries || !container.value) {
+    overlayRects.value = []
+    return
+  }
+  const latest = props.rows[props.rows.length - 1]
+  if (!latest) {
+    overlayRects.value = []
+    return
+  }
+  const width = container.value.clientWidth
+  overlayRects.value = activeOverlayLevels().flatMap((level) => {
+    const x1 = chart!.timeScale().timeToCoordinate(toTs(level.start_ts) as Time)
+    const x2 = chart!.timeScale().timeToCoordinate(toTs(latest.ts) as Time)
+    const anchorTime = level.end_ts || latest.ts
+    const anchorX = chart!.timeScale().timeToCoordinate(toTs(anchorTime) as Time)
+    const y1 = candleSeries!.priceToCoordinate(level.zone_high)
+    const y2 = candleSeries!.priceToCoordinate(level.zone_low)
+    if (x1 == null || x2 == null || anchorX == null || y1 == null || y2 == null) return []
+    return [{
+      level,
+      x: Math.min(x1, x2),
+      anchorX,
+      y: Math.min(y1, y2),
+      width: Math.max(2, Math.max(x1, x2, width - (chart!.priceScale('right').width() || 64)) - Math.min(x1, x2)),
+      height: Math.max(4, Math.abs(y2 - y1)),
+    }]
+  })
+}
+
+function updateDrawingPreview(event: PointerEvent) {
+  if (!drawMode.value || !drawing.value || !container.value) return
+  const rect = container.value.getBoundingClientRect()
+  drawing.value.x2 = Math.max(0, Math.min(rect.width, event.clientX - rect.left))
+  drawing.value.y2 = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+}
+
+function beginManualLevelDraw(event: PointerEvent) {
+  if (!drawMode.value || !container.value) return
+  event.preventDefault()
+  const rect = container.value.getBoundingClientRect()
+  drawing.value = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+    x2: event.clientX - rect.left,
+    y2: event.clientY - rect.top,
+  }
+}
+
+function finishManualLevelDraw(event: PointerEvent) {
+  if (!drawMode.value || !drawing.value || !container.value || !chart) return
+  event.preventDefault()
+  updateDrawingPreview(event)
+  const x2 = drawing.value.x2
+  const y2 = drawing.value.y2
+  const start = drawing.value
+  drawing.value = null
+  const i1 = rowIndexAtCoordinate(Math.min(start.x, x2))
+  const i2 = rowIndexAtCoordinate(Math.max(start.x, x2))
+  const p1 = candleSeries?.coordinateToPrice(start.y)
+  const p2 = candleSeries?.coordinateToPrice(y2)
+  if (i1 < 0 || i2 <= i1 || p1 == null || p2 == null) return
+  const high = roundManualPrice(Math.max(p1, p2))
+  const low = roundManualPrice(Math.min(p1, p2))
+  if (high <= low) return
+  emit('create-manual-level', {
+    symbol: props.symbol,
+    timeframe: props.timeframe,
+    name: '关键区域',
+    start_ts: props.rows[i1].ts,
+    end_ts: props.rows[i2].ts,
+    zone_low: low,
+    zone_high: high,
+    role_override: 'auto',
+    monitor_enabled: true,
+  })
+  setManualLevelDrawMode(false)
+}
+
+function handleLevelPointerDown(event: PointerEvent, id: number, handle: typeof levelDrag.value extends infer T ? T extends { handle: infer H } ? H : never : never) {
+  if (drawMode.value) return
+  // 必须从当前实际显示值取起点；上一次保存未返回时 props 仍可能是旧值。
+  const level = activeOverlayLevels().find((item) => item.id === id)
+  if (!level) return
+  event.preventDefault()
+  event.stopPropagation()
+  selectedManualLevelId.value = id
+  dragPreview.value = levelInput(level)
+  const bounds = container.value?.getBoundingClientRect()
+  const localX = bounds ? event.clientX - bounds.left : 0
+  const localY = bounds ? event.clientY - bounds.top : 0
+  const grabIndex = rowIndexAtCoordinate(localX)
+  const originalStartIndex = rowIndexAtTimestamp(level.start_ts, 0)
+  const originalEndIndex = rowIndexAtTimestamp(level.end_ts, props.rows.length - 1)
+  levelDrag.value = {
+    id,
+    handle: handle as NonNullable<typeof levelDrag.value>['handle'],
+    startX: event.clientX,
+    startY: event.clientY,
+    pointerId: event.pointerId,
+    original: { ...level },
+    grabIndex,
+    originalStartIndex,
+    originalEndIndex,
+    startPrice: candleSeries?.coordinateToPrice(localY) ?? null,
+    hasMoved: false,
+  }
+  manualLevelDragLog('start', {
+    id,
+    handle,
+    pointer: { x: event.clientX, y: event.clientY },
+    localPointer: { x: localX, y: localY },
+    grabIndex,
+    originalStartIndex,
+    originalEndIndex,
+    level: levelInput(level),
+    pending: pendingLevelUpdates.value.has(id),
+  })
+  const pointerTarget = event.currentTarget as (Element & { setPointerCapture?: (pointerId: number) => void }) | null
+  levelDragPointerTarget = pointerTarget
+  pointerTarget?.setPointerCapture?.(event.pointerId)
+  window.addEventListener('pointermove', updateLevelDrag, true)
+  window.addEventListener('pointerup', finishLevelDrag, true)
+  window.addEventListener('pointercancel', cancelLevelDrag, true)
+  emit('preview-manual-level', id, { ...dragPreview.value })
+  syncManualLevels()
+  refreshManualLevelOverlay()
+}
+
+function updateLevelDrag(event: PointerEvent) {
+  const drag = levelDrag.value
+  if (!drag || !container.value || !candleSeries) return
+  const rect = container.value.getBoundingClientRect()
+  const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left))
+  const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+  const input = dragPreview.value
+  if (!input) return
+  if (!drag.hasMoved) {
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 2) return
+    drag.hasMoved = true
+    manualLevelDragLog('move-first', {
+      id: drag.id,
+      handle: drag.handle,
+      pointer: { x: event.clientX, y: event.clientY },
+      previewBefore: { ...input },
+    })
+  }
+  const original = drag.original
+  const originalHigh = Math.max(original.zone_low, original.zone_high)
+  const originalLow = Math.min(original.zone_low, original.zone_high)
+  const rawPrice = candleSeries.coordinateToPrice(y)
+  const i = rowIndexAtCoordinate(x)
+  if (rawPrice == null || i < 0) return
+  const price = roundManualPrice(rawPrice)
+  if (drag.handle.includes('top')) input.zone_high = Math.max(input.zone_low + Number.EPSILON, price)
+  if (drag.handle.includes('bottom')) input.zone_low = Math.min(input.zone_high - Number.EPSILON, price)
+  if (drag.handle === 'left' || drag.handle.endsWith('left')) input.start_ts = props.rows[i].ts
+  if (drag.handle === 'right' || drag.handle.endsWith('right')) input.end_ts = props.rows[i].ts
+  if (drag.handle === 'move') {
+    const delta = drag.startPrice == null ? 0 : drag.startPrice - price
+    input.zone_low = originalLow - delta
+    input.zone_high = originalHigh - delta
+    const requestedShift = i - drag.grabIndex
+    // 两端一起限位，保持区域原来的时间宽度，不能在图表边缘被挤窄。
+    const shift = Math.max(
+      -drag.originalStartIndex,
+      Math.min(props.rows.length - 1 - drag.originalEndIndex, requestedShift),
+    )
+    const start = drag.originalStartIndex + shift
+    const end = drag.originalEndIndex + shift
+    input.start_ts = props.rows[start]?.ts ?? original.start_ts
+    input.end_ts = props.rows[end]?.ts ?? original.end_ts
+  }
+  if (input.zone_low > input.zone_high) {
+    const swap = input.zone_low
+    input.zone_low = input.zone_high
+    input.zone_high = swap
+  }
+  const startIndex = props.rows.findIndex((row) => row.ts === input.start_ts)
+  const endIndex = input.end_ts == null ? props.rows.length - 1 : props.rows.findIndex((row) => row.ts === input.end_ts)
+  if (startIndex >= 0 && endIndex >= 0 && endIndex <= startIndex) {
+    if (drag.handle === 'left' || drag.handle.endsWith('left')) {
+      input.start_ts = props.rows[Math.max(0, endIndex - 1)]?.ts ?? input.start_ts
+    } else {
+      input.end_ts = props.rows[Math.min(props.rows.length - 1, startIndex + 1)]?.ts ?? input.end_ts
+    }
+  }
+  refreshManualLevelOverlay()
+  emit('preview-manual-level', drag.id, { ...input })
+}
+
+function removeLevelDragListeners() {
+  window.removeEventListener('pointermove', updateLevelDrag, true)
+  window.removeEventListener('pointerup', finishLevelDrag, true)
+  window.removeEventListener('pointercancel', cancelLevelDrag, true)
+}
+
+function cancelLevelDrag() {
+  const drag = levelDrag.value
+  if (drag && levelDragPointerTarget?.releasePointerCapture) {
+    try { levelDragPointerTarget.releasePointerCapture(drag.pointerId) } catch { /* pointer 已结束 */ }
+  }
+  levelDragPointerTarget = null
+  levelDrag.value = null
+  dragPreview.value = null
+  removeLevelDragListeners()
+  if (drag) emit('preview-manual-level', drag.id, null)
+  syncManualLevels()
+  refreshManualLevelOverlay()
+}
+
+function finishLevelDrag() {
+  const drag = levelDrag.value
+  const input = dragPreview.value
+  if (drag && levelDragPointerTarget?.releasePointerCapture) {
+    try { levelDragPointerTarget.releasePointerCapture(drag.pointerId) } catch { /* pointer 已结束 */ }
+  }
+  levelDragPointerTarget = null
+  manualLevelDragLog('finish', {
+    id: drag?.id,
+    handle: drag?.handle,
+    hasMoved: drag?.hasMoved,
+    original: drag ? levelInput(drag.original) : null,
+    result: input ? { ...input } : null,
+  })
+  if (drag && !drag.hasMoved) {
+    levelDrag.value = null
+    dragPreview.value = null
+    removeLevelDragListeners()
+    emit('preview-manual-level', drag.id, null)
+    syncManualLevels()
+    refreshManualLevelOverlay()
+    return
+  }
+  let pendingInput: ManualLevelInput | null = null
+  if (drag && input) {
+    // 在父级异步保存完成前维持最终位置，避免松手瞬间按旧 props 重绘回去。
+    pendingInput = { ...input }
+    pendingLevelUpdates.value.set(drag.id, pendingInput)
+  }
+  levelDrag.value = null
+  dragPreview.value = null
+  removeLevelDragListeners()
+  syncManualLevels()
+  refreshManualLevelOverlay()
+  if (drag && pendingInput) {
+    const submittedInput = pendingInput
+    emit('update-manual-level', drag.id, { ...submittedInput }, (saved) => {
+      manualLevelDragLog('settled', {
+        id: drag.id,
+        saved: saved ? levelInput(saved) : null,
+        submitted: submittedInput,
+      })
+      // 较早一次保存晚于新拖拽返回时，不应清掉新一次拖拽的待确认预览。
+      if (pendingLevelUpdates.value.get(drag.id) === submittedInput) {
+        pendingLevelUpdates.value.delete(drag.id)
+      }
+      emit('preview-manual-level', drag.id, null)
+      syncManualLevels()
+      refreshManualLevelOverlay()
+    })
+  }
+}
+
+function selectManualLevel(id: number) {
+  selectedManualLevelId.value = id
+}
+
+function handleManualLevelCanvasPointerDown(event: PointerEvent) {
+  if (drawMode.value) return
+  const target = event.target as Element | null
+  if (target?.closest('.manual-level-object, .manual-level-draw-layer')) return
+  if (container.value) {
+    const bounds = container.value.getBoundingClientRect()
+    const x = event.clientX - bounds.left
+    const y = event.clientY - bounds.top
+    const hit = overlayRects.value.find((rect) =>
+      x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height,
+    )
+    if (hit) {
+      selectedManualLevelId.value = hit.level.id
+      return
+    }
+  }
+  selectedManualLevelId.value = null
+}
+
+function handleManualLevelKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return
+  if (drawMode.value) {
+    setManualLevelDrawMode(false)
+    event.preventDefault()
+    return
+  }
+  if (levelDrag.value) {
+    cancelLevelDrag()
+    event.preventDefault()
+    return
+  }
+  if (selectedManualLevelId.value != null) {
+    selectedManualLevelId.value = null
+    event.preventDefault()
+  }
+}
+
+function setManualLevelDrawMode(active: boolean) {
+  drawMode.value = active
+  drawing.value = null
+  if (active) selectedManualLevelId.value = null
+  emit('manual-level-draw-mode', active)
+}
+
+function toggleManualLevelDraw() {
+  setManualLevelDrawMode(!drawMode.value)
+  return drawMode.value
+}
+
 onMounted(() => {
   if (!container.value) return
+  window.addEventListener('keydown', handleManualLevelKeydown)
   // 每次进入图表页先回到默认视图（最新 displayKNum 根）；页内切换品种/级别沿用缩放
   //     `行${props.rows.length} 首行${props.rows[0] ? props.rows[0].symbol + '/' + props.rows[0].timeframe : '-'} ` +
   //     `请求${props.symbol}/${props.timeframe} 匹配${rowsMatchRequest() ? 'Y' : 'N'} 旧图${chart ? '有' : '无'}`,
@@ -1605,6 +2114,7 @@ onMounted(() => {
     const el = entries[0].target as HTMLElement
     chart?.applyOptions({ width: el.clientWidth, height: el.clientHeight })
     applyPaneHeights()
+    refreshManualLevelOverlay()
   })
   resizeObserver.observe(container.value)
   renderData()
@@ -1654,6 +2164,16 @@ watch(
   { deep: true },
 )
 watch(
+  () => props.manualLevels,
+  () => {
+    if (chart) {
+      syncManualLevels()
+      refreshManualLevelOverlay()
+    }
+  },
+  { deep: true },
+)
+watch(
   () => props.trendPoints,
   () => {
     if (!chart) return
@@ -1691,6 +2211,10 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleManualLevelKeydown)
+  removeLevelDragListeners()
+  levelDrag.value = null
+  dragPreview.value = null
   container.value?.removeEventListener('wheel', handleWheel)
   resizeObserver?.disconnect()
   if (gapPrimitive && candleSeries) {
@@ -1704,6 +2228,10 @@ onBeforeUnmount(() => {
   if (eventLabelPrimitive && candleSeries) {
     candleSeries.detachPrimitive(eventLabelPrimitive)
     eventLabelPrimitive = null
+  }
+  if (manualLevelPrimitive && candleSeries) {
+    candleSeries.detachPrimitive(manualLevelPrimitive)
+    manualLevelPrimitive = null
   }
   focusIndex = -1
   focusPinnedByKeys = false
@@ -1734,14 +2262,72 @@ onBeforeUnmount(() => {
   priceLines = []
 })
 
-defineExpose({ stepCandles })
+defineExpose({ stepCandles, toggleManualLevelDraw })
 </script>
 
 <template>
-  <div class="kline-wrap">
+  <div class="kline-wrap" @pointerdown="handleManualLevelCanvasPointerDown">
     <div ref="legend" class="legend">N趋势 K线</div>
     <div ref="timeLeft" class="time-left"></div>
     <div ref="container" class="kline-canvas"></div>
+    <svg
+      class="manual-level-overlay"
+      aria-label="关键区域编辑层"
+      @click="selectedManualLevelId = null"
+    >
+      <rect
+        v-if="drawMode && drawing"
+        class="manual-level-draw-preview"
+        :x="Math.min(drawing.x, drawing.x2)"
+        :y="Math.min(drawing.y, drawing.y2)"
+        :width="Math.abs(drawing.x2 - drawing.x)"
+        :height="Math.abs(drawing.y2 - drawing.y)"
+      />
+      <g
+        v-for="rect in overlayRects"
+        :key="`manual-level-${rect.level.id}`"
+        class="manual-level-object"
+        :class="{
+          selected: selectedManualLevelId === rect.level.id,
+          dragging: levelDrag?.id === rect.level.id,
+        }"
+      >
+        <line
+          v-if="rect.anchorX > rect.x && rect.anchorX < rect.x + rect.width"
+          class="manual-level-anchor"
+          :x1="rect.anchorX"
+          :x2="rect.anchorX"
+          :y1="rect.y"
+          :y2="rect.y + rect.height"
+        />
+        <rect
+          class="manual-level-hit"
+          :x="rect.x"
+          :y="rect.y"
+          :width="rect.width"
+          :height="rect.height"
+          @click.stop="selectManualLevel(rect.level.id)"
+          @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'move')"
+        />
+        <template v-if="selectedManualLevelId === rect.level.id">
+          <rect class="manual-level-handle manual-level-handle-corner" :x="rect.x - 4" :y="rect.y - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'top-left')" />
+          <rect class="manual-level-handle manual-level-handle-vertical" :x="rect.x + rect.width / 2 - 4" :y="rect.y - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'top')" />
+          <rect class="manual-level-handle manual-level-handle-corner" :x="rect.anchorX - 4" :y="rect.y - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'top-right')" />
+          <rect class="manual-level-handle manual-level-handle-horizontal" :x="rect.x - 4" :y="rect.y + rect.height / 2 - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'left')" />
+          <rect class="manual-level-handle manual-level-handle-horizontal" :x="rect.anchorX - 4" :y="rect.y + rect.height / 2 - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'right')" />
+          <rect class="manual-level-handle manual-level-handle-corner" :x="rect.x - 4" :y="rect.y + rect.height - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'bottom-left')" />
+          <rect class="manual-level-handle manual-level-handle-vertical" :x="rect.x + rect.width / 2 - 4" :y="rect.y + rect.height - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'bottom')" />
+          <rect class="manual-level-handle manual-level-handle-corner" :x="rect.anchorX - 4" :y="rect.y + rect.height - 4" width="8" height="8" @pointerdown.stop="handleLevelPointerDown($event, rect.level.id, 'bottom-right')" />
+        </template>
+      </g>
+    </svg>
+    <div
+      v-if="drawMode"
+      class="manual-level-draw-layer"
+      @pointerdown="beginManualLevelDraw"
+      @pointermove="updateDrawingPreview"
+      @pointerup="finishManualLevelDraw"
+    ></div>
     <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
     <n-spin v-if="loading" class="spin-mask" />
     <button
@@ -1902,6 +2488,70 @@ defineExpose({ stepCandles })
   cursor: help;
   user-select: none;
   transition: background 0.15s, color 0.15s;
+}
+.manual-level-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.manual-level-object {
+  /* 普通区域只负责绘制，不能挡住底层K线的十字线、坐标和Tooltip。 */
+  pointer-events: none;
+}
+.manual-level-hit {
+  fill: transparent;
+  stroke: transparent;
+  pointer-events: none;
+}
+.manual-level-object.selected .manual-level-hit {
+  fill: rgba(37, 99, 235, 0.04);
+  stroke: rgba(37, 99, 235, 0.8);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+}
+.manual-level-object.dragging .manual-level-hit {
+  fill: rgba(37, 99, 235, 0.13);
+  stroke: #2563eb;
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+}
+.manual-level-handle {
+  fill: #fff;
+  stroke: #2563eb;
+  stroke-width: 1.5;
+  pointer-events: auto;
+}
+.manual-level-handle-horizontal {
+  cursor: ew-resize;
+}
+.manual-level-handle-vertical {
+  cursor: ns-resize;
+}
+.manual-level-handle-corner {
+  cursor: nwse-resize;
+}
+.manual-level-anchor {
+  stroke: rgba(37, 99, 235, 0.65);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  pointer-events: none;
+}
+.manual-level-draw-preview {
+  fill: rgba(37, 99, 235, 0.13);
+  stroke: #2563eb;
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+}
+.manual-level-draw-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 7;
+  cursor: crosshair;
+  background: rgba(239, 68, 68, 0.025);
 }
 .help-icon:hover {
   background: rgba(148, 163, 184, 0.35);

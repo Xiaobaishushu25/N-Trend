@@ -19,7 +19,6 @@ pub struct Metrics {
     pub calibration: Vec<CalibrationBucket>,
     pub equal_frequency_deciles: Vec<CalibrationBucket>,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalibrationBucket {
     pub bin: usize,
@@ -177,5 +176,3 @@ mod tests {
         assert!(lift > 2.0);
     }
 }
-
-

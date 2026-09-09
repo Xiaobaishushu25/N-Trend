@@ -50,8 +50,6 @@ fn peek_log_level(path: &std::path::Path) -> Option<String> {
     v.get("log")?.get("level")?.as_str().map(|s| s.to_string())
 }
 
-
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -287,9 +285,18 @@ pub fn run() {
             commands::get_klines,
             commands::get_trend_series,
             commands::get_market_snapshot,
+            commands::list_manual_levels,
+            commands::create_manual_level,
+            commands::update_manual_level,
+            commands::set_manual_level_monitoring,
+            commands::archive_manual_level,
+            commands::delete_manual_level,
+            commands::get_manual_level_events,
             commands::get_active_events,
             commands::get_active_preclose_signals,
+            commands::get_active_preclose_candidates,
             commands::get_preclose_signals,
+            commands::get_preclose_candidates,
             commands::refresh_data_now,
             commands::run_scan_now,
             commands::run_scan_fast_now,
@@ -367,7 +374,6 @@ fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
         .init();
     Ok(())
 }
-
 
 fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
@@ -467,31 +473,26 @@ fn spawn_trigger_emails(state: Arc<AppState>, event_ids: Vec<i64>) {
         }
 
         for attempt in 0..=TRIGGER_EMAIL_PREDICTION_RETRIES {
-            let champion_available = match n_core::v2::prediction::has_champion_model(
-                &state.services.db,
-            )
-            .await
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!("查询冠军模型失败，稍后重试触发邮件: {error:#}");
-                    true
-                }
-            };
-            let mut remaining = Vec::new();
-            for event_id in pending {
-                let win_rate = match n_core::v2::prediction::champion_win_rate(
-                    &state.services.db,
-                    event_id,
-                )
-                .await
-                {
+            let champion_available =
+                match n_core::v2::prediction::has_champion_model(&state.services.db).await {
                     Ok(value) => value,
                     Err(error) => {
-                        tracing::warn!(event_id, "查询模型胜率失败: {error:#}");
-                        None
+                        tracing::warn!("查询冠军模型失败，稍后重试触发邮件: {error:#}");
+                        true
                     }
                 };
+            let mut remaining = Vec::new();
+            for event_id in pending {
+                let win_rate =
+                    match n_core::v2::prediction::champion_win_rate(&state.services.db, event_id)
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(event_id, "查询模型胜率失败: {error:#}");
+                            None
+                        }
+                    };
                 let ready = win_rate.is_some()
                     || !champion_available
                     || attempt == TRIGGER_EMAIL_PREDICTION_RETRIES;
@@ -499,23 +500,21 @@ fn spawn_trigger_emails(state: Arc<AppState>, event_ids: Vec<i64>) {
                     remaining.push(event_id);
                     continue;
                 }
-                let event = match n_core::storage::repo::pattern_event_by_id(
-                    &state.services.db,
-                    event_id,
-                )
-                .await
-                {
-                    Ok(Some(event)) => event,
-                    Ok(None) => {
-                        tracing::warn!(event_id, "触发邮件对应的正式信号已不存在");
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(event_id, "读取触发邮件信号失败: {error:#}");
-                        remaining.push(event_id);
-                        continue;
-                    }
-                };
+                let event =
+                    match n_core::storage::repo::pattern_event_by_id(&state.services.db, event_id)
+                        .await
+                    {
+                        Ok(Some(event)) => event,
+                        Ok(None) => {
+                            tracing::warn!(event_id, "触发邮件对应的正式信号已不存在");
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(event_id, "读取触发邮件信号失败: {error:#}");
+                            remaining.push(event_id);
+                            continue;
+                        }
+                    };
                 let model = win_rate
                     .as_ref()
                     .map(|rate| (rate.model_id.as_str(), rate.p_win));
@@ -530,13 +529,7 @@ fn spawn_trigger_emails(state: Arc<AppState>, event_ids: Vec<i64>) {
                     has_model_win_rate = win_rate.is_some(),
                     "准备发送触发邮件"
                 );
-                let _ = send_email_background(
-                    subject,
-                    body,
-                    cfg.email.clone(),
-                    "触发信号",
-                )
-                .await;
+                let _ = send_email_background(subject, body, cfg.email.clone(), "触发信号").await;
             }
             pending = remaining;
             if pending.is_empty() {
@@ -584,20 +577,46 @@ fn spawn_preclose_emails(
                     continue;
                 }
             };
-            let (subject, body) =
-                n_core::notify::email::preclose_email_payload(&signal, &parent);
+            let (subject, body) = n_core::notify::email::preclose_email_payload(&signal, &parent);
             tracing::info!(
                 preclose_id = signal.id,
                 symbol = signal.symbol,
                 "准备发送收盘前预检测邮件"
             );
-            let _ = send_email_background(
-                subject,
-                body,
-                cfg.email.clone(),
-                "收盘前预检测",
-            )
-            .await;
+            let _ = send_email_background(subject, body, cfg.email.clone(), "收盘前预检测").await;
+        }
+    });
+}
+
+fn spawn_preclose_candidate_emails(
+    state: Arc<AppState>,
+    updates: Vec<n_core::storage::entities::preclose_candidates::Model>,
+) {
+    // preclose_candidate_tick 会在后续行情跳动时回传同一行；仅首个 emitted_at/last_seen_at
+    // 相等的版本发邮件，避免临时候选刷新造成重复提醒。
+    let candidates = updates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.state == "provisional" && candidate.emitted_at == candidate.last_seen_at
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let cfg = state.services.config().await;
+        if !cfg.email.enabled || !cfg.email.sendable() {
+            return;
+        }
+        for candidate in candidates {
+            let (subject, body) =
+                n_core::notify::email::preclose_candidate_email_payload(&candidate);
+            tracing::info!(
+                candidate_id = candidate.id,
+                symbol = candidate.symbol,
+                "准备发送临时未收盘扫描邮件"
+            );
+            let _ = send_email_background(subject, body, cfg.email.clone(), "临时未收盘扫描").await;
         }
     });
 }
@@ -633,12 +652,27 @@ fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
                         Err(error) => tracing::warn!("入场价触发检测失败: {error:#}"),
                         _ => {}
                     }
+                    match state.services.manual_level_alerts(&snapshots).await {
+                        Ok(alerts) if !alerts.is_empty() => {
+                            let _ = app.emit("manual-level-alert", &alerts);
+                        }
+                        Err(error) => tracing::warn!("关键区域轮询失败: {error:#}"),
+                        _ => {}
+                    }
                     match state.services.preclose_tick(&snapshots).await {
                         Ok(updates) if !updates.is_empty() => {
                             let _ = app.emit("preclose-signal", &updates);
                             spawn_preclose_emails(state.clone(), updates);
                         }
                         Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
+                        _ => {}
+                    }
+                    match state.services.preclose_candidate_tick(&snapshots).await {
+                        Ok(updates) if !updates.is_empty() => {
+                            let _ = app.emit("preclose-candidate", &updates);
+                            spawn_preclose_candidate_emails(state.clone(), updates);
+                        }
+                        Err(error) => tracing::warn!("临时未收盘扫描失败: {error:#}"),
                         _ => {}
                     }
                     let _ = app.emit("quote-updated", &snapshots);
@@ -667,19 +701,15 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
                 continue;
             }
 
-            let codes: Vec<String> = match n_core::storage::repo::list_symbols(
-                &state.services.db,
-                true,
-            )
-            .await
-            {
-                Ok(rows) => rows.into_iter().map(|row| row.code).collect(),
-                Err(error) => {
-                    tracing::warn!("天勤闭合事件订阅读取品种失败: {error}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
+            let codes: Vec<String> =
+                match n_core::storage::repo::list_symbols(&state.services.db, true).await {
+                    Ok(rows) => rows.into_iter().map(|row| row.code).collect(),
+                    Err(error) => {
+                        tracing::warn!("天勤闭合事件订阅读取品种失败: {error}");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                };
             if codes.is_empty() {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -689,7 +719,9 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
                 is_first_subscribe = false;
                 // 冷启动错峰 30s：等 service::refresh_data 的 22*get_kline + subscribe_quotes 排空 worker 队列
                 // 否则单线程 TqDataWorker 会被 subscribe_klines(22*KQ.m@ 35s) 堵死，同期 quotes 12s 超时 queue=1->4
-                tracing::info!("[FAST_PATH] 冷启动错峰: 首轮订阅延迟 30s，避免与历史K线抢单线程 worker");
+                tracing::info!(
+                    "[FAST_PATH] 冷启动错峰: 首轮订阅延迟 30s，避免与历史K线抢单线程 worker"
+                );
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             let tq = state.services.data_source.tq_client().await;
@@ -753,7 +785,9 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
                     Ok(response) => response,
                     Err(error) => {
                         // 长轮询失败仅中断本轮快速路径，重新订阅即可，不降级主数据源
-                        tracing::warn!("天勤闭合事件长轮询失败，快速路径暂停(不影响主行情源): {error:#}");
+                        tracing::warn!(
+                            "天勤闭合事件长轮询失败，快速路径暂停(不影响主行情源): {error:#}"
+                        );
                         break;
                     }
                 };
@@ -877,13 +911,15 @@ async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
                 stats.succeeded + stats.failures
             );
             if stats.failures > 0 {
-                tracing::warn!("⚠ 本次刷新有 {} 个品种失败，请检查网络或稍后重试", stats.failures);
+                tracing::warn!(
+                    "⚠ 本次刷新有 {} 个品种失败，请检查网络或稍后重试",
+                    stats.failures
+                );
             }
         }
         Err(e) => tracing::error!("❌ 定时刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis()),
     }
 }
-
 
 async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
     let t0 = Instant::now();
@@ -893,11 +929,26 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
         Ok(res) => {
             state.note_scan_success().await;
             let _ = app.emit("scan-completed", &res);
-            match state.services.reconcile_preclose_signals(Local::now().naive_local()).await {
+            match state
+                .services
+                .reconcile_preclose_signals(Local::now().naive_local())
+                .await
+            {
                 Ok(updates) if !updates.is_empty() => {
                     let _ = app.emit("preclose-signal", &updates);
                 }
                 Err(error) => tracing::warn!("收盘前预检测结算失败: {error:#}"),
+                _ => {}
+            }
+            match state
+                .services
+                .reconcile_preclose_candidates(Local::now().naive_local())
+                .await
+            {
+                Ok(updates) if !updates.is_empty() => {
+                    let _ = app.emit("preclose-candidate", &updates);
+                }
+                Err(error) => tracing::warn!("临时未收盘候选结算失败: {error:#}"),
                 _ => {}
             }
             tracing::info!(
@@ -919,7 +970,8 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                     .collect(),
             );
             if cfg.email.enabled && cfg.email.sendable() {
-                let triggered_ids: std::collections::HashSet<i64> = res.newly_triggered.iter().map(|e| e.id).collect();
+                let triggered_ids: std::collections::HashSet<i64> =
+                    res.newly_triggered.iter().map(|e| e.id).collect();
                 let mut emails = Vec::new();
                 for e in res
                     .new_warnings
@@ -931,13 +983,20 @@ async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
                 // 单K锤/针独立邮件(不受评分阈值限制,有就发)
                 for sb in &res.single_bars {
                     let (subject, body) = n_core::notify::email::single_bar_email_payload(sb);
-                    if let Err(err) = n_core::notify::email::send_summary(&subject, &body, &cfg.email) {
+                    if let Err(err) =
+                        n_core::notify::email::send_summary(&subject, &body, &cfg.email)
+                    {
                         tracing::error!("单K邮件发送失败: {err}");
                     }
                 }
                 for (kind, e) in emails {
                     let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
-                    tracing::info!("[SEND_MAIL] subject='{}' to='{}' symbol='{}'", subject, cfg.email.to, e.symbol);
+                    tracing::info!(
+                        "[SEND_MAIL] subject='{}' to='{}' symbol='{}'",
+                        subject,
+                        cfg.email.to,
+                        e.symbol
+                    );
                     if let Err(err) =
                         n_core::notify::email::send_summary(&subject, &body, &cfg.email)
                     {
@@ -1048,6 +1107,3 @@ pub struct AppInfo {
 // sessionbreak-gapfilter-1605
 
 // bg-enrich-013841
-
-
-

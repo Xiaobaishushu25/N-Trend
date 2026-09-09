@@ -12,7 +12,6 @@ pub struct SplineTable {
     pub values: Vec<f64>, // f(knot) learned
     pub df: usize,
 }
-
 impl SplineTable {
     pub fn new(feature: String, knots: Vec<f64>, df: usize) -> Self {
         let n = knots.len();
@@ -227,4 +226,3 @@ mod tests {
         assert!(!m.splines.is_empty());
     }
 }
-
