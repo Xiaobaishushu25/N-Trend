@@ -46,6 +46,12 @@ export interface KlineRow {
   rollover: boolean
 }
 
+export interface ChartKlineResponse {
+  rows: KlineRow[]
+  status: 'tqsdk' | 'tq_unavailable' | 'sina_consistent' | 'sina_mismatch' | 'sina_unverified' | 'tqsdk_recovery_pending' | string
+  message: string
+}
+
 /** 当前周期 MA20 长期趋势线的一个数据点 */
 export interface TrendPointDto {
   ts: string
@@ -428,7 +434,7 @@ export interface UiConfig {
 export interface DataSourceConfig {
   /** 主力数据源: "tqsdk" 或 "sina" */
   primary_source: string
-  /** 是否在主力数据源不可用时自动降级到新浪 */
+  /** 是否允许图表在天勤不可用时临时使用新浪；临时数据不入库 */
   fallback_enabled: boolean
   /** 快期账户 */
   tq_account: string

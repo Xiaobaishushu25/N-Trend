@@ -74,6 +74,19 @@ impl HybridDataSource {
         self.tq_available.load(Ordering::Relaxed)
     }
 
+    /// 图表和其他按需读路径使用的健康状态：不可用时最多每10秒探测一次，
+    /// 避免用户频繁切换图表造成健康接口请求风暴。
+    pub async fn tq_available_or_probe(&self) -> bool {
+        if self.tq_available.load(Ordering::Relaxed) {
+            return true;
+        }
+        let last = *self.last_health_check.read().await;
+        if last.elapsed() <= Duration::from_secs(10) {
+            return false;
+        }
+        self.check_and_update_health().await
+    }
+
     /// 动态热更新天勤本地桥接端口
     pub async fn update_bridge_port(&self, port: u16) {
         *self.tq_client.write().await = TqBridgeClient::with_port(port);
@@ -105,8 +118,11 @@ impl HybridDataSource {
         let healthy = self.tq_client.read().await.is_healthy().await;
         *self.last_health_check.write().await = Instant::now();
         if !healthy {
-            self.mark_tq_unavailable("天勤桥接服务健康检查失败，当前使用新浪备用数据源", emit_event)
-                .await;
+            self.mark_tq_unavailable(
+                "天勤桥接服务健康检查失败，当前使用新浪备用数据源",
+                emit_event,
+            )
+            .await;
             return false;
         }
 
@@ -198,9 +214,9 @@ impl HybridDataSource {
 impl MarketDataSource for HybridDataSource {
     fn name(&self) -> &'static str {
         if self.tq_available.load(Ordering::Relaxed) {
-            "hybrid(tqsdk->sina)"
+            "tqsdk"
         } else {
-            "hybrid(sina-fallback)"
+            "tqsdk-unavailable"
         }
     }
 
@@ -209,66 +225,35 @@ impl MarketDataSource for HybridDataSource {
             return Ok(HashMap::new());
         }
 
-        let fallback_enabled = self.config.read().await.data_source.fallback_enabled;
-
         if self.should_use_tq().await {
             let tq = self.tq_client.read().await.clone();
             match tq.fetch_quotes(codes).await {
                 Ok(quotes) if !quotes.is_empty() => {
                     self.record_tq_success();
-                    // 如果部分品种天勤未返回（如特殊代码），且启用了降级时用新浪补充
-                    if quotes.len() < codes.len() && fallback_enabled {
-                        let missing: Vec<String> = codes
-                            .iter()
-                            .filter(|c| !quotes.contains_key(*c))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            if let Ok(sina_supplement) =
-                                self.sina_client.fetch_quotes(&missing).await
-                            {
-                                let mut combined = quotes;
-                                for (k, v) in sina_supplement {
-                                    combined.insert(k, v);
-                                }
-                                return Ok(combined);
-                            }
-                        }
-                    }
+                    // 主力天勤正常时不再混入新浪报价。缺失品种由上层保留旧快照，
+                    // 避免实时触发和临时图表使用不同语义的数据源。
                     return Ok(quotes);
                 }
                 Ok(_) => {
-                    tracing::warn!("天勤未返回任何行情数据");
-                    if !fallback_enabled {
-                        anyhow::bail!("天勤未返回任何行情数据，且已禁用自动降级切换");
-                    }
+                    anyhow::bail!("天勤未返回任何行情数据");
                 }
                 Err(e) => {
                     self.record_tq_failure(&e).await;
-                    if !fallback_enabled {
-                        return Err(e);
-                    }
+                    return Err(e);
                 }
             }
         } else {
             let cfg = self.config.read().await;
-            if cfg.data_source.primary_source == "tqsdk" && !fallback_enabled {
-                anyhow::bail!("天勤数据源当前不可用，且已禁用自动降级切换至新浪");
+            if cfg.data_source.primary_source == "tqsdk" {
+                anyhow::bail!("天勤数据源当前不可用，实时报价暂不使用新浪回退");
             }
         }
 
-        // 回退/直连新浪
+        // 非天勤主数据源模式才直连新浪。
         self.sina_client.fetch_quotes(codes).await
     }
 
-    async fn fetch_minute(
-        &self,
-        symbol: &str,
-        period: &str,
-        count: usize,
-    ) -> Result<Vec<Kline>> {
-        let fallback_enabled = self.config.read().await.data_source.fallback_enabled;
-
+    async fn fetch_minute(&self, symbol: &str, period: &str, count: usize) -> Result<Vec<Kline>> {
         if self.should_use_tq().await {
             let tq = self.tq_client.read().await.clone();
             match tq.fetch_minute(symbol, period, count).await {
@@ -277,26 +262,21 @@ impl MarketDataSource for HybridDataSource {
                     return Ok(klines);
                 }
                 Ok(_) => {
-                    tracing::warn!("天勤返回空K线 ({symbol}/{period})");
-                    if !fallback_enabled {
-                        anyhow::bail!("天勤返回空K线 ({symbol}/{period})，且已禁用自动降级切换");
-                    }
+                    anyhow::bail!("天勤返回空K线 ({symbol}/{period})");
                 }
                 Err(e) => {
                     self.record_tq_failure(&e).await;
-                    if !fallback_enabled {
-                        return Err(e);
-                    }
+                    return Err(e);
                 }
             }
         } else {
             let cfg = self.config.read().await;
-            if cfg.data_source.primary_source == "tqsdk" && !fallback_enabled {
-                anyhow::bail!("天勤数据源当前不可用，且已禁用自动降级切换至新浪");
+            if cfg.data_source.primary_source == "tqsdk" {
+                anyhow::bail!("天勤数据源当前不可用，K线持久化暂不使用新浪回退");
             }
         }
 
-        // 回退/直连新浪
+        // 非天勤主数据源模式才直连新浪；临时图表回退由 Services 单独处理。
         self.sina_client.fetch_minute(symbol, period, count).await
     }
 
@@ -306,8 +286,6 @@ impl MarketDataSource for HybridDataSource {
         period: &str,
         count: usize,
     ) -> Result<RawKlineResponse> {
-        let fallback_enabled = self.config.read().await.data_source.fallback_enabled;
-
         if self.should_use_tq().await {
             let tq = self.tq_client.read().await.clone();
             match tq.fetch_minute_raw(symbol, period, count).await {
@@ -316,26 +294,21 @@ impl MarketDataSource for HybridDataSource {
                     return Ok(raw);
                 }
                 Ok(_) => {
-                    tracing::warn!("天勤返回空原始K线 ({symbol}/{period})");
-                    if !fallback_enabled {
-                        anyhow::bail!("天勤返回空原始K线 ({symbol}/{period})，且已禁用自动降级切换");
-                    }
+                    anyhow::bail!("天勤返回空原始K线 ({symbol}/{period})");
                 }
                 Err(e) => {
                     self.record_tq_failure(&e).await;
-                    if !fallback_enabled {
-                        return Err(e);
-                    }
+                    return Err(e);
                 }
             }
         } else {
             let cfg = self.config.read().await;
-            if cfg.data_source.primary_source == "tqsdk" && !fallback_enabled {
-                anyhow::bail!("天勤数据源当前不可用，且已禁用自动降级切换至新浪");
+            if cfg.data_source.primary_source == "tqsdk" {
+                anyhow::bail!("天勤数据源当前不可用，原始K线持久化暂不使用新浪回退");
             }
         }
 
-        // 回退/直连新浪
+        // 非天勤主数据源模式才直连新浪；临时图表回退由 Services 单独处理。
         self.sina_client
             .fetch_minute_raw(symbol, period, count)
             .await
@@ -364,7 +337,12 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn is_healthy(&self) -> bool {
-        self.check_and_update_health().await || self.sina_client.is_healthy().await
+        let primary_is_tq = self.config.read().await.data_source.primary_source == "tqsdk";
+        if primary_is_tq {
+            self.tq_available_or_probe().await
+        } else {
+            self.sina_client.is_healthy().await
+        }
     }
 }
 
@@ -380,7 +358,7 @@ mod tests {
         let hybrid = HybridDataSource::new(tq_client, sina_client, config);
 
         // 未经真实健康探测时必须保持降级态，不能先乐观标记为天勤。
-        assert_eq!(hybrid.name(), "hybrid(sina-fallback)");
+        assert_eq!(hybrid.name(), "tqsdk-unavailable");
         // 当 Tq 端口无法连接时，健康检查返回 false
         let healthy = hybrid.tq_client().await.is_healthy().await;
         assert!(!healthy);
@@ -398,6 +376,9 @@ mod tests {
 
         // 当关闭 fallback_enabled 且 Tq 不可用时，fetch 应返回 Err
         let res = hybrid.fetch_quotes(&["RB0".to_string()]).await;
-        assert!(res.is_err(), "当 fallback_enabled 为 false 时不应降级回退到新浪");
+        assert!(
+            res.is_err(),
+            "当 fallback_enabled 为 false 时不应降级回退到新浪"
+        );
     }
 }

@@ -5,9 +5,9 @@ use chrono::Local;
 use n_core::analyze::outcome::ReviewStats;
 use n_core::config::Config;
 use n_core::service::{
-    KlineDto, ManualLevelInput, MarketSnapshot, OutcomeDetail, OutcomeRefresh, RefreshStats,
-    ReviewSignalDetail, ScanResult, SignalAnnotationDto, SignalDecisionDto, SignalUserData,
-    TrendPointDto,
+    ChartKlineResponse, KlineDto, ManualLevelInput, MarketSnapshot, OutcomeDetail, OutcomeRefresh,
+    RefreshStats, ReviewSignalDetail, ScanResult, SignalAnnotationDto, SignalDecisionDto,
+    SignalUserData, TrendPointDto,
 };
 use n_core::storage::entities::{groups, manual_level_events, manual_levels, symbols};
 use serde::Serialize;
@@ -367,6 +367,20 @@ pub async fn get_klines(
     state
         .services
         .get_klines(&symbol, &timeframe, limit)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_chart_klines(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+    timeframe: String,
+    limit: Option<usize>,
+) -> Result<ChartKlineResponse, String> {
+    state
+        .services
+        .get_chart_klines(&symbol, &timeframe, limit)
         .await
         .map_err(|e| e.to_string())
 }

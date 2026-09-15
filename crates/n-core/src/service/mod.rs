@@ -30,6 +30,9 @@ pub mod pipeline;
 pub use pipeline::{RawPipeline, SymbolLocks};
 
 const MONTH_KLINE_CACHE_TTL: Duration = Duration::from_secs(900);
+const CHART_FALLBACK_COUNT: usize = 100;
+const CHART_FALLBACK_CACHE_TTL: Duration = Duration::from_secs(300);
+const CHART_COMPARE_BARS: usize = 30;
 const ROLLOVER_SCAN_SETTING_PREFIX: &str = "rollover_scanned::";
 const ROLLOVER_PENDING_RETENTION_DAYS: i64 = 30;
 /// 临时未收盘扫描沿用正式预警的有效门槛，避免把低分噪声显示成预做多/预做空。
@@ -731,7 +734,10 @@ fn validate_manual_level_input(input: &ManualLevelInput) -> Result<()> {
     {
         return Err(anyhow!("关键区域结束时间不能早于起始时间"));
     }
-    if !matches!(input.role_override.as_str(), "auto" | "support" | "resistance") {
+    if !matches!(
+        input.role_override.as_str(),
+        "auto" | "support" | "resistance"
+    ) {
         return Err(anyhow!("关键区域角色只能是自动识别、支撑或压力"));
     }
     if input.zone_low.is_nan()
@@ -783,9 +789,7 @@ fn provisional_5m_bucket_ts(now: NaiveDateTime) -> NaiveDateTime {
     // 原始5m时间戳是桶末语义：14:57~14:59仍属于14:55这根未收盘5m，
     // 它聚合后才会形成15:00收盘的临时15m，而不是误放进15:15桶。
     let end_minute = (elapsed / 5) * 5;
-    now.date()
-        .and_hms_opt(0, 0, 0)
-        .expect("valid midnight")
+    now.date().and_hms_opt(0, 0, 0).expect("valid midnight")
         + ChronoDuration::minutes(end_minute as i64)
 }
 
@@ -798,7 +802,11 @@ fn preclose_candidate_model(
     provisional_fingerprint: &str,
     timestamp: &str,
 ) -> preclose_candidates::Model {
-    let direction = if candidate.direction == Dir::Up { "up" } else { "down" };
+    let direction = if candidate.direction == Dir::Up {
+        "up"
+    } else {
+        "down"
+    };
     let warning_ts = bar_ts(&bars[candidate.warning_index]);
     let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);
     let entry_score_dims = serde_json::json!({
@@ -1301,6 +1309,23 @@ pub struct KlineDto {
     pub rollover: bool,
 }
 
+/// 图表专用数据响应。临时新浪数据只通过该响应返回，不进入正式行情管道。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChartKlineResponse {
+    pub rows: Vec<KlineDto>,
+    /// tqsdk / sina_consistent / sina_mismatch / sina_unverified / tqsdk_recovery_pending
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChartFallbackCache {
+    bars_5m: Vec<Kline>,
+    status: String,
+    message: String,
+    fetched_at: Instant,
+}
+
 /// 60m 长期趋势线的一个数据点：MA20 值及其多空方向。
 #[derive(Debug, Clone, Serialize)]
 pub struct TrendPointDto {
@@ -1388,6 +1413,8 @@ pub struct Services {
     deep_backfilled: RwLock<HashSet<String>>,
     /// 月合约 5m K 线缓存：同一品种换月确认短时间不重复抓取
     month_kline_cache: RwLock<HashMap<String, (Instant, usize, Vec<Kline>)>>,
+    /// 图表临时新浪数据缓存；只存在内存，不进入 RawPipeline。
+    chart_fallback_cache: Mutex<HashMap<String, ChartFallbackCache>>,
     /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
     scan_lock: Mutex<()>,
     /// 串行化全量行情刷新与扫描，避免启动刷新尚未完成时扫描读取半批新、半批旧数据。
@@ -1473,6 +1500,7 @@ impl Services {
             preclose_candidate_last_tick: Mutex::new(None),
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
+            chart_fallback_cache: Mutex::new(HashMap::new()),
             scan_lock: Mutex::new(()),
             data_cycle_lock: Mutex::new(()),
             pipeline,
@@ -1733,7 +1761,10 @@ impl Services {
         Ok(refreshed)
     }
 
-    pub async fn create_manual_level(&self, input: ManualLevelInput) -> Result<manual_levels::Model> {
+    pub async fn create_manual_level(
+        &self,
+        input: ManualLevelInput,
+    ) -> Result<manual_levels::Model> {
         validate_manual_level_input(&input)?;
         let now = now_ts();
         let role_override = input.role_override.clone();
@@ -2111,9 +2142,7 @@ impl Services {
         raw.sort_by(|a, b| a.datetime.cmp(&b.datetime));
 
         let current_ts_string = current_ts.format("%Y-%m-%d %H:%M:%S").to_string();
-        let same_index = raw
-            .iter()
-            .position(|bar| bar.datetime == current_ts_string);
+        let same_index = raw.iter().position(|bar| bar.datetime == current_ts_string);
         let previous = raw
             .iter()
             .rev()
@@ -2202,10 +2231,9 @@ impl Services {
             if !crate::session::SessionCalendar::is_trading_time(&symbol_row.code, &now) {
                 continue;
             }
-            let Some(close) = crate::session::SessionCalendar::next_session_close(
-                &symbol_row.code,
-                &now_naive,
-            ) else {
+            let Some(close) =
+                crate::session::SessionCalendar::next_session_close(&symbol_row.code, &now_naive)
+            else {
                 continue;
             };
             let remaining = (close - now_naive).num_seconds();
@@ -2219,7 +2247,10 @@ impl Services {
             {
                 Ok(bars) => bars,
                 Err(error) => {
-                    tracing::debug!(symbol = symbol_row.code, "临时未收盘扫描读取K线失败: {error:#}");
+                    tracing::debug!(
+                        symbol = symbol_row.code,
+                        "临时未收盘扫描读取K线失败: {error:#}"
+                    );
                     continue;
                 }
             };
@@ -2238,7 +2269,11 @@ impl Services {
                 .filter(|candidate| candidate.warning_index == last_index)
                 .filter(|candidate| candidate.entry_score >= min_score)
             {
-                let direction = if candidate.direction == Dir::Up { "up" } else { "down" };
+                let direction = if candidate.direction == Dir::Up {
+                    "up"
+                } else {
+                    "down"
+                };
                 let warning_ts = bar_ts(&bars[candidate.warning_index]);
                 if repo::pattern_event_by_warning(
                     &self.db,
@@ -3284,6 +3319,181 @@ impl Services {
         Ok(apply_limit_dto(rows, limit))
     }
 
+    /// 图表专用K线入口：正式库只读天勤数据；天勤不可用时，新浪数据只在内存中临时拼接显示。
+    /// 该路径绝不调用 RawPipeline，因此不会污染本地5m、15m、60m数据。
+    pub async fn get_chart_klines(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+    ) -> Result<ChartKlineResponse> {
+        let config = self.config().await;
+        let primary_is_tq = config.data_source.primary_source == "tqsdk";
+        if !primary_is_tq {
+            return Ok(ChartKlineResponse {
+                rows: self.get_klines(symbol, timeframe, limit).await?,
+                status: "tqsdk".to_string(),
+                message: String::new(),
+            });
+        }
+
+        // 健康检查有自己的冷却与连续成功策略，避免短暂抖动时反复切换。
+        let tq_ready = self.data_source.tq_available_or_probe().await;
+
+        if tq_ready {
+            let had_fallback = self.chart_fallback_cache.lock().await.contains_key(symbol);
+            let mut recovery_pending = false;
+            let mut recovery_message = String::new();
+            if had_fallback {
+                match self.recover_chart_gap(symbol).await {
+                    Ok(()) => {
+                        self.chart_fallback_cache.lock().await.remove(symbol);
+                    }
+                    Err(error) => {
+                        recovery_pending = true;
+                        recovery_message = format!("天勤已恢复，但缺口同步失败：{error:#}");
+                        tracing::warn!(symbol, "图表临时数据恢复同步失败: {error:#}");
+                    }
+                }
+            }
+
+            return Ok(ChartKlineResponse {
+                rows: self.get_klines(symbol, timeframe, limit).await?,
+                status: if recovery_pending {
+                    "tqsdk_recovery_pending".to_string()
+                } else {
+                    "tqsdk".to_string()
+                },
+                message: recovery_message,
+            });
+        }
+
+        if !config.data_source.fallback_enabled {
+            return Ok(ChartKlineResponse {
+                rows: self.get_klines(symbol, timeframe, limit).await?,
+                status: "tq_unavailable".to_string(),
+                message: "天勤暂不可用，已关闭新浪临时图表回退；当前仅显示本地最后一段数据。".to_string(),
+            });
+        }
+
+        self.get_chart_klines_from_sina(symbol, timeframe, limit)
+            .await
+    }
+
+    async fn get_chart_klines_from_sina(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+    ) -> Result<ChartKlineResponse> {
+        let cached = {
+            let cache = self.chart_fallback_cache.lock().await;
+            cache
+                .get(symbol)
+                .filter(|entry| entry.fetched_at.elapsed() < CHART_FALLBACK_CACHE_TTL)
+                .cloned()
+        };
+
+        let entry = if let Some(entry) = cached {
+            entry
+        } else {
+            let bars_5m = self
+                .client
+                .fetch_minute(symbol, "5", CHART_FALLBACK_COUNT)
+                .await?;
+            let local = repo::raw_klines(&self.db, symbol)
+                .await?
+                .iter()
+                .map(model_to_fetch)
+                .collect::<Vec<_>>();
+            let (status, message) = compare_chart_sources(&local, &bars_5m);
+            let entry = ChartFallbackCache {
+                bars_5m,
+                status,
+                message,
+                fetched_at: Instant::now(),
+            };
+            self.chart_fallback_cache
+                .lock()
+                .await
+                .insert(symbol.to_string(), entry.clone());
+            entry
+        };
+
+        let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
+        let temp_bars = aggregate(&entry.bars_5m, tf);
+        let source = "sina_temp";
+        let mut temp_rows: Vec<KlineDto> = temp_bars
+            .iter()
+            .map(|bar| KlineDto {
+                symbol: symbol.to_string(),
+                timeframe: tf.as_str().to_string(),
+                ts: bar.datetime.clone(),
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.volume,
+                hold: bar.hold,
+                source: source.to_string(),
+                rollover: false,
+            })
+            .collect();
+
+        let mut local_rows = self.get_klines(symbol, timeframe, limit).await?;
+        if let Some(first_temp_ts) = temp_rows.first().map(|row| row.ts.as_str()) {
+            // 异常模式允许视觉拼接，但用新浪最近100根替换同时间窗口，避免重复时间戳。
+            local_rows.retain(|row| row.ts.as_str() < first_temp_ts);
+        }
+        local_rows.append(&mut temp_rows);
+        let rows = apply_limit_dto(local_rows, limit);
+
+        let message = match entry.status.as_str() {
+            "sina_consistent" => {
+                format!(
+                    "天勤暂不可用，新浪与本地天勤重叠K线基本一致（{}）；当前仅临时绘图，不写入本地库、不参与策略。",
+                    entry.message
+                )
+            }
+            "sina_mismatch" => {
+                format!(
+                    "天勤暂不可用，新浪与本地天勤数据不一致（{}）；图表前段为本地天勤，后段为新浪最近100根临时数据，仅供行情观察。",
+                    entry.message
+                )
+            }
+            _ => format!(
+                "天勤暂不可用，缺少足够重叠数据完成一致性确认（{}）；当前新浪数据仅供临时观察。",
+                entry.message
+            ),
+        };
+
+        Ok(ChartKlineResponse {
+            rows,
+            status: entry.status,
+            message,
+        })
+    }
+
+    /// 天勤恢复后只补本地实际缺口加20根重叠数据，不固定重拉500/1000根。
+    async fn recover_chart_gap(&self, symbol: &str) -> Result<()> {
+        let latest = repo::latest_ts(&self.db, symbol, "5m").await?;
+        let count = if let Some(latest_ts) = latest {
+            let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let gap_minutes = ts_gap_minutes(&now, &latest_ts).unwrap_or(0).max(0);
+            ((gap_minutes / 5) as usize + 20).clamp(20, 300)
+        } else {
+            100
+        };
+
+        let tq = self.data_source.tq_client().await;
+        let rows = tq.fetch_minute(symbol, "5", count).await?;
+        if rows.is_empty() {
+            return Err(anyhow!("天勤恢复同步未返回已定版K线"));
+        }
+        self.pipeline.process_raw_batch(symbol, &rows).await?;
+        Ok(())
+    }
+
     /// 当前周期长期趋势线：逐根 MA20 及方向，供图表叠加参考线使用。
     pub async fn trend_series(
         &self,
@@ -3402,15 +3612,15 @@ impl Services {
         self.data_source.subscribe_events()
     }
 
-    /// 获取当前生效的数据源展示名称（如 "天勤"、"新浪"、"新浪 (降级)"）
+    /// 获取当前生效的数据源展示名称（如 "天勤"、"新浪"、"天勤不可用"）
     pub async fn active_data_source_name(&self) -> String {
         let cfg = self.config().await;
         if cfg.data_source.primary_source == "sina" {
             "新浪".to_string()
         } else {
             let name = self.data_source.name();
-            if name.contains("fallback") {
-                "新浪 (降级)".to_string()
+            if name.contains("unavailable") {
+                "天勤不可用".to_string()
             } else {
                 "天勤".to_string()
             }
@@ -4406,6 +4616,63 @@ fn ts_gap_minutes(later: &str, earlier: &str) -> Option<i64> {
     Some((a - b).num_minutes())
 }
 
+/// 比较图表临时回退数据与本地天勤历史的重叠区间。
+/// 不比较成交量/持仓量，避免不同供应商的更新时间差异造成误判。
+fn compare_chart_sources(local: &[Kline], fallback: &[Kline]) -> (String, String) {
+    let local_by_ts: HashMap<&str, &Kline> = local
+        .iter()
+        .map(|bar| (bar.datetime.as_str(), bar))
+        .collect();
+    let pairs: Vec<(&Kline, &Kline)> = fallback
+        .iter()
+        .rev()
+        .filter_map(|bar| {
+            local_by_ts
+                .get(bar.datetime.as_str())
+                .map(|local| (*local, bar))
+        })
+        .take(CHART_COMPARE_BARS)
+        .collect();
+
+    if pairs.len() < 10 {
+        return (
+            "sina_unverified".to_string(),
+            format!("仅找到{}根重叠K线，无法完成双源一致性确认", pairs.len()),
+        );
+    }
+
+    let matched = pairs
+        .iter()
+        .filter(|(local, fallback)| {
+            [
+                (local.open, fallback.open),
+                (local.high, fallback.high),
+                (local.low, fallback.low),
+                (local.close, fallback.close),
+            ]
+            .iter()
+            .all(|(a, b)| relative_price_error(*a, *b) <= 0.003)
+        })
+        .count();
+
+    if matched * 5 >= pairs.len() * 4 {
+        (
+            "sina_consistent".to_string(),
+            format!("{}根重叠K线中{}根价格一致", pairs.len(), matched),
+        )
+    } else {
+        (
+            "sina_mismatch".to_string(),
+            format!("{}根重叠K线中仅{}根价格一致", pairs.len(), matched),
+        )
+    }
+}
+
+fn relative_price_error(a: f64, b: f64) -> f64 {
+    let scale = a.abs().max(b.abs()).max(1.0);
+    (a - b).abs() / scale
+}
+
 pub fn model_to_fetch(m: &klines::Model) -> Kline {
     Kline {
         datetime: m.ts.clone(),
@@ -4591,6 +4858,48 @@ fn parse_dt(s: &str) -> Option<DT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_test_bar(ts: &str, price: f64) -> Kline {
+        Kline {
+            datetime: ts.to_string(),
+            open: price,
+            high: price + 1.0,
+            low: price - 1.0,
+            close: price,
+            volume: 100.0,
+            hold: 200.0,
+        }
+    }
+
+    #[test]
+    fn chart_source_comparison_accepts_matching_overlap() {
+        let local: Vec<Kline> = (0..12)
+            .map(|i| source_test_bar(&format!("2026-09-15 10:{:02}:00", i * 5), 3000.0 + i as f64))
+            .collect();
+        let fallback = local.clone();
+        let (status, _) = compare_chart_sources(&local, &fallback);
+        assert_eq!(status, "sina_consistent");
+    }
+
+    #[test]
+    fn chart_source_comparison_rejects_different_price_family() {
+        let local: Vec<Kline> = (0..12)
+            .map(|i| source_test_bar(&format!("2026-09-15 10:{:02}:00", i * 5), 3400.0 + i as f64))
+            .collect();
+        let fallback: Vec<Kline> = (0..12)
+            .map(|i| source_test_bar(&format!("2026-09-15 10:{:02}:00", i * 5), 3000.0 + i as f64))
+            .collect();
+        let (status, _) = compare_chart_sources(&local, &fallback);
+        assert_eq!(status, "sina_mismatch");
+    }
+
+    #[test]
+    fn chart_source_comparison_requires_enough_overlap() {
+        let local = vec![source_test_bar("2026-09-15 10:00:00", 3000.0)];
+        let fallback = local.clone();
+        let (status, _) = compare_chart_sources(&local, &fallback);
+        assert_eq!(status, "sina_unverified");
+    }
 
     fn pattern_event(id: i64, score: f64, state: &str) -> pattern_events::Model {
         pattern_events::Model {

@@ -386,7 +386,7 @@ impl Default for UiConfig {
 pub struct DataSourceConfig {
     /// 主力数据源: "tqsdk" 或 "sina"
     pub primary_source: String,
-    /// 是否在主力数据源不可用时自动降级到新浪
+    /// 是否允许图表在主力天勤不可用时临时使用新浪（不写入本地库）
     pub fallback_enabled: bool,
     /// 快期账户
     pub tq_account: String,

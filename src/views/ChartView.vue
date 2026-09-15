@@ -13,7 +13,7 @@ import {
 import { Adjustments, ArrowLeft, Eye, EyeOff, List, Plus, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import { api, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
 import { useGroupsStore } from '../stores/groups'
@@ -584,6 +584,10 @@ async function loadTrendLine() {
   const tf = timeframe.value
   const seq = ++trendSeq
   if (!sym) {
+    trendPoints.value = []
+    return
+  }
+  if (klinesStore.chartStatus !== 'tqsdk') {
     trendPoints.value = []
     return
   }
@@ -1723,6 +1727,16 @@ onMounted(async () => {
     }),
   )
   unlisteners.push(
+    await onDataSourceFailover((_event) => {
+      if (!symbol.value) return
+      // 数据源切换后重新走图表专用入口：天勤异常时临时取新浪，恢复时补缺口并清缓存。
+      void (async () => {
+        await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+        await loadTrendLine()
+      })()
+    }),
+  )
+  unlisteners.push(
     await onDataUpdated(() => {
       // 数据库刷新后实时临时桶已经转正，清掉残留，避免旧收盘继续覆盖历史K线
       liveBars.value = []
@@ -2010,6 +2024,17 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="chart-col" @wheel.prevent="handleChartWheel">
+        <div
+          v-if="klinesStore.chartStatus !== 'tqsdk' || klinesStore.chartMessage"
+          class="chart-data-notice"
+          :class="{
+            'is-warning': klinesStore.chartStatus === 'sina_mismatch' || klinesStore.chartStatus === 'sina_unverified',
+            'is-info': klinesStore.chartStatus === 'sina_consistent',
+            'is-pending': klinesStore.chartStatus === 'tqsdk_recovery_pending',
+          }"
+        >
+          {{ klinesStore.chartMessage || '当前图表使用临时数据源，数据不会写入本地库或参与策略。' }}
+        </div>
         <KLineChart
           v-if="symbol && klinesStore.rows.length"
           ref="chartRef"
@@ -3214,6 +3239,27 @@ onBeforeUnmount(() => {
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+.chart-data-notice {
+  flex: 0 0 auto;
+  margin: 5px 8px 0;
+  padding: 6px 10px;
+  border: 1px solid #f0c36d;
+  border-radius: 6px;
+  color: #8a5a00;
+  background: rgba(255, 248, 225, 0.95);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.chart-data-notice.is-info {
+  border-color: #91caff;
+  color: #0958d9;
+  background: rgba(230, 244, 255, 0.95);
+}
+.chart-data-notice.is-pending {
+  border-color: #c4b5fd;
+  color: #6d28d9;
+  background: rgba(245, 243, 255, 0.95);
 }
 .chart-empty {
   flex: 1;

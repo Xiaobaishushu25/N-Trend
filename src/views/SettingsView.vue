@@ -155,7 +155,7 @@ async function save() {
     if (ds?.primary_source === 'tqsdk' && settingsStore.status.active_data_source === '天勤') {
       message.success('设置已保存，天勤数据源已连接并通过健康检查')
     } else if (ds?.primary_source === 'tqsdk') {
-      message.warning('设置已保存，但天勤尚未通过健康检查，当前继续使用新浪备用数据源')
+      message.warning('设置已保存，但天勤尚未通过健康检查；图表可临时使用新浪数据，本地库仍只写入天勤')
     } else {
       message.success('设置已保存')
     }
@@ -553,7 +553,7 @@ onMounted(async () => {
               :bordered="false"
               style="margin-bottom: 14px; border-radius: 6px"
             >
-              当前选择天勤为主力数据源，但账号或密码尚未完整配置。请在下方填写后保存；配置不完整时系统将使用新浪备用数据源。
+              当前选择天勤为主力数据源，但账号或密码尚未完整配置。请在下方填写后保存；配置不完整时图表可临时使用新浪数据，但不会写入本地库。
             </n-alert>
             <div class="setting-card-row">
               <div class="row-label">
@@ -567,8 +567,8 @@ onMounted(async () => {
             </div>
             <div class="setting-card-row">
               <div class="row-label">
-                故障自动降级至新浪
-                <Tip text="开启后，当主力数据源（天勤）连接断开或连续超时时，自动平滑无缝降级至新浪接口；数据源恢复后自动切回。" />
+                图表故障临时使用新浪
+                <Tip text="开启后，当天勤不可用时，当前查看品种的图表可临时请求新浪数据；临时数据不写入本地库、不参与策略，天勤恢复后自动切回。" />
               </div>
               <n-switch v-model:value="form.data_source.fallback_enabled" />
             </div>

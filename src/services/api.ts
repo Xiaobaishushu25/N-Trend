@@ -9,6 +9,7 @@ import type {
   AppInfo,
   Config,
   ContractSuggestion,
+  ChartKlineResponse,
   EntryTriggerHit,
   GroupRow,
   KlineRow,
@@ -78,6 +79,8 @@ export const api = {
 
   getKlines: (symbol: string, timeframe: string, limit?: number) =>
     invoke<KlineRow[]>('get_klines', { symbol, timeframe, limit }),
+  getChartKlines: (symbol: string, timeframe: string, limit?: number) =>
+    invoke<ChartKlineResponse>('get_chart_klines', { symbol, timeframe, limit }),
   getTrendSeries: (symbol: string, timeframe: string, limit?: number) =>
     invoke<TrendPointDto[]>('get_trend_series', { symbol, timeframe, limit }),
 
@@ -168,6 +171,12 @@ export const api = {
 
 export function onDataUpdated(cb: (stats: RefreshStats) => void) {
   return listen<RefreshStats>('data-updated', (e) => cb(e.payload))
+}
+
+export function onDataSourceFailover(
+  cb: (event: { from: string; to: string; reason: string }) => void,
+) {
+  return listen<{ from: string; to: string; reason: string }>('data-source-failover', (e) => cb(e.payload))
 }
 
 export function onQuotesUpdated(cb: (snapshots: MarketSnapshot[]) => void) {

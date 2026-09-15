@@ -283,6 +283,7 @@ pub fn run() {
             commands::refresh_symbol_list,
             commands::enrich_symbol_names,
             commands::get_klines,
+            commands::get_chart_klines,
             commands::get_trend_series,
             commands::get_market_snapshot,
             commands::list_manual_levels,

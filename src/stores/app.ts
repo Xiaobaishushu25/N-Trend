@@ -139,9 +139,9 @@ export const useAppStore = defineStore('app', {
           if (!isMainWindow()) return
           const settingsStore = useSettingsStore()
           if (event.payload.to === 'sina') {
-            settingsStore.status.active_data_source = '新浪 (降级)'
-            notify.warning(event.payload.reason, {
-              title: '数据源已自动降级',
+            settingsStore.status.active_data_source = '天勤不可用'
+            notify.warning('天勤暂时不可用；当前查看品种的图表可临时使用新浪数据，临时数据不会写入本地库。', {
+              title: '天勤数据源暂时不可用',
               duration: 8000,
             })
           } else {
