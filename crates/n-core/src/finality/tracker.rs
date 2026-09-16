@@ -34,7 +34,11 @@ pub struct BarFinalityTracker {
 }
 
 impl BarFinalityTracker {
-    pub fn new(symbol: impl Into<String>, bar_ts: impl Into<String>, session_type: SessionType) -> Self {
+    pub fn new(
+        symbol: impl Into<String>,
+        bar_ts: impl Into<String>,
+        session_type: SessionType,
+    ) -> Self {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         Self {
             symbol: symbol.into(),
@@ -58,7 +62,12 @@ impl BarFinalityTracker {
     }
 
     /// 录入一次探针观测值，推进状态机并返回本次变更事件。
-    pub fn record_probe(&mut self, now_str: &str, elapsed_ms: i64, fp: BarFingerprint) -> ProbeResult {
+    pub fn record_probe(
+        &mut self,
+        now_str: &str,
+        elapsed_ms: i64,
+        fp: BarFingerprint,
+    ) -> ProbeResult {
         self.probe_count += 1;
         if self.first_seen_at.is_none() {
             self.first_seen_at = Some(now_str.to_string());
@@ -147,7 +156,8 @@ mod tests {
 
     #[test]
     fn test_candidate_final_normal_flow() {
-        let mut tracker = BarFinalityTracker::new("RB0", "2026-08-28 10:45:00", SessionType::Normal);
+        let mut tracker =
+            BarFinalityTracker::new("RB0", "2026-08-28 10:45:00", SessionType::Normal);
         let res1 = tracker.record_probe("10:45:00", 0, fp("100"));
         assert_eq!(res1.same_count, 1);
         assert!(!res1.became_candidate_final);
@@ -172,7 +182,8 @@ mod tests {
 
     #[test]
     fn test_candidate_final_late_revision_triggers_false_final() {
-        let mut tracker = BarFinalityTracker::new("CJ0", "2026-08-28 11:30:00", SessionType::Close1130);
+        let mut tracker =
+            BarFinalityTracker::new("CJ0", "2026-08-28 11:30:00", SessionType::Close1130);
         tracker.record_probe("11:30:00", 0, fp("100"));
         tracker.record_probe("11:30:05", 5000, fp("100"));
         let res3 = tracker.record_probe("11:30:10", 10000, fp("100"));
@@ -195,7 +206,8 @@ mod tests {
 
     #[test]
     fn test_early_revision_then_stabilize() {
-        let mut tracker = BarFinalityTracker::new("PB0", "2026-08-28 11:30:00", SessionType::Close1130);
+        let mut tracker =
+            BarFinalityTracker::new("PB0", "2026-08-28 11:30:00", SessionType::Close1130);
         tracker.record_probe("11:30:00", 0, fp("100"));
         // 5秒时变动
         let res2 = tracker.record_probe("11:30:05", 5000, fp("102"));

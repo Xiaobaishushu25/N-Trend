@@ -131,11 +131,7 @@ fn rejection_candle(bar: &Bar, resistance: bool) -> bool {
     }
 }
 
-fn role_from_window(
-    window: &[Bar],
-    low: f64,
-    high: f64,
-) -> (ManualLevelRole, f64, usize, usize) {
+fn role_from_window(window: &[Bar], low: f64, high: f64) -> (ManualLevelRole, f64, usize, usize) {
     if window.len() < MIN_ROLE_BARS {
         return (ManualLevelRole::Unknown, 0.0, 0, 0);
     }
@@ -199,7 +195,11 @@ pub fn evaluate(
             phase: "pending".to_string(),
             event: None,
             role: forced_role,
-            role_confidence: if forced_role == ManualLevelRole::Unknown { 0.0 } else { 1.0 },
+            role_confidence: if forced_role == ManualLevelRole::Unknown {
+                0.0
+            } else {
+                1.0
+            },
             price: latest_price,
             reason: if forced_role == ManualLevelRole::Unknown {
                 "暂无足够K线".to_string()
@@ -487,9 +487,23 @@ mod tests {
             .collect::<Vec<_>>();
         bars.push(bar(28, 101.0, 104.0, 100.0, 103.0));
         bars.push(bar(29, 102.0, 103.0, 99.5, 102.0));
-        let first = evaluate(&definition(), &bars[..29], None, "pending", "resistance", "auto");
+        let first = evaluate(
+            &definition(),
+            &bars[..29],
+            None,
+            "pending",
+            "resistance",
+            "auto",
+        );
         assert_eq!(first.event, Some(ManualLevelEventKind::BreakoutUp));
-        let second = evaluate(&definition(), &bars, None, "breakout_confirmed", "resistance", "auto");
+        let second = evaluate(
+            &definition(),
+            &bars,
+            None,
+            "breakout_confirmed",
+            "resistance",
+            "auto",
+        );
         assert_eq!(second.event, Some(ManualLevelEventKind::RetestSupport));
         assert_eq!(second.role, ManualLevelRole::Support);
     }

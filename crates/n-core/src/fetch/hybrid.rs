@@ -87,6 +87,34 @@ impl HybridDataSource {
         self.check_and_update_health().await
     }
 
+    /// 只从天勤获取 K 线，供会写入本地标准库的修复/同步流程使用。
+    ///
+    /// 这里故意不经过 `MarketDataSource::fetch_minute` 的主源分流，
+    /// 也绝不回退新浪，避免把不同合约映射下的行情混入同一份本地数据。
+    pub async fn fetch_tq_minute(
+        &self,
+        symbol: &str,
+        period: &str,
+        count: usize,
+    ) -> Result<Vec<Kline>> {
+        if !self.tq_available_or_probe().await {
+            anyhow::bail!("天勤数据源当前不可用，持久化修复不会使用新浪回退");
+        }
+
+        let tq = self.tq_client.read().await.clone();
+        match tq.fetch_minute(symbol, period, count).await {
+            Ok(klines) if !klines.is_empty() => {
+                self.record_tq_success();
+                Ok(klines)
+            }
+            Ok(_) => anyhow::bail!("天勤返回空K线 ({symbol}/{period})"),
+            Err(error) => {
+                self.record_tq_failure(&error).await;
+                Err(error)
+            }
+        }
+    }
+
     /// 动态热更新天勤本地桥接端口
     pub async fn update_bridge_port(&self, port: u16) {
         *self.tq_client.write().await = TqBridgeClient::with_port(port);
@@ -380,5 +408,18 @@ mod tests {
             res.is_err(),
             "当 fallback_enabled 为 false 时不应降级回退到新浪"
         );
+    }
+
+    #[tokio::test]
+    async fn tq_only_kline_fetch_never_falls_back_to_sina() {
+        let config = Arc::new(RwLock::new(Config::default()));
+        let hybrid = HybridDataSource::new(
+            TqBridgeClient::with_port(9999), // 无效端口
+            SinaClient::new(),
+            config,
+        );
+
+        let result = hybrid.fetch_tq_minute("RB0", "5", 10).await;
+        assert!(result.is_err(), "天勤不可用时，修复通道不应回退新浪");
     }
 }

@@ -15,8 +15,6 @@ pub use analysis::{
     StrategySimulationResult,
 };
 pub use judger::{FinalityJudger, FinalityPolicy, FinalityStatus};
-pub use model::{
-    BarFingerprint, FinalityTrial, ObservationRecord, SessionType, DEFAULT_SENTINELS,
-};
+pub use model::{BarFingerprint, FinalityTrial, ObservationRecord, SessionType, DEFAULT_SENTINELS};
 pub use observer::{FinalityConfig, FinalityObserver};
 pub use tracker::{BarFinalityTracker, ProbeResult};

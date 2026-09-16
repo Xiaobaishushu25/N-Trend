@@ -12,10 +12,10 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::{fetch_to_model, model_to_fetch};
 use crate::derive::{aggregate, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::storage::repo;
-use super::{fetch_to_model, model_to_fetch};
 
 /// 品种级更新互斥锁管理器（Per-Symbol Lock）。
 /// 保证同一时刻对同一品种的数据写入与派生重算是串行的，
@@ -119,7 +119,8 @@ impl RawPipeline {
 
     /// 单根 Final 5m 行情更新入口（未来 Finality 确认后的统一持久化入口）。
     pub async fn process_final_bar(&self, symbol: &str, bar: &Kline) -> Result<usize> {
-        self.process_raw_batch(symbol, std::slice::from_ref(bar)).await
+        self.process_raw_batch(symbol, std::slice::from_ref(bar))
+            .await
     }
 
     /// 显式全量重构指定品种的 Derived 15m/60m（在 symbol 锁与单事务内执行）。

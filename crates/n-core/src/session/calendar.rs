@@ -1,7 +1,7 @@
 //! Global session calendar and registry for all futures symbols.
 
-use chrono::{DateTime, Local, NaiveDateTime};
 use super::spec::{NightSessionType, TradingSessionSpec};
+use chrono::{DateTime, Local, NaiveDateTime};
 
 pub struct SessionCalendar;
 
@@ -67,7 +67,10 @@ impl SessionCalendar {
                 candidates.push(candidate);
             }
         }
-        candidates.into_iter().filter(|candidate| *candidate > *now).min()
+        candidates
+            .into_iter()
+            .filter(|candidate| *candidate > *now)
+            .min()
     }
 
     /// 国内全市场全部可能的收盘时刻列表（用于调度器全局结算判定）：

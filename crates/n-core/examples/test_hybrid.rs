@@ -18,7 +18,10 @@ async fn main() -> anyhow::Result<()> {
     let sina_client = SinaClient::new();
     let data_source = HybridDataSource::new(tq_client, sina_client, config_arc);
 
-    println!(">>> 2. 检查数据源健康状态: {}", data_source.is_healthy().await);
+    println!(
+        ">>> 2. 检查数据源健康状态: {}",
+        data_source.is_healthy().await
+    );
     println!(">>> 当前激活数据源名称: {}", data_source.name());
 
     println!("\n>>> 3. 测试批量实时行情请求 (RB0, IF0, AU0, MA0)...");

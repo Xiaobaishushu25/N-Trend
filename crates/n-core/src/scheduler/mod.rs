@@ -142,10 +142,20 @@ pub fn is_symbol_trading_time(symbol: &str, now: &DateTime<Local>) -> bool {
 mod tests {
     use super::*;
     fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
-        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, 0).unwrap().and_local_timezone(Local).unwrap()
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
     }
     fn dt_sec(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Local> {
-        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, min, s).unwrap().and_local_timezone(Local).unwrap()
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, s)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
     }
     #[test]
     fn trading_window_weekday_day() {
@@ -175,43 +185,160 @@ mod tests {
     #[test]
     fn refresh_fires_at_session_close() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(next_action(dt(2026, 8, 3, 15, 0), &cfg, Some(dt(2026, 8, 3, 14, 55)), Some(dt(2026, 8, 3, 14, 45))), SchedulerAction::Refresh);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 15, 1, 20), &cfg, Some(dt(2026, 8, 3, 15, 0)), Some(dt(2026, 8, 3, 14, 45))), SchedulerAction::RefreshAndScan);
+        assert_eq!(
+            next_action(
+                dt(2026, 8, 3, 15, 0),
+                &cfg,
+                Some(dt(2026, 8, 3, 14, 55)),
+                Some(dt(2026, 8, 3, 14, 45))
+            ),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 15, 1, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 15, 0)),
+                Some(dt(2026, 8, 3, 14, 45))
+            ),
+            SchedulerAction::RefreshAndScan
+        );
     }
     #[test]
     fn scan_runs_after_settle_with_refresh() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 15), &cfg, None, None), SchedulerAction::Refresh);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 9, 15, 39), &cfg, Some(dt(2026, 8, 3, 9, 15)), Some(dt(2026, 8, 3, 9, 0))), SchedulerAction::None);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 9, 15, 40), &cfg, Some(dt(2026, 8, 3, 9, 15)), Some(dt(2026, 8, 3, 9, 0))), SchedulerAction::RefreshAndScan);
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 20), &cfg, Some(dt(2026, 8, 3, 9, 16)), Some(dt_sec(2026, 8, 3, 9, 15, 40))), SchedulerAction::None);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 9, 30, 40), &cfg, Some(dt(2026, 8, 3, 9, 25)), Some(dt_sec(2026, 8, 3, 9, 15, 40))), SchedulerAction::RefreshAndScan);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 11, 30, 40), &cfg, Some(dt(2026, 8, 3, 11, 30)), Some(dt_sec(2026, 8, 3, 11, 15, 40))), SchedulerAction::None);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 11, 31, 20), &cfg, Some(dt(2026, 8, 3, 11, 30)), Some(dt_sec(2026, 8, 3, 11, 15, 40))), SchedulerAction::RefreshAndScan);
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 15), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 15, 39),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 15)),
+                Some(dt(2026, 8, 3, 9, 0))
+            ),
+            SchedulerAction::None
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 15, 40),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 15)),
+                Some(dt(2026, 8, 3, 9, 0))
+            ),
+            SchedulerAction::RefreshAndScan
+        );
+        assert_eq!(
+            next_action(
+                dt(2026, 8, 3, 9, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 16)),
+                Some(dt_sec(2026, 8, 3, 9, 15, 40))
+            ),
+            SchedulerAction::None
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 30, 40),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 25)),
+                Some(dt_sec(2026, 8, 3, 9, 15, 40))
+            ),
+            SchedulerAction::RefreshAndScan
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 11, 30, 40),
+                &cfg,
+                Some(dt(2026, 8, 3, 11, 30)),
+                Some(dt_sec(2026, 8, 3, 11, 15, 40))
+            ),
+            SchedulerAction::None
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 11, 31, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 11, 30)),
+                Some(dt_sec(2026, 8, 3, 11, 15, 40))
+            ),
+            SchedulerAction::RefreshAndScan
+        );
     }
     #[test]
     fn scan_no_drift_after_delayed_first_scan() {
         let cfg = SchedulerConfig::default();
         let first_scan = dt_sec(2026, 8, 26, 11, 1, 1);
-        assert_eq!(next_action(dt_sec(2026, 8, 26, 11, 15, 40), &cfg, Some(dt_sec(2026, 8, 26, 11, 15, 0)), Some(first_scan)), SchedulerAction::RefreshAndScan);
-        assert_eq!(next_action(dt_sec(2026, 8, 26, 11, 15, 55), &cfg, Some(dt_sec(2026, 8, 26, 11, 15, 40)), Some(dt_sec(2026, 8, 26, 11, 15, 40))), SchedulerAction::None);
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 26, 11, 15, 40),
+                &cfg,
+                Some(dt_sec(2026, 8, 26, 11, 15, 0)),
+                Some(first_scan)
+            ),
+            SchedulerAction::RefreshAndScan
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 26, 11, 15, 55),
+                &cfg,
+                Some(dt_sec(2026, 8, 26, 11, 15, 40)),
+                Some(dt_sec(2026, 8, 26, 11, 15, 40))
+            ),
+            SchedulerAction::None
+        );
     }
     #[test]
     fn refresh_aligned_to_minute_grid() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 17), &cfg, None, None), SchedulerAction::None);
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 20), &cfg, None, None), SchedulerAction::Refresh);
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 30), &cfg, None, None), SchedulerAction::Refresh);
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 9, 30, 40), &cfg, Some(dt(2026, 8, 3, 9, 30)), None), SchedulerAction::RefreshAndScan);
-        assert_eq!(next_action(dt(2026, 8, 3, 10, 0), &cfg, None, None), SchedulerAction::Refresh);
-        assert_eq!(next_action(dt(2026, 8, 3, 9, 20), &cfg, Some(dt(2026, 8, 3, 9, 20)), None), SchedulerAction::None);
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 17), &cfg, None, None),
+            SchedulerAction::None
+        );
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 20), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 9, 30), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt_sec(2026, 8, 3, 9, 30, 40),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 30)),
+                None
+            ),
+            SchedulerAction::RefreshAndScan
+        );
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 10, 0), &cfg, None, None),
+            SchedulerAction::Refresh
+        );
+        assert_eq!(
+            next_action(
+                dt(2026, 8, 3, 9, 20),
+                &cfg,
+                Some(dt(2026, 8, 3, 9, 20)),
+                None
+            ),
+            SchedulerAction::None
+        );
     }
     #[test]
     fn trading_filter_blocks_off_hours() {
         let cfg = SchedulerConfig::default();
-        assert_eq!(next_action(dt(2026, 8, 3, 16, 0), &cfg, None, None), SchedulerAction::None);
+        assert_eq!(
+            next_action(dt(2026, 8, 3, 16, 0), &cfg, None, None),
+            SchedulerAction::None
+        );
         let mut off = cfg.clone();
         off.trading_only = false;
-        assert_eq!(next_action(dt_sec(2026, 8, 3, 16, 0, 40), &off, None, None), SchedulerAction::RefreshAndScan);
+        assert_eq!(
+            next_action(dt_sec(2026, 8, 3, 16, 0, 40), &off, None, None),
+            SchedulerAction::RefreshAndScan
+        );
     }
 }

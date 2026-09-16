@@ -374,8 +374,9 @@ fn a_leg_amplitude_factor(leg_atr: f64, n_atr: f64) -> f64 {
         return leg_atr / A_LEG_AMPLITUDE_ATR_RAMP_MIN;
     }
     if leg_atr < A_LEG_AMPLITUDE_ATR_FULL_MIN {
-        return 0.5 + 0.5 * (leg_atr - A_LEG_AMPLITUDE_ATR_RAMP_MIN)
-            / (A_LEG_AMPLITUDE_ATR_FULL_MIN - A_LEG_AMPLITUDE_ATR_RAMP_MIN);
+        return 0.5
+            + 0.5 * (leg_atr - A_LEG_AMPLITUDE_ATR_RAMP_MIN)
+                / (A_LEG_AMPLITUDE_ATR_FULL_MIN - A_LEG_AMPLITUDE_ATR_RAMP_MIN);
     }
     let cap = A_LEG_AMPLITUDE_CAP_BASE_ATR
         + (n_atr - A_LEG_AMPLITUDE_CAP_N_BASE_ATR).max(0.0) * A_LEG_AMPLITUDE_CAP_PER_N_ATR;
@@ -383,7 +384,8 @@ fn a_leg_amplitude_factor(leg_atr: f64, n_atr: f64) -> f64 {
         return 1.0;
     }
     if leg_atr <= cap + A_LEG_AMPLITUDE_CAP_DECAY_ATR {
-        return 1.0 - (leg_atr - cap) / A_LEG_AMPLITUDE_CAP_DECAY_ATR * A_LEG_AMPLITUDE_CAP_DECAY_MAX;
+        return 1.0
+            - (leg_atr - cap) / A_LEG_AMPLITUDE_CAP_DECAY_ATR * A_LEG_AMPLITUDE_CAP_DECAY_MAX;
     }
     A_LEG_AMPLITUDE_FLOOR
 }
@@ -402,9 +404,10 @@ fn a_leg_speed_factor(speed_atr: f64) -> f64 {
         return 1.0;
     }
     if speed_atr <= A_LEG_SPEED_ATR_FAST_START {
-        return 1.0 - (speed_atr - A_LEG_SPEED_ATR_FULL)
-            / (A_LEG_SPEED_ATR_FAST_START - A_LEG_SPEED_ATR_FULL)
-            * A_LEG_SPEED_FAST_PENALTY_MAX;
+        return 1.0
+            - (speed_atr - A_LEG_SPEED_ATR_FULL)
+                / (A_LEG_SPEED_ATR_FAST_START - A_LEG_SPEED_ATR_FULL)
+                * A_LEG_SPEED_FAST_PENALTY_MAX;
     }
     A_LEG_SPEED_FLOOR
 }
@@ -588,11 +591,7 @@ pub(crate) fn wick_direction_penalty(bar: &Bar, dir: Dir) -> f64 {
 }
 
 /// 预警K线体量扣分：按振幅相对 ATR20 的倍数衡量是否“特别巨大”，方向无关。
-pub(crate) fn warning_size_penalty(
-    bars: &[Bar],
-    atr20: &[Option<f64>],
-    w: usize,
-) -> f64 {
+pub(crate) fn warning_size_penalty(bars: &[Bar], atr20: &[Option<f64>], w: usize) -> f64 {
     let Some(bar) = bars.get(w) else {
         return 0.0;
     };
@@ -604,8 +603,7 @@ pub(crate) fn warning_size_penalty(
     if ratio <= WARNING_SIZE_ATR_START {
         return 0.0;
     }
-    let t = ((ratio - WARNING_SIZE_ATR_START)
-        / (WARNING_SIZE_ATR_FULL - WARNING_SIZE_ATR_START))
+    let t = ((ratio - WARNING_SIZE_ATR_START) / (WARNING_SIZE_ATR_FULL - WARNING_SIZE_ATR_START))
         .clamp(0.0, 1.0);
     WARNING_SIZE_PENALTY_MAX * t
 }
@@ -641,12 +639,7 @@ pub(crate) fn dim_warning(
 /// 入场分 = 0.60×A段 + 0.20×B段 + 0.20×预警K线。
 /// 多K累积覆盖总分封顶 3.9，只允许小仓试错；
 /// 长影线预警总分封顶 3.0，历史分档胜率全面偏弱，不进 3.5+ 标准仓区间。
-pub(crate) fn entry_score(
-    dim_a: f64,
-    dim_b: f64,
-    dim_warning: f64,
-    kind: &str,
-) -> f64 {
+pub(crate) fn entry_score(dim_a: f64, dim_b: f64, dim_warning: f64, kind: &str) -> f64 {
     let score = 0.60 * dim_a + 0.20 * dim_b + 0.20 * dim_warning;
     match kind {
         "cumulative" => score.min(CUMULATIVE_ENTRY_SCORE_MAX),
@@ -1346,32 +1339,68 @@ mod tests {
     #[test]
     fn a_leg_bar_score_ranks_same_direction_candles() {
         // 干净同色：实体占比≥0.55、逆势影≤0.4 实体、振幅 0.4~2.0 ATR。
-        assert!((a_leg_bar_score(&bar(100.0, 113.0, 98.0, 112.0), Some(10.0), Dir::Up) - 1.0).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 113.0, 98.0, 112.0), Some(10.0), Dir::Up) - 1.0).abs()
+                < 1e-9
+        );
         // 普通同色：实体占比不足，给轻分。
-        assert!((a_leg_bar_score(&bar(100.0, 104.0, 97.0, 102.0), Some(10.0), Dir::Up) - 0.4).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 104.0, 97.0, 102.0), Some(10.0), Dir::Up) - 0.4).abs()
+                < 1e-9
+        );
         // 大同色：振幅超过 2.5 ATR 直接扣分。
-        assert!((a_leg_bar_score(&bar(100.0, 130.0, 98.0, 128.0), Some(10.0), Dir::Up) - -0.6).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 130.0, 98.0, 128.0), Some(10.0), Dir::Up) - -0.6).abs()
+                < 1e-9
+        );
         // 无长影的十字星只轻扣。
-        assert!((a_leg_bar_score(&bar(100.0, 101.5, 98.5, 100.1), Some(10.0), Dir::Up) - -0.1).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 101.5, 98.5, 100.1), Some(10.0), Dir::Up) - -0.1).abs()
+                < 1e-9
+        );
     }
 
     #[test]
     fn a_leg_bar_score_handles_wicks_and_reverse_candles() {
         // 顺向长影：做空A段小阳线带长上影（14:30 场景）应给正分，不再当小反向。
-        assert!((a_leg_bar_score(&bar(90.0, 110.0, 89.0, 92.0), Some(10.0), Dir::Down) - 0.2).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(90.0, 110.0, 89.0, 92.0), Some(10.0), Dir::Down) - 0.2).abs()
+                < 1e-9
+        );
         // 顺向长影：做多A段阴线带长下影，同样给正分。
-        assert!((a_leg_bar_score(&bar(93.0, 102.0, 90.0, 92.0), Some(10.0), Dir::Up) - 0.2).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(93.0, 102.0, 90.0, 92.0), Some(10.0), Dir::Up) - 0.2).abs()
+                < 1e-9
+        );
         // 同色小实体长上影（向上腿）判逆势长影，不再被 Doji 吞掉。
-        assert!((a_leg_bar_score(&bar(95.0, 110.0, 94.0, 100.0), Some(10.0), Dir::Up) - -0.5).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(95.0, 110.0, 94.0, 100.0), Some(10.0), Dir::Up) - -0.5).abs()
+                < 1e-9
+        );
         // 同色小实体长下影（向下腿）镜像扣分。
-        assert!((a_leg_bar_score(&bar(95.0, 98.0, 80.0, 90.0), Some(10.0), Dir::Down) - -0.5).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(95.0, 98.0, 80.0, 90.0), Some(10.0), Dir::Down) - -0.5).abs()
+                < 1e-9
+        );
         // 反向小K带逆势长影：重扣但不到大反向档。
         // 注意收盘要落在反向不利位置，否则会先被“顺向长影+收盘有利”救成 FavWick。
-        assert!((a_leg_bar_score(&bar(100.0, 105.0, 92.0, 97.0), Some(10.0), Dir::Up) - -0.9).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 105.0, 92.0, 97.0), Some(10.0), Dir::Up) - -0.9).abs()
+                < 1e-9
+        );
         // 小反向、普通反向、大反向逐级加重。
-        assert!((a_leg_bar_score(&bar(100.0, 101.0, 96.0, 98.0), Some(10.0), Dir::Up) - -0.4).abs() < 1e-9);
-        assert!((a_leg_bar_score(&bar(100.0, 102.0, 93.0, 96.0), Some(10.0), Dir::Up) - -1.2).abs() < 1e-9);
-        assert!((a_leg_bar_score(&bar(100.0, 102.0, 88.0, 90.0), Some(10.0), Dir::Up) - -1.8).abs() < 1e-9);
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 101.0, 96.0, 98.0), Some(10.0), Dir::Up) - -0.4).abs()
+                < 1e-9
+        );
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 102.0, 93.0, 96.0), Some(10.0), Dir::Up) - -1.2).abs()
+                < 1e-9
+        );
+        assert!(
+            (a_leg_bar_score(&bar(100.0, 102.0, 88.0, 90.0), Some(10.0), Dir::Up) - -1.8).abs()
+                < 1e-9
+        );
     }
 
     #[test]

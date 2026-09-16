@@ -58,7 +58,14 @@ pub fn send_summary(subject: &str, body: &str, s: &EmailSettings) -> Result<()> 
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SmtpTransport, Transport};
 
-    tracing::info!("[SEND_SUMMARY] subject repr={:?} to={:?} host={}:{} len={}", subject, s.to, s.smtp_host, s.smtp_port, subject.len());
+    tracing::info!(
+        "[SEND_SUMMARY] subject repr={:?} to={:?} host={}:{} len={}",
+        subject,
+        s.to,
+        s.smtp_host,
+        s.smtp_port,
+        subject.len()
+    );
     let from = s.from.parse::<Mailbox>().context("发件人邮箱格式错误")?;
     let mut builder = Message::builder().from(from).subject(subject.to_string());
     for address in s.to.split(',').map(str::trim).filter(|a| !a.is_empty()) {
@@ -68,7 +75,11 @@ pub fn send_summary(subject: &str, body: &str, s: &EmailSettings) -> Result<()> 
         builder = builder.to(mailbox);
     }
     let email = builder.body(body.to_string()).context("构造邮件内容失败")?;
-    if let Some(h) = email.headers().get_raw("Subject") { tracing::info!("[SEND_SUMMARY] built Subject header raw={:?}", h); } else { tracing::warn!("[SEND_SUMMARY] no Subject header after build"); }
+    if let Some(h) = email.headers().get_raw("Subject") {
+        tracing::info!("[SEND_SUMMARY] built Subject header raw={:?}", h);
+    } else {
+        tracing::warn!("[SEND_SUMMARY] no Subject header after build");
+    }
 
     let tls_params = TlsParameters::new(s.smtp_host.clone())
         .with_context(|| format!("创建TLS参数失败: {}", s.smtp_host))?;
@@ -196,7 +207,12 @@ pub fn event_email_payload_with_model(
         grade = e.grade,
         score = e.entry_score,
     );
-    tracing::info!("[MAIL_SUBJECT] kind={} symbol={} subject={}", kind_label, e.symbol, subject);
+    tracing::info!(
+        "[MAIL_SUBJECT] kind={} symbol={} subject={}",
+        kind_label,
+        e.symbol,
+        subject
+    );
 
     let (dim_a, dim_b, dim_w) = event_dims(e);
     let dims_text = format!(
@@ -305,7 +321,11 @@ pub fn preclose_email_payload(
 pub fn preclose_candidate_email_payload(
     candidate: &preclose_candidates::Model,
 ) -> (String, String) {
-    let direction = if candidate.direction == "up" { "预做多" } else { "预做空" };
+    let direction = if candidate.direction == "up" {
+        "预做多"
+    } else {
+        "预做空"
+    };
     let subject = format!(
         "N趋势临时未收盘扫描【{}】{} {} {:.2}分",
         candidate.symbol, direction, candidate.grade, candidate.entry_score,
@@ -328,7 +348,10 @@ pub fn preclose_candidate_email_payload(
 
 pub fn single_bar_email_payload(alert: &crate::analyze::model::SingleBarAlert) -> (String, String) {
     let kind_label = if alert.kind == "hammer" { "锤" } else { "针" };
-    let subject = format!("N趋势{}·15m【{}】{}", kind_label, alert.symbol, alert.trigger_bar_ts);
+    let subject = format!(
+        "N趋势{}·15m【{}】{}",
+        kind_label, alert.symbol, alert.trigger_bar_ts
+    );
     let body = format!(
         "品种：{}\n形态：{}·15m ({})\n触发K线：{}\n有效期至：{}\n收盘价：{:.1}\n最高：{:.1}  最低：{:.1}\n时间框架：15m\n\n说明：光头/光脚长影线，影线≥1.5倍实体且≥40%振幅且≥0.7ATR，反向影线≤5%振幅，实体≥25%振幅。下一根K线内有效。",
         alert.symbol,
@@ -442,8 +465,11 @@ mod tests {
         assert!(body.contains("当前持仓评分：4.10"));
         assert!(body.contains("冠军模型胜率：暂无可用结果"));
 
-        let (_, body) =
-            event_email_payload_with_model(EventEmailKind::Trigger, &e, Some(("logistic-v2", 0.684)));
+        let (_, body) = event_email_payload_with_model(
+            EventEmailKind::Trigger,
+            &e,
+            Some(("logistic-v2", 0.684)),
+        );
         assert!(body.contains("冠军模型胜率：68.4%（logistic-v2）"));
 
         let preclose = preclose_signals::Model {

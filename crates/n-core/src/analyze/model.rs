@@ -1,5 +1,5 @@
-use std::fmt;
 use chrono::{Datelike, Timelike};
+use std::fmt;
 
 pub const ATR_PERIOD: usize = 20;
 
@@ -22,7 +22,6 @@ impl fmt::Display for DT {
     }
 }
 
-
 impl DT {
     /// 统一的 bar 时间字符串（带秒），与 DB / ScanResult 保持一致
     pub fn to_bar_ts(&self) -> String {
@@ -33,17 +32,27 @@ impl DT {
     }
     /// 从 "YYYY-MM-DD HH:MM:SS" 解析 DT，兼容无秒的 "YYYY-MM-DD HH:MM"
     pub fn from_bar_ts(s: &str) -> Option<Self> {
-        if s.len() < 16 { return None; }
+        if s.len() < 16 {
+            return None;
+        }
         let y = s[0..4].parse().ok()?;
         let m = s[5..7].parse().ok()?;
         let d = s[8..10].parse().ok()?;
         let h = s[11..13].parse().ok()?;
         let min = s[14..16].parse().ok()?;
-        Some(Self { year: y, month: m, day: d, hour: h, minute: min })
+        Some(Self {
+            year: y,
+            month: m,
+            day: d,
+            hour: h,
+            minute: min,
+        })
     }
     /// 增加分钟数，使用 chrono 处理跨天/月/年，避免手工 days_in_month 重复
     pub fn add_minutes(&self, mins: i32) -> Self {
-        if let Some(date) = chrono::NaiveDate::from_ymd_opt(self.year, self.month as u32, self.day as u32) {
+        if let Some(date) =
+            chrono::NaiveDate::from_ymd_opt(self.year, self.month as u32, self.day as u32)
+        {
             if let Some(dt) = date.and_hms_opt(self.hour as u32, self.minute as u32, 0) {
                 let exp = dt + chrono::Duration::minutes(mins as i64);
                 return Self {
@@ -55,18 +64,63 @@ impl DT {
                 };
             }
         }
-        let mut y = self.year; let mut m = self.month; let mut d = self.day; let mut h = self.hour; let mut min = self.minute + mins;
-        while min >= 60 { min -= 60; h += 1; }
-        while min < 0 { min += 60; h -= 1; }
-        while h >= 24 { h -= 24; d += 1; let dim = Self::days_in_month(y, m); if d > dim { d = 1; m += 1; if m > 12 { m = 1; y += 1; } } }
-        while h < 0 { h += 24; d -= 1; if d < 1 { m -= 1; if m < 1 { m = 12; y -= 1; } d = Self::days_in_month(y, m); } }
-        Self { year: y, month: m, day: d, hour: h, minute: min }
+        let mut y = self.year;
+        let mut m = self.month;
+        let mut d = self.day;
+        let mut h = self.hour;
+        let mut min = self.minute + mins;
+        while min >= 60 {
+            min -= 60;
+            h += 1;
+        }
+        while min < 0 {
+            min += 60;
+            h -= 1;
+        }
+        while h >= 24 {
+            h -= 24;
+            d += 1;
+            let dim = Self::days_in_month(y, m);
+            if d > dim {
+                d = 1;
+                m += 1;
+                if m > 12 {
+                    m = 1;
+                    y += 1;
+                }
+            }
+        }
+        while h < 0 {
+            h += 24;
+            d -= 1;
+            if d < 1 {
+                m -= 1;
+                if m < 1 {
+                    m = 12;
+                    y -= 1;
+                }
+                d = Self::days_in_month(y, m);
+            }
+        }
+        Self {
+            year: y,
+            month: m,
+            day: d,
+            hour: h,
+            minute: min,
+        }
     }
     fn days_in_month(y: i32, m: i32) -> i32 {
         match m {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
             4 | 6 | 9 | 11 => 30,
-            2 => if (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) { 29 } else { 28 },
+            2 => {
+                if (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) {
+                    29
+                } else {
+                    28
+                }
+            }
             _ => 30,
         }
     }
@@ -198,7 +252,10 @@ impl Trend60 {
     }
 
     pub fn is_down(&self) -> bool {
-        matches!(self.direction.as_str(), "DOWN" | "WEAK_DOWN" | "STRONG_DOWN")
+        matches!(
+            self.direction.as_str(),
+            "DOWN" | "WEAK_DOWN" | "STRONG_DOWN"
+        )
     }
 
     pub fn aligned_with(&self, dir: Dir) -> bool {
@@ -210,14 +267,27 @@ impl Trend60 {
     }
 
     pub fn strong(&self) -> bool {
-        matches!(self.direction.as_str(), "UP" | "DOWN" | "STRONG_UP" | "STRONG_DOWN")
+        matches!(
+            self.direction.as_str(),
+            "UP" | "DOWN" | "STRONG_UP" | "STRONG_DOWN"
+        )
     }
 
-    pub fn is_weak_up(&self) -> bool { self.direction == "WEAK_UP" }
-    pub fn is_weak_down(&self) -> bool { self.direction == "WEAK_DOWN" }
-    pub fn is_strong_up(&self) -> bool { self.direction == "STRONG_UP" }
-    pub fn is_strong_down(&self) -> bool { self.direction == "STRONG_DOWN" }
-    pub fn is_range(&self) -> bool { self.direction == "RANGE" || self.direction == "NEUTRAL" }
+    pub fn is_weak_up(&self) -> bool {
+        self.direction == "WEAK_UP"
+    }
+    pub fn is_weak_down(&self) -> bool {
+        self.direction == "WEAK_DOWN"
+    }
+    pub fn is_strong_up(&self) -> bool {
+        self.direction == "STRONG_UP"
+    }
+    pub fn is_strong_down(&self) -> bool {
+        self.direction == "STRONG_DOWN"
+    }
+    pub fn is_range(&self) -> bool {
+        self.direction == "RANGE" || self.direction == "NEUTRAL"
+    }
 }
 
 #[derive(Clone)]
@@ -289,7 +359,6 @@ impl SignalCheck {
         }
     }
 }
-
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SingleBarAlert {

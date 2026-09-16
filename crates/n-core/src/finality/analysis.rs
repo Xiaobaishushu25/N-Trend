@@ -1,7 +1,7 @@
 //! Multi-strategy simulation and statistical analysis for Finality observations.
 
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::model::{FinalityTrial, ObservationRecord};
 
@@ -243,7 +243,10 @@ pub fn summarize_trials(trials: &[FinalityTrial]) -> FinalityReport {
     // 按 session_type 分组
     let mut session_map: BTreeMap<String, Vec<&FinalityTrial>> = BTreeMap::new();
     for t in trials {
-        session_map.entry(t.session_type.clone()).or_default().push(t);
+        session_map
+            .entry(t.session_type.clone())
+            .or_default()
+            .push(t);
     }
     let mut by_session = Vec::new();
     for (session, list) in session_map {

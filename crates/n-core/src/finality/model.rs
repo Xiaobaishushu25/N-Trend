@@ -222,20 +222,57 @@ mod tests {
 
     #[test]
     fn test_fingerprint_equality() {
-        let fp1 = BarFingerprint::new("2026-08-28 10:45:00", "8260.00", "8265.0", "8250", "8255.000", "100.0", "5000");
-        let fp2 = BarFingerprint::new("2026-08-28 10:45:00", "8260", "8265", "8250.00", "8255", "100", "5000.0");
+        let fp1 = BarFingerprint::new(
+            "2026-08-28 10:45:00",
+            "8260.00",
+            "8265.0",
+            "8250",
+            "8255.000",
+            "100.0",
+            "5000",
+        );
+        let fp2 = BarFingerprint::new(
+            "2026-08-28 10:45:00",
+            "8260",
+            "8265",
+            "8250.00",
+            "8255",
+            "100",
+            "5000.0",
+        );
         assert_eq!(fp1, fp2);
         assert_eq!(fp1.signature(), fp2.signature());
     }
 
     #[test]
     fn test_session_type_classify() {
-        assert_eq!(SessionType::classify("RB0", "2026-08-28 10:15:00"), SessionType::Close1015);
-        assert_eq!(SessionType::classify("CJ0", "2026-08-28 11:30:00"), SessionType::Close1130);
-        assert_eq!(SessionType::classify("CJ0", "2026-08-28 15:00:00"), SessionType::Close1500);
-        assert_eq!(SessionType::classify("RB0", "2026-08-28 23:00:00"), SessionType::NightClose2300);
-        assert_eq!(SessionType::classify("PB0", "2026-08-28 01:00:00"), SessionType::NightClose0100);
-        assert_eq!(SessionType::classify("AU0", "2026-08-28 02:30:00"), SessionType::NightClose0230);
-        assert_eq!(SessionType::classify("RB0", "2026-08-28 10:45:00"), SessionType::Normal);
+        assert_eq!(
+            SessionType::classify("RB0", "2026-08-28 10:15:00"),
+            SessionType::Close1015
+        );
+        assert_eq!(
+            SessionType::classify("CJ0", "2026-08-28 11:30:00"),
+            SessionType::Close1130
+        );
+        assert_eq!(
+            SessionType::classify("CJ0", "2026-08-28 15:00:00"),
+            SessionType::Close1500
+        );
+        assert_eq!(
+            SessionType::classify("RB0", "2026-08-28 23:00:00"),
+            SessionType::NightClose2300
+        );
+        assert_eq!(
+            SessionType::classify("PB0", "2026-08-28 01:00:00"),
+            SessionType::NightClose0100
+        );
+        assert_eq!(
+            SessionType::classify("AU0", "2026-08-28 02:30:00"),
+            SessionType::NightClose0230
+        );
+        assert_eq!(
+            SessionType::classify("RB0", "2026-08-28 10:45:00"),
+            SessionType::Normal
+        );
     }
 }

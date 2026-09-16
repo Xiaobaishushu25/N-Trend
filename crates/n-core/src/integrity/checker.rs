@@ -10,8 +10,8 @@ use chrono::{Duration, NaiveDateTime};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::repo;
 use super::schedule::{is_valid_5m_slot, next_expected_5m_slot};
+use crate::storage::repo;
 
 /// 缺失 K 线连续区间。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,7 +72,7 @@ pub struct RawDataIntegrityChecker;
 impl RawDataIntegrityChecker {
     /// 检查指定品种的 Raw 5m 数据完整性。
     ///
-    /// - `max_api_window_bars`: 新浪 API 最大可回溯的 5m 根数（通常为 1000 根），
+    /// - `max_api_window_bars`: 天勤接口最大可回溯的 5m 根数（通常为 1000 根），
     ///   用于判断数据洞是否属于可自愈修复范围。
     pub async fn inspect_symbol(
         db: &DatabaseConnection,
@@ -162,14 +162,14 @@ impl RawDataIntegrityChecker {
 
         // 4. 将离散缺失槽位聚合成连续区间 GapRange，并判定是否可被 API 恢复
         let latest_dt = parsed_bars.last().copied();
-        let api_reach_limit = latest_dt.map(|ldt| {
-            ldt - Duration::minutes((max_api_window_bars as i64) * 5)
-        });
+        let api_reach_limit =
+            latest_dt.map(|ldt| ldt - Duration::minutes((max_api_window_bars as i64) * 5));
 
         let missing_count = missing_slots.len();
         let missing_gaps = group_missing_slots(&missing_slots, symbol, api_reach_limit);
 
-        let is_clean = missing_count == 0 && unexpected_bars.is_empty() && corrupted_bars.is_empty();
+        let is_clean =
+            missing_count == 0 && unexpected_bars.is_empty() && corrupted_bars.is_empty();
 
         Ok(SymbolIntegrityReport {
             symbol: symbol.to_string(),
@@ -235,8 +235,8 @@ fn group_missing_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::Set;
     use crate::storage::entities::klines;
+    use sea_orm::Set;
 
     fn make_row(symbol: &str, ts: &str, close: f64) -> klines::ActiveModel {
         klines::ActiveModel {
@@ -267,7 +267,9 @@ mod tests {
         ];
         repo::upsert_klines(&db, rows).await.unwrap();
 
-        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000).await.unwrap();
+        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000)
+            .await
+            .unwrap();
         assert!(report.is_clean);
         assert_eq!(report.missing_count, 0);
         assert_eq!(report.total_bars, 3);
@@ -287,7 +289,9 @@ mod tests {
         ];
         repo::upsert_klines(&db, rows).await.unwrap();
 
-        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000).await.unwrap();
+        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000)
+            .await
+            .unwrap();
         assert!(!report.is_clean);
         assert_eq!(report.missing_count, 2);
         assert_eq!(report.missing_gaps.len(), 1);
@@ -310,7 +314,9 @@ mod tests {
 
         repo::upsert_klines(&db, vec![row1, row2]).await.unwrap();
 
-        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000).await.unwrap();
+        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000)
+            .await
+            .unwrap();
         assert!(!report.is_clean);
         assert_eq!(report.unexpected_bars.len(), 1);
         assert_eq!(report.unexpected_bars[0], "2026-08-28 12:00:00");

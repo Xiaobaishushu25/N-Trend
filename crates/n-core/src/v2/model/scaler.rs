@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::v2::dataset::DatasetRow;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StandardScaler {
@@ -13,29 +13,53 @@ impl StandardScaler {
         let n = feature_names.len();
         let mut means = vec![0.0; n];
         let mut stds = vec![1.0; n];
-        if rows.is_empty() { return Self { feature_names: feature_names.to_vec(), means, stds }; }
+        if rows.is_empty() {
+            return Self {
+                feature_names: feature_names.to_vec(),
+                means,
+                stds,
+            };
+        }
         for (j, name) in feature_names.iter().enumerate() {
             let vals: Vec<f64> = rows.iter().filter_map(|r| get_feature(r, name)).collect();
-            if vals.is_empty() { continue; }
+            if vals.is_empty() {
+                continue;
+            }
             let m = vals.iter().sum::<f64>() / vals.len() as f64;
             let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
             let s = var.sqrt().max(1e-9);
             means[j] = m;
             stds[j] = s;
         }
-        Self { feature_names: feature_names.to_vec(), means, stds }
+        Self {
+            feature_names: feature_names.to_vec(),
+            means,
+            stds,
+        }
     }
     pub fn transform_row(&self, row: &DatasetRow) -> Vec<f64> {
-        self.feature_names.iter().enumerate().map(|(j, name)| {
-            if let Some(v) = get_feature(row, name) {
-                (v - self.means[j]) / self.stds[j]
-            } else { 0.0 }
-        }).collect()
+        self.feature_names
+            .iter()
+            .enumerate()
+            .map(|(j, name)| {
+                if let Some(v) = get_feature(row, name) {
+                    (v - self.means[j]) / self.stds[j]
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
     pub fn transform_slice(&self, feats: &[f64]) -> Vec<f64> {
-        feats.iter().enumerate().map(|(j, v)| (v - self.means[j]) / self.stds[j]).collect()
+        feats
+            .iter()
+            .enumerate()
+            .map(|(j, v)| (v - self.means[j]) / self.stds[j])
+            .collect()
     }
-    pub fn transform_features(&self, features: &[f64]) -> Vec<f64> { self.transform_slice(features) }
+    pub fn transform_features(&self, features: &[f64]) -> Vec<f64> {
+        self.transform_slice(features)
+    }
 }
 
 pub fn get_feature(row: &DatasetRow, name: &str) -> Option<f64> {
@@ -79,7 +103,47 @@ mod tests {
     use super::*;
     use crate::v2::dataset::DatasetRow;
     fn mk_row(a_atr: f64, ret: f64) -> DatasetRow {
-        DatasetRow { event_id: "x".into(), symbol: "RB".into(), direction: "up".into(), setup_quality: 3.0, a_move: 10.0, b_move: 5.0, a_move_atr: a_atr, b_move_atr: 1.0, a_speed: 2.0, retracement: ret, warning_volume_ratio: Some(1.0), trigger_close_overshoot_r: Some(0.2), trigger_close_location: Some(0.5), trigger_body_atr: Some(1.0), trigger_volume_ratio: Some(1.0), trigger_wick_atr: Some(0.3), internal_swing_margin_r: Some(0.2), chase_distance_r: Some(0.1), missing_mask: 0, label_win: 1, r_multiple: Some(1.0), is_1r_aux_win: Some(true), trigger_bar_ts: Some("2024-01-01 10:00:00".into()), exit_ts: Some("2024-01-01 11:00:00".into()), schema_version: crate::v2::FEATURE_SCHEMA_VERSION.into(), trend_gap_60:None, trend_slope_60:None, trend_strength_60:None, trend_alignment_60:None, trend_10d:None, trend_alignment_10d:None, range_position_10d:None, mr_position_10d:None, distance_ma10_dir:None, trend_position_interaction:None, context_as_of_ts:None, context_last_60m_ts:None, context_last_daily_day:None, crossed_rollover_10d:false }
+        DatasetRow {
+            event_id: "x".into(),
+            symbol: "RB".into(),
+            direction: "up".into(),
+            setup_quality: 3.0,
+            a_move: 10.0,
+            b_move: 5.0,
+            a_move_atr: a_atr,
+            b_move_atr: 1.0,
+            a_speed: 2.0,
+            retracement: ret,
+            warning_volume_ratio: Some(1.0),
+            trigger_close_overshoot_r: Some(0.2),
+            trigger_close_location: Some(0.5),
+            trigger_body_atr: Some(1.0),
+            trigger_volume_ratio: Some(1.0),
+            trigger_wick_atr: Some(0.3),
+            internal_swing_margin_r: Some(0.2),
+            chase_distance_r: Some(0.1),
+            missing_mask: 0,
+            label_win: 1,
+            r_multiple: Some(1.0),
+            is_1r_aux_win: Some(true),
+            trigger_bar_ts: Some("2024-01-01 10:00:00".into()),
+            exit_ts: Some("2024-01-01 11:00:00".into()),
+            schema_version: crate::v2::FEATURE_SCHEMA_VERSION.into(),
+            trend_gap_60: None,
+            trend_slope_60: None,
+            trend_strength_60: None,
+            trend_alignment_60: None,
+            trend_10d: None,
+            trend_alignment_10d: None,
+            range_position_10d: None,
+            mr_position_10d: None,
+            distance_ma10_dir: None,
+            trend_position_interaction: None,
+            context_as_of_ts: None,
+            context_last_60m_ts: None,
+            context_last_daily_day: None,
+            crossed_rollover_10d: false,
+        }
     }
     #[test]
     fn scaler_mean_std() {

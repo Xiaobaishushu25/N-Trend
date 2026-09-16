@@ -45,7 +45,11 @@ pub fn extract_setup_features(
 ) -> SetupFeatures {
     let atr_s1 = atr15.get(pattern.s1.index).and_then(|x| *x).unwrap_or(1.0);
     let atr_s2 = atr15.get(pattern.s2.index).and_then(|x| *x).unwrap_or(1.0);
-    let a_speed = if pattern.a_bars > 0 { pattern.a_move / pattern.a_bars as f64 } else { 0.0 };
+    let a_speed = if pattern.a_bars > 0 {
+        pattern.a_move / pattern.a_bars as f64
+    } else {
+        0.0
+    };
     // warning bar is s2 bar itself (end of b leg)
     let wb = bars15.get(pattern.s2.index);
     let (close_loc, body_atr, wick_ratio, vol_ratio) = if let Some(b) = wb {
@@ -55,18 +59,30 @@ pub fn extract_setup_features(
         let ba = if atr_s2 > 1e-9 { body / atr_s2 } else { 0.0 };
         let upper = b.high - b.open.max(b.close);
         let lower = b.open.min(b.close) - b.low;
-        let wick = if body > 1e-9 { upper.max(lower) / body } else { 0.0 };
+        let wick = if body > 1e-9 {
+            upper.max(lower) / body
+        } else {
+            0.0
+        };
         // Keep live/replay volume semantics in one place.  In particular,
         // do not divide by a fixed 20 when the window contains missing
         // volume observations.
         let vr = crate::analyze::outcome::vol_ratio_at(bars15, pattern.s2.index);
         (Some(cl), Some(ba), Some(wick), vr)
-    } else { (None, None, None, None) };
+    } else {
+        (None, None, None, None)
+    };
 
     let mut mask = 0u32;
-    if close_loc.is_none() { mask |= 1; }
-    if body_atr.is_none() { mask |= 2; }
-    if atr_s1.is_nan() || atr_s1 <= 0.0 { mask |= 4; }
+    if close_loc.is_none() {
+        mask |= 1;
+    }
+    if body_atr.is_none() {
+        mask |= 2;
+    }
+    if atr_s1.is_nan() || atr_s1 <= 0.0 {
+        mask |= 4;
+    }
 
     SetupFeatures {
         a_move: pattern.a_move,
@@ -75,11 +91,22 @@ pub fn extract_setup_features(
         b_bars: pattern.b_bars as i64,
         retracement: pattern.retracement,
         a_speed,
-        a_move_atr: if atr_s1 > 1e-9 { pattern.a_move / atr_s1 } else { 0.0 },
-        b_move_atr: if atr_s2 > 1e-9 { pattern.b_move / atr_s2 } else { 0.0 },
+        a_move_atr: if atr_s1 > 1e-9 {
+            pattern.a_move / atr_s1
+        } else {
+            0.0
+        },
+        b_move_atr: if atr_s2 > 1e-9 {
+            pattern.b_move / atr_s2
+        } else {
+            0.0
+        },
         grade: format!("{:?}", pattern.grade),
         level: pattern.level.to_string(),
-        direction: match pattern.dir { Dir::Up => "up".to_string(), Dir::Down => "down".to_string() },
+        direction: match pattern.dir {
+            Dir::Up => "up".to_string(),
+            Dir::Down => "down".to_string(),
+        },
         a_strong_count: 0, // filled by caller if available
         setup_quality,
         trend60_state: format!("{:?}", trend60),
@@ -95,17 +122,77 @@ pub fn extract_setup_features(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::model::{Bar, DT, Dir, Grade, NPattern, Swing, Trend60};
+    use crate::analyze::model::{Bar, Dir, Grade, NPattern, Swing, Trend60, DT};
 
     fn bar(o: f64, h: f64, l: f64, c: f64) -> Bar {
-        Bar { dt: DT { year: 2024, month: 1, day: 1, hour: 10, minute: 0 }, open: o, high: h, low: l, close: c, volume: 1000.0, hold: 0.0, rollover: false }
+        Bar {
+            dt: DT {
+                year: 2024,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 0,
+            },
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: 1000.0,
+            hold: 0.0,
+            rollover: false,
+        }
     }
     #[test]
     fn setup_speed_computed() {
-        let p = NPattern { level: "fine", dir: Dir::Up, s0: Swing{index:0, price:10.0, is_high:false}, s1: Swing{index:5, price:20.0, is_high:true}, s2: Swing{index:8, price:15.0, is_high:false}, a_move:10.0, b_move:5.0, a_bars:6, b_bars:3, retracement:0.5, grade: Grade::A, hard_failure:false, a_too_long:false, b_too_long:false, b_fast:false, b_weakening:false, b_weakening_ratio:None, a_strong_trend:0, b_strong_reverse:0, c_move:0.0, c_bars:0, c_extended:false, c_hard_failure:false };
-        let bars = vec![bar(10.0,11.0,9.0,10.5); 10];
+        let p = NPattern {
+            level: "fine",
+            dir: Dir::Up,
+            s0: Swing {
+                index: 0,
+                price: 10.0,
+                is_high: false,
+            },
+            s1: Swing {
+                index: 5,
+                price: 20.0,
+                is_high: true,
+            },
+            s2: Swing {
+                index: 8,
+                price: 15.0,
+                is_high: false,
+            },
+            a_move: 10.0,
+            b_move: 5.0,
+            a_bars: 6,
+            b_bars: 3,
+            retracement: 0.5,
+            grade: Grade::A,
+            hard_failure: false,
+            a_too_long: false,
+            b_too_long: false,
+            b_fast: false,
+            b_weakening: false,
+            b_weakening_ratio: None,
+            a_strong_trend: 0,
+            b_strong_reverse: 0,
+            c_move: 0.0,
+            c_bars: 0,
+            c_extended: false,
+            c_hard_failure: false,
+        };
+        let bars = vec![bar(10.0, 11.0, 9.0, 10.5); 10];
         let atr = vec![Some(1.0); 10];
-        let t60 = Trend60 { direction: "UP".to_string(), ma20: 0.0, slope: 0.0, price_vs_ma: 0.0, higher_highs: false, higher_lows: false, lower_highs: false, lower_lows: false };
+        let t60 = Trend60 {
+            direction: "UP".to_string(),
+            ma20: 0.0,
+            slope: 0.0,
+            price_vs_ma: 0.0,
+            higher_highs: false,
+            higher_lows: false,
+            lower_highs: false,
+            lower_lows: false,
+        };
         let f = extract_setup_features(&p, &bars, &atr, &t60, 3.5);
         assert!((f.a_speed - 1.666).abs() < 0.01);
     }

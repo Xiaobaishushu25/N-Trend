@@ -5,18 +5,24 @@
 //! those two pieces for both historical backfill and live trigger events.
 
 use anyhow::{Context, Result};
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
+    Statement,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use crate::analyze::indicators;
-use crate::analyze::model::{Bar, DT, ATR_PERIOD};
+use crate::analyze::model::{Bar, ATR_PERIOD, DT};
 use crate::analyze::outcome;
 use crate::derive::{aggregate, Timeframe};
 use crate::storage::entities::{klines, pattern_events, rollovers, v2_model_registry};
 use crate::storage::repo;
 use crate::v2::dataset::DatasetRow;
-use crate::v2::features::{extract_market_context, normalize_direction, extract_trigger_features, MarketContextSnapshot, SetupFeatures};
+use crate::v2::features::{
+    extract_market_context, extract_trigger_features, normalize_direction, MarketContextSnapshot,
+    SetupFeatures,
+};
 use crate::v2::model::{
     predict_gam, predict_logistic, GamModel, InferenceBundle, LogisticModel, Prediction,
     SplineTable,
@@ -61,8 +67,10 @@ fn bundle_from_registry(row: &v2_model_registry::Model) -> Option<InferenceBundl
     let coefficients: serde_json::Value = serde_json::from_str(&row.coefficients).ok()?;
 
     if row.name == "gam-v1" || row.spline_knots.is_some() {
-        let linear_features = json_string_array(&coefficients, "linear_features").unwrap_or_default();
-        let linear_coefficients = json_f64_array(&coefficients, "linear_coefficients").unwrap_or_default();
+        let linear_features =
+            json_string_array(&coefficients, "linear_features").unwrap_or_default();
+        let linear_coefficients =
+            json_f64_array(&coefficients, "linear_coefficients").unwrap_or_default();
         let splines: Vec<SplineTable> = row
             .spline_knots
             .as_deref()
@@ -117,7 +125,8 @@ fn bundle_from_registry(row: &v2_model_registry::Model) -> Option<InferenceBundl
 async fn load_bundles(db: &DatabaseConnection) -> Result<Vec<InferenceBundle>> {
     let rows = v2_model_registry::Entity::find()
         .filter(v2_model_registry::Column::Status.eq("champion"))
-        .all(db).await?;
+        .all(db)
+        .await?;
     Ok(rows.iter().filter_map(bundle_from_registry).collect())
 }
 
@@ -140,10 +149,16 @@ fn to_bars(rows: &[klines::Model]) -> Vec<Bar> {
 }
 
 fn to_rollover_records(rows: &[rollovers::Model]) -> Vec<crate::derive::rollover::RolloverRecord> {
-    rows.iter().filter(|r| r.confirmed).map(|r| crate::derive::rollover::RolloverRecord {
-        symbol: r.symbol.clone(), ts: r.ts.clone(), from_contract: r.from_contract.clone(),
-        to_contract: r.to_contract.clone(), confirmed: r.confirmed,
-    }).collect()
+    rows.iter()
+        .filter(|r| r.confirmed)
+        .map(|r| crate::derive::rollover::RolloverRecord {
+            symbol: r.symbol.clone(),
+            ts: r.ts.clone(),
+            from_contract: r.from_contract.clone(),
+            to_contract: r.to_contract.clone(),
+            confirmed: r.confirmed,
+        })
+        .collect()
 }
 
 fn find_bar_index(bars: &[Bar], ts: &str) -> Option<usize> {
@@ -162,7 +177,8 @@ fn event_dim_string(event: &pattern_events::Model, key: &str) -> Option<String> 
 }
 
 fn is_current_event_cohort(event: &pattern_events::Model) -> bool {
-    event_dim_string(event, "event_logic_version").as_deref() == Some(crate::v2::version::EVENT_LOGIC_VERSION)
+    event_dim_string(event, "event_logic_version").as_deref()
+        == Some(crate::v2::version::EVENT_LOGIC_VERSION)
         && event_dim_string(event, "pattern_version").as_deref()
             == Some(crate::v2::PATTERN_LOGIC_VERSION)
         && event_dim_string(event, "execution_version").as_deref()
@@ -212,9 +228,9 @@ pub fn dataset_row_from_event_with_context(
         .and_then(|index| atr_series.get(index).and_then(|value| *value))
         .unwrap_or(0.0);
     let warning_volume = warning_index.and_then(|index| outcome::vol_ratio_at(bars, index));
-    let (warning_close_location, warning_body_atr, warning_wick_ratio) =
-        warning_index
-            .and_then(|index| bars.get(index).map(|bar| {
+    let (warning_close_location, warning_body_atr, warning_wick_ratio) = warning_index
+        .and_then(|index| {
+            bars.get(index).map(|bar| {
                 let range = (bar.high - bar.low).max(1e-9);
                 let body = (bar.close - bar.open).abs();
                 let upper = bar.high - bar.open.max(bar.close);
@@ -222,10 +238,15 @@ pub fn dataset_row_from_event_with_context(
                 (
                     Some((bar.close - bar.low) / range),
                     Some(body / b_atr.max(1e-9)),
-                    Some(if body > 1e-9 { upper.max(lower) / body } else { 0.0 }),
+                    Some(if body > 1e-9 {
+                        upper.max(lower) / body
+                    } else {
+                        0.0
+                    }),
                 )
-            }))
-            .unwrap_or((None, None, None));
+            })
+        })
+        .unwrap_or((None, None, None));
     let mut setup = SetupFeatures {
         a_move: event.a_move,
         b_move: event.b_move,
@@ -242,7 +263,11 @@ pub fn dataset_row_from_event_with_context(
         } else {
             0.0
         },
-        b_move_atr: if b_atr > 1e-9 { event.b_move / b_atr } else { 0.0 },
+        b_move_atr: if b_atr > 1e-9 {
+            event.b_move / b_atr
+        } else {
+            0.0
+        },
         grade: event.grade.clone(),
         level: event.level.clone(),
         direction: event.direction.clone(),
@@ -293,11 +318,20 @@ pub fn dataset_row_from_event_with_context(
         range_position_10d: market_context.as_ref().and_then(|c| c.range_position_10d),
         mr_position_10d: market_context.as_ref().and_then(|c| c.mr_position_10d),
         distance_ma10_dir: market_context.as_ref().and_then(|c| c.distance_ma10_dir),
-        trend_position_interaction: market_context.as_ref().and_then(|c| c.trend_position_interaction),
+        trend_position_interaction: market_context
+            .as_ref()
+            .and_then(|c| c.trend_position_interaction),
         context_as_of_ts: market_context.as_ref().map(|c| c.as_of_ts.clone()),
-        context_last_60m_ts: market_context.as_ref().and_then(|c| c.latest_60m_close_ts.clone()),
-        context_last_daily_day: market_context.as_ref().and_then(|c| c.latest_daily_trading_day.clone()),
-        crossed_rollover_10d: market_context.as_ref().map(|c| c.crossed_rollover_10d).unwrap_or(false),
+        context_last_60m_ts: market_context
+            .as_ref()
+            .and_then(|c| c.latest_60m_close_ts.clone()),
+        context_last_daily_day: market_context
+            .as_ref()
+            .and_then(|c| c.latest_daily_trading_day.clone()),
+        crossed_rollover_10d: market_context
+            .as_ref()
+            .map(|c| c.crossed_rollover_10d)
+            .unwrap_or(false),
     })
 }
 
@@ -306,15 +340,29 @@ fn predict(bundle: &InferenceBundle, row: &DatasetRow) -> Option<Prediction> {
     // scaled zero/mean values.  The caller can retain the V0 champion as the
     // fallback when this returns None.
     let context_features = [
-        "trend_gap_60", "trend_slope_60", "trend_strength_60", "trend_alignment_60",
-        "trend_10d", "trend_alignment_10d", "range_position_10d", "mr_position_10d",
-        "distance_ma10_dir", "trend_position_interaction",
+        "trend_gap_60",
+        "trend_slope_60",
+        "trend_strength_60",
+        "trend_alignment_60",
+        "trend_10d",
+        "trend_alignment_10d",
+        "range_position_10d",
+        "mr_position_10d",
+        "distance_ma10_dir",
+        "trend_position_interaction",
     ];
-    if bundle.feature_whitelist.iter().any(|name| context_features.contains(&name.as_str())) {
+    if bundle
+        .feature_whitelist
+        .iter()
+        .any(|name| context_features.contains(&name.as_str()))
+    {
         let complete = bundle.feature_whitelist.iter().all(|name| {
-            !context_features.contains(&name.as_str()) || crate::v2::model::get_feature(row, name).is_some()
+            !context_features.contains(&name.as_str())
+                || crate::v2::model::get_feature(row, name).is_some()
         });
-        if !complete { return None; }
+        if !complete {
+            return None;
+        }
     }
     if bundle.logistic.is_some() {
         predict_logistic(bundle, row)
@@ -357,14 +405,69 @@ pub async fn predict_event(
     let raw_rows = repo::raw_klines(db, &event.symbol).await?;
     let rollover_rows = repo::symbol_rollovers(db, &event.symbol).await?;
     let rollover_records = to_rollover_records(&rollover_rows);
-    let raw = raw_rows.iter().map(crate::service::model_to_fetch).collect::<Vec<_>>();
+    let raw = raw_rows
+        .iter()
+        .map(crate::service::model_to_fetch)
+        .collect::<Vec<_>>();
     let (_, bars60) = {
-        let m15 = aggregate(&raw, Timeframe::M15).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
-        let m60 = aggregate(&raw, Timeframe::M60).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+        let m15 = aggregate(&raw, Timeframe::M15)
+            .iter()
+            .filter_map(|k| {
+                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
+                    dt,
+                    open: k.open,
+                    high: k.high,
+                    low: k.low,
+                    close: k.close,
+                    volume: k.volume,
+                    hold: k.hold,
+                    rollover: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let m60 = aggregate(&raw, Timeframe::M60)
+            .iter()
+            .filter_map(|k| {
+                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
+                    dt,
+                    open: k.open,
+                    high: k.high,
+                    low: k.low,
+                    close: k.close,
+                    volume: k.volume,
+                    hold: k.hold,
+                    rollover: false,
+                })
+            })
+            .collect::<Vec<_>>();
         (m15, m60)
     };
-    let daily = aggregate(&raw, Timeframe::Day).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
-    let context = event.trigger_bar_ts.as_deref().and_then(|ts| extract_market_context(&event.symbol, ts, &event.direction, bars, &bars60, &daily, &rollover_records));
+    let daily = aggregate(&raw, Timeframe::Day)
+        .iter()
+        .filter_map(|k| {
+            DT::from_bar_ts(&k.datetime).map(|dt| Bar {
+                dt,
+                open: k.open,
+                high: k.high,
+                low: k.low,
+                close: k.close,
+                volume: k.volume,
+                hold: k.hold,
+                rollover: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let context = event.trigger_bar_ts.as_deref().and_then(|ts| {
+        extract_market_context(
+            &event.symbol,
+            ts,
+            &event.direction,
+            bars,
+            &bars60,
+            &daily,
+            &rollover_records,
+        )
+    });
     let Some(row) = dataset_row_from_event_with_context(event, bars, context) else {
         return Ok(0);
     };
@@ -472,7 +575,10 @@ pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
             } else {
                 legacy_cohort_events += 1;
             }
-            by_symbol.entry(event.symbol.clone()).or_default().push(event);
+            by_symbol
+                .entry(event.symbol.clone())
+                .or_default()
+                .push(event);
         }
     }
 
@@ -488,12 +594,53 @@ pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
         let rollover_rows = repo::symbol_rollovers(db, &symbol).await?;
         let rollover_records = to_rollover_records(&rollover_rows);
         let raw_rows = repo::raw_klines(db, &symbol).await?;
-        let raw = raw_rows.iter().map(crate::service::model_to_fetch).collect::<Vec<_>>();
-        let bars60 = aggregate(&raw, Timeframe::M60).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
-        let daily = aggregate(&raw, Timeframe::Day).iter().filter_map(|k| DT::from_bar_ts(&k.datetime).map(|dt| Bar { dt, open:k.open, high:k.high, low:k.low, close:k.close, volume:k.volume, hold:k.hold, rollover:false })).collect::<Vec<_>>();
+        let raw = raw_rows
+            .iter()
+            .map(crate::service::model_to_fetch)
+            .collect::<Vec<_>>();
+        let bars60 = aggregate(&raw, Timeframe::M60)
+            .iter()
+            .filter_map(|k| {
+                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
+                    dt,
+                    open: k.open,
+                    high: k.high,
+                    low: k.low,
+                    close: k.close,
+                    volume: k.volume,
+                    hold: k.hold,
+                    rollover: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let daily = aggregate(&raw, Timeframe::Day)
+            .iter()
+            .filter_map(|k| {
+                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
+                    dt,
+                    open: k.open,
+                    high: k.high,
+                    low: k.low,
+                    close: k.close,
+                    volume: k.volume,
+                    hold: k.hold,
+                    rollover: false,
+                })
+            })
+            .collect::<Vec<_>>();
         for event in events {
             result.events_seen += 1;
-            let context = event.trigger_bar_ts.as_deref().and_then(|ts| extract_market_context(&symbol, ts, &event.direction, &bars, &bars60, &daily, &rollover_records));
+            let context = event.trigger_bar_ts.as_deref().and_then(|ts| {
+                extract_market_context(
+                    &symbol,
+                    ts,
+                    &event.direction,
+                    &bars,
+                    &bars60,
+                    &daily,
+                    &rollover_records,
+                )
+            });
             let Some(row) = dataset_row_from_event_with_context(&event, &bars, context) else {
                 continue;
             };

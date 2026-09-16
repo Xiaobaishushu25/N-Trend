@@ -1,7 +1,7 @@
-﻿//! Market data source trait abstraction.
+//! Market data source trait abstraction.
 
-use std::collections::HashMap;
 use anyhow::Result;
+use std::collections::HashMap;
 
 use crate::fetch::kline::{Kline, RawKlineResponse};
 use crate::fetch::quotes::Quote;

@@ -63,9 +63,13 @@ pub fn extract_market_context(
         .rev()
         .take(10)
         .map(|b| date(b))
-        .any(|day| rollovers.iter().any(|r| {
-            parse_dt(&r.ts).map(|ts| trading_day(ts) == day).unwrap_or(false)
-        }));
+        .any(|day| {
+            rollovers.iter().any(|r| {
+                parse_dt(&r.ts)
+                    .map(|ts| trading_day(ts) == day)
+                    .unwrap_or(false)
+            })
+        });
 
     let mut snapshot = MarketContextSnapshot {
         as_of_ts: as_of_ts.to_string(),
@@ -86,7 +90,11 @@ pub fn extract_market_context(
         crossed_rollover_10d,
     };
 
-    let side = if direction == "down" || direction == "short" { -1.0 } else { 1.0 };
+    let side = if direction == "down" || direction == "short" {
+        -1.0
+    } else {
+        1.0
+    };
     if eligible60.len() >= 60 {
         let closed: Vec<Bar> = eligible60.into_iter().cloned().collect();
         let atr = indicators::atr(&closed, 20);
@@ -153,7 +161,9 @@ fn date(bar: &Bar) -> NaiveDate {
 
 fn ema(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
     let mut out = vec![None; bars.len()];
-    if bars.len() < period || period == 0 { return out; }
+    if bars.len() < period || period == 0 {
+        return out;
+    }
     let mut value = bars[..period].iter().map(|b| b.close).sum::<f64>() / period as f64;
     out[period - 1] = Some(value);
     let alpha = 2.0 / (period as f64 + 1.0);
@@ -165,12 +175,18 @@ fn ema(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
 }
 
 fn daily_atr(bars: &[&Bar]) -> f64 {
-    if bars.is_empty() { return 0.0; }
+    if bars.is_empty() {
+        return 0.0;
+    }
     let mut total = 0.0;
     for (i, bar) in bars.iter().enumerate() {
-        let tr = if i == 0 { bar.high - bar.low } else {
+        let tr = if i == 0 {
+            bar.high - bar.low
+        } else {
             let prev = bars[i - 1].close;
-            (bar.high - bar.low).max((bar.high - prev).abs()).max((bar.low - prev).abs())
+            (bar.high - bar.low)
+                .max((bar.high - prev).abs())
+                .max((bar.low - prev).abs())
         };
         total += tr;
     }
@@ -180,7 +196,9 @@ fn daily_atr(bars: &[&Bar]) -> f64 {
 fn adx(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
     let n = bars.len();
     let mut out = vec![None; n];
-    if period == 0 || n < period * 2 { return out; }
+    if period == 0 || n < period * 2 {
+        return out;
+    }
     let mut tr = vec![0.0; n];
     let mut plus = vec![0.0; n];
     let mut minus = vec![0.0; n];
@@ -190,22 +208,32 @@ fn adx(bars: &[Bar], period: usize) -> Vec<Option<f64>> {
             .max((bars[i].low - bars[i - 1].close).abs());
         let up = bars[i].high - bars[i - 1].high;
         let down = bars[i - 1].low - bars[i].low;
-        if up > down && up > 0.0 { plus[i] = up; }
-        if down > up && down > 0.0 { minus[i] = down; }
+        if up > down && up > 0.0 {
+            plus[i] = up;
+        }
+        if down > up && down > 0.0 {
+            minus[i] = down;
+        }
     }
     let mut dx = vec![None; n];
     for i in period..n {
         let start = i + 1 - period;
         let atr = tr[start..=i].iter().sum::<f64>();
-        if atr <= 0.0 { continue; }
+        if atr <= 0.0 {
+            continue;
+        }
         let pdi = 100.0 * plus[start..=i].iter().sum::<f64>() / atr;
         let mdi = 100.0 * minus[start..=i].iter().sum::<f64>() / atr;
         let denom = pdi + mdi;
-        if denom > 0.0 { dx[i] = Some(100.0 * (pdi - mdi).abs() / denom); }
+        if denom > 0.0 {
+            dx[i] = Some(100.0 * (pdi - mdi).abs() / denom);
+        }
     }
     for i in (period * 2 - 1)..n {
         let values: Vec<f64> = dx[i + 1 - period..=i].iter().filter_map(|v| *v).collect();
-        if values.len() == period { out[i] = Some(values.iter().sum::<f64>() / period as f64); }
+        if values.len() == period {
+            out[i] = Some(values.iter().sum::<f64>() / period as f64);
+        }
     }
     out
 }
@@ -216,7 +244,24 @@ mod tests {
     use crate::analyze::model::DT;
 
     fn bars(n: usize, scale: f64) -> Vec<Bar> {
-        (0..n).map(|i| Bar { dt: DT { year: 2024, month: 1, day: 1 + (i / 24) as i32, hour: (i % 24) as i32, minute: 0 }, open: 100.0 + i as f64 * scale, high: 101.0 + i as f64 * scale, low: 99.0 + i as f64 * scale, close: 100.0 + i as f64 * scale, volume: 1.0, hold: 1.0, rollover: false }).collect()
+        (0..n)
+            .map(|i| Bar {
+                dt: DT {
+                    year: 2024,
+                    month: 1,
+                    day: 1 + (i / 24) as i32,
+                    hour: (i % 24) as i32,
+                    minute: 0,
+                },
+                open: 100.0 + i as f64 * scale,
+                high: 101.0 + i as f64 * scale,
+                low: 99.0 + i as f64 * scale,
+                close: 100.0 + i as f64 * scale,
+                volume: 1.0,
+                hold: 1.0,
+                rollover: false,
+            })
+            .collect()
     }
 
     #[test]
@@ -227,10 +272,16 @@ mod tests {
         let as_of = b15[400].dt.to_bar_ts();
         let before = extract_market_context("RB0", &as_of, "up", &b15, &b60, &daily, &[]).unwrap();
         let mut mutated = b15.clone();
-        for bar in mutated.iter_mut().skip(401) { bar.high *= 10.0; bar.low *= 10.0; bar.close *= 10.0; }
-        let after_mutation = extract_market_context("RB0", &as_of, "up", &mutated, &b60, &daily, &[]).unwrap();
+        for bar in mutated.iter_mut().skip(401) {
+            bar.high *= 10.0;
+            bar.low *= 10.0;
+            bar.close *= 10.0;
+        }
+        let after_mutation =
+            extract_market_context("RB0", &as_of, "up", &mutated, &b60, &daily, &[]).unwrap();
         assert_eq!(before, after_mutation);
-        let deleted = extract_market_context("RB0", &as_of, "up", &b15[..=400], &b60, &daily, &[]).unwrap();
+        let deleted =
+            extract_market_context("RB0", &as_of, "up", &b15[..=400], &b60, &daily, &[]).unwrap();
         assert_eq!(before, deleted);
     }
 
@@ -241,7 +292,9 @@ mod tests {
         let daily = bars(30 * 24, 0.5);
         let as_of = b15[400].dt.to_bar_ts();
         let mut mutated = b60.clone();
-        for bar in mutated.iter_mut().skip(401) { bar.close *= 10.0; }
+        for bar in mutated.iter_mut().skip(401) {
+            bar.close *= 10.0;
+        }
         let a = extract_market_context("RB0", &as_of, "up", &b15, &b60, &daily, &[]).unwrap();
         let b = extract_market_context("RB0", &as_of, "up", &b15, &mutated, &daily, &[]).unwrap();
         assert_eq!(a, b);
@@ -253,10 +306,22 @@ mod tests {
         let b60 = bars(500, 0.2);
         let daily = bars(30 * 24, 0.5);
         let rollover = RolloverRecord {
-            symbol: "RB0".into(), ts: "2024-01-15 21:00:00".into(),
-            from_contract: "RB2405".into(), to_contract: "RB2409".into(), confirmed: true,
+            symbol: "RB0".into(),
+            ts: "2024-01-15 21:00:00".into(),
+            from_contract: "RB2405".into(),
+            to_contract: "RB2409".into(),
+            confirmed: true,
         };
-        let snapshot = extract_market_context("RB0", &b15[400].dt.to_bar_ts(), "up", &b15, &b60, &daily, &[rollover]).unwrap();
+        let snapshot = extract_market_context(
+            "RB0",
+            &b15[400].dt.to_bar_ts(),
+            "up",
+            &b15,
+            &b60,
+            &daily,
+            &[rollover],
+        )
+        .unwrap();
         assert!(snapshot.crossed_rollover_10d);
         assert!(snapshot.trend_10d.is_none());
         assert!(snapshot.range_position_10d.is_none());

@@ -229,7 +229,9 @@ impl SinaRequestCoordinator {
 
     /// Dynamically updates the rate limiter parameters (e.g. on config change).
     pub async fn update_limits(&self, interval_ms: u64, minutely_budget: usize) {
-        self.limiter.update_limits(interval_ms, minutely_budget).await;
+        self.limiter
+            .update_limits(interval_ms, minutely_budget)
+            .await;
     }
 
     /// Returns current queue stats.

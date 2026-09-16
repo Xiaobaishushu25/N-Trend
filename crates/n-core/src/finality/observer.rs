@@ -19,9 +19,7 @@ use tracing::{error, info, warn};
 
 use crate::fetch::kline::fetch_minute_raw;
 use crate::fetch::SinaClient;
-use crate::finality::model::{
-    BarFingerprint, ObservationRecord, SessionType, DEFAULT_SENTINELS,
-};
+use crate::finality::model::{BarFingerprint, ObservationRecord, SessionType, DEFAULT_SENTINELS};
 use crate::finality::tracker::BarFinalityTracker;
 use crate::storage::repo::{insert_bar_observation, upsert_finality_trial};
 
@@ -111,7 +109,9 @@ impl FinalityObserver {
         tokio::spawn(async move {
             info!(
                 "🔭 Finality 独立观测系统已启动 | 哨兵品种: {:?} | 探测周期: {}s | 观察时长: {}s",
-                self.config.sentinels, self.config.probe_interval_secs, self.config.observe_duration_secs
+                self.config.sentinels,
+                self.config.probe_interval_secs,
+                self.config.observe_duration_secs
             );
 
             // 每 1 秒轮询一次当前秒数，对齐 5m 边界整点 (minute % 5 == 0 && second == 0)
@@ -132,7 +132,10 @@ impl FinalityObserver {
                     last_observed_boundary = Some(boundary_ts.clone());
 
                     if is_valid_5m_trading_boundary(&now) {
-                        info!("🎯 捕获 5m 观测边界: {}，启动 T+0~T+120s 影子探测会话", boundary_ts);
+                        info!(
+                            "🎯 捕获 5m 观测边界: {}，启动 T+0~T+120s 影子探测会话",
+                            boundary_ts
+                        );
                         let observer = self.clone();
                         tokio::spawn(async move {
                             observer.run_observation_session(&boundary_ts, now).await;
@@ -152,10 +155,13 @@ impl FinalityObserver {
             trackers.insert(sym.clone(), BarFinalityTracker::new(sym, bar_ts, st));
         }
 
-        let total_probes = (self.config.observe_duration_secs / self.config.probe_interval_secs) as i32 + 1;
+        let total_probes =
+            (self.config.observe_duration_secs / self.config.probe_interval_secs) as i32 + 1;
         info!(
             "[{}] 开始会话: 监控 {} 个哨兵品种，预计探测 {} 轮",
-            bar_ts, sentinels.len(), total_probes
+            bar_ts,
+            sentinels.len(),
+            total_probes
         );
 
         for probe_index in 0..total_probes {
@@ -180,7 +186,9 @@ impl FinalityObserver {
                                 if res.became_candidate_final {
                                     info!(
                                         "⚡ [Candidate Final] 品种: {} | 延迟: {:.1}s | 指纹: {}",
-                                        symbol, elapsed_ms as f64 / 1000.0, fp.signature()
+                                        symbol,
+                                        elapsed_ms as f64 / 1000.0,
+                                        fp.signature()
                                     );
                                 }
                                 if res.became_false_final {
@@ -201,7 +209,9 @@ impl FinalityObserver {
                                     id: None,
                                     symbol: symbol.clone(),
                                     bar_ts: bar_ts.to_string(),
-                                    observed_at: probe_time.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                                    observed_at: probe_time
+                                        .format("%Y-%m-%d %H:%M:%S%.3f")
+                                        .to_string(),
                                     elapsed_ms,
                                     probe_index,
                                     open: bar.open,
@@ -216,7 +226,8 @@ impl FinalityObserver {
                                     raw_response: raw_to_save,
                                 };
 
-                                if let Err(e) = insert_bar_observation(&self.db, &obs_record).await {
+                                if let Err(e) = insert_bar_observation(&self.db, &obs_record).await
+                                {
                                     error!("写入 bar_observation 失败: {e:?}");
                                 }
 

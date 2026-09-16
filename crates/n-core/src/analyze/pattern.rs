@@ -242,7 +242,12 @@ pub fn make_pattern(
         grade,
         hard_failure,
         a_too_long: a_bars > 7,
-        b_too_long: match grade { Grade::A => b_bars > 8, Grade::B => b_bars > 12, Grade::C => b_bars > 14, _ => b_bars > 8 },
+        b_too_long: match grade {
+            Grade::A => b_bars > 8,
+            Grade::B => b_bars > 12,
+            Grade::C => b_bars > 14,
+            _ => b_bars > 8,
+        },
         b_fast: b_speed > 0.8 * a_speed,
         b_weakening,
         b_weakening_ratio,
@@ -358,9 +363,22 @@ pub(crate) fn best_pattern_for_b_end(
         }
 
         if let Some(p) = make_pattern(level, dir, *s0, s1, b_end, bars, trend_k) {
-            let cur_score = scoring::score_a(bars, &atr20, &p)*0.6 + scoring::score_b(&p)*0.2;
-            let best_score = best.as_ref().map(|b| scoring::score_a(bars, &atr20, b)*0.6 + scoring::score_b(b)*0.2).unwrap_or(f64::NEG_INFINITY);
-            if best.as_ref().map_or(true, |b| if p.hard_failure != b.hard_failure { !p.hard_failure } else if cur_score > best_score + 1e-9 { true } else if (cur_score - best_score).abs() <= 1e-9 { better_pattern(&p, b) } else { false }) {
+            let cur_score = scoring::score_a(bars, &atr20, &p) * 0.6 + scoring::score_b(&p) * 0.2;
+            let best_score = best
+                .as_ref()
+                .map(|b| scoring::score_a(bars, &atr20, b) * 0.6 + scoring::score_b(b) * 0.2)
+                .unwrap_or(f64::NEG_INFINITY);
+            if best.as_ref().map_or(true, |b| {
+                if p.hard_failure != b.hard_failure {
+                    !p.hard_failure
+                } else if cur_score > best_score + 1e-9 {
+                    true
+                } else if (cur_score - best_score).abs() <= 1e-9 {
+                    better_pattern(&p, b)
+                } else {
+                    false
+                }
+            }) {
                 best = Some(p);
             }
         }

@@ -216,7 +216,7 @@ async function handleRepairIntegrity() {
   }
   const ok = await confirmAction({
     title: "补全缺口",
-    content: "确定为 " + symbol.value + " 补全缺口吗？将从天勤/新浪拉取缺失的 5m K线并重算 15m/60m 派生。",
+    content: "确定为 " + symbol.value + " 补全缺口吗？将使用天勤拉取缺失的 5m K线并重算 15m/60m 派生；天勤不可用时不会使用新浪写入本地库。",
     positiveText: "开始补全",
     negativeText: "取消",
     type: "info",

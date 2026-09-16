@@ -3372,7 +3372,8 @@ impl Services {
             return Ok(ChartKlineResponse {
                 rows: self.get_klines(symbol, timeframe, limit).await?,
                 status: "tq_unavailable".to_string(),
-                message: "天勤暂不可用，已关闭新浪临时图表回退；当前仅显示本地最后一段数据。".to_string(),
+                message: "天勤暂不可用，已关闭新浪临时图表回退；当前仅显示本地最后一段数据。"
+                    .to_string(),
             });
         }
 

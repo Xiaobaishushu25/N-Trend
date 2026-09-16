@@ -91,12 +91,7 @@ impl FinalityJudger {
     }
 
     /// 查询特定品种单根 K 线是否已达到 Final 状态。
-    pub fn is_bar_final(
-        &self,
-        symbol: &str,
-        bar_dt: &NaiveDateTime,
-        now: &NaiveDateTime,
-    ) -> bool {
+    pub fn is_bar_final(&self, symbol: &str, bar_dt: &NaiveDateTime, now: &NaiveDateTime) -> bool {
         self.evaluate_bar(symbol, bar_dt, now) == FinalityStatus::Final
     }
 
@@ -155,13 +150,19 @@ mod tests {
 
         // 29 秒：尚在结算窗口，为 Candidate
         let now_29 = dt("2026-08-31 10:00:29");
-        assert_eq!(judger.evaluate_bar("RB0", &bar_dt, &now_29), FinalityStatus::Candidate);
+        assert_eq!(
+            judger.evaluate_bar("RB0", &bar_dt, &now_29),
+            FinalityStatus::Candidate
+        );
         assert!(!judger.is_bar_final("RB0", &bar_dt, &now_29));
         assert_eq!(judger.remaining_settle_secs("RB0", &bar_dt, &now_29), 1);
 
         // 30 秒：达到 minimum_settle，为 Final
         let now_30 = dt("2026-08-31 10:00:30");
-        assert_eq!(judger.evaluate_bar("RB0", &bar_dt, &now_30), FinalityStatus::Final);
+        assert_eq!(
+            judger.evaluate_bar("RB0", &bar_dt, &now_30),
+            FinalityStatus::Final
+        );
         assert!(judger.is_bar_final("RB0", &bar_dt, &now_30));
         assert_eq!(judger.remaining_settle_secs("RB0", &bar_dt, &now_30), 0);
     }
@@ -174,16 +175,25 @@ mod tests {
 
         // 普通 35 秒：对收盘 K 仍然是 Candidate（旧代码在此处误放行）
         let now_35 = dt("2026-08-31 11:30:35");
-        assert_eq!(judger.evaluate_bar("RB0", &close_dt, &now_35), FinalityStatus::Candidate);
+        assert_eq!(
+            judger.evaluate_bar("RB0", &close_dt, &now_35),
+            FinalityStatus::Candidate
+        );
         assert_eq!(judger.remaining_settle_secs("RB0", &close_dt, &now_35), 40);
 
         // 74 秒：仍需等待 1 秒
         let now_74 = dt("2026-08-31 11:31:14");
-        assert_eq!(judger.evaluate_bar("RB0", &close_dt, &now_74), FinalityStatus::Candidate);
+        assert_eq!(
+            judger.evaluate_bar("RB0", &close_dt, &now_74),
+            FinalityStatus::Candidate
+        );
 
         // 75 秒：收盘 K 线正式 Final
         let now_75 = dt("2026-08-31 11:31:15");
-        assert_eq!(judger.evaluate_bar("RB0", &close_dt, &now_75), FinalityStatus::Final);
+        assert_eq!(
+            judger.evaluate_bar("RB0", &close_dt, &now_75),
+            FinalityStatus::Final
+        );
         assert!(judger.is_bar_final("RB0", &close_dt, &now_75));
         assert_eq!(judger.remaining_settle_secs("RB0", &close_dt, &now_75), 0);
     }

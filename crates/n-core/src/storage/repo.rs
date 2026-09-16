@@ -11,8 +11,8 @@ use sea_orm::{
 use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
     bar_finality_trials, bar_observations, groups, klines, manual_level_events, manual_levels,
-    pattern_events, preclose_candidates, preclose_signals, rollovers, settings, signal_annotations, signal_decisions,
-    symbol_groups, symbols,
+    pattern_events, preclose_candidates, preclose_signals, rollovers, settings, signal_annotations,
+    signal_decisions, symbol_groups, symbols,
 };
 
 /// Move a trained model through the lifecycle registry.  Promotion is
@@ -1265,9 +1265,7 @@ pub async fn insert_manual_level(
     row: manual_levels::ActiveModel,
 ) -> Result<manual_levels::Model> {
     db.transaction::<_, manual_levels::Model, anyhow::Error>(|txn| {
-        Box::pin(async move {
-            Ok(row.insert(txn).await?)
-        })
+        Box::pin(async move { Ok(row.insert(txn).await?) })
     })
     .await
     .context("创建关键区域失败")
@@ -1345,7 +1343,10 @@ pub async fn delete_manual_level(db: &DatabaseConnection, id: i64) -> Result<()>
         .await
         .context("删除关键区域失败")?;
     if result.rows_affected != 1 {
-        return Err(anyhow!("删除关键区域失败: 影响行数 {}", result.rows_affected));
+        return Err(anyhow!(
+            "删除关键区域失败: 影响行数 {}",
+            result.rows_affected
+        ));
     }
     Ok(())
 }

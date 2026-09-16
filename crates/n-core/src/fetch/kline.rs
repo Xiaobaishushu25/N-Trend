@@ -102,7 +102,11 @@ pub fn settled_kline_rows(rows: Vec<Kline>, now: NaiveDateTime) -> Vec<Kline> {
 }
 
 /// 按指定品种时段与 Finality 策略过滤已定版 K 线。
-pub fn filter_final_rows_for_symbol(symbol: &str, rows: Vec<Kline>, now: NaiveDateTime) -> Vec<Kline> {
+pub fn filter_final_rows_for_symbol(
+    symbol: &str,
+    rows: Vec<Kline>,
+    now: NaiveDateTime,
+) -> Vec<Kline> {
     crate::finality::FinalityJudger::default().filter_final_rows(symbol, rows, now)
 }
 
@@ -373,10 +377,10 @@ mod tests {
             volume: 100.0,
             hold: 1000.0,
         };
-        let not_yet = NaiveDateTime::parse_from_str("2026-08-19 14:15:29", "%Y-%m-%d %H:%M:%S")
-            .unwrap();
-        let settled = NaiveDateTime::parse_from_str("2026-08-19 14:15:30", "%Y-%m-%d %H:%M:%S")
-            .unwrap();
+        let not_yet =
+            NaiveDateTime::parse_from_str("2026-08-19 14:15:29", "%Y-%m-%d %H:%M:%S").unwrap();
+        let settled =
+            NaiveDateTime::parse_from_str("2026-08-19 14:15:30", "%Y-%m-%d %H:%M:%S").unwrap();
         assert!(settled_kline_rows(vec![row.clone()], not_yet).is_empty());
         assert_eq!(settled_kline_rows(vec![row], settled).len(), 1);
     }
@@ -393,12 +397,17 @@ mod tests {
             hold: 1000.0,
         };
         // 11:30:40 (40秒后)：普通 K 线已通过，但收盘 K 仍未过 75s
-        let now_40 = NaiveDateTime::parse_from_str("2026-08-19 11:30:40", "%Y-%m-%d %H:%M:%S").unwrap();
+        let now_40 =
+            NaiveDateTime::parse_from_str("2026-08-19 11:30:40", "%Y-%m-%d %H:%M:%S").unwrap();
         assert!(filter_final_rows_for_symbol("RB0", vec![row.clone()], now_40).is_empty());
 
         // 11:31:15 (75秒后)：收盘 K 线正式定版通过
-        let now_75 = NaiveDateTime::parse_from_str("2026-08-19 11:31:15", "%Y-%m-%d %H:%M:%S").unwrap();
-        assert_eq!(filter_final_rows_for_symbol("RB0", vec![row], now_75).len(), 1);
+        let now_75 =
+            NaiveDateTime::parse_from_str("2026-08-19 11:31:15", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(
+            filter_final_rows_for_symbol("RB0", vec![row], now_75).len(),
+            1
+        );
     }
 
     #[test]
@@ -412,8 +421,8 @@ mod tests {
             volume: 100.0,
             hold: 1000.0,
         };
-        let just_arrived = NaiveDateTime::parse_from_str("2026-08-19 14:15:05", "%Y-%m-%d %H:%M:%S")
-            .unwrap();
+        let just_arrived =
+            NaiveDateTime::parse_from_str("2026-08-19 14:15:05", "%Y-%m-%d %H:%M:%S").unwrap();
         // 生产链路 30s 过滤会丢弃
         assert!(settled_kline_rows(vec![row.clone()], just_arrived).is_empty());
         // 原始抓取保留

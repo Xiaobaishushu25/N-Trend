@@ -10,10 +10,16 @@ pub struct StateMachine {
 
 impl StateMachine {
     pub fn new() -> Self {
-        Self { state: EventState::SetupDetected, last_advance_ts: None }
+        Self {
+            state: EventState::SetupDetected,
+            last_advance_ts: None,
+        }
     }
     pub fn with_state(state: EventState) -> Self {
-        Self { state, last_advance_ts: None }
+        Self {
+            state,
+            last_advance_ts: None,
+        }
     }
     /// Try to advance; returns error if transition illegal
     pub fn try_advance(&mut self, next: EventState, bar_ts: &str) -> anyhow::Result<()> {
@@ -37,7 +43,9 @@ impl StateMachine {
 }
 
 impl Default for StateMachine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -46,11 +54,14 @@ mod tests {
     #[test]
     fn advance_guards_replay() {
         let mut sm = StateMachine::new();
-        sm.try_advance(EventState::WaitingTrigger, "2024-01-01 10:00:00").unwrap();
+        sm.try_advance(EventState::WaitingTrigger, "2024-01-01 10:00:00")
+            .unwrap();
         // same bar re-advance is idempotent
-        sm.try_advance(EventState::WaitingTrigger, "2024-01-01 10:00:00").unwrap_err();
+        sm.try_advance(EventState::WaitingTrigger, "2024-01-01 10:00:00")
+            .unwrap_err();
         // but Touch is allowed from Waiting
-        sm.try_advance(EventState::TriggerTouched, "2024-01-01 10:15:00").unwrap();
+        sm.try_advance(EventState::TriggerTouched, "2024-01-01 10:15:00")
+            .unwrap();
         assert_eq!(sm.state, EventState::TriggerTouched);
     }
 }

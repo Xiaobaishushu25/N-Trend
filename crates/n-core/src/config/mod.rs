@@ -93,15 +93,13 @@ impl Config {
             match std::fs::read_to_string(path) {
                 Ok(text) => match serde_json::from_str::<Config>(&text) {
                     Ok(mut config) => {
-                        let stored_preclose_version = serde_json::from_str::<serde_json::Value>(&text)
-                            .ok()
-                            .and_then(|value| {
-                                value
-                                    .get("preclose")?
-                                    .get("schema_version")?
-                                    .as_u64()
-                            })
-                            .unwrap_or(1) as u32;
+                        let stored_preclose_version =
+                            serde_json::from_str::<serde_json::Value>(&text)
+                                .ok()
+                                .and_then(|value| {
+                                    value.get("preclose")?.get("schema_version")?.as_u64()
+                                })
+                                .unwrap_or(1) as u32;
                         if stored_preclose_version < PRECLOSE_CONFIG_SCHEMA_VERSION {
                             // v1 的 30 分钟是旧默认值；升级为新的 60 分钟默认。
                             // schema_version 落盘后，用户日后主动改回 30 分钟不会再被覆盖。
@@ -579,7 +577,10 @@ mod tests {
         assert_eq!(config.notify.new_pattern_min_score, 0.0);
         assert_eq!(config.preclose.lead_secs, 180);
         assert_eq!(config.preclose.horizon_minutes, 60);
-        assert_eq!(config.preclose.schema_version, PRECLOSE_CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            config.preclose.schema_version,
+            PRECLOSE_CONFIG_SCHEMA_VERSION
+        );
         assert_eq!(config.ui.score_pill_full_score, 3.5);
     }
 

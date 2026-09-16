@@ -2,7 +2,7 @@
 //!
 //! 实现缺洞自愈修复管道（Issue 05）：
 //! 1. 扫描检测报告中的可恢复数据洞（Recoverable Gaps）；
-//! 2. 通过共享 `SinaClient` 重新获取包含该区间的原始 K 线批次；
+//! 2. 通过天勤重新获取包含该区间的原始 K 线批次；
 //! 3. 接入 `RawPipeline::process_raw_batch` 进行原子入库与受影响 Derived K 线的同步重算；
 //! 4. 自动复检修复效果，生成修复前后对比报告。
 
@@ -11,13 +11,9 @@ use chrono::NaiveDateTime;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
 
-use crate::fetch::datasource::MarketDataSource;
-use crate::fetch::HybridDataSource;
-#[allow(unused_imports)]
-use crate::fetch::SinaClient; // for test wrapper only
-#[allow(unused_imports)] use crate::fetch::SinaClient as _SinaClient2;
-use crate::service::pipeline::RawPipeline;
 use super::checker::RawDataIntegrityChecker;
+use crate::fetch::HybridDataSource;
+use crate::service::pipeline::RawPipeline;
 
 /// 单品种缺洞修复结果统计。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,7 +37,8 @@ impl IntegrityRepairer {
         symbol: &str,
         max_api_window_bars: usize,
     ) -> Result<RepairResult> {
-        let initial_report = RawDataIntegrityChecker::inspect_symbol(db, symbol, max_api_window_bars).await?;
+        let initial_report =
+            RawDataIntegrityChecker::inspect_symbol(db, symbol, max_api_window_bars).await?;
 
         if initial_report.missing_count == 0 {
             return Ok(RepairResult {
@@ -67,7 +64,7 @@ impl IntegrityRepairer {
                 repaired_count: 0,
                 remaining_missing: initial_report.missing_count,
                 is_fully_repaired: false,
-                message: "缺失区间已超出新浪接口回溯窗口（永久历史缺口），无法自动恢复".to_string(),
+                message: "缺失区间已超出天勤接口回溯窗口（永久历史缺口），无法自动恢复".to_string(),
             });
         }
 
@@ -93,7 +90,7 @@ impl IntegrityRepairer {
             _ => max_api_window_bars,
         };
 
-                tracing::info!(
+        tracing::info!(
             "🔧 [{symbol}] 启动数据缺洞自愈: 发现 {} 个可恢复缺口 (共 {} 根缺失)，请求回补 {} 根 5m",
             recoverable_gaps.len(),
             initial_report.missing_count,
@@ -106,7 +103,11 @@ impl IntegrityRepairer {
                 g.start_ts,
                 g.end_ts,
                 g.missing_count,
-                if g.recoverable_by_api { "可恢复" } else { "不可恢复" }
+                if g.recoverable_by_api {
+                    "可恢复"
+                } else {
+                    "不可恢复"
+                }
             );
         }
         if initial_report.missing_gaps.len() > recoverable_gaps.len() {
@@ -114,18 +115,24 @@ impl IntegrityRepairer {
                 if !g.recoverable_by_api {
                     tracing::warn!(
                         "   ↳ 永久缺口(超出API窗口) [{}]: {} ~ {} 缺{}根",
-                        symbol, g.start_ts, g.end_ts, g.missing_count
+                        symbol,
+                        g.start_ts,
+                        g.end_ts,
+                        g.missing_count
                     );
                 }
             }
         }
 
-        // 重新拉取对应跨度的 5m K线：优先走当前主力（天勤优先，新浪兜底），与日常 Hybrid 保持一致
-        let fetch_source = if hybrid.tq_is_available() { "天勤(Hybrid→tqsdk)" } else { "新浪(Hybrid→sina)" };
-        tracing::info!("📡 [{symbol}] 补全数据源: {} (tq_available={})", fetch_source, hybrid.tq_is_available());
-        let fetched = hybrid.fetch_minute(symbol, "5", needed_count)
+        // 缺口修复会写入本地标准库，必须使用天勤专用通道，禁止新浪回退。
+        tracing::info!(
+            "📡 [{symbol}] 补全数据源: 天勤(tqsdk-only) (tq_available={})",
+            hybrid.tq_is_available()
+        );
+        let fetched = hybrid
+            .fetch_tq_minute(symbol, "5", needed_count)
             .await
-            .context("缺洞修复抓取失败")?;
+            .context("天勤缺洞修复抓取失败")?;
         tracing::info!(
             "📥 [{symbol}] 回补抓取完成: 返回 {} 根 5m | 区间 {} ~ {} | 请求 {} 根",
             fetched.len(),
@@ -134,8 +141,8 @@ impl IntegrityRepairer {
             needed_count
         );
         tracing::info!(
-            "   ↳ 实际使用: {} | fetched_len={}",
-            fetch_source, fetched.len()
+            "   ↳ 实际使用: 天勤(tqsdk-only) | fetched_len={}",
+            fetched.len()
         );
 
         // 接入 RawPipeline 原子落库并重新派生受影响的 15m/60m
@@ -145,12 +152,21 @@ impl IntegrityRepairer {
             .context("缺洞修复数据写入原子管道失败")?;
 
         // 复检修复后的状态
-        let post_report = RawDataIntegrityChecker::inspect_symbol(db, symbol, max_api_window_bars).await?;
-        let repaired = initial_report.missing_count.saturating_sub(post_report.missing_count);
+        let post_report =
+            RawDataIntegrityChecker::inspect_symbol(db, symbol, max_api_window_bars).await?;
+        let repaired = initial_report
+            .missing_count
+            .saturating_sub(post_report.missing_count);
         let fully_repaired = post_report.missing_count == 0;
         tracing::info!(
             "📊 [{symbol}] 自愈复检: {} | 初始缺{}  repaired={} 剩余缺{} 全量修复={}",
-            if fully_repaired { "✅ 全部补齐" } else if repaired>0 { "⚠️ 部分补齐" } else { "❌ 未补到" },
+            if fully_repaired {
+                "✅ 全部补齐"
+            } else if repaired > 0 {
+                "⚠️ 部分补齐"
+            } else {
+                "❌ 未补到"
+            },
             initial_report.missing_count,
             repaired,
             post_report.missing_count,
@@ -160,14 +176,21 @@ impl IntegrityRepairer {
             for g in &post_report.missing_gaps {
                 tracing::warn!(
                     "   ↳ 仍缺 [{}]: {} ~ {} 缺{}根 {}",
-                    symbol, g.start_ts, g.end_ts, g.missing_count,
-                    if g.recoverable_by_api { "可恢复" } else { "永久缺口" }
+                    symbol,
+                    g.start_ts,
+                    g.end_ts,
+                    g.missing_count,
+                    if g.recoverable_by_api {
+                        "可恢复"
+                    } else {
+                        "永久缺口"
+                    }
                 );
             }
         }
         if repaired == 0 && !fully_repaired {
             tracing::warn!(
-                "⚠️ [{symbol}] 抓取区间 {} ~ {} 未覆盖缺口 {} ~ {} 或被Finality过滤，请检查fetch_minute返回 | needed={} fetched={}",
+                "⚠️ [{symbol}] 天勤抓取区间 {} ~ {} 未覆盖缺口 {} ~ {} 或被Finality过滤，请检查fetch_tq_minute返回 | needed={} fetched={}",
                 fetched.first().map(|k| k.datetime.as_str()).unwrap_or("-"),
                 fetched.last().map(|k| k.datetime.as_str()).unwrap_or("-"),
                 recoverable_gaps.first().map(|g| g.start_ts.as_str()).unwrap_or("-"),
@@ -180,7 +203,10 @@ impl IntegrityRepairer {
         let message = if fully_repaired {
             format!("成功补齐全部 {} 根缺失 K 线", repaired)
         } else if repaired > 0 {
-            format!("成功补齐 {} 根，仍有 {} 根属于永久历史缺口", repaired, post_report.missing_count)
+            format!(
+                "成功补齐 {} 根，仍有 {} 根属于永久历史缺口",
+                repaired, post_report.missing_count
+            )
         } else {
             "接口未返回所需历史区间，未能修复缺口".to_string()
         };
@@ -199,8 +225,8 @@ impl IntegrityRepairer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::pipeline::SymbolLocks;
     use crate::fetch::kline::Kline;
+    use crate::service::pipeline::SymbolLocks;
 
     #[tokio::test]
     async fn test_repair_symbol_already_clean() {
@@ -233,6 +259,3 @@ mod tests {
         assert_eq!(res.initial_missing, 0);
     }
 }
-
-
-

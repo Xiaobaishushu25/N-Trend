@@ -1,12 +1,11 @@
-/// V2 Probabilistic Decision Pipeline
-/// Phase 1: version contracts + state machine + feature/replay/dataset/model modules
-
-pub mod state_machine;
-pub mod features;
-pub mod replay;
 pub mod dataset;
+pub mod features;
 pub mod model;
 pub mod prediction;
+pub mod replay;
+/// V2 Probabilistic Decision Pipeline
+/// Phase 1: version contracts + state machine + feature/replay/dataset/model modules
+pub mod state_machine;
 pub mod version;
 
 /// Feature schema version — bump when any feature definition changes

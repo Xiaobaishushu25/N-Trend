@@ -55,9 +55,7 @@ pub fn is_valid_5m_slot(symbol: &str, dt: &NaiveDateTime) -> bool {
     if is_night_part2 {
         if matches!(
             night_type,
-            NightSessionType::Close2330
-                | NightSessionType::Close0100
-                | NightSessionType::Close0230
+            NightSessionType::Close2330 | NightSessionType::Close0100 | NightSessionType::Close0230
         ) {
             return matches!(
                 weekday,
@@ -139,7 +137,11 @@ pub fn next_expected_5m_slot(symbol: &str, current: NaiveDateTime) -> Option<Nai
             return Some(target_date.and_hms_opt(21, 5, 0)?);
         } else {
             // 无夜盘，周五跳到下周一 09:05；周一到周四跳到明天 09:05
-            let add_days = if current.weekday() == Weekday::Fri { 3 } else { 1 };
+            let add_days = if current.weekday() == Weekday::Fri {
+                3
+            } else {
+                1
+            };
             return Some((date + chrono::Duration::days(add_days)).and_hms_opt(9, 5, 0)?);
         }
     }
@@ -248,7 +250,7 @@ mod tests {
         // RB0 有夜盘，周五 15:00 -> 周一 21:05
         assert_eq!(
             next_expected_5m_slot("RB0", dt("2026-08-28 15:00:00")).unwrap(), // 2026-08-28 是周五
-            dt("2026-08-31 21:05:00")                                        // 2026-08-31 是周一
+            dt("2026-08-31 21:05:00")                                         // 2026-08-31 是周一
         );
 
         // CJ0 无夜盘，周五 15:00 -> 周一 09:05

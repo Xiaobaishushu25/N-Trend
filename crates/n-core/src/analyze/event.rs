@@ -82,8 +82,6 @@ fn warning_kind_at(
     None
 }
 
-
-
 fn pattern_for_current_bar(
     level: &'static str,
     dir: Dir,

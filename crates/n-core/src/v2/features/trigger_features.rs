@@ -48,17 +48,28 @@ pub fn extract_trigger_features(
     let close_location = (trigger_bar.close - trigger_bar.low) / range;
     let body = (trigger_bar.close - trigger_bar.open).abs();
     let body_atr = body / atr;
-    let wick = (trigger_bar.high - trigger_bar.open.max(trigger_bar.close)).max(trigger_bar.open.min(trigger_bar.close) - trigger_bar.low);
+    let wick = (trigger_bar.high - trigger_bar.open.max(trigger_bar.close))
+        .max(trigger_bar.open.min(trigger_bar.close) - trigger_bar.low);
     let wick_atr = wick / atr;
-    let overshoot_r = if risk.abs() > 1e-9 { (trigger_bar.close - trigger_level) / risk } else { 0.0 };
+    let overshoot_r = if risk.abs() > 1e-9 {
+        (trigger_bar.close - trigger_level) / risk
+    } else {
+        0.0
+    };
     // For short, overshoot should be negative direction; we keep signed — normalization handles it
     let chase_r = overshoot_r.abs();
-    let swing_r = internal_swing_margin.map(|v| if risk.abs()>1e-9 { v / risk } else { 0.0 });
+    let swing_r = internal_swing_margin.map(|v| if risk.abs() > 1e-9 { v / risk } else { 0.0 });
 
     let mut mask = 0u32;
-    if atr_missing { mask |= 4; } // bit4 = ATR missing (discard)
-    if volume_ratio.is_none() { mask |= 2; } // bit2 = vol missing (optional)
-    if oi_ratio.is_none() { mask |= 8; } // bit8 = OI missing (optional, never discard)
+    if atr_missing {
+        mask |= 4;
+    } // bit4 = ATR missing (discard)
+    if volume_ratio.is_none() {
+        mask |= 2;
+    } // bit2 = vol missing (optional)
+    if oi_ratio.is_none() {
+        mask |= 8;
+    } // bit8 = OI missing (optional, never discard)
 
     TriggerFeatures {
         trigger_bar_ts: trigger_bar.dt.to_bar_ts(),
@@ -83,7 +94,22 @@ mod tests {
     use crate::analyze::model::{Bar, DT};
     #[test]
     fn trigger_close_location() {
-        let b = Bar{ dt: DT{year:2024, month:1, day:1, hour:10, minute:15}, open:10.0, high:12.0, low:10.0, close:12.0, volume:1000.0, hold:0.0, rollover:false };
+        let b = Bar {
+            dt: DT {
+                year: 2024,
+                month: 1,
+                day: 1,
+                hour: 10,
+                minute: 15,
+            },
+            open: 10.0,
+            high: 12.0,
+            low: 10.0,
+            close: 12.0,
+            volume: 1000.0,
+            hold: 0.0,
+            rollover: false,
+        };
         let f = extract_trigger_features(&b, 11.0, 1.0, Some(1.0), Some(1.5), None, Some(0.5));
         assert!((f.close_location.unwrap() - 1.0).abs() < 1e-9);
         assert!((f.close_overshoot_r.unwrap() - 1.0).abs() < 1e-9);
