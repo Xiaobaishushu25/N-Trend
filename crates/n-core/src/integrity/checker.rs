@@ -301,6 +301,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_integrity_checker_detects_afternoon_hole() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+
+        // 午盘后的连续交易时段缺失 14:40 和 14:45，不能只依赖早盘样例。
+        let rows = vec![
+            make_row("RB0", "2026-08-28 14:35:00", 100.0),
+            make_row("RB0", "2026-08-28 14:50:00", 102.0),
+        ];
+        repo::upsert_klines(&db, rows).await.unwrap();
+
+        let report = RawDataIntegrityChecker::inspect_symbol(&db, "RB0", 1000)
+            .await
+            .unwrap();
+        assert_eq!(report.missing_count, 2);
+        assert_eq!(report.missing_gaps[0].start_ts, "2026-08-28 14:40:00");
+        assert_eq!(report.missing_gaps[0].end_ts, "2026-08-28 14:45:00");
+        assert!(report.missing_gaps[0].recoverable_by_api);
+    }
+
+    #[tokio::test]
     async fn test_integrity_checker_detects_unexpected_and_corrupted() {
         let db = crate::storage::connect(std::path::Path::new(":memory:"))
             .await

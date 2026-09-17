@@ -2806,6 +2806,16 @@ impl Services {
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
     pub async fn refresh_data(&self) -> Result<RefreshStats> {
+        self.refresh_data_inner(false).await
+    }
+
+    /// 数据源启动/恢复后的安全刷新：无论本地已有多少历史，都强制拉取一段完整窗口，
+    /// 避免实时订阅只推进最新时间而把中间缺口掩盖掉。
+    pub async fn refresh_data_with_backfill(&self) -> Result<RefreshStats> {
+        self.refresh_data_inner(true).await
+    }
+
+    async fn refresh_data_inner(&self, force_backfill: bool) -> Result<RefreshStats> {
         let _cycle_guard = self.data_cycle_lock.lock().await;
         let symbols = repo::list_symbols(&self.db, true).await?;
         let now = chrono::Local::now();
@@ -2816,7 +2826,7 @@ impl Services {
             if !crate::session::SessionCalendar::is_active_for_refresh(&sym.code, &now) {
                 continue;
             }
-            match self.refresh_symbol_data(&sym.code).await {
+            match self.refresh_symbol_data(&sym.code, force_backfill).await {
                 Ok(_) => stats.succeeded += 1,
                 Err(e) => {
                     stats.failures += 1;
@@ -2827,8 +2837,71 @@ impl Services {
         Ok(stats)
     }
 
-    async fn refresh_symbol_data(&self, code: &str) -> Result<()> {
+    async fn refresh_symbol_data(&self, code: &str, force_backfill: bool) -> Result<()> {
         let s = self.config().await;
+        let mut oldest_recoverable_gap: Option<String> = None;
+        let mut recoverable_missing_count = 0usize;
+        let mut integrity_check_failed = false;
+
+        // 日常刷新也检查中间缺口，不能只根据 latest_ts 推算增量数量。
+        // 只有天勤可用时才执行自动修复；天勤不可用时保留原有刷新错误语义，
+        // 避免把新浪回退数据混入标准 Raw 库。
+        if self.data_source.tq_is_available() {
+            match crate::integrity::RawDataIntegrityChecker::inspect_symbol(
+                &self.db,
+                code,
+                s.fetch.backfill_count,
+            )
+            .await
+            {
+                Ok(report) => {
+                    let recoverable_gaps: Vec<_> = report
+                        .missing_gaps
+                        .iter()
+                        .filter(|gap| gap.recoverable_by_api)
+                        .collect();
+                    recoverable_missing_count =
+                        recoverable_gaps.iter().map(|gap| gap.missing_count).sum();
+                    oldest_recoverable_gap = recoverable_gaps
+                        .iter()
+                        .min_by_key(|gap| gap.start_ts.as_str())
+                        .map(|gap| gap.start_ts.clone());
+
+                    // 恢复回补本身会按缺口跨度取数；日常刷新则先走已有的精确缺口修复。
+                    if !force_backfill && recoverable_missing_count > 0 {
+                        match crate::integrity::IntegrityRepairer::repair_symbol(
+                            &self.db,
+                            &self.pipeline,
+                            &self.data_source,
+                            code,
+                            s.fetch.backfill_count,
+                        )
+                        .await
+                        {
+                            Ok(result) => tracing::info!(
+                                "🔁 [{}] 定时刷新前缺口检查: 初始缺{} 修复{} 剩余{}",
+                                code,
+                                result.initial_missing,
+                                result.repaired_count,
+                                result.remaining_missing
+                            ),
+                            Err(error) => tracing::warn!(
+                                "⚠ [{}] 定时刷新前自动修复缺口失败，继续执行增量刷新: {error:#}",
+                                code
+                            ),
+                        }
+                    }
+                }
+                Err(error) => {
+                    integrity_check_failed = true;
+                    tracing::warn!(
+                        "⚠ [{}] 定时刷新前完整性检查失败，继续执行增量刷新: {error:#}",
+                        code
+                    );
+                }
+            }
+        }
+
         let latest = repo::latest_ts(&self.db, code, "5m").await?;
         let stored = repo::raw_klines(&self.db, code).await?.len();
 
@@ -2848,6 +2921,33 @@ impl Services {
         let deep_done = self.deep_backfilled.read().await.contains(code);
         let count = if stored < s.fetch.backfill_count && !deep_done {
             s.fetch.backfill_count
+        } else if force_backfill && integrity_check_failed {
+            // 完整性状态未知时使用配置上限兜底，避免在检查异常时漏掉历史缺口。
+            s.fetch.backfill_count
+        } else if force_backfill {
+            // 已有足够历史时，恢复回补只覆盖当前时间到最早可恢复缺口，
+            // 加上与完整性修复一致的冗余；没有缺口时退化为普通增量数量。
+            let recovery_count = oldest_recoverable_gap
+                .as_deref()
+                .and_then(|gap_start| {
+                    ts_gap_minutes(
+                        &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                        gap_start,
+                    )
+                })
+                .map(|gap_min| {
+                    (gap_min.max(0) / 5 + recoverable_missing_count as i64 * 2 + 30) as usize
+                })
+                .unwrap_or(needed)
+                .clamp(s.fetch.incremental_count, s.fetch.backfill_count);
+            tracing::info!(
+                "🔄 [{}] 启动恢复按需回补: 请求 {} 根 | 缺口 {} 根 | 最早缺口 {}",
+                code,
+                recovery_count,
+                recoverable_missing_count,
+                oldest_recoverable_gap.as_deref().unwrap_or("无")
+            );
+            recovery_count
         } else {
             needed
         };
@@ -4421,6 +4521,7 @@ impl Services {
     pub async fn repair_all_symbols_integrity(
         &self,
     ) -> Result<Vec<crate::integrity::RepairResult>> {
+        let _cycle_guard = self.data_cycle_lock.lock().await;
         let symbols = repo::list_symbols(&self.db, true).await?;
         let s = self.config().await;
         let mut results = Vec::new();

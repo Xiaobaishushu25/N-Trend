@@ -384,10 +384,44 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
         // 启动特例：刷新改为分钟网格对齐后，启动时若不在边界时刻会最多等一个周期才有数据，
         // 因此在交易时段内的首次 tick 强制刷新一次，之后回到边界对齐节奏
         let mut startup_refresh_done = false;
+        // 天勤从不可用恢复时，必须重新做一次完整回补，而不是只等待下一个5分钟增量。
+        let mut tq_was_available = false;
+        let mut last_tq_recovery_attempt: Option<Instant> = None;
         loop {
             ticker.tick().await;
             let now = Local::now();
             let cfg = state.services.scheduler_config().await;
+            let tq_required = state.services.config().await.data_source.primary_source == "tqsdk";
+            let tq_available = state.services.data_source.tq_is_available();
+
+            // 首次探活成功，以及运行中从降级状态恢复，都走完整回补+缺口修复。
+            // 这一步放在普通调度判定之前，避免 latest_ts 已被实时事件推进后漏掉中间缺口。
+            if tq_required && tq_available && !tq_was_available {
+                let retry_due = last_tq_recovery_attempt
+                    .map(|attempt| attempt.elapsed() >= Duration::from_secs(60))
+                    .unwrap_or(true);
+                if !retry_due {
+                    continue;
+                }
+                last_tq_recovery_attempt = Some(Instant::now());
+                if recover_after_tq_ready(&app, &state).await {
+                    startup_refresh_done = true;
+                    tq_was_available = true;
+                } else {
+                    // 桥接已健康但回补失败：保留重试资格，不把本次恢复视为完成。
+                    tq_was_available = false;
+                }
+                continue;
+            }
+            if tq_required && !startup_refresh_done && tq_available {
+                // 上一次恢复回补失败时，等待退避窗口后再重试，不退回到普通10根增量路径。
+                continue;
+            }
+            if tq_required && !tq_available {
+                last_tq_recovery_attempt = None;
+            }
+            tq_was_available = tq_available;
+
             let mut action = {
                 let rt = state.scheduler.read().await;
                 if !rt.running {
@@ -402,6 +436,10 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
                 n_core::scheduler::next_action(now, &cfg, last_refresh, last_scan)
             };
             if !startup_refresh_done {
+                // 主数据源尚未健康时不消耗“首次刷新”机会，等天勤恢复后由上面的恢复路径处理。
+                if tq_required && !tq_available {
+                    continue;
+                }
                 startup_refresh_done = true;
                 if action == n_core::scheduler::SchedulerAction::None
                     && n_core::scheduler::is_trading_time(&now)
@@ -424,6 +462,55 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// 天勤桥接服务健康后执行一次强制历史回补，并立即修复可恢复的中间缺口。
+async fn recover_after_tq_ready(app: &AppHandle, state: &Arc<AppState>) -> bool {
+    let t0 = Instant::now();
+    tracing::info!("🔄 天勤数据源恢复，启动强制历史回补与缺口检查");
+
+    let refresh_ok = match state.services.refresh_data_with_backfill().await {
+        Ok(stats) => {
+            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
+            if stats.succeeded > 0 {
+                state.note_refresh_success().await;
+                let _ = app.emit("data-updated", &stats);
+            }
+            tracing::info!(
+                "✅ 天勤恢复回补完成 耗时 {}ms | 成功 {} 失败 {}",
+                t0.elapsed().as_millis(),
+                stats.succeeded,
+                stats.failures
+            );
+            stats.succeeded > 0
+        }
+        Err(error) => {
+            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
+            tracing::warn!("⚠ 天勤恢复回补失败，保留待重试状态: {error:#}");
+            false
+        }
+    };
+
+    if !refresh_ok || !state.services.data_source.tq_is_available() {
+        return false;
+    }
+
+    match state.services.repair_all_symbols_integrity().await {
+        Ok(results) => {
+            let repaired: usize = results.iter().map(|result| result.repaired_count).sum();
+            let remaining: usize = results.iter().map(|result| result.remaining_missing).sum();
+            tracing::info!(
+                "✅ 天勤恢复缺口检查完成 | 品种 {} | 自动补齐 {} 根 | 剩余缺口 {} 根",
+                results.len(),
+                repaired,
+                remaining
+            );
+        }
+        Err(error) => {
+            tracing::warn!("⚠ 天勤恢复后的缺口检查失败，下一次恢复/刷新继续重试: {error:#}");
+        }
+    }
+    true
 }
 
 const TRIGGER_EMAIL_PREDICTION_RETRIES: usize = 80;
@@ -898,11 +985,15 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
 
 async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
     let t0 = Instant::now();
-    state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
     tracing::info!("⏳ 定时刷新触发 | {}", Local::now().format("%H:%M:%S"));
     match state.services.refresh_data().await {
         Ok(stats) => {
-            state.note_refresh_success().await;
+            // 请求完成后才推进调度锚点，避免请求尚未开始就吞掉一次重试机会；
+            // 全量失败由数据源恢复路径负责强制回补，普通调度仍按周期退避。
+            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
+            if stats.succeeded > 0 {
+                state.note_refresh_success().await;
+            }
             let _ = app.emit("data-updated", &stats);
             tracing::info!(
                 "✅ 定时刷新完成 耗时 {}ms | 成功 {} 失败 {} | 总计 {}",
@@ -918,7 +1009,10 @@ async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
                 );
             }
         }
-        Err(e) => tracing::error!("❌ 定时刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis()),
+        Err(e) => {
+            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
+            tracing::error!("❌ 定时刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
+        }
     }
 }
 
