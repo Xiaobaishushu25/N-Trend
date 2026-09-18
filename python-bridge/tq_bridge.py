@@ -37,6 +37,67 @@ STREAM_ID = uuid.uuid4().hex
 MARKET_STALE_SECS = 15.0
 RECONNECT_INITIAL_DELAY_SECS = 1.0
 RECONNECT_MAX_DELAY_SECS = 30.0
+TRACE_PRICE_GAP_PCT = 0.05
+TRACE_HOLD_CHANGE_PCT = 0.20
+
+
+def _trace_kline_sequence(
+    layer: str,
+    symbol: str,
+    tq_symbol: str,
+    period: str,
+    requested: int,
+    rows: list,
+    cache_hit=None,
+    raw_text_len=None,
+):
+    """记录跨边界 K 线摘要，并标记相邻异常跳变。"""
+    first = rows[0].get("datetime") if rows else None
+    last = rows[-1].get("datetime") if rows else None
+    logger.info(
+        "KLINE_TRACE layer=%s symbol=%s tq_symbol=%s period=%s requested=%s rows=%s "
+        "first=%s last=%s cache_hit=%s raw_text_len=%s",
+        layer,
+        symbol,
+        tq_symbol,
+        period,
+        requested,
+        len(rows),
+        first,
+        last,
+        cache_hit,
+        raw_text_len,
+    )
+
+    if period not in {"5m", "5"}:
+        return
+
+    for previous, current in zip(rows, rows[1:]):
+        previous_close = float(previous.get("close") or 0.0)
+        current_open = float(current.get("open") or 0.0)
+        previous_hold = float(previous.get("hold") or 0.0)
+        current_hold = float(current.get("hold") or 0.0)
+        price_gap_pct = abs(current_open - previous_close) / max(abs(previous_close), 1.0)
+        hold_change_pct = abs(current_hold - previous_hold) / max(abs(previous_hold), 1.0)
+        if price_gap_pct >= TRACE_PRICE_GAP_PCT or hold_change_pct >= TRACE_HOLD_CHANGE_PCT:
+            logger.info(
+                "KLINE_ANOMALY layer=%s symbol=%s tq_symbol=%s period=%s "
+                "prev_ts=%s prev_close=%.8g prev_hold=%.8g ts=%s open=%.8g close=%.8g "
+                "hold=%.8g price_gap_pct=%.6f hold_change_pct=%.6f",
+                layer,
+                symbol,
+                tq_symbol,
+                period,
+                previous.get("datetime"),
+                previous_close,
+                previous_hold,
+                current.get("datetime"),
+                current_open,
+                float(current.get("close") or 0.0),
+                current_hold,
+                price_gap_pct,
+                hold_change_pct,
+            )
 
 
 class BridgeCommandTimeout(TimeoutError):
@@ -470,8 +531,9 @@ class TqDataWorker:
             duration = args["duration_seconds"]
             data_length = args["data_length"]
             key = (tq_symbol, duration)
+            cache_hit = key in self.klines
 
-            if key in self.klines:
+            if cache_hit:
                 klines = self.klines[key]
                 if len(klines) < data_length:
                     klines = self.api.get_kline_serial(tq_symbol, duration_seconds=duration, data_length=data_length)
@@ -483,6 +545,10 @@ class TqDataWorker:
 
             # If already populated with valid data, return immediately without blocking!
             if len(klines) > 0 and not pd.isna(klines.iloc[-1]["close"]):
+                logger.info(
+                    "KLINE_CACHE tq_symbol=%s duration=%s requested=%s cache_hit=%s rows=%s",
+                    tq_symbol, duration, data_length, cache_hit, len(klines),
+                )
                 return klines.copy()
 
             # Otherwise wait briefly for initial data download
@@ -491,6 +557,10 @@ class TqDataWorker:
                 self._pump_update(time.time() + 0.05)
                 if len(klines) > 0 and not pd.isna(klines.iloc[-1]["close"]):
                     break
+            logger.info(
+                "KLINE_CACHE tq_symbol=%s duration=%s requested=%s cache_hit=%s rows=%s waited=true",
+                tq_symbol, duration, data_length, cache_hit, len(klines),
+            )
             return klines.copy()
 
         elif cmd == "subscribe_klines":
@@ -1091,12 +1161,32 @@ async def handle_kline(request: web.Request) -> web.Response:
             "hold": float(hold_val),
         })
 
-    return web.json_response({
+    quote = worker.quotes.get(tq_symbol)
+    underlying_symbol = getattr(quote, "underlying_symbol", None) if quote is not None else None
+    logger.info(
+        "KLINE_MAPPING symbol=%s tq_symbol=%s underlying_symbol=%s period=%s",
+        symbol, tq_symbol, underlying_symbol, period,
+    )
+    _trace_kline_sequence(
+        "tqsdk_dataframe", symbol, tq_symbol, period, count, rows,
+    )
+
+    response_body = {
         "symbol": symbol,
         "period": period,
         "includes_current": True,
         "klines": rows,
-    })
+    }
+    _trace_kline_sequence(
+        "bridge_http",
+        symbol,
+        tq_symbol,
+        period,
+        count,
+        response_body["klines"],
+        raw_text_len=None,
+    )
+    return web.json_response(response_body)
 
 
 async def handle_search(request: web.Request) -> web.Response:

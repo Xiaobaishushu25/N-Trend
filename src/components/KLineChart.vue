@@ -385,7 +385,16 @@ class RolloverPrimitive implements ISeriesPrimitive<Time> {
 }
 
 /** 同一品种/级别内的缩放/平移状态：切换品种或级别时沿用同样的横向视图，避免跳变 */
-let lastView: { from: number; to: number; totalAtCapture: number } | null = null
+interface ChartViewState {
+  from: number
+  to: number
+  totalAtCapture: number
+  /** 手动缩放后的价格区间；自动缩放状态下仅作快照，不强制恢复。 */
+  priceRange: { from: number; to: number } | null
+  priceAutoScale: boolean
+}
+
+let lastView: ChartViewState | null = null
 /** 最近一次写入图表的数据量：captureView 用它标记视图取自多长的数据，
  *  用于识别“数据不足被撑满”的短数据瞬态（详见 dropStaleView） */
 let lastDataCount = 0
@@ -909,12 +918,20 @@ function applyPaneHeights() {
   }
 }
 
-/** 保存当前视图作为全局缩放状态 */
+/** 保存当前视图作为全局缩放状态（横轴 + 价格轴）。 */
 function captureView() {
   if (!chart || !props.rows.length) return
   const logical = chart.timeScale().getVisibleLogicalRange()
   if (!logical) return
-  lastView = { from: logical.from, to: logical.to, totalAtCapture: lastDataCount }
+  const priceApi = chart.priceScale('right')
+  const priceRange = priceApi.getVisibleRange()
+  lastView = {
+    from: logical.from,
+    to: logical.to,
+    totalAtCapture: lastDataCount,
+    priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
+    priceAutoScale: priceApi.options().autoScale,
+  }
 }
 
 /** 丢弃短数据瞬态留下的缩放状态：
@@ -935,7 +952,8 @@ function dropStaleView(total: number) {
   }
 }
 
-/** 把全局视图套用到当前数据：优先保持原窗口位置（含右侧空白），数据不足时贴右端显示同样数量的K线 */
+/** 把全局视图套用到当前数据：优先保持原窗口位置（含右侧空白），数据不足时贴右端显示同样数量的K线。
+ *  同品种实时数据更新时也恢复手动价格区间，避免正在形成的K线一到来就重置 Ctrl+滚轮缩放。 */
 function restoreView() {
   if (!chart) return
   if (!candleSeries || candleSeries.data().length === 0) return
@@ -964,8 +982,12 @@ function restoreView() {
   }
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
-  // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
-  priceApi.setAutoScale(true)
+  if (!lastView.priceAutoScale && lastView.priceRange) {
+    priceApi.setAutoScale(false)
+    priceApi.setVisibleRange(lastView.priceRange)
+  } else {
+    priceApi.setAutoScale(true)
+  }
 }
 
 /** 切换品种/周期时：保留当前缩放级别（可见K线根数），但视图贴到新数据最右端并留出右侧空白 */
@@ -1097,7 +1119,15 @@ function centerFocusView(index: number) {
   }
   ts.setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
-  lastView = { from, to, totalAtCapture: total }
+  const priceApi = chart.priceScale('right')
+  const priceRange = priceApi.getVisibleRange()
+  lastView = {
+    from,
+    to,
+    totalAtCapture: total,
+    priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
+    priceAutoScale: priceApi.options().autoScale,
+  }
 }
 
 /** 复盘模式自动定位：数据未就绪时先记下，等K线到位后再聚焦；带重试避免时序竞态（50%不聚焦） */

@@ -5,10 +5,11 @@
 //! 2. 单事务原子写入：Raw 5m 与受影响的 Derived 15m/60m 在单事务内完成替换，避免中间状态泄漏；
 //! 3. 统一入口 `process_raw_batch` 与 `process_final_bar`，收敛定时刷新、延迟补拉与未来 Finality 落地。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use chrono::NaiveDateTime;
 use sea_orm::DatabaseConnection;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -99,6 +100,16 @@ impl RawPipeline {
         let existing = repo::raw_klines(&self.db, symbol).await?;
         let mut merged_bars: Vec<Kline> = existing.iter().map(model_to_fetch).collect();
         merge_klines(&mut merged_bars, incoming_bars);
+        tracing::info!(
+            target: "market_trace",
+            layer = "raw_pipeline",
+            symbol,
+            incoming = incoming_bars.len(),
+            existing = existing.len(),
+            merged = merged_bars.len(),
+            "KLINE_PIPELINE"
+        );
+        trace_pipeline_anomalies(symbol, &merged_bars, incoming_bars);
 
         let mut derived_models = Vec::new();
         if merged_bars.len() >= 3 {
@@ -161,6 +172,49 @@ fn merge_klines(existing: &mut Vec<Kline>, incoming: &[Kline]) {
         map.insert(k.datetime.clone(), k.clone());
     }
     *existing = map.into_values().collect();
+}
+
+fn trace_pipeline_anomalies(symbol: &str, merged: &[Kline], incoming: &[Kline]) {
+    let incoming_timestamps: HashSet<&str> = incoming.iter().map(|k| k.datetime.as_str()).collect();
+
+    for pair in merged.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        if !incoming_timestamps.contains(previous.datetime.as_str())
+            && !incoming_timestamps.contains(current.datetime.as_str())
+        {
+            continue;
+        }
+
+        let price_gap_pct = (current.open - previous.close).abs() / previous.close.abs().max(1.0);
+        let hold_change_pct = (current.hold - previous.hold).abs() / previous.hold.abs().max(1.0);
+        if price_gap_pct >= 0.05 || hold_change_pct >= 0.20 {
+            let timestamp_gap_minutes =
+                NaiveDateTime::parse_from_str(&current.datetime, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .and_then(|current_ts| {
+                        NaiveDateTime::parse_from_str(&previous.datetime, "%Y-%m-%d %H:%M:%S")
+                            .ok()
+                            .map(|previous_ts| (current_ts - previous_ts).num_minutes())
+                    });
+            tracing::info!(
+                target: "market_trace",
+                layer = "raw_pipeline",
+                symbol,
+                prev_ts = %previous.datetime,
+                prev_close = previous.close,
+                prev_hold = previous.hold,
+                ts = %current.datetime,
+                open = current.open,
+                close = current.close,
+                hold = current.hold,
+                timestamp_gap_minutes = ?timestamp_gap_minutes,
+                price_gap_pct,
+                hold_change_pct,
+                "KLINE_ANOMALY"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

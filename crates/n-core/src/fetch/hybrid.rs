@@ -282,7 +282,17 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn fetch_minute(&self, symbol: &str, period: &str, count: usize) -> Result<Vec<Kline>> {
-        if self.should_use_tq().await {
+        let use_tq = self.should_use_tq().await;
+        tracing::info!(
+            target: "market_trace",
+            layer = "hybrid",
+            symbol,
+            period,
+            requested = count,
+            selected_source = if use_tq { "tqsdk" } else { "sina" },
+            "KLINE_SOURCE"
+        );
+        if use_tq {
             let tq = self.tq_client.read().await.clone();
             match tq.fetch_minute(symbol, period, count).await {
                 Ok(klines) if !klines.is_empty() => {
@@ -314,7 +324,18 @@ impl MarketDataSource for HybridDataSource {
         period: &str,
         count: usize,
     ) -> Result<RawKlineResponse> {
-        if self.should_use_tq().await {
+        let use_tq = self.should_use_tq().await;
+        tracing::info!(
+            target: "market_trace",
+            layer = "hybrid",
+            symbol,
+            period,
+            requested = count,
+            selected_source = if use_tq { "tqsdk" } else { "sina" },
+            raw = true,
+            "KLINE_SOURCE"
+        );
+        if use_tq {
             let tq = self.tq_client.read().await.clone();
             match tq.fetch_minute_raw(symbol, period, count).await {
                 Ok(raw) if !raw.klines.is_empty() => {

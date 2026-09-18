@@ -231,6 +231,56 @@ fn exclude_current_kline(mut rows: Vec<Kline>, count: usize) -> Vec<Kline> {
     rows
 }
 
+fn trace_kline_response(
+    symbol: &str,
+    period: &str,
+    requested: usize,
+    raw_text_len: usize,
+    klines: &[KlineDto],
+) {
+    tracing::info!(
+        target: "market_trace",
+        layer = "rust_tq_client",
+        symbol,
+        period,
+        requested,
+        rows = klines.len(),
+        raw_text_len,
+        first = %klines.first().map(|k| k.datetime.as_str()).unwrap_or("-"),
+        last = %klines.last().map(|k| k.datetime.as_str()).unwrap_or("-"),
+        "KLINE_TRACE"
+    );
+
+    if period != "5m" && period != "5" {
+        return;
+    }
+
+    for pair in klines.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let price_gap_pct = (current.open - previous.close).abs() / previous.close.abs().max(1.0);
+        let hold_change_pct = (current.hold - previous.hold).abs() / previous.hold.abs().max(1.0);
+        if price_gap_pct >= 0.05 || hold_change_pct >= 0.20 {
+            tracing::info!(
+                target: "market_trace",
+                layer = "rust_tq_client",
+                symbol,
+                period,
+                prev_ts = %previous.datetime,
+                prev_close = previous.close,
+                prev_hold = previous.hold,
+                ts = %current.datetime,
+                open = current.open,
+                close = current.close,
+                hold = current.hold,
+                price_gap_pct,
+                hold_change_pct,
+                "KLINE_ANOMALY"
+            );
+        }
+    }
+}
+
 impl MarketDataSource for TqBridgeClient {
     fn name(&self) -> &'static str {
         "tqsdk"
@@ -318,6 +368,8 @@ impl MarketDataSource for TqBridgeClient {
         if body.klines.is_empty() {
             bail!("天勤接口未返回品种 {} 的 K 线数据", symbol);
         }
+
+        trace_kline_response(symbol, period, count, raw_text.len(), &body.klines);
 
         let klines = body
             .klines
