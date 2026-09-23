@@ -8,6 +8,7 @@ export const useManualLevelsStore = defineStore('manualLevels', {
     loading: false,
     saving: false,
     error: '' as string,
+    loadSeq: 0,
   }),
   getters: {
     forChart: (state) => (symbol: string, timeframe: string) =>
@@ -17,14 +18,26 @@ export const useManualLevelsStore = defineStore('manualLevels', {
   },
   actions: {
     async load(symbol?: string, timeframe?: string) {
+      const seq = ++this.loadSeq
       this.loading = true
       this.error = ''
       try {
-        this.levels = await api.listManualLevels(symbol, timeframe, false)
+        const rows = await api.listManualLevels(symbol, timeframe, false)
+        if (seq !== this.loadSeq) return
+        if (symbol && timeframe) {
+          // 保留其他图表已经读取过的区域：返回曾访问的品种/周期时可以立即用缓存绘制，
+          // 同时以本次 DB 结果完整替换当前作用域，避免留下已删除的记录。
+          this.levels = [
+            ...this.levels.filter((level) => level.symbol !== symbol || level.timeframe !== timeframe),
+            ...rows,
+          ]
+        } else {
+          this.levels = rows
+        }
       } catch (error) {
-        this.error = String(error)
+        if (seq === this.loadSeq) this.error = String(error)
       } finally {
-        this.loading = false
+        if (seq === this.loadSeq) this.loading = false
       }
     },
     async create(input: ManualLevelInput) {

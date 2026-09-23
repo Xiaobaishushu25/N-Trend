@@ -853,7 +853,7 @@ fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
                 stream_id
             );
             if stream_changed {
-                let stats = state.services.reconcile_sina_finality(&codes).await;
+                let stats = state.services.reconcile_tq_finality(&codes).await;
                 tracing::info!(
                     "事件流初始化 Finality 安全补齐完成 | 成功 {} 失败 {}",
                     stats.succeeded,

@@ -1749,16 +1749,11 @@ impl Services {
         timeframe: Option<&str>,
         active_only: bool,
     ) -> Result<Vec<manual_levels::Model>> {
-        let rows = repo::manual_levels(&self.db, symbol, timeframe, active_only).await?;
-        let mut refreshed = Vec::with_capacity(rows.len());
-        for row in rows {
-            if row.monitor_enabled && matches!(row.status.as_str(), "active" | "broken") {
-                refreshed.push(self.refresh_manual_level_state(row).await?);
-            } else {
-                refreshed.push(row);
-            }
-        }
-        Ok(refreshed)
+        // 图表首屏只需要已持久化的区域边界和状态。这里曾逐条重新读取整段 K 线、
+        // 计算状态并写库，区域越多首屏越慢，而且相同品种/周期的 K 线会被重复查询。
+        // 状态本身已由行情轮询持续维护，创建和修改时也会即时刷新，因此列表读取应保持
+        // 为一次轻量 DB 查询，让区域能与 K 线同时呈现。
+        repo::manual_levels(&self.db, symbol, timeframe, active_only).await
     }
 
     pub async fn create_manual_level(
@@ -3012,27 +3007,20 @@ impl Services {
                             > judger.policy().ordinary_settle_secs;
                     let pipeline = self.pipeline.clone();
                     let code_owned = code.to_string();
-                    // 没有天勤闭合证明时，安全兜底必须明确走新浪30/75秒定版过滤。
-                    // 不能调用 Hybrid：休市最后一根在天勤序列末行，会被生产接口安全排除。
-                    let client = self.client.clone();
+                    // 没有天勤闭合证明时仍只能从天勤获取已定版序列；
+                    // 天勤不可用时放弃本次补拉，绝不能把新浪临时数据写入 RawPipeline。
+                    let data_source = self.data_source.clone();
                     let do_refetch = {
                         let pipeline = pipeline.clone();
                         let code_owned = code_owned.clone();
-                        let client = client.clone();
+                        let data_source = data_source.clone();
                         move |label: &str| {
                             let pipeline = pipeline.clone();
                             let code_owned = code_owned.clone();
-                            let client = client.clone();
+                            let data_source = data_source.clone();
                             let label = label.to_string();
                             async move {
-                                match crate::fetch::kline::fetch_minute(
-                                    &client,
-                                    &code_owned,
-                                    "5",
-                                    10,
-                                )
-                                .await
-                                {
+                                match data_source.fetch_tq_minute(&code_owned, "5", 10).await {
                                     Ok(fetched) => {
                                         if let Err(e) =
                                             pipeline.process_raw_batch(&code_owned, &fetched).await
@@ -3102,11 +3090,12 @@ impl Services {
         self.pipeline.process_final_bar(symbol, bar).await
     }
 
-    /// 事件流初始化不回放历史闭合事件；用新浪 Finality 规则补齐重启前可能遗漏的收盘末根。
-    pub async fn reconcile_sina_finality(&self, symbols: &[String]) -> RefreshStats {
+    /// 事件流初始化不回放历史闭合事件；只用天勤补齐重启前可能遗漏的收盘末根。
+    /// 天勤不可用时跳过写入，不使用新浪数据污染标准 Raw 库。
+    pub async fn reconcile_tq_finality(&self, symbols: &[String]) -> RefreshStats {
         let mut stats = RefreshStats::default();
         for symbol in symbols {
-            match crate::fetch::kline::fetch_minute(&self.client, symbol, "5", 10).await {
+            match self.data_source.fetch_tq_minute(symbol, "5", 10).await {
                 Ok(rows) => match self.pipeline.process_raw_batch(symbol, &rows).await {
                     Ok(_) => stats.succeeded += 1,
                     Err(error) => {

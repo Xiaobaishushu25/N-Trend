@@ -27,6 +27,7 @@ import {
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
 import type { KlineRow, ManualLevelDto, ManualLevelInput, PatternDto, ReviewExitOverlay, TrendPointDto, SingleBarEvent } from '../types'
 import { SINGLE_BAR_COLORS } from '../utils/singleBar'
+import { computePriceGaps, gapBoundaryCoordinate, type PriceGapSegment } from '../utils/priceGaps'
 import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
@@ -62,13 +63,6 @@ const timeLeft = ref<HTMLDivElement | null>(null)
 const trendVisible = ref(true)
 const settingsStore = useSettingsStore()
 const minBarSpacing = computed(() => settingsStore.settings.ui.min_bar_spacing)
-
-interface GapRect {
-  from: Time
-  to: Time
-  top: number
-  bottom: number
-}
 
 interface EventLabelData {
   time: Time
@@ -205,8 +199,8 @@ class EventLabelPrimitive implements ISeriesPrimitive<Time> {
 class GapPaneRenderer implements IPrimitivePaneRenderer {
   private chart: IChartApi
   private source: ISeriesApi<'Candlestick'>
-  private gaps: GapRect[]
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: GapRect[]) {
+  private gaps: PriceGapSegment[]
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: PriceGapSegment[]) {
     this.chart = chart
     this.source = source
     this.gaps = gaps
@@ -216,19 +210,21 @@ class GapPaneRenderer implements IPrimitivePaneRenderer {
     target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
       const { context } = scope
       const timeScale = this.chart.timeScale()
-      const priceScale = this.chart.priceScale('right')
-      context.fillStyle = 'rgba(100, 116, 139, 0.16)'
+      const candles = this.source.data()
+      const boundary = (index: number) => gapBoundaryCoordinate(
+        candles, index, (time) => timeScale.timeToCoordinate(time),
+      )
       for (const gap of this.gaps) {
-        const x1 = timeScale.timeToCoordinate(gap.from)
-        const x2 = timeScale.timeToCoordinate(gap.to)
+        const x1 = boundary(gap.fromIndex)
         const yTop = this.source.priceToCoordinate(gap.top)
         const yBottom = this.source.priceToCoordinate(gap.bottom)
-        if (x1 == null || x2 == null || yTop == null || yBottom == null) continue
-        const left = Math.min(x1, x2)
-        const width = Math.max(2, Math.abs(x2 - x1))
+        if (x1 == null || yTop == null || yBottom == null) continue
+        const left = Math.max(0, x1)
+        const width = scope.mediaSize.width - left
         const topY = Math.min(yTop, yBottom)
         const height = Math.abs(yTop - yBottom)
-        if (height <= 0) continue
+        if (height <= 0 || width <= 0) continue
+        context.fillStyle = '#E5E7EE'
         context.fillRect(left, topY, width, height)
       }
     })
@@ -237,7 +233,7 @@ class GapPaneRenderer implements IPrimitivePaneRenderer {
 
 class GapPaneView implements IPrimitivePaneView {
   private paneRenderer: GapPaneRenderer
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: GapRect[]) {
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: PriceGapSegment[]) {
     this.paneRenderer = new GapPaneRenderer(chart, source, gaps)
   }
   renderer(): IPrimitivePaneRenderer | null {
@@ -250,7 +246,7 @@ class GapPaneView implements IPrimitivePaneView {
 
 class GapPrimitive implements ISeriesPrimitive<Time> {
   private view: GapPaneView
-  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: GapRect[]) {
+  constructor(chart: IChartApi, source: ISeriesApi<'Candlestick'>, gaps: PriceGapSegment[]) {
     this.view = new GapPaneView(chart, source, gaps)
   }
   paneViews(): readonly IPrimitivePaneView[] {
@@ -858,18 +854,19 @@ function syncTrendSeries() {
   trendSeries.setData(data)
 }
 
-function applyDefaultView() {
-  if (!chart) return
+function applyDefaultView(): { from: number; to: number } | null {
+  if (!chart) return null
   // 空图表（数据尚未写入）上设置视图会污染时间轴的间距状态，等数据就位后再校准
-  if (!candleSeries || candleSeries.data().length === 0) return
+  if (!candleSeries || candleSeries.data().length === 0) return null
   const total = props.rows.length
-  if (total === 0) return
+  if (total === 0) return null
   const visible = Math.min(displayKNum.value, total)
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
+  return { from, to }
 }
 
 /** 兜底：若K线间距小于 MIN_BAR_SPACING，收窄可见范围直到间距达标（右边缘不动）。
@@ -954,17 +951,16 @@ function dropStaleView(total: number) {
 
 /** 把全局视图套用到当前数据：优先保持原窗口位置（含右侧空白），数据不足时贴右端显示同样数量的K线。
  *  同品种实时数据更新时也恢复手动价格区间，避免正在形成的K线一到来就重置 Ctrl+滚轮缩放。 */
-function restoreView() {
-  if (!chart) return
-  if (!candleSeries || candleSeries.data().length === 0) return
+function restoreView(): { from: number; to: number } | null {
+  if (!chart) return null
+  if (!candleSeries || candleSeries.data().length === 0) return null
   const priceApi = chart.priceScale('right')
   //   `== 恢复视图: 行${props.rows.length} 保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'}`,
   // )
   dropStaleView(props.rows.length)
   if (!lastView) {
     priceApi.setAutoScale(true)
-    applyDefaultView()
-    return
+    return applyDefaultView()
   }
   const total = props.rows.length
   const span = lastView.to - lastView.from
@@ -988,14 +984,15 @@ function restoreView() {
   } else {
     priceApi.setAutoScale(true)
   }
+  return { from, to }
 }
 
 /** 切换品种/周期时：保留当前缩放级别（可见K线根数），但视图贴到新数据最右端并留出右侧空白 */
-function applySwitchView(span: number) {
-  if (!chart) return
-  if (!candleSeries || candleSeries.data().length === 0) return
+function applySwitchView(span: number): { from: number; to: number } | null {
+  if (!chart) return null
+  if (!candleSeries || candleSeries.data().length === 0) return null
   const total = props.rows.length
-  if (total === 0) return
+  if (total === 0) return null
   const visible = Math.min(span, total)
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - span)
@@ -1003,6 +1000,7 @@ function applySwitchView(span: number) {
   clampMinBarSpacing({ from, to })
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
   chart.priceScale('right').setAutoScale(true)
+  return { from, to }
 }
 
 function focusRow(): KlineRow | null {
@@ -1038,11 +1036,14 @@ function syncFocus() {
 }
 
 /** 焦点到可视区边缘时，让画面自动跟随一根，保持焦点K线可见 */
-function ensureFocusVisible() {
+function ensureFocusVisible(pendingRange?: { from: number; to: number }) {
   if (!chart) return
   if (focusIndex < 0 || focusIndex >= props.rows.length) return
   const ts = chart.timeScale()
-  const logical = ts.getVisibleLogicalRange()
+  // setVisibleLogicalRange() 只会在 lightweight-charts 下一轮绘制时生效。
+  // 实时追加一根K线后，优先基于 restoreView() 刚提交的目标范围计算跟随，
+  // 避免读到 setData() 后的旧范围并用第二次调用覆盖掉用户的缩放状态。
+  const logical = pendingRange ?? ts.getVisibleLogicalRange()
   if (!logical) return
   const total = props.rows.length
   const span = logical.to - logical.from
@@ -1204,64 +1205,6 @@ function stepCandles(dir: number) {
   ensureFocusVisible()
 }
 
-/** 相邻K线时间间隔超过该分钟数视为交易时段断裂（午休、日盘/夜盘切换、周末），
- *  跨时段的“缺口”是正常停盘，不是价格缺口，不画矩形 */
-const SESSION_BREAK_MIN = 60
-
-/** 忽略的微小缺口阈值：缺口高度小于 max(2 点, 价格的 0.1%) 不画，避免噪声 */
-function isSignificantGap(bottom: number, size: number): boolean {
-  return size >= Math.max(2, bottom * 0.001)
-}
-
-/** 相邻两根K线的时间间隔（分钟），用于判断是否同一交易时段 */
-function tsDiffMinutes(a: string, b: string): number {
-  return (new Date(b.replace(' ', 'T') + 'Z').getTime() - new Date(a.replace(' ', 'T') + 'Z').getTime()) / 60000
-}
-
-/** 找出价格缺口（同一交易时段内相邻K线价格区间不衔接），矩形从缺口处向右延伸，
- *  直到有K线重新进入该价格带（缺口回补）为止；未回补的延伸到数据最右端 */
-function computeGaps(): GapRect[] {
-  const gaps: GapRect[] = []
-  const n = props.rows.length
-  for (let i = 1; i < n; i++) {
-    const prev = props.rows[i - 1]
-    const cur = props.rows[i]
-    // 跨交易时段（午休/日盘夜盘切换/周末）的间隔不算缺口
-    if (tsDiffMinutes(prev.ts, cur.ts) > SESSION_BREAK_MIN) continue
-    let top: number
-    let bottom: number
-    if (cur.low > prev.high) {
-      // 向上缺口：空隙为 前一根高点 ~ 当前低点
-      top = cur.low
-      bottom = prev.high
-    } else if (cur.high < prev.low) {
-      // 向下缺口：空隙为 当前高点 ~ 前一根低点
-      top = prev.low
-      bottom = cur.high
-    } else {
-      continue
-    }
-    if (!isSignificantGap(bottom, top - bottom)) continue
-    // 向右延伸：直到某根K线的价格带重新进入缺口区间为止
-    let end = i
-    for (let j = i; j < n; j++) {
-      const bar = props.rows[j]
-      const filled = cur.low > prev.high ? bar.low <= bottom : bar.high >= top
-      if (filled) {
-        break
-      }
-      end = j
-    }
-    gaps.push({
-      from: toTs(cur.ts) as Time,
-      to: toTs(props.rows[end].ts) as Time,
-      top,
-      bottom,
-    })
-  }
-  return gaps
-}
-
 /** 重建跳空灰底图层 */
 function syncGaps() {
   if (!chart || !candleSeries) return
@@ -1269,7 +1212,7 @@ function syncGaps() {
     candleSeries.detachPrimitive(gapPrimitive)
     gapPrimitive = null
   }
-  const gaps = computeGaps()
+  const gaps = computePriceGaps(props.rows, props.timeframe)
   if (!gaps.length) return
   gapPrimitive = new GapPrimitive(chart, candleSeries, gaps)
   candleSeries.attachPrimitive(gapPrimitive)
@@ -1523,14 +1466,17 @@ function renderData() {
   syncRollovers()
   syncManualLevels()
   refreshManualLevelOverlay()
+  // setVisibleLogicalRange 要到下一绘制帧才反映到查询结果；后续自动跟随必须
+  // 直接沿用本次提交的目标范围，不能立即回读尚未更新的旧范围。
+  let targetRange: { from: number; to: number } | null = null
   if (isSwitch) {
     dropStaleView(props.rows.length)
     const span = lastView
       ? Math.min(lastView.to - lastView.from, props.rows.length)
       : Math.min(displayKNum.value, props.rows.length)
-    applySwitchView(span)
+    targetRange = applySwitchView(span)
   } else {
-    restoreView()
+    targetRange = restoreView()
   }
   const lastTsForHover = props.rows.length ? (toTs(props.rows[props.rows.length - 1].ts) as Time) : null
   const hoveringOnHistory = isHovering && hoveredTime != null && lastTsForHover != null && hoveredTime !== lastTsForHover
@@ -1577,7 +1523,7 @@ function renderData() {
     nextTick(() => {
       if (focusIndex === savedIdx && chart) centerFocusView(savedIdx)
     })
-  } else if (shouldAutoFollow) ensureFocusVisible()
+  } else if (shouldAutoFollow) ensureFocusVisible(targetRange ?? undefined)
   else if (pendingFocusTs) {
     // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
     scheduleFocusRetry()
@@ -2159,10 +2105,8 @@ onMounted(() => {
         height: container.value.clientHeight,
       })
       applyPaneHeights()
-      // 尺寸定稿后再校准一次默认视图：防止初始化期间宽度变化把视图重置成全量
-      // 图表还没有数据时不能设置视图：空图表上应用视图会污染时间轴的间距状态，
-      // 等数据到达后 renderData 会用正确的数据长度校准视图
-      if (!lastView && candleSeries && candleSeries.data().length > 0) applyDefaultView()
+      // 可见范围已在 renderData 中一次性提交。这里不能再复位，否则首屏会先按
+      // 临时范围绘制、下一帧再缩放到默认根数，形成明显的“进场缩放”。
       // requestAnimationFrame(() => {
       //   if (!chart) return
       //   const lr = chart.timeScale().getVisibleLogicalRange()

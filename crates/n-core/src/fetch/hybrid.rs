@@ -97,6 +97,15 @@ impl HybridDataSource {
         period: &str,
         count: usize,
     ) -> Result<Vec<Kline>> {
+        tracing::info!(
+            target: "market_trace",
+            layer = "hybrid_tq_only",
+            symbol,
+            period,
+            requested = count,
+            selected_source = "tqsdk",
+            "KLINE_SOURCE"
+        );
         if !self.tq_available_or_probe().await {
             anyhow::bail!("天勤数据源当前不可用，持久化修复不会使用新浪回退");
         }

@@ -687,7 +687,7 @@ function updateLiveBar(latest: number) {
       close: latest,
       volume: seed?.volume ?? 0,
       hold: seed?.hold ?? 0,
-      source: 'live',
+      source: seed ? 'live' : 'live_quote',
       rollover: false,
     })
     // 只保留最近一小段，等库内每 5 分钟刷新后自然由历史序列接管
