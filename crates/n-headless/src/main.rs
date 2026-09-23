@@ -322,7 +322,19 @@ async fn run_scan(svc: &Services) -> anyhow::Result<()> {
             emails.push((n_core::notify::email::EventEmailKind::Trigger, e));
         }
         for (kind, e) in emails {
-            let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
+            let win_rate = if kind == n_core::notify::email::EventEmailKind::Trigger {
+                n_core::v2::prediction::champion_win_rate(&svc.db, e.id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let model = win_rate
+                .as_ref()
+                .map(|rate| (rate.model_id.as_str(), rate.p_win));
+            let (subject, body) =
+                n_core::notify::email::event_email_payload_with_model(kind, e, model);
             tracing::info!(
                 "[SEND_MAIL] subject='{}' to='{}' symbol='{}'",
                 subject,

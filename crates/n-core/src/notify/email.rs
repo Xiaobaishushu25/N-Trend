@@ -200,17 +200,25 @@ pub fn event_email_payload_with_model(
         EventEmailKind::Warning => "预警",
         EventEmailKind::Trigger => "触发",
     };
+    let is_high_win_rate = matches!(kind, EventEmailKind::Trigger)
+        && model_win_rate.map(|(_, p)| p >= 0.5).unwrap_or(false);
+    let high_win_prefix = if is_high_win_rate {
+        "【高胜率形态触发】"
+    } else {
+        ""
+    };
     let subject = format!(
-        "N趋势{kind_label}【{symbol}】{dir} {grade} {score:.2}分",
+        "{high_win_prefix}N趋势{kind_label}【{symbol}】{dir} {grade} {score:.2}分",
         symbol = e.symbol,
         dir = event_dir_label(e),
         grade = e.grade,
         score = e.entry_score,
     );
     tracing::info!(
-        "[MAIL_SUBJECT] kind={} symbol={} subject={}",
+        "[MAIL_SUBJECT] kind={} symbol={} high_win_rate={} subject={}",
         kind_label,
         e.symbol,
+        is_high_win_rate,
         subject
     );
 
@@ -457,7 +465,8 @@ mod tests {
         e.trigger_score = Some(3.9);
         e.overshoot_r = Some(0.02);
         e.hold_score = Some(4.1);
-        let (_, body) = event_email_payload(EventEmailKind::Trigger, &e);
+        let (subject_no_model, body) = event_email_payload(EventEmailKind::Trigger, &e);
+        assert!(!subject_no_model.contains("高胜率形态触发"));
         assert!(body.contains("触发时间：2026-08-14 13:45"));
         assert!(body.contains("触发价：4217.0"));
         assert!(body.contains("追价深度：0.02R"));
@@ -465,11 +474,20 @@ mod tests {
         assert!(body.contains("当前持仓评分：4.10"));
         assert!(body.contains("冠军模型胜率：暂无可用结果"));
 
-        let (_, body) = event_email_payload_with_model(
+        let (subject_low, _) = event_email_payload_with_model(
+            EventEmailKind::Trigger,
+            &e,
+            Some(("logistic-v2", 0.42)),
+        );
+        assert!(!subject_low.contains("高胜率形态触发"));
+
+        let (subject_high, body) = event_email_payload_with_model(
             EventEmailKind::Trigger,
             &e,
             Some(("logistic-v2", 0.684)),
         );
+        assert!(subject_high.starts_with("【高胜率形态触发】"));
+        assert!(subject_high.contains("N趋势触发【BU0】做多 A级 3.60分"));
         assert!(body.contains("冠军模型胜率：68.4%（logistic-v2）"));
 
         let preclose = preclose_signals::Model {
