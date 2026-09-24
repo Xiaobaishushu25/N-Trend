@@ -622,6 +622,22 @@ class TqDataWorker:
             # Find matching symbols
             return self._search_symbols(keyword)
 
+        elif cmd == "get_trading_calendar":
+            start_dt = args.get("start_dt")
+            end_dt = args.get("end_dt")
+            if isinstance(start_dt, str):
+                start_dt = datetime.datetime.strptime(start_dt, "%Y-%m-%d").date()
+            if isinstance(end_dt, str):
+                end_dt = datetime.datetime.strptime(end_dt, "%Y-%m-%d").date()
+
+            cal = self.api.get_trading_calendar(start_dt=start_dt, end_dt=end_dt)
+            results = []
+            for _, row in cal.iterrows():
+                d_val = row["date"]
+                d_str = d_val.strftime("%Y-%m-%d") if hasattr(d_val, "strftime") else str(d_val)
+                results.append({"date": d_str, "trading": bool(row["trading"])})
+            return results
+
         return None
 
     @staticmethod
@@ -1189,6 +1205,31 @@ async def handle_kline(request: web.Request) -> web.Response:
     return web.json_response(response_body)
 
 
+async def handle_trading_calendar(request: web.Request) -> web.Response:
+    global worker
+    if not worker or not worker.connected:
+        return web.json_response({"error": "TqApi not connected"}, status=503)
+
+    today = datetime.date.today()
+    default_start = datetime.date(today.year - 1, 1, 1).strftime("%Y-%m-%d")
+    default_end = datetime.date(today.year + 1, 12, 31).strftime("%Y-%m-%d")
+
+    start_dt = request.query.get("start", default_start)
+    end_dt = request.query.get("end", default_end)
+
+    try:
+        results = await asyncio.to_thread(
+            worker.exec_cmd,
+            "get_trading_calendar",
+            {"start_dt": start_dt, "end_dt": end_dt},
+            10.0,
+        )
+        return web.json_response({"calendar": results})
+    except Exception as e:
+        status = 504 if isinstance(e, BridgeCommandTimeout) else 503
+        return web.json_response({"error": f"{type(e).__name__}: {e}"}, status=status)
+
+
 async def handle_search(request: web.Request) -> web.Response:
     global worker
     keyword = request.query.get("keyword", "").strip()
@@ -1214,6 +1255,7 @@ def create_app() -> web.Application:
     app.router.add_get("/api/quotes", handle_quotes)
     app.router.add_get("/api/kline", handle_kline)
     app.router.add_get("/api/search", handle_search)
+    app.router.add_get("/api/trading-calendar", handle_trading_calendar)
     return app
 
 

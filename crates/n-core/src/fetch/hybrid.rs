@@ -15,7 +15,7 @@ use crate::fetch::datasource::MarketDataSource;
 use crate::fetch::kline::{Kline, RawKlineResponse};
 use crate::fetch::quotes::Quote;
 use crate::fetch::symbols::FuturesSymbol;
-use crate::fetch::tq_client::TqBridgeClient;
+use crate::fetch::tq_client::{TqBridgeClient, TradingCalendarDay};
 use crate::fetch::SinaClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +85,15 @@ impl HybridDataSource {
             return false;
         }
         self.check_and_update_health().await
+    }
+
+    pub async fn fetch_trading_calendar(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Vec<TradingCalendarDay>> {
+        let tq = self.tq_client.read().await.clone();
+        tq.fetch_trading_calendar(start, end).await
     }
 
     /// 只从天勤获取 K 线，供会写入本地标准库的修复/同步流程使用。

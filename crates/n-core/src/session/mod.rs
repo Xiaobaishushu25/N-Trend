@@ -5,6 +5,8 @@
 
 pub mod calendar;
 pub mod spec;
+pub mod trading_calendar;
 
 pub use calendar::{classify_night_session, SessionCalendar};
 pub use spec::{NightSessionType, TradingSessionSpec};
+pub use trading_calendar::TradingCalendar;

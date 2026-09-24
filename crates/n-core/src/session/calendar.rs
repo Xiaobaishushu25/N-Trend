@@ -105,6 +105,31 @@ impl SessionCalendar {
     pub fn is_global_trading_time(now: &DateTime<Local>) -> bool {
         Self::get("AU0").is_in_trading_time(now)
     }
+
+    /// 更新全局交易日历（来自天勤 API）。
+    pub fn update_trading_calendar(days: &[crate::fetch::tq_client::TradingCalendarDay]) {
+        super::trading_calendar::update_global_calendar(days);
+    }
+
+    /// 从本地缓存文件加载交易日历。
+    pub fn load_trading_calendar_file(path: &std::path::Path) -> anyhow::Result<()> {
+        super::trading_calendar::load_global_calendar_from_file(path)
+    }
+
+    /// 将全局交易日历持久化保存到文件。
+    pub fn save_trading_calendar_file(path: &std::path::Path) -> anyhow::Result<()> {
+        super::trading_calendar::save_global_calendar_to_file(path)
+    }
+
+    /// 查询某日期是否为法定交易日。
+    pub fn is_trading_day(date: &chrono::NaiveDate) -> bool {
+        super::trading_calendar::is_trading_day(date)
+    }
+
+    /// 查询某日期当晚是否有夜盘。
+    pub fn has_night_session_tonight(date: &chrono::NaiveDate) -> bool {
+        super::trading_calendar::has_night_session_tonight(date)
+    }
 }
 
 /// 根据品种代码或前缀分类夜盘类型（自动提取字母前缀并转大写）。

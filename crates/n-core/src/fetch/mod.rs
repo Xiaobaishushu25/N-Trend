@@ -12,7 +12,8 @@ pub use coordinator::{CoordinatorStats, RequestPriority, SinaRequest, SinaReques
 pub use datasource::MarketDataSource;
 pub use hybrid::{DataSourceEvent, HybridDataSource};
 pub use tq_client::{
-    BarCloseProof, ClosedBarEvent, ClosedBarEventsResponse, SubscribeKlinesResponse, TqBridgeClient,
+    BarCloseProof, ClosedBarEvent, ClosedBarEventsResponse, SubscribeKlinesResponse,
+    TqBridgeClient, TradingCalendarDay,
 };
 
 use std::collections::VecDeque;

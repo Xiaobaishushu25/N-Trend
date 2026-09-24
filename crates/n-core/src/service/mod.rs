@@ -1441,6 +1441,18 @@ impl Services {
             client.clone(),
             config_arc.clone(),
         ));
+        let cal_path = config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("trading_calendar.json");
+        if cal_path.exists() {
+            if let Err(e) = crate::session::SessionCalendar::load_trading_calendar_file(&cal_path) {
+                tracing::warn!("加载本地交易日历缓存失败: {e:#}");
+            } else {
+                tracing::info!("📅 已加载本地法定交易日历缓存: {}", cal_path.display());
+            }
+        }
+
         // 白屏修复：Sidecar 30秒探测不再阻塞 Services::new / 窗口首绘，改为后台异步拉起
         {
             let ds_cfg = config_arc.read().await.data_source.clone();
@@ -1454,6 +1466,7 @@ impl Services {
             } else {
                 let ds_for_spawn = data_source.clone();
                 let ds_for_mark = data_source.clone();
+                let cal_path_for_spawn = cal_path.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     let sidecar_started = match SidecarManager::start(&ds_cfg).await {
@@ -1479,6 +1492,17 @@ impl Services {
                             tracing::warn!("天勤桥接服务未通过健康检查，当前使用新浪备用数据源");
                         } else {
                             tracing::info!("✅ 天勤桥接服务后台就绪，已切回主力天勤数据源");
+                            let cal_path_clone = cal_path_for_spawn.clone();
+                            match ds_for_spawn.fetch_trading_calendar(None, None).await {
+                                Ok(days) => {
+                                    crate::session::SessionCalendar::update_trading_calendar(&days);
+                                    let _ = crate::session::SessionCalendar::save_trading_calendar_file(&cal_path_clone);
+                                    tracing::info!("📅 成功同步并持久化天勤法定交易日历 ({}天)", days.len());
+                                }
+                                Err(err) => {
+                                    tracing::warn!("同步天勤法定交易日历失败: {err:#}");
+                                }
+                            }
                         }
                     }
                 });
@@ -1519,6 +1543,20 @@ impl Services {
 
     pub async fn config(&self) -> Config {
         self.config.read().await.clone()
+    }
+
+    /// 同步并持久化法定交易日历。
+    pub async fn sync_trading_calendar(&self) -> Result<()> {
+        let cal_path = self
+            .config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("trading_calendar.json");
+        let days = self.data_source.fetch_trading_calendar(None, None).await?;
+        crate::session::SessionCalendar::update_trading_calendar(&days);
+        let _ = crate::session::SessionCalendar::save_trading_calendar_file(&cal_path);
+        tracing::info!("📅 成功同步并持久化天勤法定交易日历 ({}天)", days.len());
+        Ok(())
     }
 
     /// 应用新配置：平滑更新全局限速器时隙与预算，写 JSON 文件，更新内存。

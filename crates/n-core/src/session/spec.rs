@@ -1,6 +1,6 @@
 //! Trading session specifications for domestic futures symbols.
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Weekday};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, Timelike};
 
 /// 夜盘时段类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,23 +54,17 @@ impl TradingSessionSpec {
 
     /// 判断当前时刻是否处于该品种的有效交易时间窗口内（含收盘边界分钟）。
     pub fn is_in_trading_time(&self, dt: &DateTime<Local>) -> bool {
-        let weekday = dt.weekday();
         let (h, m) = (dt.hour(), dt.minute());
         let t_mins = h * 60 + m; // 0..1439
+        let date = dt.date_naive();
 
-        // 日盘时段（周一至周五）：
-        // 09:00 - 10:15 (含 10:15)  => [540, 615]
-        // 10:30 - 11:30 (含 11:30)  => [630, 690]
-        // 13:30 - 15:00 (含 15:00)  => [810, 900]
+        // 1. 日盘时段（09:00-10:15, 10:30-11:30, 13:30-15:00）：必须是法定交易日
         let is_day_window = (540..=615).contains(&t_mins)
             || (630..=690).contains(&t_mins)
             || (810..=900).contains(&t_mins);
 
         if is_day_window {
-            return matches!(
-                weekday,
-                Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
-            );
+            return super::trading_calendar::is_trading_day(&date);
         }
 
         // 无夜盘品种
@@ -78,66 +72,51 @@ impl TradingSessionSpec {
             return false;
         }
 
-        // 夜盘 21:00 - 23:00 => [1260, 1380]（周一至周五晚）
-        if (1260..=1380).contains(&t_mins) {
-            return matches!(
-                weekday,
-                Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
-            );
-        }
-
-        // 23:01 - 23:30 => [1381, 1410]
-        if (1381..=1410).contains(&t_mins) {
-            if matches!(
-                self.night_type,
-                NightSessionType::Close2330
-                    | NightSessionType::Close0100
-                    | NightSessionType::Close0230
-            ) {
+        // 2. 夜盘前半夜（21:00 至 24:00）
+        if (1260..=1439).contains(&t_mins) {
+            // 节前最后一个交易日当晚无夜盘
+            if !super::trading_calendar::has_night_session_tonight(&date) {
+                return false;
+            }
+            // 21:00 - 23:00 => [1260, 1380]
+            if (1260..=1380).contains(&t_mins) {
+                return true;
+            }
+            // 23:01 - 23:30 => [1381, 1410]
+            if (1381..=1410).contains(&t_mins) {
                 return matches!(
-                    weekday,
-                    Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+                    self.night_type,
+                    NightSessionType::Close2330
+                        | NightSessionType::Close0100
+                        | NightSessionType::Close0230
+                );
+            }
+            // 23:31 - 24:00 => [1411, 1439]
+            if (1411..=1439).contains(&t_mins) {
+                return matches!(
+                    self.night_type,
+                    NightSessionType::Close0100 | NightSessionType::Close0230
                 );
             }
             return false;
         }
 
-        // 23:31 - 24:00 => [1411, 1439]
-        if (1411..=1439).contains(&t_mins) {
-            if matches!(
-                self.night_type,
-                NightSessionType::Close0100 | NightSessionType::Close0230
-            ) {
+        // 3. 跨日凌晨时段（00:00 - 02:30，属于前一天晚上夜盘的延伸）：
+        if (0..=150).contains(&t_mins) {
+            let prev_date = date - chrono::Days::new(1);
+            if !super::trading_calendar::has_night_session_tonight(&prev_date) {
+                return false;
+            }
+            // 00:00 - 01:00 => [0, 60]
+            if (0..=60).contains(&t_mins) {
                 return matches!(
-                    weekday,
-                    Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+                    self.night_type,
+                    NightSessionType::Close0100 | NightSessionType::Close0230
                 );
             }
-            return false;
-        }
-
-        // 跨日凌晨时段（周二至周六凌晨，对应周一至周五晚上的夜盘延伸）：
-        // 00:00 - 01:00 => [0, 60]
-        if (0..=60).contains(&t_mins) {
-            if matches!(
-                self.night_type,
-                NightSessionType::Close0100 | NightSessionType::Close0230
-            ) {
-                return matches!(
-                    weekday,
-                    Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri | Weekday::Sat
-                );
-            }
-            return false;
-        }
-
-        // 01:01 - 02:30 => [61, 150]
-        if (61..=150).contains(&t_mins) {
-            if matches!(self.night_type, NightSessionType::Close0230) {
-                return matches!(
-                    weekday,
-                    Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri | Weekday::Sat
-                );
+            // 01:01 - 02:30 => [61, 150]
+            if (61..=150).contains(&t_mins) {
+                return matches!(self.night_type, NightSessionType::Close0230);
             }
             return false;
         }
@@ -149,6 +128,22 @@ impl TradingSessionSpec {
     pub fn is_in_close_grace(&self, dt: &DateTime<Local>, grace_secs: u64) -> bool {
         let now = dt.naive_local();
         let date = now.date();
+        let hour = dt.hour();
+
+        // 如果当天或当时段本来就未开市，绝不进入收盘宽限期
+        if hour >= 20 {
+            if !super::trading_calendar::has_night_session_tonight(&date) {
+                return false;
+            }
+        } else if hour < 4 {
+            let prev_date = date - chrono::Days::new(1);
+            if !super::trading_calendar::has_night_session_tonight(&prev_date) {
+                return false;
+            }
+        } else if !super::trading_calendar::is_trading_day(&date) {
+            return false;
+        }
+
         let closes = self.session_close_times();
 
         for (h, m) in closes {
@@ -176,23 +171,28 @@ impl TradingSessionSpec {
         }
     }
 
-    /// 归属交易日：夜盘（20:00 之后及跨日凌晨）归入下一个工作日/交易日；周五夜盘归入周一。
+    /// 归属交易日：夜盘（20:00 之后及跨日凌晨）归入下一个实际交易日；周五夜盘归入周一。
     pub fn trading_day(&self, dt: &NaiveDateTime) -> NaiveDate {
         let date = dt.date();
         let hour = dt.hour();
         if hour >= 20 {
-            // 夜盘开始，归入下一交易日
-            match date.weekday() {
-                Weekday::Fri => date + chrono::Duration::days(3),
-                Weekday::Sat => date + chrono::Duration::days(2),
-                _ => date + chrono::Duration::days(1),
+            let mut cand = date + chrono::Duration::days(1);
+            for _ in 0..15 {
+                if super::trading_calendar::is_trading_day(&cand) {
+                    return cand;
+                }
+                cand += chrono::Duration::days(1);
             }
+            cand
         } else if hour < 4 && self.night_type != NightSessionType::None {
-            // 凌晨跨日的夜盘延伸（周二至周六凌晨），实际属于当天的早盘交易日（周六凌晨属于周一交易日）
-            match date.weekday() {
-                Weekday::Sat => date + chrono::Duration::days(2),
-                _ => date,
+            let mut cand = date;
+            for _ in 0..15 {
+                if super::trading_calendar::is_trading_day(&cand) {
+                    return cand;
+                }
+                cand += chrono::Duration::days(1);
             }
+            cand
         } else {
             date
         }

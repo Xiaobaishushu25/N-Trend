@@ -61,6 +61,17 @@ struct SearchResponse {
     results: Vec<FuturesSymbol>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingCalendarDay {
+    pub date: String,
+    pub trading: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TradingCalendarResponse {
+    calendar: Vec<TradingCalendarDay>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct QuotesRequest<'a> {
     symbols: &'a [String],
@@ -220,6 +231,37 @@ impl TqBridgeClient {
         } else {
             None
         }
+    }
+
+    pub async fn fetch_trading_calendar(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Vec<TradingCalendarDay>> {
+        let mut url = format!("{}/api/trading-calendar", self.base_url);
+        let mut query = Vec::new();
+        if let Some(s) = start {
+            query.push(format!("start={s}"));
+        }
+        if let Some(e) = end {
+            query.push(format!("end={e}"));
+        }
+        if !query.is_empty() {
+            url = format!("{}?{}", url, query.join("&"));
+        }
+        let response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .context("请求天勤交易日历接口失败")?;
+        if !response.status().is_success() {
+            bail!("天勤交易日历接口返回异常: {}", response.status());
+        }
+        let data: TradingCalendarResponse =
+            response.json().await.context("解析天勤交易日历失败")?;
+        Ok(data.calendar)
     }
 }
 
