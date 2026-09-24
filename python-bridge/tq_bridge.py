@@ -625,10 +625,29 @@ class TqDataWorker:
         elif cmd == "get_trading_calendar":
             start_dt = args.get("start_dt")
             end_dt = args.get("end_dt")
-            if isinstance(start_dt, str):
-                start_dt = datetime.datetime.strptime(start_dt, "%Y-%m-%d").date()
-            if isinstance(end_dt, str):
-                end_dt = datetime.datetime.strptime(end_dt, "%Y-%m-%d").date()
+            if isinstance(start_dt, str) and start_dt.strip():
+                start_dt = datetime.datetime.strptime(start_dt.strip(), "%Y-%m-%d").date()
+            else:
+                start_dt = None
+            if isinstance(end_dt, str) and end_dt.strip():
+                end_dt = datetime.datetime.strptime(end_dt.strip(), "%Y-%m-%d").date()
+            else:
+                end_dt = None
+
+            try:
+                from tqsdk.api import _init_chinese_rest_days
+                first_date, latest_date = _init_chinese_rest_days()
+            except Exception:
+                first_date = datetime.date(2003, 1, 1)
+                latest_date = datetime.date(2026, 12, 31)
+
+            today = datetime.date.today()
+            if not start_dt or start_dt < first_date:
+                start_dt = max(first_date, datetime.date(today.year - 1, 1, 1))
+            if not end_dt or end_dt > latest_date:
+                end_dt = latest_date
+            if start_dt > end_dt:
+                start_dt = first_date
 
             cal = self.api.get_trading_calendar(start_dt=start_dt, end_dt=end_dt)
             results = []
@@ -1210,12 +1229,8 @@ async def handle_trading_calendar(request: web.Request) -> web.Response:
     if not worker or not worker.connected:
         return web.json_response({"error": "TqApi not connected"}, status=503)
 
-    today = datetime.date.today()
-    default_start = datetime.date(today.year - 1, 1, 1).strftime("%Y-%m-%d")
-    default_end = datetime.date(today.year + 1, 12, 31).strftime("%Y-%m-%d")
-
-    start_dt = request.query.get("start", default_start)
-    end_dt = request.query.get("end", default_end)
+    start_dt = request.query.get("start")
+    end_dt = request.query.get("end")
 
     try:
         results = await asyncio.to_thread(
