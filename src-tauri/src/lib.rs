@@ -387,12 +387,35 @@ fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
         // 天勤从不可用恢复时，必须重新做一次完整回补，而不是只等待下一个5分钟增量。
         let mut tq_was_available = false;
         let mut last_tq_recovery_attempt: Option<Instant> = None;
+        let mut last_trading_status: Option<n_core::session::TradingStatus> = None;
         loop {
             ticker.tick().await;
             let now = Local::now();
             let cfg = state.services.scheduler_config().await;
             let tq_required = state.services.config().await.data_source.primary_source == "tqsdk";
             let tq_available = state.services.data_source.tq_is_available();
+
+            let current_status = n_core::session::SessionCalendar::current_trading_status(&now);
+            if last_trading_status != Some(current_status) {
+                match current_status {
+                    n_core::session::TradingStatus::Trading => {
+                        tracing::info!("☀️ [调度器] 交易时段已开启，恢复常规行情刷新与扫描调度");
+                    }
+                    n_core::session::TradingStatus::HolidayOff => {
+                        tracing::info!("🌙 [调度器] 当前处于法定节假日休市时段，服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::PreHolidayNightOff => {
+                        tracing::info!("🌙 [调度器] 当前处于法定节假日前夕（今晚无夜盘），服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::WeekendOff => {
+                        tracing::info!("🌙 [调度器] 当前处于周末休市时段，服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::DailyIntermission => {
+                        tracing::info!("🌙 [调度器] 当前处于日常非交易时段，服务进入静默休眠");
+                    }
+                }
+                last_trading_status = Some(current_status);
+            }
 
             // 首次探活成功，以及运行中从降级状态恢复，都走完整回补+缺口修复。
             // 这一步放在普通调度判定之前，避免 latest_ts 已被实时事件推进后漏掉中间缺口。

@@ -227,10 +227,34 @@ async fn main() -> anyhow::Result<()> {
         let mut startup_done = false;
         let mut last_refresh: Option<chrono::DateTime<Local>> = None;
         let mut last_scan: Option<chrono::DateTime<Local>> = None;
+        let mut last_trading_status: Option<n_core::session::TradingStatus> = None;
         loop {
             ticker.tick().await;
             let now = Local::now();
             let cfg = svc.config().await.scheduler.clone();
+
+            let current_status = n_core::session::SessionCalendar::current_trading_status(&now);
+            if last_trading_status != Some(current_status) {
+                match current_status {
+                    n_core::session::TradingStatus::Trading => {
+                        tracing::info!("☀️ [调度器] 交易时段已开启，恢复常规行情刷新与扫描调度");
+                    }
+                    n_core::session::TradingStatus::HolidayOff => {
+                        tracing::info!("🌙 [调度器] 当前处于法定节假日休市时段，服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::PreHolidayNightOff => {
+                        tracing::info!("🌙 [调度器] 当前处于法定节假日前夕（今晚无夜盘），服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::WeekendOff => {
+                        tracing::info!("🌙 [调度器] 当前处于周末休市时段，服务进入静默休眠");
+                    }
+                    n_core::session::TradingStatus::DailyIntermission => {
+                        tracing::info!("🌙 [调度器] 当前处于日常非交易时段，服务进入静默休眠");
+                    }
+                }
+                last_trading_status = Some(current_status);
+            }
+
             if !startup_done {
                 startup_done = true;
                 if n_core::scheduler::is_trading_time(&now) {

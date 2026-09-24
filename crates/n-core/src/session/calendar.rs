@@ -1,7 +1,33 @@
 //! Global session calendar and registry for all futures symbols.
 
 use super::spec::{NightSessionType, TradingSessionSpec};
-use chrono::{DateTime, Local, NaiveDateTime};
+use chrono::{Datelike, DateTime, Local, NaiveDateTime, Timelike};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradingStatus {
+    /// 正常交易时段
+    Trading,
+    /// 法定节假日全天休市 (如中秋、国庆、春节等)
+    HolidayOff,
+    /// 节假日前夕当晚无夜盘
+    PreHolidayNightOff,
+    /// 周末全天休市
+    WeekendOff,
+    /// 正常盘间/盘后休市 (午休、收盘后等)
+    DailyIntermission,
+}
+
+impl TradingStatus {
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Trading => "交易时段开启",
+            Self::HolidayOff => "法定节假日休市",
+            Self::PreHolidayNightOff => "法定节假日前夕无夜盘",
+            Self::WeekendOff => "周末休市",
+            Self::DailyIntermission => "日常非交易时段",
+        }
+    }
+}
 
 pub struct SessionCalendar;
 
@@ -130,6 +156,42 @@ impl SessionCalendar {
     pub fn has_night_session_tonight(date: &chrono::NaiveDate) -> bool {
         super::trading_calendar::has_night_session_tonight(date)
     }
+
+    /// 查询当前时刻的交易时段状态类型（用于调度器状态切换时的精准提示）。
+    pub fn current_trading_status(now: &DateTime<Local>) -> TradingStatus {
+        if Self::is_global_trading_time(now) {
+            return TradingStatus::Trading;
+        }
+
+        let date = now.date_naive();
+        let hour = now.hour();
+
+        if !super::trading_calendar::is_trading_day(&date) {
+            if matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) {
+                return TradingStatus::WeekendOff;
+            } else {
+                return TradingStatus::HolidayOff;
+            }
+        }
+
+        if hour >= 20 && !super::trading_calendar::has_night_session_tonight(&date) {
+            return TradingStatus::PreHolidayNightOff;
+        }
+
+        if hour < 4 {
+            let prev = date - chrono::Duration::days(1);
+            if !super::trading_calendar::has_night_session_tonight(&prev) {
+                if !super::trading_calendar::is_trading_day(&prev)
+                    && !matches!(prev.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
+                {
+                    return TradingStatus::HolidayOff;
+                }
+                return TradingStatus::PreHolidayNightOff;
+            }
+        }
+
+        TradingStatus::DailyIntermission
+    }
 }
 
 /// 根据品种代码或前缀分类夜盘类型（自动提取字母前缀并转大写）。
@@ -213,6 +275,30 @@ mod tests {
         assert_eq!(
             SessionCalendar::next_session_close("AU0", &at_au_night),
             Some((day + chrono::Days::new(1)).and_hms_opt(2, 30, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_current_trading_status_recognition() {
+        // 白天交易时段 (9:30)
+        let trading_dt = local_dt(2026, 8, 24, 9, 30);
+        assert_eq!(
+            SessionCalendar::current_trading_status(&trading_dt),
+            TradingStatus::Trading
+        );
+
+        // 周末休市
+        let weekend_dt = local_dt(2026, 8, 23, 14, 0); // 周日
+        assert_eq!(
+            SessionCalendar::current_trading_status(&weekend_dt),
+            TradingStatus::WeekendOff
+        );
+
+        // 日常非交易时段 (下午 16:00)
+        let afternoon_off = local_dt(2026, 8, 24, 16, 0);
+        assert_eq!(
+            SessionCalendar::current_trading_status(&afternoon_off),
+            TradingStatus::DailyIntermission
         );
     }
 }
