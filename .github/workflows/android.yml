@@ -15,6 +15,7 @@ on:
       - 'vite.config.ts'
       - 'index.html'
       - 'tsconfig*.json'
+      - 'scripts/patch-android-mainactivity.py'
       - '.github/workflows/android.yml'
 
 permissions:
