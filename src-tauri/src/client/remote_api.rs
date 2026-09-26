@@ -147,6 +147,18 @@ impl RemoteApiClient {
         self.execute_empty(self.request(Method::DELETE, &format!("devices/{device_id}"))).await
     }
 
+    pub async fn update_device_role(&self, device_id: &str, role: &str) -> Result<(), ApiErrorResponse> {
+        #[derive(Serialize)]
+        struct RoleReq<'a> {
+            role: &'a str,
+        }
+        self.execute_empty(
+            self.request(Method::PUT, &format!("devices/{device_id}/role"))
+                .json(&RoleReq { role }),
+        )
+        .await
+    }
+
     pub async fn pair_device(&self, req: &DeviceRegisterRequest) -> Result<DeviceRegisterResponse, ApiErrorResponse> {
         self.execute(self.request(Method::POST, "devices/register").json(req)).await
     }

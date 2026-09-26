@@ -851,6 +851,15 @@ pub async fn revoke_device(state: State<'_, Arc<AppState>>, device_id: String) -
 }
 
 #[tauri::command]
+pub async fn update_device_role(
+    state: State<'_, Arc<AppState>>,
+    device_id: String,
+    role: String,
+) -> Result<(), String> {
+    state.api.update_device_role(&device_id, &role).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
 pub async fn pair_device(
     state: State<'_, Arc<AppState>>,
     req: DeviceRegisterRequest,

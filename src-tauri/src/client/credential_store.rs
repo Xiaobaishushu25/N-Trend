@@ -58,7 +58,16 @@ impl CredentialStore {
         }
     }
 
+    pub fn reload_from_disk(&self) {
+        if let Ok(content) = std::fs::read_to_string(&self.auth_file_path) {
+            if let Ok(saved) = serde_json::from_str::<AuthRecord>(&content) {
+                *self.record.write().unwrap() = saved;
+            }
+        }
+    }
+
     pub fn get_record(&self) -> AuthRecord {
+        self.reload_from_disk();
         self.record.read().unwrap().clone()
     }
 

@@ -31,6 +31,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/devices/register", post(devices::register_device))
         .route("/devices", get(devices::list_devices))
         .route("/devices/:id", delete(devices::revoke_device))
+        .route("/devices/:id/role", put(devices::update_device_role))
         // 品种与分组
         .route("/symbols", get(symbols::get_symbols).post(symbols::add_symbol))
         .route("/symbols/:code", delete(symbols::remove_symbol))

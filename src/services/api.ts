@@ -195,6 +195,7 @@ export const api = {
   updateServerSettings: (req: ServerSettingsUpdate) => invoke<ConfigApplyResult>('update_server_settings', { req }),
   listDevices: () => invoke<DeviceItemDto[]>('list_devices'),
   revokeDevice: (deviceId: string) => invoke<void>('revoke_device', { deviceId }),
+  updateDeviceRole: (deviceId: string, role: string) => invoke<void>('update_device_role', { deviceId, role }),
   pairDevice: (req: DeviceRegisterRequest) => invoke<DeviceRegisterResponse>('pair_device', { req }),
   restartServer: () => invoke<void>('restart_server'),
   restartBridge: () => invoke<void>('restart_bridge'),

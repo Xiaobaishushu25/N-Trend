@@ -18,11 +18,19 @@ pub async fn register_device(
         return Err((StatusCode::UNAUTHORIZED, Json(err)));
     }
 
-    // 判断是否已有设备；若这是第一个注册的设备，自动赋予 admin 角色，后续设备默认为 standard
+    // 若这是第一个注册的设备，或者没有生效中的管理员，或者设备名称标明为桌面/PC/Admin，自动赋予 admin 角色
     let existing = n_core::storage::repo::list_devices(&ctx.db)
         .await
         .unwrap_or_default();
-    let role = if existing.is_empty() {
+    let name_lower = payload.device_name.to_lowercase();
+    let is_pc_or_admin_name = name_lower.contains("pc")
+        || name_lower.contains("desktop")
+        || name_lower.contains("admin");
+    let has_active_admin = existing
+        .iter()
+        .any(|d| d.role == "admin" && d.revoked_at.is_none());
+
+    let role = if !has_active_admin || is_pc_or_admin_name {
         "admin"
     } else {
         "standard"
@@ -103,6 +111,39 @@ pub async fn revoke_device(
         }
         Err(e) => {
             let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("吊销设备失败: {e}"), "");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct UpdateDeviceRoleRequest {
+    pub role: String,
+}
+
+pub async fn update_device_role(
+    State(ctx): State<Arc<ServerContext>>,
+    RequireAdmin(_): RequireAdmin,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateDeviceRoleRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
+    if payload.role != "admin" && payload.role != "standard" {
+        let err = ApiErrorResponse::new("INVALID_PARAM", "无效的设备角色", "");
+        return Err((StatusCode::BAD_REQUEST, Json(err)));
+    }
+
+    match n_core::storage::repo::update_device_role(&ctx.db, &id, &payload.role).await {
+        Ok(success) => {
+            if success {
+                tracing::info!("🔄 设备角色已更新 | ID: {} | 新角色: {}", id, payload.role);
+                Ok(StatusCode::NO_CONTENT)
+            } else {
+                let err = ApiErrorResponse::new("NOT_FOUND", "设备不存在或已被吊销", "");
+                Err((StatusCode::NOT_FOUND, Json(err)))
+            }
+        }
+        Err(e) => {
+            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("更新设备角色失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }

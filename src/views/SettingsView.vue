@@ -366,6 +366,17 @@ async function revokeDevice(deviceId: string) {
   }
 }
 
+async function changeDeviceRole(deviceId: string, currentRole: string) {
+  const targetRole = currentRole.includes('admin') ? 'standard' : 'admin'
+  try {
+    await api.updateDeviceRole(deviceId, targetRole)
+    message.success(`设备角色已更新为: ${targetRole === 'admin' ? '主管理员' : '标准终端'}`)
+    await loadDevices()
+  } catch (e: any) {
+    message.error(`修改角色失败: ${e?.message || e}`)
+  }
+}
+
 const deviceColumns: DataTableColumns<DeviceItemDto> = [
   { title: '设备名称', key: 'name' },
   { title: '设备ID', key: 'id', ellipsis: { tooltip: true } },
@@ -376,7 +387,7 @@ const deviceColumns: DataTableColumns<DeviceItemDto> = [
       return h(
         NTag,
         { size: 'small', type: row.role.includes('admin') ? 'primary' : 'default', round: true },
-        () => (row.role.includes('admin') ? '管理员' : '只读终端'),
+        () => (row.role.includes('admin') ? '主管理员' : '标准终端'),
       )
     },
   },
@@ -393,19 +404,32 @@ const deviceColumns: DataTableColumns<DeviceItemDto> = [
     key: 'actions',
     render(row) {
       if (row.id === authRecord.value.device_id) {
-        return h(NTag, { size: 'small', type: 'info' }, () => '当前设备')
+        return h(NTag, { size: 'small', type: 'info' }, () => '当前设备 (本机)')
       }
-      return h(
-        NPopconfirm,
-        {
-          onPositiveClick: () => revokeDevice(row.id),
-        },
-        {
-          trigger: () =>
-            h(NButton, { size: 'tiny', type: 'error', quaternary: true }, () => '撤销授权'),
-          default: () => '确定撤销该设备的访问授权吗？撤销后该终端将无法访问服务。',
-        },
-      )
+      const isTargetAdmin = row.role.includes('admin')
+      return h(NSpace, { size: 'small' }, () => [
+        h(
+          NButton,
+          {
+            size: 'tiny',
+            quaternary: true,
+            type: isTargetAdmin ? 'warning' : 'primary',
+            onClick: () => changeDeviceRole(row.id, row.role),
+          },
+          () => (isTargetAdmin ? '降为标准终端' : '提权为主管'),
+        ),
+        h(
+          NPopconfirm,
+          {
+            onPositiveClick: () => revokeDevice(row.id),
+          },
+          {
+            trigger: () =>
+              h(NButton, { size: 'tiny', type: 'error', quaternary: true }, () => '撤销授权'),
+            default: () => '确定撤销该设备的访问授权吗？撤销后该终端将无法访问服务。',
+          },
+        ),
+      ])
     },
   },
 ]
@@ -579,7 +603,7 @@ onMounted(async () => {
                   <div class="row-label">设备身份角色</div>
                   <div style="display: flex; align-items: center; gap: 8px">
                     <n-tag :type="isAdmin ? 'primary' : 'default'" size="small" round>
-                      {{ isAdmin ? '主管理员 (PC Admin)' : '只读终端 (Read Only)' }}
+                      {{ isAdmin ? '主管理员 (PC Admin)' : '标准终端 (Standard)' }}
                     </n-tag>
                     <n-text depth="3" style="font-size: 12px">ID: {{ authRecord.device_id || '未配对' }}</n-text>
                   </div>

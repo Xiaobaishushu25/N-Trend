@@ -203,6 +203,7 @@ pub fn run() {
             commands::restart_bridge,
             commands::list_devices,
             commands::revoke_device,
+            commands::update_device_role,
             commands::pair_device,
             commands::get_backup_status,
             commands::trigger_database_backup,

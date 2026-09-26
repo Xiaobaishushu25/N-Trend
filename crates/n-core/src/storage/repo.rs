@@ -1915,6 +1915,19 @@ pub async fn revoke_device(db: &DatabaseConnection, id: &str) -> Result<bool> {
     Ok(res.rows_affected() > 0)
 }
 
+pub async fn update_device_role(db: &DatabaseConnection, id: &str, role: &str) -> Result<bool> {
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE devices SET role = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+            vec![role.into(), id.into()],
+        ))
+        .await
+        .context("更新设备角色失败")?;
+    bump_revision(db, "devices").await.ok();
+    Ok(res.rows_affected() > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Notification History (Persistent)
 // ---------------------------------------------------------------------------
