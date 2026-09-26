@@ -40,6 +40,7 @@ pub async fn app_info() -> AppInfo {
 
 #[tauri::command]
 pub async fn set_window_size(window: tauri::Window, width: f64, height: f64) -> Result<(), String> {
+    #[cfg(desktop)]
     if let Ok(is_max) = window.is_maximized() {
         if is_max {
             let _ = window.unmaximize();
@@ -872,8 +873,16 @@ pub async fn trigger_database_backup(state: State<'_, Arc<AppState>>) -> Result<
 #[tauri::command]
 pub async fn open_backup_directory(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let dir = state.backup_scheduler.backup_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    open::that(&dir).map_err(|e| format!("打开备份目录失败: {e}"))
+    #[cfg(desktop)]
+    {
+        let _ = std::fs::create_dir_all(&dir);
+        open::that(&dir).map_err(|e| format!("打开备份目录失败: {e}"))
+    }
+    #[cfg(mobile)]
+    {
+        let _ = dir;
+        Err("移动端不支持打开本地备份目录".to_string())
+    }
 }
 
 // ── Integrity ──
@@ -919,6 +928,14 @@ pub async fn get_finality_sentinel_eval(_state: State<'_, Arc<AppState>>) -> Res
 #[tauri::command]
 pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    open::that(&dir).map_err(|e| e.to_string())
+    #[cfg(desktop)]
+    {
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        open::that(&dir).map_err(|e| e.to_string())
+    }
+    #[cfg(mobile)]
+    {
+        let _ = dir;
+        Err("移动端不支持打开本地日志目录".to_string())
+    }
 }

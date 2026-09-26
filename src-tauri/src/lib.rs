@@ -1,10 +1,13 @@
+#[cfg(desktop)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Local;
+#[cfg(desktop)]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager};
+use tauri::Manager;
+#[cfg(desktop)]
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 pub mod client;
@@ -14,6 +17,7 @@ mod state;
 use client::{BackupScheduler, CredentialStore, KlineMemoryCache, RealtimeClient, RemoteApiClient};
 use state::AppState;
 
+#[cfg(desktop)]
 pub static QUITTING: AtomicBool = AtomicBool::new(false);
 
 /// 日志时间：使用本地时间（北京时间），替代 tracing 默认的 UTC 时间。
@@ -41,7 +45,10 @@ fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
+
+    #[cfg(desktop)]
+    let builder = builder
         // 单实例：重复启动时不再创建新进程，而是唤起已有实例的主窗口
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -50,7 +57,6 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }))
-        .plugin(tauri_plugin_notification::init())
         // 开机自启：Windows 写注册表 Run 项，macOS 用 LaunchAgent
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -61,7 +67,9 @@ pub fn run() {
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
-        )
+        );
+
+    builder
         .setup(|app| {
             let setup_t0 = Instant::now();
             let data_dir = app_data_dir(app)?;
@@ -93,7 +101,8 @@ pub fn run() {
             ));
             app.manage(state);
 
-            // 3. 设置系统托盘
+            // 3. 桌面端设置系统托盘
+            #[cfg(desktop)]
             setup_tray(app)?;
 
             tracing::info!("✅ 主窗口就绪 总耗时 {}ms", setup_t0.elapsed().as_millis());
@@ -101,14 +110,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else if window.label() != "main" {
-                    let _ = window
-                        .app_handle()
-                        .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
+            #[cfg(desktop)]
+            {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    } else if window.label() != "main" {
+                        let _ = window
+                            .app_handle()
+                            .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
+                    }
                 }
             }
         })
@@ -246,6 +258,7 @@ fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(desktop)]
 fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     use tauri::menu::{Menu, MenuItem};
 
@@ -296,6 +309,7 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(desktop)]
 fn open_settings_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
