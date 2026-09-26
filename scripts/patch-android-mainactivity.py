@@ -13,7 +13,7 @@ import android.os.Bundle
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import app.tauri.plugin.TauriActivity
+import app.tauri.TauriActivity
 
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
