@@ -51,12 +51,12 @@ jobs:
         run: npm run tauri -- android init --ci
 
       - name: Build APK
-        run: npm run tauri -- android build --apk --target aarch64
+        run: npm run tauri -- android build --debug --apk --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ntrend-android-apk
+          name: ntrend-android-debug-apk
           path: src-tauri/gen/android/app/build/outputs/**/*.apk
           if-no-files-found: error
           retention-days: 14
