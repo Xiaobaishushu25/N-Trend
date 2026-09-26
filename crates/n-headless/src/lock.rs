@@ -63,7 +63,14 @@ fn is_process_running(pid: u32) -> bool {
 
 #[cfg(not(windows))]
 fn is_process_running(pid: u32) -> bool {
-    // Unix: kill(pid, 0) == 0
-    let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    res == 0
+    let proc_path = format!("/proc/{}", pid);
+    if Path::new(&proc_path).exists() {
+        return true;
+    }
+    // Unix 通用后备方案 (kill -0 pid)
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
