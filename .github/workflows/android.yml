@@ -50,13 +50,85 @@ jobs:
       - name: Initialize Android project
         run: npm run tauri -- android init --ci
 
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          android_dir = Path("src-tauri/gen/android")
+          app_gradle = android_dir / "app/build.gradle.kts"
+          required = (
+              "ANDROID_KEYSTORE_BASE64",
+              "ANDROID_KEYSTORE_PASSWORD",
+              "ANDROID_KEY_ALIAS",
+              "ANDROID_KEY_PASSWORD",
+          )
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing GitHub Actions secrets: " + ", ".join(missing))
+
+          keystore = android_dir / "release-keystore.jks"
+          keystore.write_bytes(__import__("base64").b64decode(os.environ["ANDROID_KEYSTORE_BASE64"]))
+          properties = {
+              "storeFile": "release-keystore.jks",
+              "storePassword": os.environ["ANDROID_KEYSTORE_PASSWORD"],
+              "keyAlias": os.environ["ANDROID_KEY_ALIAS"],
+              "keyPassword": os.environ["ANDROID_KEY_PASSWORD"],
+          }
+          (android_dir / "keystore.properties").write_text(
+              "".join(f"{key}={value}\n" for key, value in properties.items()),
+              encoding="utf-8",
+          )
+
+          text = app_gradle.read_text(encoding="utf-8")
+          if 'create("release")' in text:
+              raise SystemExit("Release signing already appears configured in app/build.gradle.kts")
+          if not re.search(r'(?m)^android\s*\{', text):
+              raise SystemExit("Could not find the android block in app/build.gradle.kts")
+          text = re.sub(
+              r'(?m)^android\s*\{',
+              '''android {
+              val signingProperties = java.util.Properties().apply {
+                  load(rootProject.file("keystore.properties").inputStream())
+              }
+              signingConfigs {
+                  create("release") {
+                      storeFile = rootProject.file(signingProperties.getProperty("storeFile"))
+                      storePassword = signingProperties.getProperty("storePassword")
+                      keyAlias = signingProperties.getProperty("keyAlias")
+                      keyPassword = signingProperties.getProperty("keyPassword")
+                  }
+              }
+          ''',
+              text,
+              count=1,
+          )
+          pattern = r'(getByName\("release"\)\s*\{)'
+          text, replacements = re.subn(
+              pattern,
+              r'\1\n            signingConfig = signingConfigs.getByName("release")',
+              text,
+              count=1,
+          )
+          if replacements != 1:
+              raise SystemExit("Could not find the release build type in app/build.gradle.kts")
+          app_gradle.write_text(text, encoding="utf-8")
+          PY
+
       - name: Build APK
-        run: npm run tauri -- android build --debug --apk --target aarch64
+        run: npm run tauri -- android build --apk --target aarch64
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ntrend-android-debug-apk
+          name: ntrend-android-release-apk
           path: src-tauri/gen/android/app/build/outputs/**/*.apk
           if-no-files-found: error
           retention-days: 14

@@ -22,3 +22,8 @@ zhihu_screenshot.png
 ntrend.db
 data/
 
+# Android release signing material (never commit)
+/release-signing/
+/src-tauri/gen/android/keystore.properties
+/src-tauri/gen/android/release-keystore.jks
+
