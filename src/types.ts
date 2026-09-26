@@ -181,6 +181,9 @@ export interface PatternDto {
   trend_state: string
   trend_bonus: number
   trend_label: string
+  outcome?: string
+  exit_reason?: string
+  r_multiple?: number | null
 }
 
 export interface TrendDto {
@@ -489,6 +492,8 @@ export interface MarketSnapshot {
 export interface AppInfo {
   name: string
   version: string
+  platform?: string
+  is_mobile?: boolean
 }
 
 /** 复盘统计：单个分组（总体或某个维度分组） */
@@ -718,6 +723,118 @@ export interface NotificationHistoryItem {
 
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const
 export type Timeframe = (typeof TIMEFRAMES)[number]
+
+// ---- Multi-terminal & Server Architecture ----
+export type ConnectionStatus = 'connected' | 'reconnecting' | 'unauthorized' | 'version_mismatch' | 'disconnected'
+
+export interface ConnectionStateDto {
+  status: ConnectionStatus
+  server_url: string
+  quote_delay_ms: number | null
+  last_event_seq: number
+}
+
+export interface AuthRecord {
+  server_url: string
+  device_id: string
+  device_token: string
+  device_role: string
+  device_name: string
+}
+
+export interface ClientLocalSettings {
+  serverUrl: string
+  deviceId: string
+  deviceName: string
+  theme: string
+  chartDisplayBars: number
+  chartRightGap: number
+  minBarSpacing: number
+  timeframes: string[]
+  lastGroupId: number | null
+  desktopNotificationEnabled: boolean
+  backupDir?: string | null
+  lastBackupDate?: string | null
+}
+
+export interface MetaDto {
+  api_version: string
+  server_version: string
+  min_client_version: string
+  server_time: number
+}
+
+export interface ServerStatusDto {
+  tq_available: boolean
+  db_available: boolean
+  last_refresh: string | null
+  last_scan: string | null
+  quote_delay_ms: number | null
+  symbol_count: number
+  uptime_secs: number
+  active_connections: number
+}
+
+export interface ServerSettingsDto {
+  configRevision: number
+  appConfig: AppConfig
+  scheduler: SchedulerConfig
+  fetch: FetchConfig
+  quote: QuoteConfig
+  notify: NotifyConfig
+  preclose: PrecloseConfig
+  log: LogConfig
+  dataSource: DataSourceConfig & { tqPasswordConfigured?: boolean }
+  email: EmailSettings & { smtpPasswordConfigured?: boolean }
+}
+
+export interface ServerSettingsUpdate {
+  configRevision: number
+  appConfig?: Partial<AppConfig>
+  scheduler?: Partial<SchedulerConfig>
+  fetch?: Partial<FetchConfig>
+  quote?: Partial<QuoteConfig>
+  notify?: Partial<NotifyConfig>
+  preclose?: Partial<PrecloseConfig>
+  log?: Partial<LogConfig>
+  dataSource?: Partial<DataSourceConfig> & { tqPassword?: string }
+  email?: Partial<EmailSettings> & { smtpPassword?: string }
+}
+
+export interface ConfigApplyResult {
+  applied: string[]
+  restartRequired: string[]
+  rejected: string[]
+  newRevision: number
+}
+
+export interface DeviceItemDto {
+  id: string
+  name: string
+  role: string
+  createdAt: string
+  lastSeenAt?: string | null
+  revokedAt?: string | null
+}
+
+export interface DeviceRegisterRequest {
+  deviceName: string
+  adminKey: string
+}
+
+export interface DeviceRegisterResponse {
+  deviceId: string
+  token: string
+  role: string
+  serverTime: number
+}
+
+export interface BackupStatus {
+  last_backup_date: string | null
+  backup_count: number
+  backup_dir: string
+}
+
 
 // ---- V2 ----
 export interface V2ModelRow { model_id: string; name: string; schema_version: string; feature_whitelist: string; train_window: string; dataset_hash: string; coefficients: string; spline_knots: string | null; metrics: string; created_at: string; }

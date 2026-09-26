@@ -36,10 +36,25 @@ import type {
   SignalUserData,
   SymbolRow,
   TrendPointDto,
+  ConnectionStatus,
+  ConnectionStateDto,
+  AuthRecord,
+  ClientLocalSettings,
+  MetaDto,
+  ServerStatusDto,
+  ServerSettingsDto,
+  ServerSettingsUpdate,
+  ConfigApplyResult,
+  DeviceItemDto,
+  DeviceRegisterRequest,
+  DeviceRegisterResponse,
+  BackupStatus,
 } from '../types'
 
 export const api = {
   appInfo: () => invoke<AppInfo>('app_info'),
+  setWindowSize: (width: number, height: number) =>
+    invoke<void>('set_window_size', { width, height }),
   recordNotification: (item: NewNotificationHistoryItem) =>
     invoke<NotificationHistoryItem[]>('record_notification', { item }),
   getNotificationHistory: () =>
@@ -167,6 +182,49 @@ export const api = {
   getV2Predictions: (modelId?: string | null) => invoke<V2PredictionRow[]>('get_v2_predictions', { modelId: modelId || null }),
   backfillV2Predictions: () => invoke<{ models: number; events_seen: number; events_scored: number; predictions_written: number }>('backfill_v2_predictions'),
   getV2Report: () => invoke<V2ReportBundle>('get_v2_dataset_report'),
+
+  // ---- Multi-terminal & Server Architecture ----
+  getConnectionStatus: () => invoke<ConnectionStateDto>('get_connection_status'),
+  getAuthRecord: () => invoke<AuthRecord>('get_auth_record'),
+  updateAuthRecord: (record: AuthRecord) => invoke<void>('update_auth_record', { record }),
+  getClientSettings: () => invoke<ClientLocalSettings>('get_client_settings'),
+  updateClientSettings: (settings: ClientLocalSettings) => invoke<void>('update_client_settings', { settings }),
+  getMeta: () => invoke<MetaDto>('get_meta'),
+  getServerStatus: () => invoke<ServerStatusDto>('get_server_status'),
+  getServerSettings: () => invoke<ServerSettingsDto>('get_server_settings'),
+  updateServerSettings: (req: ServerSettingsUpdate) => invoke<ConfigApplyResult>('update_server_settings', { req }),
+  listDevices: () => invoke<DeviceItemDto[]>('list_devices'),
+  revokeDevice: (deviceId: string) => invoke<void>('revoke_device', { deviceId }),
+  pairDevice: (req: DeviceRegisterRequest) => invoke<DeviceRegisterResponse>('pair_device', { req }),
+  restartServer: () => invoke<void>('restart_server'),
+  restartBridge: () => invoke<void>('restart_bridge'),
+  getBackupStatus: () => invoke<BackupStatus>('get_backup_status'),
+  triggerDatabaseBackup: () => invoke<string>('trigger_database_backup'),
+  openBackupDirectory: () => invoke<void>('open_backup_directory'),
+}
+
+export function onConnectionStatusChanged(cb: (status: ConnectionStatus) => void) {
+  return listen<ConnectionStatus>('connection-status-changed', (e) => cb(e.payload))
+}
+
+export function onBackupCompleted(cb: (filename: string) => void) {
+  return listen<string>('backup-completed', (e) => cb(e.payload))
+}
+
+export function onServerStatus(cb: (status: ServerStatusDto) => void) {
+  return listen<ServerStatusDto>('server-status', (e) => cb(e.payload))
+}
+
+export function onKlinePartial(cb: (payload: { symbol: string; timeframe: string; bar: any }) => void) {
+  return listen<{ symbol: string; timeframe: string; bar: any }>('kline-partial', (e) => cb(e.payload))
+}
+
+export function onKlineClosed(cb: (payload: { symbol: string; timeframe: string; bar: any }) => void) {
+  return listen<{ symbol: string; timeframe: string; bar: any }>('kline-closed', (e) => cb(e.payload))
+}
+
+export function onStateChanged(cb: (payload: { scope: string; revision: number }) => void) {
+  return listen<{ scope: string; revision: number }>('state-changed', (e) => cb(e.payload))
 }
 
 export function onDataUpdated(cb: (stats: RefreshStats) => void) {

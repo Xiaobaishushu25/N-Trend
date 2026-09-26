@@ -1,0 +1,28 @@
+[Unit]
+Description=N-Trend Headless Authoritative Server Daemon
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntrend
+Group=ntrend
+WorkingDirectory=/opt/ntrend
+Environment=RUST_LOG=info
+Environment=DATA_DIR=/opt/ntrend/data
+Environment=BIND_ADDR=127.0.0.1:8780
+
+ExecStart=/opt/ntrend/bin/n-headless
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+# 安全限制
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

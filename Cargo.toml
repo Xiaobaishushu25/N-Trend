@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/n-core", "crates/n-headless", "src-tauri"]
+members = ["crates/n-protocol", "crates/n-core", "crates/n-headless", "src-tauri"]
 
 [workspace.package]
-version = "1.2.0-alpha"
+version = "3.0.0"
 edition = "2021"

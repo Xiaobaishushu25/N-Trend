@@ -8,8 +8,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
-chrono = "0.4"
-n-core = { path = "../crates/n-core" }
+chrono = { version = "0.4", features = ["serde"] }
+n-protocol = { path = "../crates/n-protocol" }
 open = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,3 +22,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+keyring = "2"
+lru = "0.12"
+sha2 = "0.10"
+flate2 = "1.0"
+bytes = "1"

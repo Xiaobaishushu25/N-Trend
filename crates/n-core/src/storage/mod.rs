@@ -21,6 +21,9 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
     let db = SeaDatabase::connect(&url)
         .await
         .map_err(|e| anyhow!("连接 SQLite 失败 ({}): {e}", url))?;
+    let _ = db.execute_unprepared("PRAGMA journal_mode = WAL;").await;
+    let _ = db.execute_unprepared("PRAGMA busy_timeout = 5000;").await;
+    let _ = db.execute_unprepared("PRAGMA foreign_keys = ON;").await;
     migrate_with_path(&db, Some(path)).await?;
     Ok(db)
 }
@@ -80,6 +83,26 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
             .create_table_from_entity(entities::manual_level_events::Entity)
             .if_not_exists()
             .to_owned(),
+        schema
+            .create_table_from_entity(entities::devices::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::notification_history::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::sync_revisions::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::idempotency_requests::Entity)
+            .if_not_exists()
+            .to_owned(),
+        schema
+            .create_table_from_entity(entities::server_settings::Entity)
+            .if_not_exists()
+            .to_owned(),
     ];
     let backend = db.get_database_backend();
     db.execute_unprepared("DROP TABLE IF EXISTS manual_box_events")
@@ -91,6 +114,11 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     for table in tables {
         let stmt = backend.build(&table);
         db.execute(stmt).await.context("创建数据表失败")?;
+    }
+    for scope in ["symbols", "groups", "manual_levels", "signals", "settings", "notifications"] {
+        let _ = db.execute_unprepared(&format!(
+            "INSERT OR IGNORE INTO sync_revisions (scope, revision, updated_at) VALUES ('{scope}', 1, datetime('now', 'localtime'))"
+        )).await;
     }
     db.execute_unprepared(
         "UPDATE manual_levels SET zone_low = ROUND(zone_low, 2), zone_high = ROUND(zone_high, 2)",

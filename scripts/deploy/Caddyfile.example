@@ -1,0 +1,41 @@
+# Caddyfile 部署示例 (反向代理至 n-headless 服务端)
+# 将 your-ntrend-server.example.com 替换为实际域名
+
+your-ntrend-server.example.com {
+    # 自动申请 Let's Encrypt / ZeroSSL 证书
+    # tls user@example.com
+
+    # 请求正文限制（数据库备份与大批量导入）
+    request_body {
+        max_size 500MB
+    }
+
+    # API 与 WebSocket 反向代理
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8780 {
+            # 保持长连接与 WebSocket 升级
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+
+            # 针对大文件下载（如一致性备份）调高超时限制
+            transport http {
+                response_header_timeout 60s
+                dial_timeout 10s
+            }
+        }
+    }
+
+    # 兜底直接返回 404 或静态说明
+    handle {
+        respond "N-Trend Authoritative Cloud Server" 200
+    }
+
+    log {
+        output file /var/log/caddy/ntrend.access.log {
+            roll_size 20mb
+            roll_keep 7
+        }
+    }
+}

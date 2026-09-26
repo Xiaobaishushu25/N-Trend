@@ -34,6 +34,7 @@ import { useActionsStore } from '../stores/actions'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
+import { usePlatform } from '../utils/platform'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, PrecloseSignal, SymbolRow } from '../types'
 
@@ -41,6 +42,7 @@ import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, Preclos
 defineOptions({ name: 'DashboardView' })
 
 const router = useRouter()
+const { isMobile } = usePlatform()
 const symbolsStore = useSymbolsStore()
 const scansStore = useScansStore()
 const settingsStore = useSettingsStore()
@@ -241,8 +243,15 @@ function rowProps(row: WatchRow): Record<string, unknown> {
       { 'insert-before': listDragging.value && insertBeforeCode.value === row.symbol.code },
     ],
     'data-code': row.symbol.code,
+    onClick: () => {
+      // 移动端/手机仿真模式：非拖拽模式下单触直接进K线图；拖拽开启时禁止跳转避免误触
+      if (isMobile.value) {
+        if (suppressOpenChart || listDragging.value || tableReorderEnabled.value) return
+        openChart(row)
+      }
+    },
     onDblclick: () => {
-      if (suppressOpenChart) return
+      if (suppressOpenChart || tableReorderEnabled.value) return
       openChart(row)
     },
     onContextmenu: (e: MouseEvent) => onRowContextMenu(row, e),
@@ -263,6 +272,9 @@ function setupTableSortable() {
     animation: 150,
     draggable: 'tr[data-code]',
     disabled: !tableReorderEnabled.value,
+    delay: 120,
+    delayOnTouchOnly: true,
+    touchStartThreshold: 3,
     // 排除启用开关等交互控件：点击开关正常切换，不触发拖拽
     filter: '.n-switch, input, button, textarea, select, a',
     preventOnFilter: false,
@@ -987,10 +999,90 @@ onBeforeUnmount(() => {
   flashTimers.clear()
   for (const fn of unlisteners) fn()
 })
+
+const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
+  {
+    title: '品种',
+    key: 'symbol_info',
+    minWidth: 120,
+    render: (r) =>
+      h('div', { class: 'mobile-sym-cell' }, [
+        h('div', { class: 'mobile-sym-name-row' }, [
+          r.symbol.is_followed ? h(Star, { class: 'cell-star-icon mobile-star' }) : null,
+          h('span', { class: 'mobile-sym-name' }, r.symbol.name && r.symbol.name !== r.symbol.code ? r.symbol.name : r.symbol.code),
+        ]),
+        h('span', { class: 'mobile-sym-code' }, r.symbol.code),
+      ]),
+  },
+  {
+    title: '最新价',
+    key: 'latest',
+    minWidth: 80,
+    align: 'right',
+    render: (r) =>
+      h(
+        'span',
+        { class: 'mobile-price', style: { color: trendColor(r.changePct) } },
+        fmt(r.latest, 1),
+      ),
+  },
+  {
+    title: '涨跌幅',
+    key: 'change',
+    minWidth: 78,
+    align: 'right',
+    render: (r) => {
+      if (r.changePct == null) return h('span', { class: 'cell-empty' }, '—')
+      const isUp = r.changePct >= 0
+      return h(
+        'span',
+        {
+          class: ['mobile-pill-pct', isUp ? 'is-up' : 'is-down'],
+        },
+        `${isUp ? '+' : ''}${r.changePct.toFixed(2)}%`,
+      )
+    },
+  },
+  {
+    title: '形态信号',
+    key: 'pattern_or_sig',
+    minWidth: 82,
+    align: 'right',
+    render: (r) => {
+      const s = r.signal
+      if (s) {
+        return h(
+          'span',
+          {
+            class: ['mobile-sig-pill', s.direction === 'up' ? 'is-up' : 'is-down'],
+            title: `${patternLabel(s)} · ${stateLabel(s.state)}`,
+          },
+          patternLabel(s),
+        )
+      }
+      const sb = scansStore.singleBars.get(r.symbol.code)
+      if (sb) {
+        return h(
+          'span',
+          {
+            style: singleBarBadgeStyle(sb.kind) + 'padding: 1px 5px; font-size: 10px; border-radius: 4px; display: inline-block;',
+            title: singleBarTitle(sb),
+          },
+          sb.label,
+        )
+      }
+      return h('span', { class: 'cell-empty' }, '—')
+    },
+  },
+])
+
+const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
+  return isMobile.value ? mobileColumns.value : columns
+})
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" :class="{ 'is-mobile-layout': isMobile }">
     <div v-if="visiblePrecloseSignals.length" class="preclose-strip">
       <span class="preclose-strip-title">收盘前预检测</span>
       <span
@@ -1016,29 +1108,62 @@ onBeforeUnmount(() => {
           <n-tab v-else :name="String(t.g.id)">{{ t.g.name }}</n-tab>
         </template>
       </n-tabs>
-      <n-space align="center" :size="8">
+      <div v-if="!isMobile" class="group-actions-desktop">
+        <n-space align="center" :size="8">
+          <ReorderToggle
+            v-model="tableReorderEnabled"
+            title="拖拽排序开关；开启后可拖动表格行排序"
+          />
+          <n-text depth="3" style="font-size: 12px">双击行打开K线图</n-text>
+          <n-button size="small" type="primary" ghost @click="openCreateGroup">
+            <template #icon>
+              <n-icon :component="FolderPlus" />
+            </template>
+            新建分组
+          </n-button>
+          <n-button
+            size="small"
+            :disabled="!groupsStore.groups.length"
+            @click="openManageGroup"
+          >
+            <template #icon>
+              <n-icon :component="Settings" />
+            </template>
+            管理分组
+          </n-button>
+        </n-space>
+      </div>
+      <div v-else class="group-actions-mobile">
         <ReorderToggle
           v-model="tableReorderEnabled"
           title="拖拽排序开关；开启后可拖动表格行排序"
         />
-        <n-text depth="3" style="font-size: 12px">双击行打开K线图</n-text>
-        <n-button size="small" type="primary" ghost @click="openCreateGroup">
+        <n-button
+          size="tiny"
+          quaternary
+          circle
+          title="新建分组"
+          class="mobile-grp-btn"
+          @click="openCreateGroup"
+        >
           <template #icon>
-            <n-icon :component="FolderPlus" />
+            <n-icon :component="FolderPlus" size="16" />
           </template>
-          新建分组
         </n-button>
         <n-button
-          size="small"
+          size="tiny"
+          quaternary
+          circle
+          title="管理分组"
+          class="mobile-grp-btn"
           :disabled="!groupsStore.groups.length"
           @click="openManageGroup"
         >
           <template #icon>
-            <n-icon :component="Settings" />
+            <n-icon :component="Settings" size="16" />
           </template>
-          管理分组
         </n-button>
-      </n-space>
+      </div>
     </div>
     <div
       ref="tableWrapEl"
@@ -1047,7 +1172,7 @@ onBeforeUnmount(() => {
     >
       <n-data-table
         class="watch-table"
-        :columns="columns"
+        :columns="displayColumns"
         :data="rows"
         :loading="loading"
         :row-props="rowProps"
@@ -1194,7 +1319,12 @@ onBeforeUnmount(() => {
   border: 1px solid rgba(22, 119, 255, 0.14);
   border-radius: 8px;
   background: linear-gradient(90deg, rgba(22, 119, 255, 0.06), rgba(15, 157, 88, 0.04));
-  overflow: hidden;
+  overflow-x: auto;
+  white-space: nowrap;
+  scrollbar-width: none;
+}
+.preclose-strip::-webkit-scrollbar {
+  display: none;
 }
 .preclose-strip-title {
   color: #1677ff;
@@ -1412,6 +1542,51 @@ onBeforeUnmount(() => {
 }
 .watch-table-wrap.insert-at-end :deep(.watch-table tbody tr:last-child td) {
   box-shadow: inset 0 -2px 0 #1677ff;
+}
+
+.group-actions-mobile {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+.group-actions-mobile :deep(.reorder-toggle) {
+  padding: 2px 4px;
+  gap: 3px;
+}
+.group-actions-mobile :deep(.reorder-toggle .n-switch) {
+  --n-rail-height: 16px;
+  --n-rail-width: 28px;
+  --n-button-width: 12px;
+  --n-button-height: 12px;
+}
+.mobile-grp-btn {
+  color: #64748b;
+}
+.mobile-grp-btn:hover {
+  color: #1677ff;
+  background: rgba(22, 119, 255, 0.08);
+}
+
+.is-mobile-layout {
+  gap: 6px;
+}
+.is-mobile-layout .preclose-strip {
+  min-height: 28px;
+  padding: 0 8px;
+  margin-bottom: 0;
+  gap: 6px;
+}
+.is-mobile-layout .group-bar {
+  padding: 3px 6px;
+  gap: 6px;
+}
+.is-mobile-layout .watch-table :deep(.n-data-table-td),
+.is-mobile-layout .watch-table :deep(.n-data-table-th) {
+  padding-left: 6px;
+  padding-right: 6px;
+  padding-top: 7px;
+  padding-bottom: 7px;
 }
 </style>
 
@@ -1632,6 +1807,79 @@ onBeforeUnmount(() => {
   }
 }
 
+/* 移动端表格紧凑布局样式 */
+.watch-table .mobile-sym-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  justify-content: center;
+}
+.watch-table .mobile-sym-name-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+}
+.watch-table .mobile-star {
+  width: 12px;
+  height: 12px;
+}
+.watch-table .mobile-sym-name {
+  font-weight: 600;
+  font-size: 13px;
+  color: #1e293b;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.watch-table .mobile-sym-code {
+  font-size: 11px;
+  color: #94a3b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  line-height: 1;
+}
+.watch-table .mobile-price {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 600;
+  font-size: 13px;
+}
+.watch-table .mobile-pill-pct {
+  display: inline-block;
+  padding: 3px 6px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  font-weight: 650;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  line-height: 1.1;
+  text-align: center;
+}
+.watch-table .mobile-pill-pct.is-up {
+  color: #e03131;
+  background-color: rgba(224, 49, 49, 0.1);
+}
+.watch-table .mobile-pill-pct.is-down {
+  color: #0f9d58;
+  background-color: rgba(15, 157, 88, 0.1);
+}
+.watch-table .mobile-sig-pill {
+  display: inline-block;
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.watch-table .mobile-sig-pill.is-up {
+  color: #c92a2a;
+  background-color: rgba(224, 49, 49, 0.08);
+  border: 1px solid rgba(224, 49, 49, 0.2);
+}
+.watch-table .mobile-sig-pill.is-down {
+  color: #0b723e;
+  background-color: rgba(15, 157, 88, 0.08);
+  border: 1px solid rgba(15, 157, 88, 0.2);
+}
 </style>
 
 

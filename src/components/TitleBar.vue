@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { usePlatform } from '../utils/platform'
+import { api } from '../services/api'
 
 const props = withDefaults(
   defineProps<{
@@ -28,6 +30,7 @@ const props = withDefaults(
 /** 浏览器预览（纯前端 npm run dev）下不调用任何 Tauri API */
 const inTauri = isTauri()
 const isMaximized = ref(false)
+const { isMobile, isSimulatedMobile, toggleSimulatedMobile, isNativeMobile } = usePlatform()
 let unlisteners: (() => void)[] = []
 
 const controlsVisible = computed(() => inTauri && props.showWindowControls)
@@ -45,12 +48,28 @@ function isInteractive(target: EventTarget | null): boolean {
 
 function refreshMaximized() {
   if (!inTauri) return
-  getCurrentWindow()
+  const win = getCurrentWindow()
+  win
     .isMaximized()
     .then((v) => {
       isMaximized.value = v
     })
     .catch(() => {})
+}
+
+async function toggleMobileView() {
+  toggleSimulatedMobile()
+  if (inTauri) {
+    try {
+      if (isSimulatedMobile.value) {
+        await api.setWindowSize(390, 844)
+      } else {
+        await api.setWindowSize(1360, 860)
+      }
+    } catch {
+      // 容错处理
+    }
+  }
 }
 
 /**
@@ -109,7 +128,7 @@ onBeforeUnmount(() => {
 <template>
   <div
     class="titlebar"
-    :class="`is-${variant}`"
+    :class="[`is-${variant}`, { 'is-mobile': isMobile }]"
     :style="barStyle"
     @mousedown="onBarMouseDown"
   >
@@ -124,14 +143,30 @@ onBeforeUnmount(() => {
     <div v-if="$slots.right" class="tb-right">
       <slot name="right" />
     </div>
-    <div v-if="controlsVisible" class="tb-controls">
-      <button type="button" class="tb-btn" title="最小化" aria-label="最小化" @click="minimize">
+    <div v-if="controlsVisible && !isNativeMobile" class="tb-controls">
+      <button
+        type="button"
+        class="tb-btn"
+        :title="isMobile ? '恢复桌面窗口 (1360×860)' : '一键仿真手机视口 (390×844)'"
+        :aria-label="isMobile ? '恢复桌面窗口' : '一键仿真手机视口'"
+        @click="toggleMobileView"
+      >
+        <svg v-if="!isMobile" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+          <rect x="3.5" y="1" width="9" height="14" rx="2" />
+          <circle cx="8" cy="12" r="0.75" fill="currentColor" />
+        </svg>
+        <svg v-else viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true">
+          <rect x="1.5" y="2" width="13" height="9" rx="1.5" />
+          <path d="M5 14h6M8 11v3" />
+        </svg>
+      </button>
+      <button v-if="!isMobile" type="button" class="tb-btn" title="最小化" aria-label="最小化" @click="minimize">
         <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
           <path d="M0 5h10" stroke="currentColor" stroke-width="1" />
         </svg>
       </button>
       <button
-        v-if="maximizable"
+        v-if="maximizable && !isMobile"
         type="button"
         class="tb-btn"
         :title="isMaximized ? '还原' : '最大化'"
@@ -238,5 +273,21 @@ onBeforeUnmount(() => {
 }
 .tb-btn svg {
   display: block;
+}
+
+.titlebar.is-mobile {
+  padding-left: 6px;
+}
+.titlebar.is-mobile .tb-left {
+  gap: 4px;
+}
+.titlebar.is-mobile .tb-controls {
+  margin-left: 2px;
+}
+.titlebar.is-mobile .tb-btn {
+  width: 28px;
+}
+.titlebar.is-mobile .tb-right {
+  gap: 2px;
 }
 </style>

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ntrend",
-  "version": "1.1.2",
+  "version": "3.0.0",
   "identifier": "com.ntrend.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -15,11 +15,11 @@
         "title": "N趋势",
         "width": 1360,
         "height": 860,
-        "minWidth": 1080,
-        "minHeight": 720,
+        "minWidth": 360,
+        "minHeight": 480,
         "resizable": true,
         "decorations": false,
-        "maximized": true,
+        "maximized": false,
         "center": true
       }
     ],

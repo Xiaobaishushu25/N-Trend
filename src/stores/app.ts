@@ -5,12 +5,12 @@ import {
   requestPermission,
   sendNotification,
 } from '@tauri-apps/plugin-notification'
-import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, api } from '../services/api'
+import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, api } from '../services/api'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import { isMainWindow, notify } from '../utils/notify'
 import { manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
-import type { AppInfo, ManualLevelAlert, RecentOutcomeFilters } from '../types'
+import type { AppInfo, ConnectionStatus, ManualLevelAlert, RecentOutcomeFilters } from '../types'
 
 /** 通过 Tauri 官方通知插件发送系统级通知（自动申请权限；非 Tauri 环境忽略） */
 async function sendSystemNotification(title: string, body: string) {
@@ -45,14 +45,35 @@ function manualLevelTitle(alert: ManualLevelAlert): string {
 
 export const useAppStore = defineStore('app', {
   state: () => ({
-    info: { name: 'ntrend', version: '0.1.0' } as AppInfo,
+    info: { name: 'ntrend', version: '3.0.0' } as AppInfo,
     listeners: [] as (() => void)[],
     initialized: false,
     /** 当前进程收到的关键区域最新动态，供品种列表和K线卡片同步展示。 */
     manualLevelAlerts: [] as ManualLevelAlert[],
     /** 复盘窗口点击明细行时带入的筛选上下文；K线页复盘模式据此拉取信号列表 */
     reviewJumpFilters: null as RecentOutcomeFilters | null,
+    /** 客户端连接服务端状态 */
+    connectionStatus: 'reconnecting' as ConnectionStatus,
+    quoteDelayMs: null as number | null,
+    serverUrl: '',
   }),
+  getters: {
+    isOnline: (state) => state.connectionStatus === 'connected',
+    statusBadge: (state) => {
+      switch (state.connectionStatus) {
+        case 'connected':
+          return { color: '#10b981', text: '在线', delay: state.quoteDelayMs ? `${state.quoteDelayMs}ms` : undefined }
+        case 'reconnecting':
+          return { color: '#f59e0b', text: '连接中...', delay: undefined }
+        case 'unauthorized':
+          return { color: '#ef4444', text: '认证失效', delay: undefined }
+        case 'version_mismatch':
+          return { color: '#ef4444', text: '版本不符', delay: undefined }
+        default:
+          return { color: '#6b7280', text: '已断开', delay: undefined }
+      }
+    },
+  },
   actions: {
     async init() {
       if (this.initialized) return
@@ -62,6 +83,34 @@ export const useAppStore = defineStore('app', {
       } catch {
         // 浏览器预览环境下无后端命令，忽略
       }
+      try {
+        const conn = await api.getConnectionStatus()
+        this.connectionStatus = conn.status
+        this.serverUrl = conn.server_url
+        this.quoteDelayMs = conn.quote_delay_ms
+      } catch {
+        // 忽略
+      }
+      this.listeners.push(
+        await onConnectionStatusChanged(async (status) => {
+          this.connectionStatus = status
+          if (status === 'connected') {
+            const symbolsStore = useSymbolsStore()
+            if (symbolsStore.symbols.length === 0) {
+              symbolsStore.load().catch(() => {})
+            }
+            const settingsStore = useSettingsStore()
+            settingsStore.refreshStatus().catch(() => {})
+          }
+        }),
+      )
+      this.listeners.push(
+        await onServerStatus((status) => {
+          if (status.quote_delay_ms != null) {
+            this.quoteDelayMs = status.quote_delay_ms
+          }
+        }),
+      )
       try {
         const history = await api.getNotificationHistory()
         const latestByLevel = new Map<number, ManualLevelAlert>()

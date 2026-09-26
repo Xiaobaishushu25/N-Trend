@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import draggable from 'vuedraggable'
 import {
@@ -10,7 +10,7 @@ import {
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, Eye, EyeOff, List, Plus, Star, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, ChevronRight, Eye, EyeOff, InfoCircle, List, Plus, Settings, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -30,6 +30,7 @@ import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
+import { usePlatform } from '../utils/platform'
 import type {
   GroupRow,
   KlineRow,
@@ -501,6 +502,9 @@ function toChartSignalFromOutcome(row: OutcomeDetail): PatternDto {
     trend_bonus: parseTrendDims(row.entry_score_dims).bonus,
     trend_label: trendText(parseTrendDims(row.entry_score_dims).state),
     active: false,
+    outcome: row.outcome,
+    exit_reason: row.exit_reason,
+    r_multiple: row.r_multiple,
   }
 }
 
@@ -617,12 +621,101 @@ function applyDefaultHidden() {
   hiddenNumbers.value = showFirst ? new Set(nums.slice(1)) : new Set(nums)
 }
 
-/** 左侧品种列表开关与行情快照 */
-const showList = ref(true)
+/** 移动端/窄屏模式感知 */
+/** 多端与平台感知（Android原生 / 开发者手机仿真 / 窄屏降级） */
+const { isMobile } = usePlatform()
+const showMobileInfo = ref(false)
+
+watch(isMobile, (mobile) => {
+  if (mobile) {
+    showList.value = false
+    showMobileInfo.value = false
+  }
+})
+
+/** 触控手势滑动切换品种 */
+let touchStartX = 0
+let touchStartY = 0
+function handleTouchStart(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    touchStartX = e.touches[0].clientX
+    touchStartY = e.touches[0].clientY
+  }
+}
+function handleTouchEnd(e: TouchEvent) {
+  if (e.changedTouches.length === 1) {
+    const dx = e.changedTouches[0].clientX - touchStartX
+    const dy = e.changedTouches[0].clientY - touchStartY
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (dx < 0) {
+        switchSymbol(1)
+      } else {
+        switchSymbol(-1)
+      }
+    }
+  }
+}
+
+/** 左侧品种列表开关与行情快照（手机端默认收起） */
+const showList = ref(!isMobile.value)
 const chartRef = ref<{
   stepCandles: (dir: number) => void
   toggleManualLevelDraw: () => boolean
+  trendVisible?: boolean
+  toggleTrendVisible?: () => boolean
 } | null>(null)
+
+const isTrendVisible = computed(() => chartRef.value?.trendVisible ?? true)
+function toggleChartTrend() {
+  chartRef.value?.toggleTrendVisible?.()
+}
+
+const topActivePattern = computed<PatternDto | null>(() => {
+  return signals.value.length ? signals.value[0] : null
+})
+
+const topRecentPattern = computed<PatternDto | null>(() => {
+  return recentHistorySignals.value.length ? recentHistorySignals.value[0] : null
+})
+
+function recentPatternStatus(p: PatternDto): { text: string; cls: string } {
+  if (p.outcome === 'win') {
+    const r = p.r_multiple != null ? ` +${p.r_multiple.toFixed(1)}R` : ''
+    return { text: `止盈${r}`, cls: 'status-win' }
+  }
+  if (p.outcome === 'loss') {
+    const r = p.r_multiple != null ? ` ${p.r_multiple.toFixed(1)}R` : ''
+    return { text: `止损${r}`, cls: 'status-loss' }
+  }
+  if (p.exit_reason === 'target') {
+    const r = p.r_multiple != null ? ` +${p.r_multiple.toFixed(1)}R` : ''
+    return { text: `已止盈${r}`, cls: 'status-win' }
+  }
+  if (p.exit_reason === 'stop') {
+    const r = p.r_multiple != null ? ` ${p.r_multiple.toFixed(1)}R` : ''
+    return { text: `已止损${r}`, cls: 'status-loss' }
+  }
+  if (p.outcome === 'no_trigger' || p.outcome === 'invalidated') {
+    return { text: '未触发', cls: 'status-muted' }
+  }
+  if (p.outcome === 'rollover' || p.exit_reason === 'rollover') {
+    return { text: '换月', cls: 'status-warn' }
+  }
+  if (p.state === 'closed') {
+    return { text: '已了结', cls: 'status-muted' }
+  }
+  if (p.state === 'triggered' || p.state === '当前已触发') {
+    return { text: '已触发', cls: 'status-triggered' }
+  }
+  if (p.state === 'pending' || p.state === '即将触发') {
+    return { text: '待触发', cls: 'status-warn' }
+  }
+  return { text: sigLabel(p.state) || '已了结', cls: 'status-muted' }
+}
+
+const topSingleBar = computed(() => {
+  return chartSingleBars.value.length ? chartSingleBars.value[0] : null
+})
 const snapshots = ref<Record<string, MarketSnapshot>>({})
 /** 品种行闪烁方向：up=上涨(红) / down=下跌(绿)，由实时行情跳动驱动 */
 const rowFlash = ref<Record<string, 'up' | 'down'>>({})
@@ -836,6 +929,9 @@ function onSymbolRowClick(code: string) {
   if (reviewMode.value) return
   if (symbolSuppressClick) return
   router.push({ name: 'chart', params: { symbol: code } })
+  if (isMobile.value) {
+    showList.value = false
+  }
 }
 
 /** 左侧品种行右键菜单：与表格行一致（分组操作 + 彻底删除） */
@@ -1803,143 +1899,317 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chart-page">
-    <div class="topbar">
-      <div class="topbar-left">
-        <n-button quaternary size="small" class="nav-btn" @click="router.push({ name: 'dashboard' })">
-          <template #icon>
-            <n-icon :component="ArrowLeft" />
-          </template>
-          返回
-        </n-button>
-        <n-button quaternary size="small" class="nav-btn" @click="showList = !showList">
-          <template #icon>
-            <n-icon :component="List" />
-          </template>
-          {{ showList ? '收起列表' : '品种列表' }}
-        </n-button>
-        <n-button
-          v-if="reviewMode"
-          secondary
-          size="small"
-          class="nav-btn review-exit-btn"
-          @click="exitReviewMode"
-        >
-          <template #icon>
-            <n-icon :component="X" />
-          </template>
-          退出复盘
-        </n-button>
-      </div>
-
-      <div class="topbar-symbol">
-        <span class="sym-code">{{ symbol }}</span>
-        <span v-if="currentSymbol?.name && currentSymbol.name !== symbol" class="sym-name">
-          {{ currentSymbol.name }}
-        </span>
-        <span class="sym-divider" />
-        <span v-if="quotePrice !== null" class="sym-price" :style="{ color: quoteColor }">
-          {{ quotePrice.toFixed(1) }}
-        </span>
-        <span
-          v-if="snapshot?.change_pct != null"
-          class="sym-change"
-          :style="{ color: quoteColor, background: quoteBg(snapshot.change_pct) }"
-        >
-          {{ fmtChange(snapshot.change_pct) }}
-        </span>
-      </div>
-
-            <ReorderToggle
-              v-model="reorderEnabled"
-              :disabled="reviewMode"
-              :title="reviewMode ? '复盘模式下不可排序' : '拖拽排序开关；开启后可拖动左侧品种重排'"
-            />
-
-      <div class="topbar-timeframes">
-        <div class="tf-group">
-          <button
-            v-for="t in visibleTimeframes"
-            :key="t"
-            type="button"
-            class="tf-btn"
-            :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
-            :disabled="reviewMode"
-            :title="reviewMode ? '复盘模式固定 15m' : t"
-            @click="timeframe = t"
+    <div class="topbar" @touchstart.passive="handleTouchStart" @touchend.passive="handleTouchEnd">
+      <!-- 桌面端顶部导航栏：保持原有完整布局与全部按钮不变 -->
+      <template v-if="!isMobile">
+        <div class="topbar-left">
+          <n-button quaternary size="small" class="nav-btn" @click="router.push({ name: 'dashboard' })">
+            <template #icon>
+              <n-icon :component="ArrowLeft" />
+            </template>
+            返回
+          </n-button>
+          <n-button quaternary size="small" class="nav-btn" @click="showList = !showList">
+            <template #icon>
+              <n-icon :component="List" />
+            </template>
+            {{ showList ? '收起列表' : '品种列表' }}
+          </n-button>
+          <n-button
+            v-if="reviewMode"
+            secondary
+            size="small"
+            class="nav-btn review-exit-btn"
+            @click="exitReviewMode"
           >
-            {{ t }}
+            <template #icon>
+              <n-icon :component="X" />
+            </template>
+            退出复盘
+          </n-button>
+        </div>
+
+        <div class="topbar-symbol">
+          <span class="sym-code">{{ symbol }}</span>
+          <span v-if="currentSymbol?.name && currentSymbol.name !== symbol" class="sym-name">
+            {{ currentSymbol.name }}
+          </span>
+          <span class="sym-divider" />
+          <span v-if="quotePrice !== null" class="sym-price" :style="{ color: quoteColor }">
+            {{ quotePrice.toFixed(1) }}
+          </span>
+          <span
+            v-if="snapshot?.change_pct != null"
+            class="sym-change"
+            :style="{ color: quoteColor, background: quoteBg(snapshot.change_pct) }"
+          >
+            {{ fmtChange(snapshot.change_pct) }}
+          </span>
+        </div>
+
+        <ReorderToggle
+          v-model="reorderEnabled"
+          :disabled="reviewMode"
+          :title="reviewMode ? '复盘模式下不可排序' : '拖拽排序开关；开启后可拖动左侧品种重排'"
+        />
+
+        <div class="topbar-timeframes">
+          <div class="tf-group">
+            <button
+              v-for="t in visibleTimeframes"
+              :key="t"
+              type="button"
+              class="tf-btn"
+              :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
+              :disabled="reviewMode"
+              :title="reviewMode ? '复盘模式固定 15m' : t"
+              @click="timeframe = t"
+            >
+              {{ t }}
+            </button>
+            <n-popover
+              placement="bottom-end"
+              trigger="click"
+              :show-arrow="false"
+              style="padding: 0"
+            >
+              <template #trigger>
+                <button
+                  type="button"
+                  class="tf-more"
+                  :disabled="reviewMode"
+                  title="切换周期"
+                  aria-label="切换周期"
+                >
+                  <n-icon :component="Adjustments" />
+                </button>
+              </template>
+              <div class="tf-settings">
+                <div class="tf-settings-title">更多周期选择</div>
+                <div class="tf-settings-list">
+                  <label v-for="t in allTimeframes" :key="t" class="tf-check">
+                    <n-checkbox
+                      :checked="settingsStore.settings.ui.timeframes.includes(t)"
+                      @update:checked="(v: boolean) => toggleTimeframe(t, v)"
+                    />
+                    <span>{{ t }}</span>
+                  </label>
+                </div>
+                <div class="tf-settings-hint">勾选后立即生效，切换栏只显示勾选的周期</div>
+              </div>
+            </n-popover>
+          </div>
+          <button
+            type="button"
+            class="tf-btn manual-level-create-btn"
+            :class="{ active: manualLevelDrawMode }"
+            title="在K线图上拖拽创建关键区域"
+            aria-label="新建关键区域"
+            @click="toggleManualLevelDraw"
+          >
+            <n-icon :component="Plus" />
+            <span>{{ manualLevelDrawMode ? '取消绘制' : '新建关键区域' }}</span>
           </button>
+          <button
+            type="button"
+            class="tf-btn hl-btn"
+            :class="{ active: showExtremes }"
+            :title="showExtremes ? '隐藏最高/最低点标记' : '标记当前视图最高/最低点'"
+            @click="showExtremes = !showExtremes"
+          >
+            高低
+          </button>
+          <div class="integrity-bar">
+            <button type="button" class="tf-btn integrity-btn" :class="{ 'is-loading': integrityChecking }" :disabled="reviewMode || integrityChecking" @click="handleCheckIntegrity(true)" title="检测当前品种 5m 缺口">
+              <span v-if="integrityChecking" class="integrity-spinner" aria-hidden="true" />
+              检测缺口
+            </button>
+            <button v-if="integrityHasGaps" type="button" class="tf-btn integrity-btn repair-btn" :class="{ 'is-loading': integrityRepairing }" :disabled="reviewMode || integrityRepairing || integrityChecking" @click="handleRepairIntegrity" title="一键补全缺失的 5m 并重算 15m/60m">
+              <span v-if="integrityRepairing" class="integrity-spinner" aria-hidden="true" />
+              补全缺口
+            </button>
+            <span v-if="integrityReport" class="integrity-badge" :class="{ 'has-issue': integrityHasIssues }" :title="`缺口 ${integrityReport.missing_count ?? 0}，非法时段 ${integrityUnexpectedCount}，坏数据 ${integrityCorruptedCount}`">
+              {{ integrityStatusText }}
+            </span>
+          </div>
+        </div>
+      </template>
+
+      <!-- 移动端精简顶部工具栏：左侧导航、中间周期、右侧工具弹窗与形态抽屉 -->
+      <template v-else>
+        <div class="m-topbar-left">
+          <button type="button" class="m-tb-btn m-back-btn" @click="router.push({ name: 'dashboard' })" title="返回仪表盘">
+            <n-icon :component="ArrowLeft" :size="16" />
+          </button>
+          <button type="button" class="m-tb-btn" :class="{ active: showList }" @click="showList = !showList" title="切换品种列表">
+            <n-icon :component="List" :size="16" />
+            <span>品种</span>
+          </button>
+          <button
+            v-if="reviewMode"
+            type="button"
+            class="m-tb-btn m-review-exit-btn"
+            @click="exitReviewMode"
+            title="退出复盘模式"
+          >
+            <n-icon :component="X" :size="15" />
+            <span>退出</span>
+          </button>
+        </div>
+
+        <div class="m-topbar-center">
+          <div class="tf-group m-tf-group">
+            <button
+              v-for="t in visibleTimeframes"
+              :key="t"
+              type="button"
+              class="tf-btn m-tf-btn"
+              :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
+              :disabled="reviewMode"
+              :title="reviewMode ? '复盘模式固定 15m' : t"
+              @click="timeframe = t"
+            >
+              {{ t }}
+            </button>
+            <n-popover
+              placement="bottom"
+              trigger="click"
+              :show-arrow="false"
+              style="padding: 0"
+            >
+              <template #trigger>
+                <button
+                  type="button"
+                  class="tf-more m-tf-more"
+                  :disabled="reviewMode"
+                  title="选择显示周期"
+                  aria-label="选择显示周期"
+                >
+                  <n-icon :component="Adjustments" :size="14" />
+                </button>
+              </template>
+              <div class="tf-settings">
+                <div class="tf-settings-title">周期显示设置</div>
+                <div class="tf-settings-list">
+                  <label v-for="t in allTimeframes" :key="t" class="tf-check">
+                    <n-checkbox
+                      :checked="settingsStore.settings.ui.timeframes.includes(t)"
+                      @update:checked="(v: boolean) => toggleTimeframe(t, v)"
+                    />
+                    <span>{{ t }}</span>
+                  </label>
+                </div>
+              </div>
+            </n-popover>
+          </div>
+        </div>
+
+        <div class="m-topbar-right">
+          <!-- 移动端工具与操作菜单 -->
           <n-popover
             placement="bottom-end"
             trigger="click"
             :show-arrow="false"
-            style="padding: 0"
+            class="m-tools-popover-box"
           >
             <template #trigger>
-              <button
-                type="button"
-                class="tf-more"
-                :disabled="reviewMode"
-                title="切换周期"
-                aria-label="切换周期"
-              >
-                <n-icon :component="Adjustments" />
+              <button type="button" class="m-tb-btn m-tools-btn" title="图表与数据工具">
+                <n-icon :component="Settings" :size="15" />
+                <span>工具</span>
               </button>
             </template>
-            <div class="tf-settings">
-              <div class="tf-settings-title">更多周期选择</div>
-              <div class="tf-settings-list">
-                <label v-for="t in allTimeframes" :key="t" class="tf-check">
-                  <n-checkbox
-                    :checked="settingsStore.settings.ui.timeframes.includes(t)"
-                    @update:checked="(v: boolean) => toggleTimeframe(t, v)"
-                  />
-                  <span>{{ t }}</span>
-                </label>
+            <div class="m-tools-menu">
+              <div class="m-tools-group-title">图表显示</div>
+              <div class="m-tools-item" @click="toggleChartTrend">
+                <span class="m-tools-label">MA20 趋势线</span>
+                <span class="m-tools-badge" :class="{ 'is-active': isTrendVisible }">
+                  {{ isTrendVisible ? '已显示' : '已隐藏' }}
+                </span>
               </div>
-              <div class="tf-settings-hint">勾选后立即生效，切换栏只显示勾选的周期</div>
+              <div class="m-tools-item" @click="showExtremes = !showExtremes">
+                <span class="m-tools-label">最高/最低价标记</span>
+                <span class="m-tools-badge" :class="{ 'is-active': showExtremes }">
+                  {{ showExtremes ? '已标记' : '已隐藏' }}
+                </span>
+              </div>
+              <div class="m-tools-item" @click="toggleManualLevelDraw">
+                <span class="m-tools-label">手动关键区域</span>
+                <span class="m-tools-badge" :class="{ 'is-active': manualLevelDrawMode }">
+                  {{ manualLevelDrawMode ? '绘制中' : '新建绘制' }}
+                </span>
+              </div>
+
+              <div class="m-tools-divider" />
+              <div class="m-tools-group-title">数据完整性 (5m)</div>
+              <div class="m-tools-integrity-actions">
+                <button
+                  type="button"
+                  class="m-tools-action-btn"
+                  :class="{ 'is-loading': integrityChecking }"
+                  :disabled="reviewMode || integrityChecking"
+                  @click="handleCheckIntegrity(true)"
+                >
+                  {{ integrityChecking ? '正在检测...' : '检测缺口' }}
+                </button>
+                <button
+                  v-if="integrityHasGaps"
+                  type="button"
+                  class="m-tools-action-btn is-repair"
+                  :class="{ 'is-loading': integrityRepairing }"
+                  :disabled="reviewMode || integrityRepairing || integrityChecking"
+                  @click="handleRepairIntegrity"
+                >
+                  {{ integrityRepairing ? '补全中...' : '补全缺口' }}
+                </button>
+              </div>
+              <div v-if="integrityReport" class="m-tools-integrity-status" :class="{ 'has-issue': integrityHasIssues }">
+                状态: {{ integrityStatusText }}
+              </div>
             </div>
           </n-popover>
-        </div>
-        <button
-          type="button"
-          class="tf-btn manual-level-create-btn"
-          :class="{ active: manualLevelDrawMode }"
-          title="在K线图上拖拽创建关键区域"
-          aria-label="新建关键区域"
-          @click="toggleManualLevelDraw"
-        >
-          <n-icon :component="Plus" />
-          <span>{{ manualLevelDrawMode ? '取消绘制' : '新建关键区域' }}</span>
-        </button>
-        <button
-          type="button"
-          class="tf-btn hl-btn"
-          :class="{ active: showExtremes }"
-          :title="showExtremes ? '隐藏最高/最低点标记' : '标记当前视图最高/最低点'"
-          @click="showExtremes = !showExtremes"
-        >
-          高低
-        </button>
-        <div class="integrity-bar">
-          <button type="button" class="tf-btn integrity-btn" :class="{ 'is-loading': integrityChecking }" :disabled="reviewMode || integrityChecking" @click="handleCheckIntegrity(true)" title="检测当前品种 5m 缺口">
-            <span v-if="integrityChecking" class="integrity-spinner" aria-hidden="true" />
-            检测缺口
+
+          <button
+            type="button"
+            class="m-tb-btn m-info-btn"
+            :class="{ active: showMobileInfo }"
+            @click="showMobileInfo = !showMobileInfo"
+            title="查看全部形态与信息"
+          >
+            <n-icon :component="InfoCircle" :size="15" />
+            <span>形态</span>
           </button>
-          <button v-if="integrityHasGaps" type="button" class="tf-btn integrity-btn repair-btn" :class="{ 'is-loading': integrityRepairing }" :disabled="reviewMode || integrityRepairing || integrityChecking" @click="handleRepairIntegrity" title="一键补全缺失的 5m 并重算 15m/60m">
-            <span v-if="integrityRepairing" class="integrity-spinner" aria-hidden="true" />
-            补全缺口
-          </button>
-          <span v-if="integrityReport" class="integrity-badge" :class="{ 'has-issue': integrityHasIssues }" :title="`缺口 ${integrityReport.missing_count ?? 0}，非法时段 ${integrityUnexpectedCount}，坏数据 ${integrityCorruptedCount}`">
-            {{ integrityStatusText }}
-          </span>
         </div>
-      </div>
+      </template>
     </div>
 
     <div class="main">
-      <div v-if="showList" class="symbol-list" :class="{ 'can-reorder': reorderEnabled && !reviewMode }">
-        <div class="sl-title">品种</div>
+      <!-- 移动端抽屉遮罩背景 -->
+      <div
+        v-if="isMobile && (showList || showMobileInfo)"
+        class="drawer-backdrop"
+        @click="showList = false; showMobileInfo = false"
+      />
+
+      <div
+        v-if="showList"
+        class="symbol-list"
+        :class="{
+          'can-reorder': reorderEnabled && !reviewMode,
+          'is-mobile-drawer': isMobile,
+        }"
+      >
+        <div class="sl-title">
+          <span>品种列表</span>
+          <button
+            v-if="isMobile"
+            type="button"
+            class="drawer-close-btn"
+            title="关闭"
+            @click="showList = false"
+          >
+            <n-icon :component="X" />
+          </button>
+        </div>
         <n-scrollbar style="flex: 1">
           <VueDraggable
             v-model="groupSymbols"
@@ -2024,6 +2294,132 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="chart-col" @wheel.prevent="handleChartWheel">
+        <!-- 移动端顶部信息与形态卡片（稍微缩小K线高度，提供品种信息与最新活跃形态） -->
+        <div v-if="isMobile" class="mobile-summary-card">
+          <!-- 第1行：品种导航与行情概览 -->
+          <div class="msc-symbol-row">
+            <div class="msc-sym-nav">
+              <button
+                type="button"
+                class="msc-nav-arrow"
+                title="上一个品种"
+                aria-label="上一个品种"
+                @click="switchSymbol(-1)"
+              >‹</button>
+              <div class="msc-sym-title" @click="showList = true">
+                <span class="msc-sym-name">{{ currentSymbol?.name || symbol }}</span>
+                <span class="msc-sym-code">{{ symbol }}</span>
+                <span v-if="currentSymbol?.exchange" class="msc-sym-exch">{{ currentSymbol.exchange }}</span>
+              </div>
+              <button
+                type="button"
+                class="msc-nav-arrow"
+                title="下一个品种"
+                aria-label="下一个品种"
+                @click="switchSymbol(1)"
+              >›</button>
+            </div>
+
+            <div class="msc-quote-group">
+              <span v-if="quotePrice !== null" class="msc-price" :style="{ color: quoteColor }">
+                {{ quotePrice.toFixed(1) }}
+              </span>
+              <span
+                v-if="snapshot?.change_pct != null"
+                class="msc-change-pill"
+                :style="{ color: quoteColor, background: quoteBg(snapshot.change_pct) }"
+              >
+                {{ fmtChange(snapshot.change_pct) }}
+              </span>
+              <span v-if="snapshot?.change_pct != null" class="msc-points" :style="{ color: quoteColor }">
+                {{ fmtSigned(quotePoints) }}点
+              </span>
+            </div>
+          </div>
+
+          <!-- 第2行：最新活跃形态 / 单K异动 / 历史形态 -->
+          <div
+            v-if="topActivePattern"
+            class="msc-pattern-row"
+            :class="[topActivePattern.direction === 'up' ? 'is-up' : 'is-down']"
+            @click="showMobileInfo = true"
+          >
+            <div class="msc-pat-left">
+              <span class="msc-pat-dir" :class="topActivePattern.direction === 'up' ? 'badge-up' : 'badge-down'">
+                {{ dirText(topActivePattern.direction) }} {{ levelSuffix(topActivePattern.level) }}
+              </span>
+              <span class="msc-pat-state" :class="stateType(topActivePattern.state)">
+                ● {{ sigLabel(topActivePattern.state) }}
+              </span>
+              <span class="msc-pat-score">
+                评分 <b>{{ topActivePattern.score.toFixed(1) }}</b>
+              </span>
+            </div>
+            <div class="msc-pat-levels">
+              <span>入 <b>{{ topActivePattern.entry.toFixed(1) }}</b></span>
+              <span>损 <b>{{ topActivePattern.stop.toFixed(1) }}</b></span>
+              <span>标 <b>{{ topActivePattern.target.toFixed(1) }}</b></span>
+              <span>RR <b>{{ topActivePattern.rr.toFixed(1) }}</b></span>
+            </div>
+            <div class="msc-pat-more">
+              <n-icon :component="ChevronRight" :size="14" />
+            </div>
+          </div>
+
+          <!-- 若无活跃形态，但有单K异动 -->
+          <div
+            v-else-if="topSingleBar"
+            class="msc-pattern-row msc-pattern-singlebar"
+            @click="showMobileInfo = true"
+          >
+            <div class="msc-pat-left">
+              <span class="msc-singlebar-badge" :style="singleBarBadgeStyle(topSingleBar.kind)">
+                单K · {{ topSingleBar.label }}
+              </span>
+              <span class="msc-pat-hint">{{ singleBarTitle(topSingleBar) }}</span>
+            </div>
+            <div class="msc-pat-more">
+              <n-icon :component="ChevronRight" :size="14" />
+            </div>
+          </div>
+
+          <!-- 若无活跃形态及单K，显示最近历史形态（省略编号，展示状态与评分） -->
+          <div
+            v-else-if="topRecentPattern"
+            class="msc-pattern-row msc-pattern-recent"
+            @click="showMobileInfo = true"
+          >
+            <div class="msc-pat-left">
+              <span class="msc-recent-tag">最近形态</span>
+              <span class="msc-pat-dir" :class="topRecentPattern.direction === 'up' ? 'badge-up' : 'badge-down'">
+                {{ dirText(topRecentPattern.direction) }} {{ levelSuffix(topRecentPattern.level) }}
+              </span>
+              <span class="msc-status-pill" :class="recentPatternStatus(topRecentPattern).cls">
+                {{ recentPatternStatus(topRecentPattern).text }}
+              </span>
+            </div>
+            <div class="msc-pat-right">
+              <span class="msc-pat-score">
+                评分 <b>{{ topRecentPattern.score.toFixed(1) }}</b>
+              </span>
+              <span v-if="topRecentPattern.warning_ts || topRecentPattern.trigger_ts" class="msc-pat-time">
+                {{ fmtRecentTime(topRecentPattern.warning_ts || topRecentPattern.trigger_ts || '') }}
+              </span>
+              <n-icon :component="ChevronRight" :size="14" class="msc-pat-arrow" />
+            </div>
+          </div>
+
+          <!-- 都无时显示暂无形态占位 -->
+          <div
+            v-else
+            class="msc-pattern-row msc-pattern-empty"
+            @click="showMobileInfo = true"
+          >
+            <span class="msc-empty-hint">当前暂无活跃形态信号</span>
+            <span class="msc-view-all">查看全部形态 ›</span>
+          </div>
+        </div>
+
         <div
           v-if="klinesStore.chartStatus !== 'tqsdk' || klinesStore.chartMessage"
           class="chart-data-notice"
@@ -2048,6 +2444,7 @@ onBeforeUnmount(() => {
            :trend-points="trendPoints"
           :single-bars="chartSingleBars"
            :manual-levels="visibleManualLevels"
+           :is-mobile="isMobile"
            @create-manual-level="handleCreateManualLevel"
            @update-manual-level="handleUpdateManualLevel"
            @preview-manual-level="handleManualLevelPreview"
@@ -2061,7 +2458,22 @@ onBeforeUnmount(() => {
         />
       </div>
 
-      <div class="info-col">
+      <div
+        v-if="!isMobile || showMobileInfo"
+        class="info-col"
+        :class="{ 'is-mobile-drawer': isMobile }"
+      >
+        <div v-if="isMobile" class="drawer-header">
+          <span class="drawer-title">形态与信息</span>
+          <button
+            type="button"
+            class="drawer-close-btn"
+            title="关闭"
+            @click="showMobileInfo = false"
+          >
+            <n-icon :component="X" />
+          </button>
+        </div>
         <div class="info-card">
           <div class="info-head">
             <div class="info-head-left">
@@ -4112,5 +4524,561 @@ onBeforeUnmount(() => {
 .rv-ann-index {
   margin-right: 4px;
   color: #94a3b8;
+}
+
+/* 移动端/抽屉模式与手势支持 */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(2px);
+  z-index: 1000;
+  animation: fadeIn 0.2s ease-out;
+}
+
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #eef1f5;
+  background: #fff;
+}
+
+.drawer-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.drawer-close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: pointer;
+}
+.drawer-close-btn:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.sym-nav-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+}
+.sym-nav-arrow:active {
+  background: #e2e8f0;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (max-width: 768px) {
+  .chart-page {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .topbar {
+    padding: 4px 8px;
+    height: 42px;
+    align-items: center;
+    justify-content: space-between;
+    overflow-x: hidden;
+    gap: 4px;
+    flex: 0 0 42px;
+  }
+  .m-topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+  }
+  .m-topbar-center {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .m-topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+  }
+  .m-tb-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    background: #fff;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    user-select: none;
+    line-height: 1;
+  }
+  .m-tb-btn:active {
+    background: #f1f5f9;
+    transform: scale(0.97);
+  }
+  .m-tb-btn.active {
+    background: #eff6ff;
+    color: #2563eb;
+    border-color: #93c5fd;
+  }
+  .m-back-btn {
+    padding: 0 6px;
+  }
+  .m-review-exit-btn {
+    background: #fff1f2;
+    color: #e11d48;
+    border-color: #fecdd3;
+  }
+  .m-tf-group {
+    background: #f1f5f9;
+    padding: 2px;
+    border-radius: 7px;
+    gap: 2px;
+    display: inline-flex;
+    align-items: center;
+  }
+  .m-tf-btn {
+    height: 26px;
+    padding: 0 7px;
+    font-size: 11px;
+    border-radius: 5px;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .m-tf-btn.active {
+    background: #fff;
+    color: #2563eb;
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  }
+  .m-tf-more {
+    height: 26px;
+    padding: 0 5px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+  }
+
+  /* 移动端工具弹出层 */
+  .m-tools-menu {
+    width: 210px;
+    padding: 10px;
+    background: #fff;
+    border-radius: 8px;
+  }
+  .m-tools-group-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+    margin-bottom: 6px;
+    padding: 0 4px;
+  }
+  .m-tools-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: #334155;
+    cursor: pointer;
+    transition: background 0.15s;
+    user-select: none;
+  }
+  .m-tools-item:hover,
+  .m-tools-item:active {
+    background: #f8fafc;
+  }
+  .m-tools-badge {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #f1f5f9;
+    color: #64748b;
+  }
+  .m-tools-badge.is-active {
+    background: #eff6ff;
+    color: #2563eb;
+    font-weight: 600;
+  }
+  .m-tools-divider {
+    height: 1px;
+    background: #f1f5f9;
+    margin: 8px 0;
+  }
+  .m-tools-integrity-actions {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .m-tools-action-btn {
+    flex: 1;
+    height: 28px;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    background: #f8fafc;
+    color: #334155;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .m-tools-action-btn:active {
+    background: #e2e8f0;
+  }
+  .m-tools-action-btn.is-repair {
+    background: #eff6ff;
+    border-color: #bfdbfe;
+    color: #2563eb;
+  }
+  .m-tools-integrity-status {
+    font-size: 11px;
+    color: #10b981;
+    padding: 2px 4px;
+    font-weight: 500;
+  }
+  .m-tools-integrity-status.has-issue {
+    color: #f59e0b;
+  }
+
+  /* 移动端顶部信息与形态卡片 */
+  .mobile-summary-card {
+    margin: 0 4px 6px 4px;
+    background: #fff;
+    border-radius: 8px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    flex: 0 0 auto;
+  }
+  .msc-symbol-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid #f1f5f9;
+  }
+  .msc-sym-nav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .msc-nav-arrow {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    background: #f8fafc;
+    color: #64748b;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    line-height: 1;
+    user-select: none;
+  }
+  .msc-nav-arrow:active {
+    background: #e2e8f0;
+  }
+  .msc-sym-title {
+    display: flex;
+    align-items: baseline;
+    gap: 5px;
+    cursor: pointer;
+  }
+  .msc-sym-name {
+    font-size: 15px;
+    font-weight: 700;
+    color: #0f172a;
+  }
+  .msc-sym-code {
+    font-size: 12px;
+    color: #64748b;
+    font-family: Consolas, monospace;
+  }
+  .msc-sym-exch {
+    font-size: 10px;
+    color: #94a3b8;
+    background: #f1f5f9;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  .msc-quote-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .msc-price {
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .msc-change-pill {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .msc-points {
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .msc-pattern-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    background: #fafbfc;
+    cursor: pointer;
+    transition: background 0.15s;
+    font-size: 11px;
+    gap: 8px;
+  }
+  .msc-pattern-row:active {
+    background: #f1f5f9;
+  }
+  .msc-pattern-row.is-up {
+    border-left: 3px solid #ef4444;
+  }
+  .msc-pattern-row.is-down {
+    border-left: 3px solid #10b981;
+  }
+  .msc-pat-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .msc-pat-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+  }
+  .msc-pat-dir {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .badge-up {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+  }
+  .badge-down {
+    background: rgba(16, 185, 129, 0.1);
+    color: #10b981;
+  }
+  .msc-pat-state {
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .msc-pat-score {
+    font-size: 11px;
+    color: #64748b;
+  }
+  .msc-pat-score b {
+    color: #334155;
+  }
+  .msc-pat-levels {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #64748b;
+    font-variant-numeric: tabular-nums;
+  }
+  .msc-pat-levels b {
+    color: #1e293b;
+  }
+  .msc-pat-more {
+    display: flex;
+    align-items: center;
+    color: #94a3b8;
+    margin-left: 4px;
+  }
+  .msc-singlebar-badge {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .msc-recent-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: #f1f5f9;
+    color: #475569;
+    font-weight: 500;
+  }
+  .msc-status-pill {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+    line-height: 1.4;
+  }
+  .status-win {
+    background: rgba(239, 68, 68, 0.1);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.25);
+  }
+  .status-loss {
+    background: rgba(16, 185, 129, 0.1);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.25);
+  }
+  .status-triggered {
+    background: rgba(37, 99, 235, 0.1);
+    color: #2563eb;
+    border: 1px solid rgba(37, 99, 235, 0.25);
+  }
+  .status-warn {
+    background: rgba(245, 158, 11, 0.1);
+    color: #d97706;
+    border: 1px solid rgba(245, 158, 11, 0.25);
+  }
+  .status-muted {
+    background: #f1f5f9;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+  }
+  .msc-pat-time {
+    color: #94a3b8;
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .msc-pat-arrow {
+    color: #cbd5e1;
+    margin-left: 2px;
+  }
+  .msc-pat-hint {
+    color: #64748b;
+    font-size: 11px;
+  }
+  .msc-empty-hint {
+    color: #94a3b8;
+    font-size: 11px;
+  }
+  .msc-view-all {
+    color: #2563eb;
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .main {
+    position: relative;
+    padding: 0;
+    gap: 0;
+    flex: 1 1 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .symbol-list.is-mobile-drawer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    max-width: 80vw;
+    z-index: 1001;
+    border-radius: 0 12px 12px 0;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.2);
+    animation: slideInLeft 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .symbol-list.is-mobile-drawer .sl-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid #eef1f5;
+  }
+  .info-col.is-mobile-drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 320px;
+    max-width: 85vw;
+    z-index: 1001;
+    border-radius: 12px 0 0 12px;
+    box-shadow: -4px 0 24px rgba(0, 0, 0, 0.2);
+    animation: slideInRight 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    background: #fff;
+    overflow-y: auto;
+  }
+  .chart-col {
+    flex: 1 1 0;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+}
+
+@keyframes slideInLeft {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
 }
 </style>

@@ -20,6 +20,7 @@ import uuid
 from typing import Dict, List, Optional, Tuple
 
 from aiohttp import web
+from aiohttp.web_log import AccessLogger
 import pandas as pd
 from tqsdk import TqApi, TqAuth
 from tqsdk.exceptions import TqTimeoutError
@@ -1274,6 +1275,15 @@ def create_app() -> web.Application:
     return app
 
 
+class SilentEventAccessLogger(AccessLogger):
+    """过滤高频探活与事件长轮询正常返回的冗余访问日志，仅在异常报错 (>=400) 时输出。"""
+
+    def log(self, request, response, time):
+        if request.path in ("/health", "/api/events") and response.status < 400:
+            return
+        super().log(request, response, time)
+
+
 def main():
     global worker
     parser = argparse.ArgumentParser(description="TqSdk Bridge for N-Trend")
@@ -1331,7 +1341,13 @@ def main():
 
     app = create_app()
     try:
-        web.run_app(app, host="127.0.0.1", port=port, print=logger.info)
+        web.run_app(
+            app,
+            host="127.0.0.1",
+            port=port,
+            print=logger.info,
+            access_log_class=SilentEventAccessLogger,
+        )
     except OSError as e:
         logger.error("Port %d is already in use: %s", port, e)
     finally:

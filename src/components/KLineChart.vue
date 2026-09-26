@@ -48,6 +48,7 @@ const props = defineProps<{
   /** 当前周期 MA20 长期趋势线数据点 */
   trendPoints?: TrendPointDto[]
   manualLevels?: ManualLevelDto[]
+  isMobile?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -90,7 +91,7 @@ class EventLabelPaneRenderer implements IPrimitivePaneRenderer {
       const timeScale = this.chart.timeScale()
       const boxH = 18
       const rowGap = 4
-      const priceAxisWidth = this.chart.priceScale('right').width() || 64
+      const priceAxisWidth = getRightAxisWidth(this.chart)
       const rightEdge = Math.max(2, mediaSize.width - priceAxisWidth - 4)
       context.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
       context.textBaseline = 'middle'
@@ -254,6 +255,237 @@ class GapPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
+class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
+  constructor(
+    private chart: IChartApi,
+    private source: ISeriesApi<'Candlestick'>,
+    private isMobile: () => boolean,
+    private latestPrice: () => number | null,
+    private precision: () => number,
+    private crosshairY: () => number | null,
+    private crosshairPrice: () => number | null,
+  ) {}
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.isMobile()) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const width = mediaSize.width
+      const height = mediaSize.height
+
+      const priceApi = this.chart.priceScale('right')
+      const priceRange = priceApi.getVisibleRange()
+      if (!priceRange || priceRange.to <= priceRange.from) return
+
+      const prec = this.precision()
+      const formatP = (p: number) => p.toFixed(prec)
+
+      context.save()
+
+      // 1. Draw 5 horizontal inner grid lines & left-aligned price labels
+      const yRatios = [0.12, 0.34, 0.56, 0.78, 0.95]
+      context.font = '500 10px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+      context.textAlign = 'left'
+      context.textBaseline = 'middle'
+
+      for (const ratio of yRatios) {
+        const y = height * ratio
+        const p = this.source.coordinateToPrice(y)
+        if (p == null) continue
+
+        const yRound = Math.round(y) + 0.5
+
+        // Faint horizontal dashed grid line across the whole chart width
+        context.strokeStyle = 'rgba(226, 232, 240, 0.75)'
+        context.lineWidth = 1
+        context.setLineDash([3, 4])
+        context.beginPath()
+        context.moveTo(0, yRound)
+        context.lineTo(width, yRound)
+        context.stroke()
+
+        // Subtle price label on the left edge inside the chart
+        context.setLineDash([])
+        const text = formatP(p)
+        const textW = context.measureText(text).width
+        context.fillStyle = 'rgba(255, 255, 255, 0.75)'
+        context.fillRect(4, yRound - 6, textW + 4, 12)
+        context.fillStyle = '#64748b'
+        context.fillText(text, 6, yRound)
+      }
+
+      // 2. Latest price line & right badge on mobile
+      const curPrice = this.latestPrice()
+      if (curPrice != null && Number.isFinite(curPrice)) {
+        const curY = this.source.priceToCoordinate(curPrice)
+        if (curY != null && curY >= 0 && curY <= height) {
+          const curYRound = Math.round(curY) + 0.5
+          const data = this.source.data()
+          const lastCandle = data.length > 0 ? (data[data.length - 1] as any) : null
+          const isUp = lastCandle ? curPrice >= lastCandle.open : true
+          const color = isUp ? '#e03131' : '#0f9d58'
+
+          // Horizontal price line
+          context.strokeStyle = color
+          context.lineWidth = 1
+          context.setLineDash([2, 3])
+          context.beginPath()
+          context.moveTo(0, curYRound)
+          context.lineTo(width - 50, curYRound)
+          context.stroke()
+
+          // Price badge on the right edge
+          context.setLineDash([])
+          const text = formatP(curPrice)
+          const tagW = Math.max(46, context.measureText(text).width + 8)
+          const tagH = 15
+          const tagX = width - tagW - 2
+          const tagY = Math.max(2, Math.min(height - tagH - 2, curY - tagH / 2))
+
+          context.fillStyle = color
+          context.beginPath()
+          if (typeof (context as any).roundRect === 'function') {
+            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+          } else {
+            context.rect(tagX, tagY, tagW, tagH)
+          }
+          context.fill()
+
+          context.fillStyle = '#ffffff'
+          context.font = '600 10px Consolas, -apple-system, sans-serif'
+          context.textAlign = 'center'
+          context.textBaseline = 'middle'
+          context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
+        }
+      }
+
+      // 3. Hovered crosshair price badge on right edge
+      const chY = this.crosshairY()
+      const chPrice = this.crosshairPrice()
+      if (chY != null && chPrice != null && chY >= 0 && chY <= height) {
+        context.setLineDash([])
+        const text = formatP(chPrice)
+        const tagW = Math.max(48, context.measureText(text).width + 10)
+        const tagH = 16
+        const tagX = width - tagW - 2
+        const tagY = Math.max(2, Math.min(height - tagH - 2, chY - tagH / 2))
+
+        context.fillStyle = '#1e293b'
+        context.beginPath()
+        if (typeof (context as any).roundRect === 'function') {
+          ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+        } else {
+          context.rect(tagX, tagY, tagW, tagH)
+        }
+        context.fill()
+
+        context.fillStyle = '#ffffff'
+        context.font = '600 10px Consolas, -apple-system, sans-serif'
+        context.textAlign = 'center'
+        context.textBaseline = 'middle'
+        context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
+      }
+
+      context.restore()
+    })
+  }
+}
+
+class InnerPriceAxisPaneView implements IPrimitivePaneView {
+  private paneRenderer: InnerPriceAxisPaneRenderer
+  constructor(renderer: InnerPriceAxisPaneRenderer) {
+    this.paneRenderer = renderer
+  }
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'bottom'
+  }
+}
+
+class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
+  private view: InnerPriceAxisPaneView
+  constructor(
+    chart: IChartApi,
+    source: ISeriesApi<'Candlestick'>,
+    isMobile: () => boolean,
+    latestPrice: () => number | null,
+    precision: () => number,
+    crosshairY: () => number | null,
+    crosshairPrice: () => number | null,
+  ) {
+    const renderer = new InnerPriceAxisPaneRenderer(
+      chart,
+      source,
+      isMobile,
+      latestPrice,
+      precision,
+      crosshairY,
+      crosshairPrice,
+    )
+    this.view = new InnerPriceAxisPaneView(renderer)
+  }
+  paneViews(): readonly IPrimitivePaneView[] {
+    return [this.view]
+  }
+}
+
+class InnerVolumeAxisPaneRenderer implements IPrimitivePaneRenderer {
+  constructor(
+    private chart: IChartApi,
+    private isMobile: () => boolean,
+  ) {}
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.isMobile()) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context } = scope
+      const volApi = this.chart.priceScale('vol', 1)
+      const range = volApi.getVisibleRange()
+      if (!range || range.to <= 0) return
+
+      context.save()
+      context.font = '500 10px Consolas, -apple-system, BlinkMacSystemFont, sans-serif'
+      context.fillStyle = '#94a3b8'
+      context.textAlign = 'left'
+      context.textBaseline = 'top'
+
+      const maxVol = Math.round(range.to)
+      const volText = maxVol >= 10000 ? `${(maxVol / 10000).toFixed(1)}万` : String(maxVol)
+      context.fillText(volText, 6, 4)
+      context.restore()
+    })
+  }
+}
+
+class InnerVolumeAxisPaneView implements IPrimitivePaneView {
+  private paneRenderer: InnerVolumeAxisPaneRenderer
+  constructor(renderer: InnerVolumeAxisPaneRenderer) {
+    this.paneRenderer = renderer
+  }
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'bottom'
+  }
+}
+
+class InnerVolumeAxisPrimitive implements ISeriesPrimitive<Time> {
+  private view: InnerVolumeAxisPaneView
+  constructor(
+    chart: IChartApi,
+    isMobile: () => boolean,
+  ) {
+    const renderer = new InnerVolumeAxisPaneRenderer(chart, isMobile)
+    this.view = new InnerVolumeAxisPaneView(renderer)
+  }
+  paneViews(): readonly IPrimitivePaneView[] {
+    return [this.view]
+  }
+}
+
 class ManualLevelPaneRenderer implements IPrimitivePaneRenderer {
   constructor(
     private chart: IChartApi,
@@ -276,7 +508,7 @@ class ManualLevelPaneRenderer implements IPrimitivePaneRenderer {
         const bottom = this.source.priceToCoordinate(level.zone_low)
         if (x1 == null || x2 == null || top == null || bottom == null) continue
         const left = Math.min(x1, x2)
-        const right = Math.max(x1, x2, mediaSize.width - (this.chart.priceScale('right').width() || 64))
+        const right = Math.max(x1, x2, mediaSize.width - getRightAxisWidth(this.chart))
         const width = Math.max(2, right - left)
         const active = level.status === 'active' && level.monitor_enabled
         const color = level.role_override === 'support' || level.role === 'support'
@@ -403,6 +635,10 @@ let countdownTimer: ReturnType<typeof setInterval> | null = null
 let priceLines: IPriceLine[] = []
 let extremeLines: IPriceLine[] = []
 let markersApi: ISeriesMarkersPluginApi<Time> | null = null
+let innerPricePrimitive: InnerPriceAxisPrimitive | null = null
+let innerVolumePrimitive: InnerVolumeAxisPrimitive | null = null
+const crosshairY = ref<number | null>(null)
+const crosshairPrice = ref<number | null>(null)
 let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
 let eventLabelPrimitive: EventLabelPrimitive | null = null
@@ -456,8 +692,29 @@ const PATTERN_UP_COLOR = 'rgba(255, 135, 135, 0.9)' // 上涨：浅红
 const PATTERN_DOWN_COLOR = 'rgba(32, 201, 151, 0.9)' // 下跌：青绿
 const BOX_COLOR = '#ff6d00' // 箱体：亮橘色，与N形态红绿区分开
 const ZOOM_SENSITIVITY = 0.0015
-/** 价格轴上下留白：K线最高/最低点与图表边框之间的空隙比例 */
-const PRICE_SCALE_TOP = 0.06
+const isMobileChart = () => (props.isMobile !== undefined ? props.isMobile : (typeof window !== 'undefined' && window.innerWidth <= 768))
+
+function getRightAxisWidth(chart: IChartApi): number {
+  const scale = chart.priceScale('right')
+  return scale.options().visible ? (scale.width() || 64) : 0
+}
+
+function getPricePrecision(rows: KlineRow[]): number {
+  if (!rows.length) return 1
+  for (let i = rows.length - 1; i >= Math.max(0, rows.length - 30); i--) {
+    const s = String(rows[i].close)
+    const dot = s.indexOf('.')
+    if (dot !== -1) {
+      return Math.min(3, s.length - dot - 1)
+    }
+  }
+  return 0
+}
+
+/** 价格轴上下留白：K线最高/最低点与图表边框之间的空隙比例。手机端顶部加大留白(18%)，彻底避免高K线与图例重叠 */
+function getPriceScaleTop(): number {
+  return isMobileChart() ? 0.18 : 0.09
+}
 const PRICE_SCALE_BOTTOM = 0.06
 
 const toTs = (s: string): UTCTimestamp =>
@@ -517,7 +774,10 @@ function formatLegend(d: CandlestickData, time: Time): string {
   const item = (label: string, value: number) =>
     `<span class="lg-item"><span class="lg-label">${label}</span><span class="lg-value" style="color:${color}">${value}</span></span>`
   const trend = trendBadgeHtml()
-  return `<span class="lg-time">${formatTime(time)}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}${trend}`
+  const timeStr = typeof window !== 'undefined' && window.innerWidth <= 768
+    ? formatTime(time).replace(/^\d{4}-/, '')
+    : formatTime(time)
+  return `<span class="lg-time">${timeStr}</span><span class="lg-sep"></span>${item('开', d.open)}${item('高', d.high)}${item('低', d.low)}${item('收', d.close)}${trend}`
 }
 
 /** 当前周期 MA20 趋势方向徽标；无数据时不显示 */
@@ -1393,6 +1653,15 @@ function buildEventLabels(): EventLabelData[] {
 
 watch(() => props.singleBars, () => { syncEventLabels() })
 
+watch(() => props.isMobile, (mobile) => {
+  if (!chart) return
+  const isM = mobile ?? isMobileChart()
+  chart.applyOptions({
+    rightPriceScale: { visible: !isM },
+  })
+  chart.priceScale('vol', 1).applyOptions({ visible: !isM })
+})
+
 function syncEventLabels() {
   if (!chart || !candleSeries) return
   if (eventLabelPrimitive) {
@@ -1400,15 +1669,16 @@ function syncEventLabels() {
     eventLabelPrimitive = null
   }
   const labels = buildEventLabels()
-  if (!labels.length) return
   const aboveCount = labels.filter((l) => l.side === 'above').length
   const belowCount = labels.filter((l) => l.side === 'below').length
+  const baseTop = getPriceScaleTop()
   chart.priceScale('right').applyOptions({
     scaleMargins: {
-      top: Math.min(0.2, Math.max(PRICE_SCALE_TOP, 0.04 + aboveCount * 0.02)),
+      top: Math.min(0.28, Math.max(baseTop, baseTop + aboveCount * 0.025)),
       bottom: Math.min(0.2, Math.max(PRICE_SCALE_BOTTOM, 0.04 + belowCount * 0.02)),
     },
   })
+  if (!labels.length) return
   eventLabelPrimitive = new EventLabelPrimitive(chart, candleSeries, labels)
   candleSeries.attachPrimitive(eventLabelPrimitive)
 }
@@ -1696,7 +1966,7 @@ function refreshManualLevelOverlay() {
       x: Math.min(x1, x2),
       anchorX,
       y: Math.min(y1, y2),
-      width: Math.max(2, Math.max(x1, x2, width - (chart!.priceScale('right').width() || 64)) - Math.min(x1, x2)),
+      width: Math.max(2, Math.max(x1, x2, width - getRightAxisWidth(chart!)) - Math.min(x1, x2)),
       height: Math.max(4, Math.abs(y2 - y1)),
     }]
   })
@@ -2014,7 +2284,10 @@ onMounted(() => {
       vertLines: { color: 'rgba(226, 232, 240, 0.6)' },
       horzLines: { color: 'rgba(226, 232, 240, 0.6)' },
     },
-    rightPriceScale: { borderColor: 'rgba(197, 203, 215, 0.4)' },
+    rightPriceScale: {
+      visible: !isMobileChart(),
+      borderColor: 'rgba(197, 203, 215, 0.4)',
+    },
     timeScale: {
       borderColor: 'rgba(197, 203, 215, 0.4)',
       timeVisible: true,
@@ -2056,21 +2329,47 @@ onMounted(() => {
   )
   // 默认 6% 上下留白；事件文字标签较多时会由 syncEventLabels 动态放宽
   chart.priceScale('right').applyOptions({
-    scaleMargins: { top: PRICE_SCALE_TOP, bottom: PRICE_SCALE_BOTTOM },
+    scaleMargins: { top: getPriceScaleTop(), bottom: PRICE_SCALE_BOTTOM },
   })
-  chart.priceScale('vol', 1).applyOptions({ scaleMargins: { top: 0.08, bottom: 0.04 } })
+  chart.priceScale('vol', 1).applyOptions({
+    visible: !isMobileChart(),
+    scaleMargins: { top: 0.08, bottom: 0.04 },
+  })
   applyPaneHeights()
   chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleRangeChange)
+
+  innerPricePrimitive = new InnerPriceAxisPrimitive(
+    chart,
+    candleSeries,
+    isMobileChart,
+    () => (props.rows.length ? props.rows[props.rows.length - 1].close : null),
+    () => getPricePrecision(props.rows),
+    () => crosshairY.value,
+    () => crosshairPrice.value,
+  )
+  candleSeries.attachPrimitive(innerPricePrimitive)
+
+  if (volumeSeries) {
+    innerVolumePrimitive = new InnerVolumeAxisPrimitive(
+      chart,
+      isMobileChart,
+    )
+    volumeSeries.attachPrimitive(innerVolumePrimitive)
+  }
 
   chart.subscribeCrosshairMove((param) => {
     if (!legend.value || !candleSeries) return
     if (!param.time || !param.point) {
       isHovering = false
       hoveredTime = null
+      crosshairY.value = null
+      crosshairPrice.value = null
       if (focusPinnedByKeys) syncFocus()
       else renderFocusLegend()
       return
     }
+    crosshairY.value = param.point.y
+    crosshairPrice.value = candleSeries.coordinateToPrice(param.point.y)
     const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
     if (!d) {
       isHovering = false
@@ -2089,6 +2388,14 @@ onMounted(() => {
   resizeObserver = new ResizeObserver((entries) => {
     const el = entries[0].target as HTMLElement
     chart?.applyOptions({ width: el.clientWidth, height: el.clientHeight })
+    const mobile = isMobileChart()
+    chart?.applyOptions({
+      rightPriceScale: { visible: !mobile },
+    })
+    chart?.priceScale('vol', 1).applyOptions({ visible: !mobile })
+    chart?.priceScale('right').applyOptions({
+      scaleMargins: { top: getPriceScaleTop(), bottom: PRICE_SCALE_BOTTOM },
+    })
     applyPaneHeights()
     refreshManualLevelOverlay()
   })
@@ -2221,6 +2528,14 @@ onBeforeUnmount(() => {
   }
   markersApi?.detach()
   markersApi = null
+  if (innerPricePrimitive && candleSeries) {
+    candleSeries.detachPrimitive(innerPricePrimitive)
+    innerPricePrimitive = null
+  }
+  if (innerVolumePrimitive && volumeSeries) {
+    volumeSeries.detachPrimitive(innerVolumePrimitive)
+    innerVolumePrimitive = null
+  }
   for (const line of extremeLines) candleSeries?.removePriceLine(line)
   extremeLines = []
   for (const line of patternLines) chart?.removeSeries(line)
@@ -2236,19 +2551,25 @@ onBeforeUnmount(() => {
   priceLines = []
 })
 
-defineExpose({ stepCandles, toggleManualLevelDraw })
+function toggleTrendVisible() {
+  trendVisible.value = !trendVisible.value
+  return trendVisible.value
+}
+
+defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisible })
 </script>
 
 <template>
   <div class="kline-wrap" @pointerdown="handleManualLevelCanvasPointerDown">
     <div ref="legend" class="legend">N趋势 K线</div>
-    <div ref="timeLeft" class="time-left"></div>
-    <div ref="container" class="kline-canvas"></div>
-    <svg
-      class="manual-level-overlay"
-      aria-label="关键区域编辑层"
-      @click="selectedManualLevelId = null"
-    >
+    <div class="chart-canvas-area">
+      <div ref="timeLeft" class="time-left"></div>
+      <div ref="container" class="kline-canvas"></div>
+      <svg
+        class="manual-level-overlay"
+        aria-label="关键区域编辑层"
+        @click="selectedManualLevelId = null"
+      >
       <rect
         v-if="drawMode && drawing"
         class="manual-level-draw-preview"
@@ -2320,6 +2641,7 @@ defineExpose({ stepCandles, toggleManualLevelDraw })
         ←/→ 切换焦点K线<br />Ctrl+滚轮 缩放<br />滚轮 切换品种<br />拖拽 平移<br />双击价格轴 复位
       </n-tooltip>
     </div>
+    </div>
   </div>
 </template>
 
@@ -2332,10 +2654,16 @@ defineExpose({ stepCandles, toggleManualLevelDraw })
   background: #fff;
   border-radius: 8px;
   overflow: hidden;
+  touch-action: none;
+}
+.chart-canvas-area {
+  position: absolute;
+  inset: 0;
 }
 .kline-canvas {
   position: absolute;
   inset: 0;
+  touch-action: none;
 }
 .legend {
   position: absolute;
@@ -2557,6 +2885,67 @@ defineExpose({ stepCandles, toggleManualLevelDraw })
   pointer-events: none;
   font-family: Consolas, monospace;
 } */
+@media (max-width: 768px) {
+  .kline-wrap {
+    display: flex;
+    flex-direction: column;
+    border-radius: 0;
+    overflow: hidden;
+  }
+  .trend-toggle,
+  .help-hint {
+    display: none !important;
+  }
+  .legend {
+    position: relative;
+    top: auto;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    width: 100%;
+    flex: 0 0 28px;
+    height: 28px;
+    padding: 0 8px;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #475569;
+    background: #ffffff;
+    border: none;
+    border-bottom: 1px solid #f1f5f9;
+    box-shadow: none;
+    border-radius: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: none;
+    pointer-events: auto;
+    user-select: none;
+    z-index: 2;
+  }
+  .legend::-webkit-scrollbar {
+    display: none;
+  }
+  .chart-canvas-area {
+    position: relative;
+    inset: auto;
+    width: 100%;
+    flex: 1 1 0;
+    min-height: 0;
+  }
+  .kline-canvas {
+    position: absolute;
+    inset: 0;
+    touch-action: none;
+  }
+  .time-left {
+    top: 6px;
+    right: 8px;
+    font-size: 10px;
+    padding: 2px 6px;
+  }
+}
 </style>
 
 

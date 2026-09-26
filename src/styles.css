@@ -1,9 +1,10 @@
-﻿html,
+html,
 body,
 #app {
   height: 100%;
   margin: 0;
   padding: 0;
+  overflow: hidden;
 }
 
 body {
@@ -20,6 +21,33 @@ body {
 
 * {
   box-sizing: border-box;
+}
+
+/* ===== 现代原生桌面软件风格滚动条 ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: rgba(140, 150, 170, 0.28);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(140, 150, 170, 0.52);
+}
+::-webkit-scrollbar-thumb:active {
+  background-color: rgba(140, 150, 170, 0.76);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(140, 150, 170, 0.28) transparent;
 }
 
 /* SortableJS 拖拽克隆体样式（克隆体挂在 body 上，须为全局样式） */

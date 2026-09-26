@@ -11,10 +11,13 @@ import {
   NIcon,
   NLayout,
   NLayoutContent,
+  NModal,
+  NPopover,
   NTag,
   NText,
   type DropdownOption,
 } from 'naive-ui'
+import { usePlatform } from '../utils/platform'
 import {
   BellX,
   Clock,
@@ -47,6 +50,8 @@ const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
+const { isMobile, isNativeMobile } = usePlatform()
+const showMobileSearch = ref(false)
 
 const activeDataSource = computed(() => {
   return (
@@ -223,21 +228,48 @@ const actionOptions = computed<DropdownOption[]>(() => [
     label: '刷新数据',
     key: 'refresh',
     icon: () => h(NIcon, { component: Refresh, size: 16 }),
-    disabled: actionsStore.refreshing,
+    disabled: actionsStore.refreshing || !appStore.isOnline,
   },
   {
     label: '立即扫描',
     key: 'scan',
     icon: () => h(NIcon, { component: Scan, size: 16 }),
-    disabled: actionsStore.scanning,
+    disabled: actionsStore.scanning || !appStore.isOnline,
   },
   {
     label: '刷新名称',
     key: 'enrich',
     icon: () => h(NIcon, { component: Tag, size: 16 }),
-    disabled: actionsStore.enriching,
+    disabled: actionsStore.enriching || !appStore.isOnline,
   },
 ])
+
+const mobileActionOptions = computed<DropdownOption[]>(() => [
+  {
+    label: '复盘统计',
+    key: 'review',
+    icon: () => h(NIcon, { component: History, size: 16 }),
+  },
+  {
+    label: '历史通知',
+    key: 'notifications',
+    icon: () => h(NIcon, { component: Clock, size: 16 }),
+  },
+  {
+    label: '系统设置',
+    key: 'settings',
+    icon: () => h(NIcon, { component: SettingsIcon, size: 16 }),
+  },
+  { type: 'divider', key: 'd1' },
+  ...actionOptions.value,
+])
+
+function onMobileActionSelect(key: string) {
+  if (key === 'review') openReviewWindow()
+  else if (key === 'notifications') openNotificationsWindow()
+  else if (key === 'settings') openSettingsWindow()
+  else onActionSelect(key)
+}
 
 function onActionSelect(key: string) {
   if (key === 'refresh') void actionsStore.refreshData()
@@ -248,6 +280,16 @@ function onActionSelect(key: string) {
 /** 状态时间只显示「MM-DD HH:mm:ss」，完整时间放 tooltip */
 function shortTime(v: string | null | undefined): string {
   return v ? v.slice(5) : '—'
+}
+
+/** 状态时间：解析为 { hm: 'HH:mm', sec: ':ss' }，方便移动端自适应隐藏秒数 */
+function parseTimeParts(v: string | null | undefined): { hm: string; sec: string } {
+  if (!v) return { hm: '—', sec: '' }
+  const m = v.match(/(\d{2}:\d{2})(?::(\d{2}))?/)
+  if (m) {
+    return { hm: m[1], sec: m[2] ? `:${m[2]}` : '' }
+  }
+  return { hm: v.slice(-8, -3) || v, sec: v.slice(-3) }
 }
 
 /**
@@ -324,12 +366,12 @@ onBeforeUnmount(() => {
   <n-layout position="absolute" style="--app-header-h: 40px">
     <TitleBar :title="windowTitle">
       <template v-if="!isStandaloneWindow" #left>
-        <div class="brand">
-          <n-icon :component="TrendingUp" size="20" color="#f5c23f" />
+        <div class="brand" :class="{ 'is-mobile-brand': isMobile }">
+          <n-icon :component="TrendingUp" :size="isMobile ? 18 : 20" color="#f5c23f" />
           <span class="brand-name">N趋势</span>
-          <n-text depth="3" style="font-size: 12px">v{{ appStore.info.version }}</n-text>
+          <n-text v-if="!isMobile" depth="3" style="font-size: 12px">v{{ appStore.info.version }}</n-text>
         </div>
-        <div class="add-box">
+        <div v-if="!isMobile" class="add-box">
           <n-auto-complete
             :value="newCode"
             @update:value="onNewCodeUpdate"
@@ -364,20 +406,54 @@ onBeforeUnmount(() => {
       </template>
 
       <template v-if="!isStandaloneWindow" #center>
-        <div class="status-area">
+        <div class="status-area" :class="{ 'is-mobile-status': isMobile }">
+          <!-- 服务端连接状态 -->
+          <n-tag
+            :size="isMobile ? 'tiny' : 'small'"
+            round
+            :bordered="false"
+            class="conn-tag"
+            :class="{ 'is-mobile-conn': isMobile }"
+            :style="{
+              backgroundColor: appStore.statusBadge.color + '1a',
+              color: appStore.statusBadge.color,
+              border: `1px solid ${appStore.statusBadge.color}33`,
+              cursor: 'pointer',
+              fontWeight: 500,
+            }"
+            :title="`服务器: ${appStore.serverUrl || '未配置'}\n状态: ${appStore.statusBadge.text}${appStore.statusBadge.delay ? '\n延迟: ' + appStore.statusBadge.delay : ''}\n点击打开设置`"
+            @click="openSettingsWindow"
+          >
+            <span
+              :style="{
+                display: 'inline-block',
+                width: '6px',
+                height: '6px',
+                borderRadius: '50%',
+                backgroundColor: appStore.statusBadge.color,
+                marginRight: '4px'
+              }"
+            />
+            {{ appStore.statusBadge.text }}
+            <span v-if="!isMobile && appStore.statusBadge.delay" style="font-size: 11px; margin-left: 4px; opacity: 0.85">
+              {{ appStore.statusBadge.delay }}
+            </span>
+          </n-tag>
+
           <div
             v-if="settingsStore.status.running"
             class="live-tag"
-            :class="{ 'is-breathing': dataActive }"
+            :class="{ 'is-breathing': dataActive, 'is-mobile-live': isMobile }"
             title="定时刷新扫描运行中"
           >
             <span class="live-dot" />
-            <span>运行中</span>
+            <span v-if="!isMobile">运行中</span>
           </div>
-          <n-tag v-else type="warning" size="small" round>已暂停</n-tag>
+          <n-tag v-else-if="!isMobile" type="warning" size="small" round>已暂停</n-tag>
 
-          <!-- 实时数据源显示 -->
+          <!-- 实时数据源显示 (PC端展示) -->
           <n-tag
+            v-if="!isMobile"
             size="small"
             round
             :bordered="false"
@@ -390,104 +466,193 @@ onBeforeUnmount(() => {
             </template>
             {{ activeDataSource }}
           </n-tag>
-          <div class="status-meta">
-            <div
-              class="status-item"
-              :title="`数据最近更新于：${settingsStore.status.last_refresh || '—'}`"
-            >
-              <span class="dot dot-data" />
-              <span class="status-label">数据</span>
-              <span class="status-value" :class="{ empty: !settingsStore.status.last_refresh }">
-                {{ shortTime(settingsStore.status.last_refresh) }}
-              </span>
+
+          <!-- 数据时间 & 形态时间 (PC端与移动端自适应，点击弹出系统运行明细) -->
+          <n-popover trigger="click" placement="bottom" :show-arrow="false">
+            <template #trigger>
+              <div
+                class="status-meta"
+                :class="{ 'is-mobile-meta': isMobile }"
+                data-titlebar-ignore
+                title="点击查看完整系统运行状态"
+              >
+                <div class="status-item">
+                  <span class="dot dot-data" />
+                  <span class="status-label" :class="{ 'mobile-label-data': isMobile }">{{ isMobile ? '数' : '数据' }}</span>
+                  <span class="status-value" :class="{ empty: !settingsStore.status.last_refresh }">
+                    <template v-if="!isMobile">
+                      {{ shortTime(settingsStore.status.last_refresh) }}
+                    </template>
+                    <template v-else>
+                      <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_refresh).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_refresh).sec }}</span>
+                    </template>
+                  </span>
+                </div>
+                <div class="status-divider" />
+                <div class="status-item">
+                  <span class="dot dot-scan" />
+                  <span class="status-label" :class="{ 'mobile-label-scan': isMobile }">{{ isMobile ? '形' : '形态' }}</span>
+                  <span class="status-value" :class="{ empty: !settingsStore.status.last_scan }">
+                    <template v-if="!isMobile">
+                      {{ shortTime(settingsStore.status.last_scan) }}
+                    </template>
+                    <template v-else>
+                      <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_scan).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_scan).sec }}</span>
+                    </template>
+                  </span>
+                </div>
+              </div>
+            </template>
+
+            <div class="status-quick-card">
+              <div class="sq-header">
+                <span class="sq-title">系统运行状态</span>
+                <n-tag size="tiny" round :bordered="false" :type="appStore.isOnline ? 'success' : 'error'">
+                  {{ appStore.statusBadge.text }}
+                </n-tag>
+              </div>
+              <div class="sq-divider" />
+              <div class="sq-row">
+                <span class="sq-k">服务器连接</span>
+                <span class="sq-v">{{ appStore.serverUrl || '未配置' }} {{ appStore.statusBadge.delay ? `(${appStore.statusBadge.delay})` : '' }}</span>
+              </div>
+              <div class="sq-row">
+                <span class="sq-k">实时数据源</span>
+                <span class="sq-v font-bold">{{ activeDataSource }}</span>
+              </div>
+              <div class="sq-row">
+                <span class="sq-k">最近数据刷新</span>
+                <span class="sq-v font-mono">{{ settingsStore.status.last_refresh || '—' }}</span>
+              </div>
+              <div class="sq-row">
+                <span class="sq-k">最近形态扫描</span>
+                <span class="sq-v font-mono">{{ settingsStore.status.last_scan || '—' }}</span>
+              </div>
+              <div class="sq-row">
+                <span class="sq-k">调度引擎</span>
+                <span class="sq-v">{{ settingsStore.status.running ? '运行中 (实时推送/轮询)' : '已暂停' }}</span>
+              </div>
             </div>
-            <div class="status-divider" />
-            <div
-              class="status-item"
-              :title="`形态最新识别于：${settingsStore.status.last_scan || '—'}`"
-            >
-              <span class="dot dot-scan" />
-              <span class="status-label">形态</span>
-              <span class="status-value" :class="{ empty: !settingsStore.status.last_scan }">
-                {{ shortTime(settingsStore.status.last_scan) }}
-              </span>
-            </div>
-          </div>
+          </n-popover>
         </div>
       </template>
 
       <template v-if="!isStandaloneWindow" #right>
-        <n-dropdown trigger="click" :options="actionOptions" @select="onActionSelect">
-          <n-button quaternary circle size="small" title="更多操作">
-            <template #icon>
-              <n-icon :component="DotsVertical" />
-            </template>
-          </n-button>
-        </n-dropdown>
-        <n-button
-          quaternary
-          circle
-          size="small"
-          title="复盘统计"
-          class="review-button"
-          @click="openReviewWindow"
-        >
-          <template #icon>
-            <n-icon :component="History" size="18" />
-          </template>
-        </n-button>
-        <n-button
-          quaternary
-          circle
-          size="small"
-          title="历史通知"
-          class="notifications-button"
-          @click="openNotificationsWindow"
-        >
-          <template #icon>
-            <n-icon :component="Clock" size="18" />
-          </template>
-        </n-button>
-        <n-button
-          quaternary
-          circle
-          size="small"
-          title="设置"
-          class="settings-button"
-          @click="openSettingsWindow"
-        >
-          <template #icon>
-            <n-icon :component="SettingsIcon" size="18" />
-          </template>
-        </n-button>
-        <n-badge
-          v-if="activeNotifyCount > 0"
-          :value="activeNotifyCount"
-          :max="99"
-          :offset="[-8, 2]"
-          class="clear-notifications-badge"
-        >
+        <template v-if="isMobile">
           <n-button
             quaternary
             circle
             size="small"
-            :title="`清空全部通知（${activeNotifyCount}）`"
-            class="clear-notifications-button"
-            @click="dismissAll"
+            title="搜索/添加品种"
+            @click="showMobileSearch = true"
           >
             <template #icon>
-              <n-icon :component="BellX" size="18" />
+              <n-icon :component="Search" size="17" />
             </template>
           </n-button>
-        </n-badge>
+          <n-dropdown trigger="click" :options="mobileActionOptions" @select="onMobileActionSelect">
+            <n-button quaternary circle size="small" title="更多">
+              <template #icon>
+                <n-icon :component="DotsVertical" size="17" />
+              </template>
+            </n-button>
+          </n-dropdown>
+          <n-badge
+            v-if="activeNotifyCount > 0"
+            :value="activeNotifyCount"
+            :max="99"
+            :offset="[-6, 2]"
+            class="clear-notifications-badge"
+          >
+            <n-button
+              quaternary
+              circle
+              size="small"
+              :title="`清空全部通知（${activeNotifyCount}）`"
+              class="clear-notifications-button"
+              @click="dismissAll"
+            >
+              <template #icon>
+                <n-icon :component="BellX" size="17" />
+              </template>
+            </n-button>
+          </n-badge>
+        </template>
+        <template v-else>
+          <n-dropdown trigger="click" :options="actionOptions" @select="onActionSelect">
+            <n-button quaternary circle size="small" title="更多操作">
+              <template #icon>
+                <n-icon :component="DotsVertical" />
+              </template>
+            </n-button>
+          </n-dropdown>
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="复盘统计"
+            class="review-button"
+            @click="openReviewWindow"
+          >
+            <template #icon>
+              <n-icon :component="History" size="18" />
+            </template>
+          </n-button>
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="历史通知"
+            class="notifications-button"
+            @click="openNotificationsWindow"
+          >
+            <template #icon>
+              <n-icon :component="Clock" size="18" />
+            </template>
+          </n-button>
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="设置"
+            class="settings-button"
+            @click="openSettingsWindow"
+          >
+            <template #icon>
+              <n-icon :component="SettingsIcon" size="18" />
+            </template>
+          </n-button>
+          <n-badge
+            v-if="activeNotifyCount > 0"
+            :value="activeNotifyCount"
+            :max="99"
+            :offset="[-8, 2]"
+            class="clear-notifications-badge"
+          >
+            <n-button
+              quaternary
+              circle
+              size="small"
+              :title="`清空全部通知（${activeNotifyCount}）`"
+              class="clear-notifications-button"
+              @click="dismissAll"
+            >
+              <template #icon>
+                <n-icon :component="BellX" size="18" />
+              </template>
+            </n-button>
+          </n-badge>
+        </template>
       </template>
     </TitleBar>
 
     <n-layout-content
       position="absolute"
-      style="top: var(--app-header-h)"
+      class="app-layout-content"
+      :class="{ 'bare-layout-content': bare }"
+      style="top: var(--app-header-h); bottom: 0; left: 0; right: 0;"
       :native-scrollbar="false"
-      :content-style="bare ? 'height: 100%; padding: 0' : 'height: 100%; box-sizing: border-box; padding: 16px'"
+      :content-style="bare ? 'height: 100%; padding: 0; overflow: hidden;' : isMobile ? 'height: 100%; box-sizing: border-box; padding: 6px;' : 'height: 100%; box-sizing: border-box; padding: 16px;'"
     >
       <!-- 只缓存列表页（DashboardView）：返回时不再全量重载；K线图页不缓存，保持每次进入重置视图 -->
       <router-view v-slot="{ Component }">
@@ -497,6 +662,41 @@ onBeforeUnmount(() => {
       </router-view>
     </n-layout-content>
   </n-layout>
+
+  <n-modal
+    v-model:show="showMobileSearch"
+    preset="card"
+    title="搜索 / 添加品种"
+    style="width: 90vw; max-width: 380px; border-radius: 12px"
+  >
+    <div style="display: flex; gap: 8px;">
+      <n-auto-complete
+        :value="newCode"
+        @update:value="onNewCodeUpdate"
+        :options="symbolOptions"
+        :input-props="addInputProps"
+        :render-label="renderSymbolLabel"
+        :loading="searching"
+        clear-after-select
+        placeholder="搜索品种/合约，如 RB"
+        size="medium"
+        style="flex: 1;"
+        @focus="reloadSymbols"
+        @select="(val) => { onSymbolSelect(val); showMobileSearch = false; }"
+      >
+        <template #prefix>
+          <n-icon :component="Search" size="16" />
+        </template>
+      </n-auto-complete>
+      <n-button
+        type="primary"
+        :loading="actionsStore.adding"
+        @click="async () => { await doAddSymbol(); showMobileSearch = false; }"
+      >
+        添加
+      </n-button>
+    </div>
+  </n-modal>
 </template>
 
 <style scoped>
@@ -630,5 +830,126 @@ onBeforeUnmount(() => {
   border-radius: 7px;
   box-sizing: border-box;
   font-size: 10px;
+}
+.bare-layout-content :deep(.n-layout-scroll-container) {
+  overflow: hidden !important;
+}
+
+.status-area.is-mobile-status {
+  gap: 4px;
+}
+.live-tag.is-mobile-live {
+  padding: 0 2px;
+  background: transparent;
+  height: 18px;
+}
+.live-tag.is-mobile-live .live-dot {
+  width: 6px;
+  height: 6px;
+}
+
+.brand.is-mobile-brand {
+  gap: 4px;
+}
+.brand.is-mobile-brand .brand-name {
+  font-size: 14px;
+  letter-spacing: 0.5px;
+}
+
+.conn-tag.is-mobile-conn {
+  padding: 0 4px;
+  font-size: 11px;
+  height: 18px;
+}
+
+.status-meta.is-mobile-meta {
+  gap: 4px;
+  padding-left: 6px;
+  border-left: 1px solid #eef1f5;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background-color 0.15s;
+}
+.status-meta.is-mobile-meta:hover {
+  background-color: rgba(0, 0, 0, 0.04);
+}
+.status-meta.is-mobile-meta .status-item {
+  gap: 3px;
+}
+.status-meta.is-mobile-meta .status-label {
+  font-size: 11px;
+  font-weight: 600;
+}
+.mobile-label-data {
+  color: #2563eb !important;
+}
+.mobile-label-scan {
+  color: #059669 !important;
+}
+.status-meta.is-mobile-meta .status-value {
+  font-size: 11px;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.status-meta.is-mobile-meta .dot {
+  width: 5px;
+  height: 5px;
+}
+.status-meta.is-mobile-meta .status-divider {
+  height: 10px;
+  background: #e2e8f0;
+}
+@media (max-width: 375px) {
+  .status-meta.is-mobile-meta .time-sec {
+    display: none;
+  }
+}
+
+/* 状态弹出卡片样式 */
+.status-quick-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 250px;
+  font-size: 12px;
+  color: #334155;
+  user-select: none;
+}
+.sq-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sq-title {
+  font-weight: 700;
+  color: #0f172a;
+  font-size: 13px;
+}
+.sq-divider {
+  height: 1px;
+  background: #f1f5f9;
+  margin: 1px 0;
+}
+.sq-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.sq-k {
+  color: #64748b;
+  flex-shrink: 0;
+}
+.sq-v {
+  color: #1e293b;
+  text-align: right;
+  word-break: break-all;
+}
+.sq-v.font-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.sq-v.font-bold {
+  font-weight: 600;
 }
 </style>

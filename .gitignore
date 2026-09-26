@@ -20,4 +20,5 @@ read_zhihu.mjs
 zhihu_screenshot.png
 *.db
 ntrend.db
+data/
 

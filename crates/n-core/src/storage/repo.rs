@@ -10,9 +10,10 @@ use sea_orm::{
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
-    bar_finality_trials, bar_observations, groups, klines, manual_level_events, manual_levels,
-    pattern_events, preclose_candidates, preclose_signals, rollovers, settings, signal_annotations,
-    signal_decisions, symbol_groups, symbols,
+    bar_finality_trials, bar_observations, devices, groups, idempotency_requests, klines,
+    manual_level_events, manual_levels, notification_history, pattern_events, preclose_candidates,
+    preclose_signals, rollovers, server_settings, settings, signal_annotations, signal_decisions,
+    symbol_groups, symbols, sync_revisions,
 };
 
 /// Move a trained model through the lifecycle registry.  Promotion is
@@ -1799,6 +1800,334 @@ fn trial_model_to_dto(m: bar_finality_trials::Model) -> FinalityTrial {
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sync Revisions
+// ---------------------------------------------------------------------------
+
+pub async fn bump_revision(db: &DatabaseConnection, scope: &str) -> Result<i64> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO sync_revisions (scope, revision, updated_at) VALUES (?1, 1, ?2) \
+         ON CONFLICT(scope) DO UPDATE SET revision = revision + 1, updated_at = ?2",
+        vec![scope.into(), now.into()],
+    ))
+    .await
+    .context("自增 sync_revision 失败")?;
+
+    get_revision(db, scope).await
+}
+
+pub async fn get_revision(db: &DatabaseConnection, scope: &str) -> Result<i64> {
+    let row = sync_revisions::Entity::find_by_id(scope.to_string())
+        .one(db)
+        .await
+        .context("查询 sync_revision 失败")?;
+    Ok(row.map(|r| r.revision).unwrap_or(1))
+}
+
+pub async fn get_all_revisions(
+    db: &DatabaseConnection,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows = sync_revisions::Entity::find()
+        .all(db)
+        .await
+        .context("查询全部 sync_revisions 失败")?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        map.insert(r.scope, r.revision);
+    }
+    Ok(map)
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+pub async fn create_device(
+    db: &DatabaseConnection,
+    id: &str,
+    name: &str,
+    token_hash: &str,
+    role: &str,
+) -> Result<devices::Model> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let model = devices::ActiveModel {
+        id: Set(id.to_string()),
+        name: Set(name.to_string()),
+        token_hash: Set(token_hash.to_string()),
+        role: Set(role.to_string()),
+        created_at: Set(now.clone()),
+        last_seen_at: Set(Some(now)),
+        revoked_at: Set(None),
+    };
+    let res = devices::Entity::insert(model).exec_with_returning(db).await?;
+    bump_revision(db, "devices").await.ok();
+    Ok(res)
+}
+
+pub async fn find_device_by_token_hash(
+    db: &DatabaseConnection,
+    token_hash: &str,
+) -> Result<Option<devices::Model>> {
+    let row = devices::Entity::find()
+        .filter(devices::Column::TokenHash.eq(token_hash))
+        .filter(devices::Column::RevokedAt.is_null())
+        .one(db)
+        .await
+        .context("查询设备失败")?;
+    Ok(row)
+}
+
+pub async fn touch_device_last_seen(db: &DatabaseConnection, id: &str) -> Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE devices SET last_seen_at = ?1 WHERE id = ?2",
+        vec![now.into(), id.into()],
+    ))
+    .await
+    .context("更新设备活动时间失败")?;
+    Ok(())
+}
+
+pub async fn list_devices(db: &DatabaseConnection) -> Result<Vec<devices::Model>> {
+    devices::Entity::find()
+        .order_by_desc(devices::Column::CreatedAt)
+        .all(db)
+        .await
+        .context("获取设备列表失败")
+}
+
+pub async fn revoke_device(db: &DatabaseConnection, id: &str) -> Result<bool> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE devices SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+            vec![now.into(), id.into()],
+        ))
+        .await
+        .context("吊销设备失败")?;
+    bump_revision(db, "devices").await.ok();
+    Ok(res.rows_affected() > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Notification History (Persistent)
+// ---------------------------------------------------------------------------
+
+pub async fn insert_notification_history(
+    db: &DatabaseConnection,
+    item: &n_protocol::NewNotificationHistoryItem,
+) -> Result<n_protocol::NotificationHistoryItem> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let signal_json = item
+        .signal
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+    let entry_trigger_json = item
+        .entry_trigger
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+    let single_bar_json = item
+        .single_bar
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+    let manual_level_json = item
+        .manual_level
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+
+    let am = notification_history::ActiveModel {
+        id: sea_orm::NotSet,
+        created_at: Set(now.clone()),
+        kind: Set(item.kind.clone()),
+        title: Set(item.title.clone()),
+        content: Set(item.content.clone()),
+        signal_json: Set(signal_json),
+        entry_trigger_json: Set(entry_trigger_json),
+        single_bar_json: Set(single_bar_json),
+        manual_level_json: Set(manual_level_json),
+        read_at: Set(None),
+    };
+
+    let model = notification_history::Entity::insert(am)
+        .exec_with_returning(db)
+        .await?;
+    bump_revision(db, "notifications").await.ok();
+
+    Ok(n_protocol::NotificationHistoryItem {
+        id: model.id as u64,
+        created_at: model.created_at,
+        kind: model.kind,
+        title: model.title,
+        content: model.content,
+        signal: item.signal.clone(),
+        entry_trigger: item.entry_trigger.clone(),
+        single_bar: item.single_bar.clone(),
+        manual_level: item.manual_level.clone(),
+        read_at: model.read_at,
+    })
+}
+
+pub async fn list_notification_history(
+    db: &DatabaseConnection,
+    limit: u64,
+) -> Result<Vec<n_protocol::NotificationHistoryItem>> {
+    let models = notification_history::Entity::find()
+        .order_by_desc(notification_history::Column::Id)
+        .limit(limit)
+        .all(db)
+        .await
+        .context("查询通知历史失败")?;
+
+    let mut out = Vec::with_capacity(models.len());
+    for m in models {
+        let signal = m
+            .signal_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let entry_trigger = m
+            .entry_trigger_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let single_bar = m
+            .single_bar_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        let manual_level = m
+            .manual_level_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        out.push(n_protocol::NotificationHistoryItem {
+            id: m.id as u64,
+            created_at: m.created_at,
+            kind: m.kind,
+            title: m.title,
+            content: m.content,
+            signal,
+            entry_trigger,
+            single_bar,
+            manual_level,
+            read_at: m.read_at,
+        });
+    }
+    Ok(out)
+}
+
+pub async fn mark_notifications_read(
+    db: &DatabaseConnection,
+    up_to_id: Option<u64>,
+) -> Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if let Some(id) = up_to_id {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE notification_history SET read_at = ?1 WHERE id <= ?2 AND read_at IS NULL",
+            vec![now.into(), (id as i64).into()],
+        ))
+        .await
+        .context("标记通知已读失败")?;
+    } else {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE notification_history SET read_at = ?1 WHERE read_at IS NULL",
+            vec![now.into()],
+        ))
+        .await
+        .context("标记所有通知已读失败")?;
+    }
+    bump_revision(db, "notifications").await.ok();
+    Ok(())
+}
+
+pub async fn clear_notification_history(db: &DatabaseConnection) -> Result<()> {
+    db.execute_unprepared("DELETE FROM notification_history")
+        .await
+        .context("清空通知历史失败")?;
+    bump_revision(db, "notifications").await.ok();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency Requests
+// ---------------------------------------------------------------------------
+
+pub async fn get_idempotent_response(
+    db: &DatabaseConnection,
+    request_id: &str,
+) -> Result<Option<String>> {
+    let row = idempotency_requests::Entity::find_by_id(request_id.to_string())
+        .one(db)
+        .await
+        .context("查询幂等记录失败")?;
+    Ok(row.map(|r| r.response_json))
+}
+
+pub async fn save_idempotent_response(
+    db: &DatabaseConnection,
+    request_id: &str,
+    scope: &str,
+    response_json: &str,
+) -> Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let am = idempotency_requests::ActiveModel {
+        request_id: Set(request_id.to_string()),
+        scope: Set(scope.to_string()),
+        response_json: Set(response_json.to_string()),
+        created_at: Set(now),
+    };
+    idempotency_requests::Entity::insert(am)
+        .on_conflict(
+            OnConflict::column(idempotency_requests::Column::RequestId)
+                .update_columns([idempotency_requests::Column::ResponseJson])
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("保存幂等记录失败")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Server Settings (Non-secret Key-Value)
+// ---------------------------------------------------------------------------
+
+pub async fn get_server_settings_map(
+    db: &DatabaseConnection,
+) -> Result<std::collections::HashMap<String, String>> {
+    let rows = server_settings::Entity::find()
+        .all(db)
+        .await
+        .context("获取服务端配置失败")?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        map.insert(r.key, r.value);
+    }
+    Ok(map)
+}
+
+pub async fn set_server_settings_map(
+    db: &DatabaseConnection,
+    map: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    for (k, v) in map {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO server_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+            vec![k.clone().into(), v.clone().into(), now.clone().into()],
+        ))
+        .await
+        .context("更新服务端配置失败")?;
+    }
+    bump_revision(db, "settings").await.ok();
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,12 +1,13 @@
 {
   "name": "ntrend",
   "private": true,
-  "version": "0.2.2",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "tauri": "tauri"
   },
   "dependencies": {
     "@imengyu/vue3-context-menu": "^1.5.6",

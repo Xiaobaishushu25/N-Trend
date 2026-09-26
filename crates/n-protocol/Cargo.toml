@@ -1,0 +1,11 @@
+[package]
+name = "n-protocol"
+version.workspace = true
+edition.workspace = true
+description = "Lightweight protocol DTOs and WebSocket messages for ntrend"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }

@@ -1,78 +1,143 @@
 use std::sync::Arc;
-use std::time::Instant;
+use n_protocol::auth::*;
+use n_protocol::config::*;
+use n_protocol::dto::*;
+use serde_json::Value;
+use tauri::{AppHandle, Emitter, Manager, State};
 
-use chrono::Local;
-use n_core::analyze::outcome::ReviewStats;
-use n_core::config::Config;
-use n_core::service::{
-    ChartKlineResponse, KlineDto, ManualLevelInput, MarketSnapshot, OutcomeDetail, OutcomeRefresh,
-    RefreshStats, ReviewSignalDetail, ScanResult, SignalAnnotationDto, SignalDecisionDto,
-    SignalUserData, TrendPointDto,
-};
-use n_core::storage::entities::{groups, manual_level_events, manual_levels, symbols};
-use serde::Serialize;
-use tauri::{Emitter, Manager, State};
+use crate::client::{AuthRecord, BackupStatus, ConnectionStateDto};
+use crate::state::AppState;
 
-use crate::state::{AppState, NewNotificationHistoryItem, NotificationHistoryItem};
-use crate::AppInfo;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SchedulerStatus {
-    pub running: bool,
-    pub last_refresh: Option<String>,
-    pub last_scan: Option<String>,
-    pub active_data_source: String,
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppInfo {
+    pub name: String,
+    pub version: String,
+    pub platform: String,
+    pub is_mobile: bool,
 }
 
 #[tauri::command]
 pub async fn app_info() -> AppInfo {
+    let platform = if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else {
+        "linux"
+    };
+    let is_mobile = cfg!(any(target_os = "android", target_os = "ios"));
     AppInfo {
         name: "ntrend".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        platform: platform.to_string(),
+        is_mobile,
     }
 }
 
 #[tauri::command]
+pub async fn set_window_size(window: tauri::Window, width: f64, height: f64) -> Result<(), String> {
+    if let Ok(is_max) = window.is_maximized() {
+        if is_max {
+            let _ = window.unmaximize();
+        }
+    }
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| e.to_string())
+}
+
+// ── Connection & Device Auth ──
+
+#[tauri::command]
+pub async fn get_connection_status(state: State<'_, Arc<AppState>>) -> Result<ConnectionStateDto, String> {
+    Ok(state.realtime.get_state().await)
+}
+
+#[tauri::command]
+pub async fn get_auth_record(state: State<'_, Arc<AppState>>) -> Result<AuthRecord, String> {
+    Ok(state.credentials.get_record())
+}
+
+#[tauri::command]
+pub async fn update_auth_record(
+    state: State<'_, Arc<AppState>>,
+    record: AuthRecord,
+) -> Result<(), String> {
+    state.credentials.update_auth(record)
+}
+
+#[tauri::command]
+pub async fn get_client_settings(state: State<'_, Arc<AppState>>) -> Result<ClientLocalSettings, String> {
+    Ok(state.local_settings.read().await.clone())
+}
+
+#[tauri::command]
+pub async fn update_client_settings(
+    state: State<'_, Arc<AppState>>,
+    settings: ClientLocalSettings,
+) -> Result<(), String> {
+    *state.local_settings.write().await = settings;
+    state.save_local_settings().await
+}
+
+#[tauri::command]
+pub async fn get_meta(state: State<'_, Arc<AppState>>) -> Result<MetaDto, String> {
+    state.api.get_meta().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_server_status(state: State<'_, Arc<AppState>>) -> Result<ServerStatusDto, String> {
+    state.api.get_server_status().await.map_err(|e| e.message)
+}
+
+// ── Notifications ──
+
+#[tauri::command]
 pub async fn record_notification(
-    app: tauri::AppHandle,
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     item: NewNotificationHistoryItem,
 ) -> Result<Vec<NotificationHistoryItem>, String> {
-    state.record_notification(item);
-    let history = state.notification_history();
-    let _ = app.emit("notification-history-updated", &history);
-    Ok(history)
+    let _local = state.record_local_notification(item.clone());
+    // Also record on server asynchronously
+    let api = state.api.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = api.record_notification(&item).await;
+    });
+    let list = state.local_notifications();
+    let _ = app.emit("notification-history-updated", &list);
+    Ok(list)
 }
 
 #[tauri::command]
 pub async fn get_notification_history(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<NotificationHistoryItem>, String> {
-    Ok(state.notification_history())
+    match state.api.get_notifications(Some(40), false).await {
+        Ok(items) => Ok(items),
+        Err(_) => Ok(state.local_notifications()),
+    }
+}
+
+// ── Symbols & Groups ──
+
+#[tauri::command]
+pub async fn get_symbols(state: State<'_, Arc<AppState>>) -> Result<Vec<SymbolDto>, String> {
+    state.api.get_symbols().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn get_symbols(state: State<'_, Arc<AppState>>) -> Result<Vec<symbols::Model>, String> {
-    n_core::storage::repo::list_symbols(&state.services.db, false)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn list_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<GroupDto>, String> {
+    state.api.list_groups().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn list_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<groups::Model>, String> {
-    n_core::storage::repo::list_groups(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn create_group(
-    state: State<'_, Arc<AppState>>,
-    name: String,
-) -> Result<groups::Model, String> {
-    n_core::storage::repo::create_group(&state.services.db, &name)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn create_group(state: State<'_, Arc<AppState>>, name: String) -> Result<GroupDto, String> {
+    state.api.create_group(&name).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -81,36 +146,28 @@ pub async fn rename_group(
     id: i64,
     name: String,
 ) -> Result<(), String> {
-    n_core::storage::repo::rename_group(&state.services.db, id, &name)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.rename_group(id, &name).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn delete_group(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    n_core::storage::repo::delete_group(&state.services.db, id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.delete_group(id).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_group_symbols(
     state: State<'_, Arc<AppState>>,
     group_id: i64,
-) -> Result<Vec<symbols::Model>, String> {
-    n_core::storage::repo::group_symbols(&state.services.db, group_id)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Vec<SymbolDto>, String> {
+    state.api.get_group_symbols(group_id).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn list_symbol_groups(
     state: State<'_, Arc<AppState>>,
     symbol: String,
-) -> Result<Vec<groups::Model>, String> {
-    n_core::storage::repo::symbol_groups(&state.services.db, &symbol)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Vec<GroupDto>, String> {
+    state.api.list_symbol_groups(&symbol).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -119,9 +176,7 @@ pub async fn add_symbol_to_group(
     symbol: String,
     group_id: i64,
 ) -> Result<(), String> {
-    n_core::storage::repo::add_symbol_to_group(&state.services.db, &symbol, group_id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.add_symbol_to_group(group_id, &symbol).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -130,9 +185,7 @@ pub async fn remove_symbol_from_group(
     symbol: String,
     group_id: i64,
 ) -> Result<(), String> {
-    n_core::storage::repo::remove_symbol_from_group(&state.services.db, &symbol, group_id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.remove_symbol_from_group(group_id, &symbol).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -141,25 +194,12 @@ pub async fn reorder_groups(
     ids: Vec<i64>,
     all_position: i64,
 ) -> Result<(), String> {
-    n_core::storage::repo::reorder_groups(&state.services.db, &ids)
-        .await
-        .map_err(|e| e.to_string())?;
-    // 一并持久化「全部品种」在分组顺序中的位置（虚拟槽位）
-    let mut map = std::collections::HashMap::new();
-    map.insert("group_all_position".to_string(), all_position.to_string());
-    n_core::storage::repo::set_settings(&state.services.db, &map)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.reorder_groups(&ids, all_position).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_group_all_position(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    let pos = n_core::storage::repo::get_setting(&state.services.db, "group_all_position")
-        .await
-        .map_err(|e| e.to_string())?
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-    Ok(pos)
+    state.api.get_group_all_position().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -168,9 +208,7 @@ pub async fn reorder_group_symbols(
     group_id: i64,
     codes: Vec<String>,
 ) -> Result<(), String> {
-    n_core::storage::repo::reorder_group_symbols(&state.services.db, group_id, &codes)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.reorder_group_symbols(group_id, &codes).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -178,70 +216,25 @@ pub async fn reorder_symbols(
     state: State<'_, Arc<AppState>>,
     codes: Vec<String>,
 ) -> Result<(), String> {
-    n_core::storage::repo::reorder_symbols(&state.services.db, &codes)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.reorder_symbols(&codes).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn add_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<usize, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户添加品种 | {}", code);
-    match state.services.add_symbol(&code).await {
-        Ok(n) => {
-            tracing::info!(
-                "✅ 添加品种完成 | {} 耗时 {}ms | 新增 {} 条K线",
-                code,
-                t0.elapsed().as_millis(),
-                n
-            );
-            Ok(n)
-        }
-        Err(e) => {
-            tracing::error!(
-                "❌ 添加品种失败 | {} 耗时 {}ms | {e}",
-                code,
-                t0.elapsed().as_millis()
-            );
-            Err(e.to_string())
-        }
-    }
+    state.api.add_symbol(&code).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn search_contracts(
     state: State<'_, Arc<AppState>>,
     keyword: String,
-) -> Result<Vec<n_core::fetch::symbols::FuturesSymbol>, String> {
-    state
-        .services
-        .search_contracts(&keyword)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Vec<ContractSuggestionDto>, String> {
+    state.api.search_contracts(&keyword).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn remove_symbol(state: State<'_, Arc<AppState>>, code: String) -> Result<(), String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户移除品种 | {}", code);
-    match state.services.remove_symbol(&code).await {
-        Ok(()) => {
-            tracing::info!(
-                "✅ 移除品种完成 | {} 耗时 {}ms",
-                code,
-                t0.elapsed().as_millis()
-            );
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!(
-                "❌ 移除品种失败 | {} 耗时 {}ms | {e}",
-                code,
-                t0.elapsed().as_millis()
-            );
-            Err(e.to_string())
-        }
-    }
+    state.api.remove_symbol(&code).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -251,111 +244,38 @@ pub async fn set_symbol_flags(
     watchlist: bool,
     enabled: bool,
 ) -> Result<(), String> {
-    tracing::info!(
-        "👆 更新品种标记 | {} watchlist={} enabled={}",
-        code,
-        watchlist,
-        enabled
-    );
-    match n_core::storage::repo::set_symbol_flags(&state.services.db, &code, watchlist, enabled)
-        .await
-    {
-        Ok(()) => {
-            tracing::info!("✅ 品种标记已更新 | {}", code);
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("❌ 更新品种标记失败 | {} | {e}", code);
-            Err(e.to_string())
-        }
-    }
+    state.api.set_symbol_flags(&code, watchlist, enabled).await.map_err(|e| e.message)
 }
 
-/// 更新品种最小变动价位（tick）。
 #[tauri::command]
 pub async fn set_symbol_tick(
     state: State<'_, Arc<AppState>>,
     code: String,
     tick: f64,
 ) -> Result<(), String> {
-    tracing::info!("👆 更新品种 tick | {} -> {}", code, tick);
-    match n_core::storage::repo::set_symbol_tick(&state.services.db, &code, tick).await {
-        Ok(()) => {
-            tracing::info!("✅ 品种 tick 已更新 | {}", code);
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("❌ 更新品种 tick 失败 | {} | {e}", code);
-            Err(e.to_string())
-        }
-    }
+    state.api.set_symbol_tick(&code, tick).await.map_err(|e| e.message)
 }
 
-/// 更新品种关注状态。
 #[tauri::command]
 pub async fn set_symbol_followed(
     state: State<'_, Arc<AppState>>,
     code: String,
     followed: bool,
 ) -> Result<(), String> {
-    tracing::info!("👆 更新品种关注 | {} followed={}", code, followed);
-    match n_core::storage::repo::set_symbol_followed(&state.services.db, &code, followed).await {
-        Ok(()) => {
-            tracing::info!("✅ 品种关注已更新 | {} -> {}", code, followed);
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("❌ 更新品种关注失败 | {} | {e}", code);
-            Err(e.to_string())
-        }
-    }
+    state.api.set_symbol_followed(&code, followed).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn enrich_symbol_names(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户触发补齐品种名称");
-    match state.services.enrich_existing_symbols().await {
-        Ok(n) => {
-            tracing::info!(
-                "✅ 补齐品种名称完成 耗时 {}ms | 共 {} 个",
-                t0.elapsed().as_millis(),
-                n
-            );
-            Ok(n)
-        }
-        Err(e) => {
-            tracing::error!(
-                "❌ 补齐品种名称失败 耗时 {}ms | {e}",
-                t0.elapsed().as_millis()
-            );
-            Err(e.to_string())
-        }
-    }
+    state.api.enrich_symbol_names().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn refresh_symbol_list(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户触发刷新可交易品种列表");
-    match state.services.refresh_symbol_list().await {
-        Ok(n) => {
-            tracing::info!(
-                "✅ 品种列表刷新完成 耗时 {}ms | 共 {} 个",
-                t0.elapsed().as_millis(),
-                n
-            );
-            Ok(n)
-        }
-        Err(e) => {
-            tracing::error!(
-                "❌ 品种列表刷新失败 耗时 {}ms | {e}",
-                t0.elapsed().as_millis()
-            );
-            Err(e.to_string())
-        }
-    }
+    state.api.refresh_symbol_list().await.map_err(|e| e.message)
 }
+
+// ── Klines & Quotes ──
 
 #[tauri::command]
 pub async fn get_klines(
@@ -364,11 +284,7 @@ pub async fn get_klines(
     timeframe: String,
     limit: Option<usize>,
 ) -> Result<Vec<KlineDto>, String> {
-    state
-        .services
-        .get_klines(&symbol, &timeframe, limit)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.get_klines(&symbol, &timeframe, limit, None).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -378,11 +294,27 @@ pub async fn get_chart_klines(
     timeframe: String,
     limit: Option<usize>,
 ) -> Result<ChartKlineResponse, String> {
-    state
-        .services
-        .get_chart_klines(&symbol, &timeframe, limit)
-        .await
-        .map_err(|e| e.to_string())
+    // Automatically subscribe active symbol and timeframe in realtime client
+    state.realtime.subscribe(vec![symbol.clone()], vec![timeframe.clone()]).await;
+
+    // Check memory cache first
+    let cached = state.kline_cache.get(&symbol, &timeframe);
+
+    // Fetch latest from server
+    match state.api.get_chart_klines(&symbol, &timeframe, limit, None).await {
+        Ok(resp) => {
+            state.kline_cache.put(&symbol, &timeframe, &resp);
+            Ok(resp)
+        }
+        Err(e) => {
+            if let Some(c) = cached {
+                tracing::warn!("网络异常，展示内存缓存K线数据: {e}");
+                Ok(c)
+            } else {
+                Err(e.message)
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -392,23 +324,17 @@ pub async fn get_trend_series(
     timeframe: String,
     limit: Option<usize>,
 ) -> Result<Vec<TrendPointDto>, String> {
-    state
-        .services
-        .trend_series(&symbol, &timeframe, limit)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.get_trend_series(&symbol, &timeframe, limit).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_market_snapshot(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MarketSnapshot>, String> {
-    state
-        .services
-        .market_snapshot()
-        .await
-        .map_err(|e| e.to_string())
+    state.api.get_market_snapshot().await.map_err(|e| e.message)
 }
+
+// ── Manual Levels ──
 
 #[tauri::command]
 pub async fn list_manual_levels(
@@ -416,28 +342,20 @@ pub async fn list_manual_levels(
     symbol: Option<String>,
     timeframe: Option<String>,
     active_only: Option<bool>,
-) -> Result<Vec<manual_levels::Model>, String> {
+) -> Result<Vec<ManualLevelDto>, String> {
     state
-        .services
-        .list_manual_levels(
-            symbol.as_deref(),
-            timeframe.as_deref(),
-            active_only.unwrap_or(false),
-        )
+        .api
+        .list_manual_levels(symbol.as_deref(), timeframe.as_deref(), active_only.unwrap_or(false))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn create_manual_level(
     state: State<'_, Arc<AppState>>,
     input: ManualLevelInput,
-) -> Result<manual_levels::Model, String> {
-    state
-        .services
-        .create_manual_level(input)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<ManualLevelDto, String> {
+    state.api.create_manual_level(&input).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -445,12 +363,8 @@ pub async fn update_manual_level(
     state: State<'_, Arc<AppState>>,
     id: i64,
     input: ManualLevelInput,
-) -> Result<manual_levels::Model, String> {
-    state
-        .services
-        .update_manual_level(id, input)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<ManualLevelDto, String> {
+    state.api.update_manual_level(id, &input).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -458,682 +372,163 @@ pub async fn set_manual_level_monitoring(
     state: State<'_, Arc<AppState>>,
     id: i64,
     enabled: bool,
-) -> Result<manual_levels::Model, String> {
-    state
-        .services
-        .set_manual_level_monitoring(id, enabled)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<ManualLevelDto, String> {
+    state.api.set_manual_level_monitoring(id, enabled).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn archive_manual_level(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    state
-        .services
-        .archive_manual_level(id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.archive_manual_level(id).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn delete_manual_level(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    state
-        .services
-        .delete_manual_level(id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.delete_manual_level(id).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_manual_level_events(
     state: State<'_, Arc<AppState>>,
     id: i64,
-) -> Result<Vec<manual_level_events::Model>, String> {
-    state
-        .services
-        .manual_level_events(id)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Vec<ManualLevelEventDto>, String> {
+    state.api.get_manual_level_events(id).await.map_err(|e| e.message)
 }
 
-/// 首屏轻量读取：直接返回 DB 中 pending / triggered 的活跃信号，不触发扫描计算（秒级）
 #[tauri::command]
 pub async fn get_active_events(
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::pattern_events::Model>, String> {
-    let events = n_core::storage::repo::all_pattern_events(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(events
-        .into_iter()
-        .filter(|e| e.state == "pending" || e.state == "triggered")
-        .collect())
+) -> Result<Value, String> {
+    state.api.get_active_events().await.map_err(|e| e.message)
 }
+
+// ── Actions ──
 
 #[tauri::command]
 pub async fn refresh_data_now(state: State<'_, Arc<AppState>>) -> Result<RefreshStats, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户手动触发刷新数据");
-    match state.services.refresh_data().await {
-        Ok(stats) => {
-            state.note_refresh_success().await;
-            tracing::info!(
-                "✅ 手动刷新完成 耗时 {}ms | 成功 {} 失败 {} | 总计 {}",
-                t0.elapsed().as_millis(),
-                stats.succeeded,
-                stats.failures,
-                stats.succeeded + stats.failures
-            );
-            if stats.failures > 0 {
-                tracing::warn!("⚠ 手动刷新有 {} 个品种失败", stats.failures);
-            }
-            Ok(stats)
-        }
-        Err(e) => {
-            tracing::error!("❌ 手动刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
-            Err(e.to_string())
-        }
-    }
+    state.api.refresh_data_now().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn run_scan_now(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<ScanResult, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户手动触发立即扫描");
-    match state.services.run_scan_try().await {
-        Ok(result) => {
-            state.note_scan_success().await;
-            let _ = app.emit("scan-completed", &result);
-            tracing::info!(
-                "✅ 手动扫描完成 耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
-                t0.elapsed().as_millis(),
-                result.scanned,
-                result.active_count,
-                result.new_warnings.len(),
-                result.newly_triggered.len()
-            );
-            Ok(result)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("扫描进行中") || msg.contains("行情数据正在刷新") {
-                tracing::warn!(
-                    "⚠ 手动扫描被限流 耗时 {}ms | {msg}",
-                    t0.elapsed().as_millis()
-                );
-            } else {
-                tracing::error!(
-                    "❌ 手动扫描失败 耗时 {}ms | {msg}",
-                    t0.elapsed().as_millis()
-                );
-            }
-            Err(msg)
-        }
-    }
+pub async fn run_scan_now(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.run_scan_now().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn run_scan_fast_now(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<ScanResult, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户手动触发立即扫描(快速)");
-    match state.services.run_scan_fast().await {
-        Ok(result) => {
-            state.note_scan_success().await;
-            let _ = app.emit("scan-completed", &result);
-            tracing::info!(
-                "✅ 手动扫描完成 耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
-                t0.elapsed().as_millis(),
-                result.scanned,
-                result.active_count,
-                result.new_warnings.len(),
-                result.newly_triggered.len()
-            );
-            Ok(result)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("扫描进行中") || msg.contains("行情数据正在刷新") {
-                tracing::warn!(
-                    "⚠ 手动扫描被限流 耗时 {}ms | {msg}",
-                    t0.elapsed().as_millis()
-                );
-            } else {
-                tracing::error!(
-                    "❌ 手动扫描失败 耗时 {}ms | {msg}",
-                    t0.elapsed().as_millis()
-                );
-            }
-            Err(msg)
-        }
-    }
+pub async fn run_scan_fast_now(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.run_scan_fast_now().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn rebuild_events_now(
-    app: tauri::AppHandle,
-    state: State<'_, Arc<AppState>>,
-) -> Result<ScanResult, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户手动触发重建事件");
-    if let Err(e) = state.services.rebuild_events().await {
-        tracing::error!("❌ 重建事件失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
-        return Err(e.to_string());
-    }
-    tracing::info!(
-        "✓ 事件表已清空重建 耗时 {}ms，开始重新扫描…",
-        t0.elapsed().as_millis()
-    );
-    state
-        .notification_history
-        .lock()
-        .expect("通知历史锁可用")
-        .clear();
-    let empty_history: Vec<NotificationHistoryItem> = Vec::new();
-    let _ = app.emit("notification-history-updated", &empty_history);
-    match state.services.run_scan().await {
-        Ok(result) => {
-            state.note_scan_success().await;
-            let _ = app.emit("scan-completed", &result);
-            tracing::info!(
-                "✅ 重建后扫描完成 总耗时 {}ms | 扫描 {} 活跃 {} 新增预警 {} 新触发 {}",
-                t0.elapsed().as_millis(),
-                result.scanned,
-                result.active_count,
-                result.new_warnings.len(),
-                result.newly_triggered.len()
-            );
-            Ok(result)
-        }
-        Err(e) => {
-            tracing::error!(
-                "❌ 重建后扫描失败 总耗时 {}ms | {e}",
-                t0.elapsed().as_millis()
-            );
-            Err(e.to_string())
-        }
-    }
+pub async fn rebuild_events_now(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.rebuild_events_now().await.map_err(|e| e.message)
 }
 
-/// 立即对未终结信号做一次结局回填（复盘页"刷新"按钮）。
 #[tauri::command]
-pub async fn refresh_outcomes_now(
-    state: State<'_, Arc<AppState>>,
-) -> Result<OutcomeRefresh, String> {
-    let t0 = Instant::now();
-    tracing::info!("👆 用户手动触发结局回填");
-    match state.services.refresh_outcomes().await {
-        Ok(r) => {
-            tracing::info!(
-                "✅ 结局回填完成 耗时 {}ms | 已更新 {}",
-                t0.elapsed().as_millis(),
-                r.updated
-            );
-            Ok(r)
-        }
-        Err(e) => {
-            tracing::error!("❌ 结局回填失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
-            Err(e.to_string())
-        }
-    }
+pub async fn refresh_outcomes_now(state: State<'_, Arc<AppState>>) -> Result<OutcomeRefresh, String> {
+    state.api.refresh_outcomes_now().await.map_err(|e| e.message)
 }
 
-/// 复盘统计：按维度分组（score_band/grade/direction/level/hour/symbol/vol_confirm/oi/trend60）。
+// ── Review & Signals ──
+
 #[tauri::command]
 pub async fn get_review_stats(
     state: State<'_, Arc<AppState>>,
     dimension: String,
-    scope: Option<String>,
+    scope: String,
     version: Option<String>,
     score_min: Option<f64>,
     score_max: Option<f64>,
-) -> Result<ReviewStats, String> {
-    let scope = scope.unwrap_or_default();
+) -> Result<Value, String> {
     state
-        .services
-        .review_stats(&dimension, &scope, version.as_deref(), score_min, score_max)
+        .api
+        .get_review_stats(&dimension, &scope, version.as_deref(), score_min, score_max)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.message)
 }
 
-/// 最近信号明细（复盘页明细表）。
 #[tauri::command]
 pub async fn get_recent_outcomes(
     state: State<'_, Arc<AppState>>,
-    limit: Option<u64>,
+    limit: Option<usize>,
     symbol: Option<String>,
+    version: Option<String>,
     direction: Option<String>,
     level: Option<String>,
     grade: Option<String>,
     score_min: Option<f64>,
     score_max: Option<f64>,
     outcome: Option<String>,
-    version: Option<String>,
-) -> Result<Vec<OutcomeDetail>, String> {
-    let filter = n_core::service::OutcomeFilter {
+) -> Result<Value, String> {
+    let filters = RecentOutcomeFilters {
         symbol,
+        version,
         direction,
         level,
         grade,
         score_min,
         score_max,
         outcome,
-        version,
     };
-    state
-        .services
-        .recent_outcomes(limit.unwrap_or(2000) as usize, &filter)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.get_recent_outcomes(limit, Some(&filters)).await.map_err(|e| e.message)
 }
 
-/// 复盘明细跳转K线图：按 signal_id 返回完整形态结构 + 结局。
 #[tauri::command]
 pub async fn get_review_signal(
     state: State<'_, Arc<AppState>>,
     event_id: i64,
-) -> Result<Option<ReviewSignalDetail>, String> {
-    state
-        .services
-        .review_signal(event_id)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Value, String> {
+    state.api.get_review_signal(event_id).await.map_err(|e| e.message)
 }
 
-/// K线右侧卡片：读取某个信号的批注与开仓记录。
 #[tauri::command]
 pub async fn get_signal_user_data(
     state: State<'_, Arc<AppState>>,
     event_id: i64,
 ) -> Result<SignalUserData, String> {
-    state
-        .services
-        .signal_user_data(event_id)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.get_signal_user_data(event_id).await.map_err(|e| e.message)
 }
 
-/// 给某个信号追加一条批注。
 #[tauri::command]
 pub async fn add_signal_annotation(
     state: State<'_, Arc<AppState>>,
     event_id: i64,
     content: String,
 ) -> Result<SignalAnnotationDto, String> {
-    state
-        .services
-        .add_signal_annotation(event_id, &content)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.add_signal_annotation(event_id, &content).await.map_err(|e| e.message)
 }
 
-/// 删除一条批注。
 #[tauri::command]
-pub async fn delete_signal_annotation(
-    state: State<'_, Arc<AppState>>,
-    id: i64,
-) -> Result<(), String> {
-    state
-        .services
-        .delete_signal_annotation(id)
-        .await
-        .map_err(|e| e.to_string())
+pub async fn delete_signal_annotation(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    state.api.delete_signal_annotation(id).await.map_err(|e| e.message)
 }
 
-/// 记录/修改某个信号是否按建议开仓。
 #[tauri::command]
 pub async fn set_signal_decision(
     state: State<'_, Arc<AppState>>,
     event_id: i64,
     opened: bool,
 ) -> Result<SignalDecisionDto, String> {
-    state
-        .services
-        .set_signal_decision(event_id, opened)
-        .await
-        .map_err(|e| e.to_string())
+    state.api.set_signal_decision(event_id, opened).await.map_err(|e| e.message)
+}
+
+// ── V2 ML & Preclose ──
+
+#[tauri::command]
+pub async fn get_v2_models(state: State<'_, Arc<AppState>>) -> Result<Vec<V2ModelRow>, String> {
+    state.api.get_v2_models().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
-    Ok(state.services.config().await)
-}
-
-#[tauri::command]
-pub async fn update_config(
-    state: State<'_, Arc<AppState>>,
-    config: Config,
-) -> Result<Config, String> {
-    let old = state.services.config().await;
-    tracing::info!(
-        "👆 用户更新配置 | 刷新 {}s->{}s 扫描 {}s->{}s 交易时段 {}->{} 日志 {}->{}",
-        old.scheduler.refresh_interval_secs,
-        config.scheduler.refresh_interval_secs,
-        old.scheduler.scan_interval_secs,
-        config.scheduler.scan_interval_secs,
-        old.scheduler.trading_only,
-        config.scheduler.trading_only,
-        old.log.level,
-        config.log.level
-    );
-    match state.services.apply_config(config).await {
-        Ok(c) => {
-            tracing::info!("✅ 配置已更新");
-            if old.log.level != c.log.level {
-                tracing::info!("ℹ 日志级别已改为 {}，重启后生效", c.log.level);
-            }
-            Ok(c)
-        }
-        Err(e) => {
-            tracing::error!("❌ 配置更新失败 | {e}");
-            Err(e.to_string())
-        }
-    }
-}
-
-/// 记录上次打开的分组表格（null=全部品种）。
-#[tauri::command]
-pub async fn set_last_group(
-    state: State<'_, Arc<AppState>>,
-    group_id: Option<i64>,
-) -> Result<(), String> {
-    state
-        .services
-        .set_last_group(group_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// 设置启用的K线周期列表。
-#[tauri::command]
-pub async fn set_timeframes(
-    state: State<'_, Arc<AppState>>,
-    timeframes: Vec<String>,
-) -> Result<(), String> {
-    tracing::info!("👆 用户更新K线周期 | {:?}", timeframes);
-    match state.services.set_timeframes(timeframes).await {
-        Ok(()) => {
-            tracing::info!("✅ K线周期已更新");
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("❌ 更新K线周期失败 | {e}");
-            Err(e.to_string())
-        }
-    }
-}
-
-/// 将所有配置恢复为默认值，返回新的默认配置。
-#[tauri::command]
-pub async fn reset_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
-    tracing::info!("👆 用户重置配置为默认值");
-    match state.services.reset_config().await {
-        Ok(c) => {
-            tracing::info!("✅ 配置已重置");
-            Ok(c)
-        }
-        Err(e) => {
-            tracing::error!("❌ 配置重置失败 | {e}");
-            Err(e.to_string())
-        }
-    }
-}
-
-/// 打开日志目录（与日志文件同目录）。
-#[tauri::command]
-pub async fn open_log_directory(app: tauri::AppHandle) -> Result<(), String> {
-    tracing::info!("👆 用户打开日志目录");
-    let dir = app.path().app_data_dir().map_err(|e| {
-        tracing::error!("❌ 获取日志目录失败 | {e}");
-        e.to_string()
-    })?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        tracing::error!("❌ 创建日志目录失败 | {e}");
-        e.to_string()
-    })?;
-    open::that(&dir).map_err(|e| {
-        tracing::error!("❌ 打开日志目录失败 | {e}");
-        e.to_string()
-    })?;
-    tracing::info!("✅ 已打开日志目录 | {}", dir.display());
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn scheduler_status(state: State<'_, Arc<AppState>>) -> Result<SchedulerStatus, String> {
-    let rt = state.scheduler.read().await;
-    let active_data_source = state.services.active_data_source_name().await;
-    Ok(SchedulerStatus {
-        running: rt.running,
-        last_refresh: rt.last_refresh.map(crate::fmt_naive),
-        last_scan: rt.last_scan.map(crate::fmt_naive),
-        active_data_source,
-    })
-}
-
-#[tauri::command]
-pub async fn set_scheduler_running(
-    state: State<'_, Arc<AppState>>,
-    running: bool,
-) -> Result<SchedulerStatus, String> {
-    tracing::info!("👆 用户{}调度器", if running { "启动" } else { "暂停" });
-    state.scheduler.write().await.running = running;
-    let s = scheduler_status(state).await?;
-    tracing::info!(
-        "✅ 调度器已{} | 运行中: {}",
-        if running { "启动" } else { "暂停" },
-        s.running
-    );
-    Ok(s)
-}
-
-#[tauri::command]
-pub async fn get_finality_report(
-    state: State<'_, Arc<AppState>>,
-) -> Result<n_core::finality::FinalityReport, String> {
-    state
-        .services
-        .finality_report()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_finality_simulation(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::finality::StrategySimulationResult>, String> {
-    state
-        .services
-        .finality_simulate_strategies()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_finality_sentinel_eval(
-    state: State<'_, Arc<AppState>>,
-    sentinels: Option<Vec<String>>,
-) -> Result<n_core::finality::SentinelEvaluationResult, String> {
-    state
-        .services
-        .finality_sentinel_eval(sentinels.as_deref())
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn check_symbol_integrity(
-    state: State<'_, Arc<AppState>>,
-    symbol: String,
-) -> Result<n_core::integrity::SymbolIntegrityReport, String> {
-    state
-        .services
-        .check_symbol_integrity(&symbol)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn check_all_symbols_integrity(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::integrity::SymbolIntegrityReport>, String> {
-    state
-        .services
-        .check_all_symbols_integrity()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn repair_symbol_integrity(
-    state: State<'_, Arc<AppState>>,
-    symbol: String,
-) -> Result<n_core::integrity::RepairResult, String> {
-    state
-        .services
-        .repair_symbol_integrity(&symbol)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_v2_models(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::v2_model_registry::Model>, String> {
-    use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let rows = state.services.db.query_all(Statement::from_string(DbBackend::Sqlite, "SELECT model_id, name, schema_version, feature_whitelist, train_window, dataset_hash, coefficients, spline_knots, metrics, created_at, status, scoring_slot FROM v2_model_registry ORDER BY created_at DESC".to_string())).await.map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        let get = |k: &str| -> String { r.try_get("", k).unwrap_or_default() };
-        let get_opt = |k: &str| -> Option<String> { r.try_get("", k).ok() };
-        out.push(n_core::storage::entities::v2_model_registry::Model {
-            model_id: get("model_id"),
-            name: get("name"),
-            schema_version: get("schema_version"),
-            feature_whitelist: get("feature_whitelist"),
-            train_window: get("train_window"),
-            dataset_hash: get("dataset_hash"),
-            coefficients: get("coefficients"),
-            spline_knots: get_opt("spline_knots"),
-            metrics: get("metrics"),
-            created_at: get("created_at"),
-            status: get("status"),
-            scoring_slot: get("scoring_slot"),
-        });
-    }
-    Ok(out)
-}
-
-#[tauri::command]
-pub async fn get_v2_dataset_report(
-    _state: State<'_, Arc<AppState>>,
-) -> Result<serde_json::Value, String> {
-    // 优先读 target/v2_reports 下文件，回退读 DB 统计
-    let mut v = serde_json::json!({});
-    for name in [
-        "logistic_report.md",
-        "gam_report.md",
-        "acceptance.md",
-        "market_context_research.md",
-    ] {
-        let p = std::path::Path::new("target/v2_reports").join(name);
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            v[name] = serde_json::Value::String(s);
-        }
-    }
-    Ok(v)
+pub async fn get_v2_dataset_report(state: State<'_, Arc<AppState>>) -> Result<V2ReportBundle, String> {
+    state.api.get_v2_dataset_report().await.map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_v2_predictions(
     state: State<'_, Arc<AppState>>,
     model_id: Option<String>,
-) -> Result<Vec<n_core::storage::entities::v2_model_predictions::Model>, String> {
-    use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let sql = if let Some(mid) = model_id.filter(|s| !s.is_empty()) {
-        format!("SELECT id, event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode FROM v2_model_predictions WHERE model_id='{}' ORDER BY predicted_at DESC LIMIT 2000", mid.replace("'","''"))
-    } else {
-        // Chart cards use the active champion only.  Keeping historical
-        // challenger rows out of this path prevents the 2000-row cap from
-        // hiding an older active event after page-open backfill is removed.
-        "SELECT p.id, p.event_id, p.model_id, p.p_win, p.logit, p.feature_hash, p.predicted_at, p.prediction_mode FROM v2_model_predictions p INNER JOIN v2_model_registry r ON r.model_id = p.model_id WHERE r.status='champion' ORDER BY p.predicted_at DESC LIMIT 2000".to_string()
-    };
-    let rows = state
-        .services
-        .db
-        .query_all(Statement::from_string(DbBackend::Sqlite, sql))
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(n_core::storage::entities::v2_model_predictions::Model {
-            id: r.try_get("", "id").unwrap_or(0),
-            event_id: r.try_get("", "event_id").unwrap_or(0),
-            model_id: r.try_get("", "model_id").unwrap_or_default(),
-            p_win: r.try_get("", "p_win").ok(),
-            logit: r.try_get("", "logit").ok(),
-            feature_hash: r.try_get("", "feature_hash").unwrap_or_default(),
-            predicted_at: r.try_get("", "predicted_at").unwrap_or_default(),
-            prediction_mode: r
-                .try_get("", "prediction_mode")
-                .unwrap_or_else(|_| "live".to_string()),
-        });
-    }
-    Ok(out)
-}
-
-/// 读取独立的收盘前预检测信号，不触发扫描。
-#[tauri::command]
-pub async fn get_active_preclose_signals(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::preclose_signals::Model>, String> {
-    // 页面加载/恢复时主动补结算，避免结算依赖行情轮询或定时扫描恰好成功。
-    state
-        .services
-        .reconcile_preclose_signals(Local::now().naive_local())
-        .await
-        .map_err(|e| e.to_string())?;
-    n_core::storage::repo::active_preclose_signals(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// 读取当前仍有效的临时未收盘预警候选，并主动补做收盘结算。
-#[tauri::command]
-pub async fn get_active_preclose_candidates(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::preclose_candidates::Model>, String> {
-    state
-        .services
-        .reconcile_preclose_candidates(Local::now().naive_local())
-        .await
-        .map_err(|e| e.to_string())?;
-    n_core::storage::repo::active_preclose_candidates(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_preclose_candidates(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::preclose_candidates::Model>, String> {
-    n_core::storage::repo::all_preclose_candidates(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn get_preclose_signals(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<n_core::storage::entities::preclose_signals::Model>, String> {
-    n_core::storage::repo::all_preclose_signals(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Vec<V2PredictionRow>, String> {
+    state.api.get_v2_predictions(model_id.as_deref()).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
@@ -1141,23 +536,389 @@ pub async fn set_v2_model_status(
     state: State<'_, Arc<AppState>>,
     model_id: String,
     status: String,
-    scoring_slot: Option<String>,
 ) -> Result<(), String> {
-    n_core::storage::repo::set_v2_model_status(
-        &state.services.db,
-        &model_id,
-        &status,
-        scoring_slot.as_deref().unwrap_or("default"),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    state.api.set_v2_model_status(&model_id, &status).await.map_err(|e| e.message)
 }
 
 #[tauri::command]
-pub async fn backfill_v2_predictions(
+pub async fn backfill_v2_predictions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.backfill_v2_predictions().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_active_preclose_signals(
     state: State<'_, Arc<AppState>>,
-) -> Result<n_core::v2::prediction::BackfillResult, String> {
-    n_core::v2::prediction::backfill(&state.services.db)
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<Value, String> {
+    state.api.get_active_preclose_signals().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_active_preclose_candidates(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    state.api.get_active_preclose_candidates().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_preclose_candidates(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    state.api.get_preclose_candidates(None).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_preclose_signals(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    state.api.get_preclose_signals(None).await.map_err(|e| e.message)
+}
+
+// ── Settings (Backward Compatible & New) ──
+
+#[tauri::command]
+pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let local = state.local_settings.read().await.clone();
+    let ui_val = serde_json::json!({
+        "flash_ms": 900,
+        "breathe_hold_ms": 5000,
+        "min_bar_spacing": local.min_bar_spacing,
+        "chart_display_bars": local.chart_display_bars,
+        "chart_right_gap": local.chart_right_gap,
+        "chart_show_first_signal": true,
+        "score_pill_full_score": 3.5,
+        "timeframes": local.timeframes,
+        "last_group_id": local.last_group_id,
+        "chart_review_focus_right": false,
+    });
+
+    match state.api.get_server_settings().await {
+        Ok(server) => {
+            Ok(serde_json::json!({
+                "app_config": server.app_config,
+                "scheduler": server.scheduler,
+                "fetch": server.fetch,
+                "quote": server.quote,
+                "notify": server.notify,
+                "preclose": server.preclose,
+                "log": server.log,
+                "data_source": server.data_source,
+                "email": server.email,
+                "ui": ui_val,
+            }))
+        }
+        Err(e) => {
+            tracing::warn!("无法从服务端读取配置，使用本地默认: {e}");
+            Ok(serde_json::json!({
+                "app_config": {
+                    "auto_start_scheduler": true,
+                    "logic_version": "1"
+                },
+                "scheduler": {
+                    "refresh_interval_secs": 300,
+                    "scan_interval_secs": 900,
+                    "trading_only": true
+                },
+                "fetch": {
+                    "request_interval_ms": 400,
+                    "minutely_budget": 60,
+                    "backfill_count": 1000,
+                    "incremental_count": 10
+                },
+                "quote": {
+                    "poll_interval_ms": 3000,
+                    "request_interval_ms": 200,
+                    "minutely_budget": 120
+                },
+                "email": {
+                    "enabled": true,
+                    "to": "",
+                    "from": "",
+                    "smtp_host": "smtp.qq.com",
+                    "smtp_port": 465,
+                    "smtp_user": "",
+                    "smtp_password": ""
+                },
+                "notify": {
+                    "in_app_new_pattern": true,
+                    "new_pattern_min_score": 0.0,
+                    "in_app_entry_trigger": true,
+                    "system_entry_trigger": false
+                },
+                "preclose": {
+                    "schema_version": 2,
+                    "enabled": true,
+                    "lead_secs": 180,
+                    "horizon_minutes": 60,
+                    "in_app_notify": true
+                },
+                "log": {
+                    "level": "info"
+                },
+                "data_source": {
+                    "primary_source": "tqsdk",
+                    "fallback_enabled": true,
+                    "tq_account": "",
+                    "tq_password": "",
+                    "bridge_port": 8765,
+                    "auto_spawn_bridge": true,
+                    "python_path": null
+                },
+                "ui": ui_val,
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn update_config(
+    state: State<'_, Arc<AppState>>,
+    config: Value,
+) -> Result<Value, String> {
+    // 1. Update UI config locally if provided
+    if let Some(ui) = config.get("ui") {
+        let mut local = state.local_settings.write().await;
+        if let Some(v) = ui.get("chart_display_bars").or_else(|| ui.get("chartDisplayBars")).and_then(|v| v.as_u64()) {
+            local.chart_display_bars = v as usize;
+        }
+        if let Some(v) = ui.get("chart_right_gap").or_else(|| ui.get("chartRightGap")).and_then(|v| v.as_u64()) {
+            local.chart_right_gap = v as usize;
+        }
+        if let Some(v) = ui.get("min_bar_spacing").or_else(|| ui.get("minBarSpacing")).and_then(|v| v.as_f64()) {
+            local.min_bar_spacing = v;
+        }
+        if let Some(v) = ui.get("timeframes").and_then(|v| v.as_array()) {
+            local.timeframes = v.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect();
+        }
+        if let Some(v) = ui.get("last_group_id").or_else(|| ui.get("lastGroupId")) {
+            local.last_group_id = v.as_i64();
+        }
+        drop(local);
+        let _ = state.save_local_settings().await;
+    }
+
+    // 2. Update server config
+    if let Ok(server_settings) = state.api.get_server_settings().await {
+        let mut update = ServerSettingsUpdate {
+            config_revision: server_settings.config_revision,
+            app_config: None,
+            scheduler: None,
+            fetch: None,
+            quote: None,
+            notify: None,
+            preclose: None,
+            log: None,
+            data_source: None,
+            email: None,
+        };
+
+        if let Some(app) = config.get("app_config").or_else(|| config.get("appConfig")) {
+            if let Ok(dto) = serde_json::from_value::<AppConfigDto>(app.clone()) {
+                update.app_config = Some(dto);
+            }
+        }
+        if let Some(s) = config.get("scheduler") {
+            if let Ok(dto) = serde_json::from_value::<SchedulerConfigDto>(s.clone()) {
+                update.scheduler = Some(dto);
+            }
+        }
+        if let Some(f) = config.get("fetch") {
+            if let Ok(dto) = serde_json::from_value::<FetchConfigDto>(f.clone()) {
+                update.fetch = Some(dto);
+            }
+        }
+        if let Some(q) = config.get("quote") {
+            if let Ok(dto) = serde_json::from_value::<QuoteConfigDto>(q.clone()) {
+                update.quote = Some(dto);
+            }
+        }
+        if let Some(n) = config.get("notify") {
+            if let Ok(dto) = serde_json::from_value::<NotifyConfigDto>(n.clone()) {
+                update.notify = Some(dto);
+            }
+        }
+        if let Some(p) = config.get("preclose") {
+            if let Ok(dto) = serde_json::from_value::<PrecloseConfigDto>(p.clone()) {
+                update.preclose = Some(dto);
+            }
+        }
+        if let Some(l) = config.get("log") {
+            if let Ok(dto) = serde_json::from_value::<LogConfigDto>(l.clone()) {
+                update.log = Some(dto);
+            }
+        }
+        if let Some(ds) = config.get("data_source").or_else(|| config.get("dataSource")) {
+            if let Ok(dto) = serde_json::from_value::<DataSourceUpdateDto>(ds.clone()) {
+                update.data_source = Some(dto);
+            }
+        }
+        if let Some(em) = config.get("email") {
+            if let Ok(dto) = serde_json::from_value::<EmailSettingsUpdateDto>(em.clone()) {
+                update.email = Some(dto);
+            }
+        }
+
+        let _ = state.api.update_server_settings(&update).await;
+    }
+
+    get_config(state).await
+}
+
+#[tauri::command]
+pub async fn reset_config(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    let _ = state.api.reset_config().await;
+    let mut local = state.local_settings.write().await;
+    *local = ClientLocalSettings::default();
+    drop(local);
+    let _ = state.save_local_settings().await;
+    get_config(state).await
+}
+
+#[tauri::command]
+pub async fn set_last_group(
+    state: State<'_, Arc<AppState>>,
+    group_id: Option<i64>,
+) -> Result<(), String> {
+    {
+        let mut local = state.local_settings.write().await;
+        local.last_group_id = group_id;
+    }
+    let _ = state.save_local_settings().await;
+    let _ = state.api.set_last_group(group_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_timeframes(
+    state: State<'_, Arc<AppState>>,
+    timeframes: Vec<String>,
+) -> Result<(), String> {
+    {
+        let mut local = state.local_settings.write().await;
+        local.timeframes = timeframes.clone();
+    }
+    let _ = state.save_local_settings().await;
+    let _ = state.api.set_timeframes(&timeframes).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_server_settings(state: State<'_, Arc<AppState>>) -> Result<ServerSettingsDto, String> {
+    state.api.get_server_settings().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn update_server_settings(
+    state: State<'_, Arc<AppState>>,
+    req: ServerSettingsUpdate,
+) -> Result<ConfigApplyResult, String> {
+    state.api.update_server_settings(&req).await.map_err(|e| e.message)
+}
+
+// ── Admin & Runtime Controls ──
+
+#[tauri::command]
+pub async fn scheduler_status(state: State<'_, Arc<AppState>>) -> Result<SchedulerStatus, String> {
+    state.api.get_scheduler_status().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn set_scheduler_running(
+    state: State<'_, Arc<AppState>>,
+    running: bool,
+) -> Result<SchedulerStatus, String> {
+    state.api.set_scheduler_running(running).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn restart_server(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.api.restart_server().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn restart_bridge(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.api.restart_bridge().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn list_devices(state: State<'_, Arc<AppState>>) -> Result<Vec<DeviceItemDto>, String> {
+    state.api.list_devices().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn revoke_device(state: State<'_, Arc<AppState>>, device_id: String) -> Result<(), String> {
+    state.api.revoke_device(&device_id).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn pair_device(
+    state: State<'_, Arc<AppState>>,
+    req: DeviceRegisterRequest,
+) -> Result<DeviceRegisterResponse, String> {
+    state.api.pair_device(&req).await.map_err(|e| e.message)
+}
+
+// ── PC Database Backup ──
+
+#[tauri::command]
+pub async fn get_backup_status(state: State<'_, Arc<AppState>>) -> Result<BackupStatus, String> {
+    Ok(state.backup_scheduler.get_status().await)
+}
+
+#[tauri::command]
+pub async fn trigger_database_backup(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    state.backup_scheduler.trigger_backup_now().await
+}
+
+#[tauri::command]
+pub async fn open_backup_directory(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let dir = state.backup_scheduler.backup_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    open::that(&dir).map_err(|e| format!("打开备份目录失败: {e}"))
+}
+
+// ── Integrity ──
+
+#[tauri::command]
+pub async fn check_symbol_integrity(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<Value, String> {
+    state.api.check_symbol_integrity(&symbol).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn check_all_symbols_integrity(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.check_all_symbols_integrity().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn repair_symbol_integrity(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<Value, String> {
+    state.api.repair_symbol_integrity(&symbol).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_finality_report(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    state.api.check_all_symbols_integrity().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_finality_simulation(_state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    Ok(serde_json::json!([]))
+}
+
+#[tauri::command]
+pub async fn get_finality_sentinel_eval(_state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    Ok(serde_json::json!([]))
+}
+
+// ── System Utilities ──
+
+#[tauri::command]
+pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    open::that(&dir).map_err(|e| e.to_string())
 }

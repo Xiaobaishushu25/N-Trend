@@ -3,30 +3,50 @@ import { computed, defineComponent, h, onMounted, ref } from 'vue'
 import {
   NAlert,
   NButton,
+  NButtonGroup,
+  NCard,
+  NDataTable,
   NIcon,
   NInput,
   NInputNumber,
+  NPopconfirm,
   NRadioButton,
   NRadioGroup,
+  NScrollbar,
   NSelect,
   NSpace,
+  NSpin,
   NSwitch,
   NTabPane,
   NTabs,
+  NTag,
   NText,
   NTooltip,
   useDialog,
   useMessage,
+  type DataTableColumns,
 } from 'naive-ui'
 import {
   Bell,
   ChartCandle,
+  Check,
+  Cloud,
+  Cpu,
   Database,
   DeviceFloppy,
+  Devices,
+  Folder,
   Help,
+  Key,
+  Lock,
+  Mail,
+  Refresh,
   RotateClockwise,
   Ruler,
+  Server,
   Settings as SettingsIcon,
+  Shield,
+  Trash,
 } from '@vicons/tabler'
 import { isTauri } from '@tauri-apps/api/core'
 import {
@@ -35,19 +55,30 @@ import {
   isEnabled as isAutoLaunchEnabled,
 } from '@tauri-apps/plugin-autostart'
 import { api } from '../services/api'
+import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
-import type { Config, SymbolRow } from '../types'
+import type {
+  AuthRecord,
+  BackupStatus,
+  ClientLocalSettings,
+  DeviceItemDto,
+  MetaDto,
+  ServerSettingsDto,
+  ServerSettingsUpdate,
+  ServerStatusDto,
+  SymbolRow,
+} from '../types'
 
+const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const message = useMessage()
 const dialog = useDialog()
+const inTauri = isTauri()
 
-/** 工具提示：参考模板的“?”小图标，悬停展示说明文字。 */
+/** 工具提示组件 */
 const Tip = defineComponent({
   name: 'Tip',
-  props: {
-    text: { type: String, required: true },
-  },
+  props: { text: { type: String, required: true } },
   setup(props) {
     return () =>
       h(
@@ -69,19 +100,374 @@ const Tip = defineComponent({
   },
 })
 
-const form = ref<Config>(cloneConfig(settingsStore.settings))
-const saving = ref(false)
-const symbolRows = ref<SymbolRow[]>([])
-const symbolFilter = ref('')
-/** 浏览器预览（纯前端 npm run dev）下不调用任何 Tauri 插件 API */
-const inTauri = isTauri()
-/** 开机自启状态（由操作系统注册项读取，不写入 config.json） */
+// ── 1. 服务端连接状态与配对 ──
+const authRecord = ref<AuthRecord>({
+  server_url: 'http://127.0.0.1:8780',
+  device_id: '',
+  device_token: '',
+  device_role: 'pc_admin',
+  device_name: 'Desktop PC',
+})
+const serverMeta = ref<MetaDto | null>(null)
+const serverStatus = ref<ServerStatusDto | null>(null)
+const testingConnection = ref(false)
+const savingAuth = ref(false)
+const pairingKey = ref('')
+const pairingDeviceName = ref('Desktop PC')
+const pairingBusy = ref(false)
+
+const isAdmin = computed(() => authRecord.value.device_role === 'pc_admin' || authRecord.value.device_role === 'admin')
+
+async function loadAuth() {
+  try {
+    authRecord.value = await api.getAuthRecord()
+    if (authRecord.value.device_name) {
+      pairingDeviceName.value = authRecord.value.device_name
+    }
+  } catch (e) {
+    // 忽略
+  }
+}
+
+async function testConnection() {
+  testingConnection.value = true
+  try {
+    const [meta, status] = await Promise.all([api.getMeta(), api.getServerStatus()])
+    serverMeta.value = meta
+    serverStatus.value = status
+    message.success(`连接成功！服务版本: v${meta.server_version}，行情延迟: ${status.quote_delay_ms ?? 0}ms`)
+  } catch (e: any) {
+    message.error(`连接失败: ${e?.message || e}`)
+  } finally {
+    testingConnection.value = false
+  }
+}
+
+async function saveAuth() {
+  savingAuth.value = true
+  try {
+    await api.updateAuthRecord(authRecord.value)
+    message.success('连接信息已保存，正在重新建立连接...')
+  } catch (e: any) {
+    message.error(`保存失败: ${e?.message || e}`)
+  } finally {
+    savingAuth.value = false
+  }
+}
+
+async function pairDevice() {
+  if (!pairingKey.value.trim()) {
+    message.warning('请输入管理配对密钥')
+    return
+  }
+  pairingBusy.value = true
+  try {
+    const res = await api.pairDevice({
+      deviceName: pairingDeviceName.value.trim() || 'Desktop PC',
+      adminKey: pairingKey.value.trim(),
+    })
+    authRecord.value.device_id = res.deviceId
+    authRecord.value.device_token = res.token
+    authRecord.value.device_role = res.role
+    await api.updateAuthRecord(authRecord.value)
+    pairingKey.value = ''
+    message.success(`设备配对成功！分配角色: ${res.role}`)
+    await testConnection()
+    await loadSymbols()
+    if (isAdmin.value) {
+      await loadServerSettings()
+    }
+  } catch (e: any) {
+    message.error(`配对失败: ${e?.message || e}`)
+  } finally {
+    pairingBusy.value = false
+  }
+}
+
+// ── 2. 本地终端偏好 ──
+const clientSettings = ref<ClientLocalSettings>({
+  serverUrl: 'http://127.0.0.1:8780',
+  deviceId: '',
+  deviceName: 'Desktop PC',
+  theme: 'dark',
+  chartDisplayBars: 200,
+  chartRightGap: 15,
+  minBarSpacing: 6,
+  timeframes: ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
+  lastGroupId: null,
+  desktopNotificationEnabled: true,
+})
 const autoLaunch = ref(false)
 const autoLaunchBusy = ref(false)
-/** 表单与当前已保存配置是否不同（有改动才允许保存） */
-const dirty = computed(
-  () => JSON.stringify(form.value) !== JSON.stringify(settingsStore.settings),
-)
+const savingClientSettings = ref(false)
+
+const availableTimeframes = [
+  { label: '5分钟 (5m)', value: '5m' },
+  { label: '15分钟 (15m)', value: '15m' },
+  { label: '30分钟 (30m)', value: '30m' },
+  { label: '1小时 (1h)', value: '1h' },
+  { label: '2小时 (2h)', value: '2h' },
+  { label: '4小时 (4h)', value: '4h' },
+  { label: '日线 (1d)', value: '1d' },
+]
+
+async function loadClientSettings() {
+  try {
+    clientSettings.value = await api.getClientSettings()
+  } catch (e) {
+    // 忽略
+  }
+  if (inTauri) {
+    try {
+      autoLaunch.value = await isAutoLaunchEnabled()
+    } catch {
+      // 忽略
+    }
+  }
+}
+
+async function saveClientSettings() {
+  savingClientSettings.value = true
+  try {
+    await api.updateClientSettings(clientSettings.value)
+    message.success('终端偏好已保存')
+  } catch (e: any) {
+    message.error(`保存失败: ${e?.message || e}`)
+  } finally {
+    savingClientSettings.value = false
+  }
+}
+
+async function toggleAutoLaunch(enabled: boolean) {
+  if (!inTauri) return
+  autoLaunchBusy.value = true
+  try {
+    if (enabled) await enableAutoLaunch()
+    else await disableAutoLaunch()
+    autoLaunch.value = enabled
+    message.success(enabled ? '开机自启已开启' : '开机自启已关闭')
+  } catch (e: any) {
+    message.error(`切换开机自启失败: ${e?.message || e}`)
+  } finally {
+    autoLaunchBusy.value = false
+  }
+}
+
+// ── 3. 服务端全局设置 ──
+const serverSettings = ref<ServerSettingsDto | null>(null)
+const serverSettingsUpdate = ref<ServerSettingsUpdate>({ configRevision: 0 })
+const newTqPassword = ref('')
+const newSmtpPassword = ref('')
+const savingServerSettings = ref(false)
+
+const logLevels = [
+  { label: 'trace', value: 'trace' },
+  { label: 'debug', value: 'debug' },
+  { label: 'info', value: 'info' },
+  { label: 'warn', value: 'warn' },
+  { label: 'error', value: 'error' },
+]
+
+async function loadServerSettings() {
+  try {
+    const s = await api.getServerSettings()
+    serverSettings.value = s
+    serverSettingsUpdate.value = {
+      configRevision: s.configRevision,
+      appConfig: { ...s.appConfig },
+      scheduler: { ...s.scheduler },
+      fetch: { ...s.fetch },
+      quote: { ...s.quote },
+      notify: { ...s.notify },
+      preclose: { ...s.preclose },
+      log: { ...s.log },
+      dataSource: { ...s.dataSource },
+      email: { ...s.email },
+    }
+    newTqPassword.value = ''
+    newSmtpPassword.value = ''
+  } catch (e: any) {
+    console.warn('获取服务端配置失败:', e)
+  }
+}
+
+async function saveServerSettings() {
+  if (!serverSettings.value) return
+  savingServerSettings.value = true
+  try {
+    const req: ServerSettingsUpdate = {
+      configRevision: serverSettings.value.configRevision,
+      appConfig: serverSettingsUpdate.value.appConfig,
+      scheduler: serverSettingsUpdate.value.scheduler,
+      fetch: serverSettingsUpdate.value.fetch,
+      quote: serverSettingsUpdate.value.quote,
+      notify: serverSettingsUpdate.value.notify,
+      preclose: serverSettingsUpdate.value.preclose,
+      log: serverSettingsUpdate.value.log,
+      dataSource: {
+        ...serverSettingsUpdate.value.dataSource,
+        tqPassword: newTqPassword.value ? newTqPassword.value : undefined,
+      },
+      email: {
+        ...serverSettingsUpdate.value.email,
+        smtpPassword: newSmtpPassword.value ? newSmtpPassword.value : undefined,
+      },
+    }
+    const res = await api.updateServerSettings(req)
+    message.success(`服务端设置已更新 (版本号: rev${res.newRevision})`)
+    if (res.restartRequired && res.restartRequired.length > 0) {
+      message.warning(`以下配置修改需要重启服务后生效: ${res.restartRequired.join(', ')}`)
+    }
+    await loadServerSettings()
+  } catch (e: any) {
+    message.error(`保存失败: ${e?.message || e}`)
+  } finally {
+    savingServerSettings.value = false
+  }
+}
+
+// ── 4. 多端设备管理 ──
+const deviceList = ref<DeviceItemDto[]>([])
+const loadingDevices = ref(false)
+
+async function loadDevices() {
+  if (!isAdmin.value) return
+  loadingDevices.value = true
+  try {
+    deviceList.value = await api.listDevices()
+  } catch (e: any) {
+    console.warn('加载设备列表失败:', e)
+  } finally {
+    loadingDevices.value = false
+  }
+}
+
+async function revokeDevice(deviceId: string) {
+  try {
+    await api.revokeDevice(deviceId)
+    message.success('已撤销该设备授权')
+    await loadDevices()
+  } catch (e: any) {
+    message.error(`撤销失败: ${e?.message || e}`)
+  }
+}
+
+const deviceColumns: DataTableColumns<DeviceItemDto> = [
+  { title: '设备名称', key: 'name' },
+  { title: '设备ID', key: 'id', ellipsis: { tooltip: true } },
+  {
+    title: '角色',
+    key: 'role',
+    render(row) {
+      return h(
+        NTag,
+        { size: 'small', type: row.role.includes('admin') ? 'primary' : 'default', round: true },
+        () => (row.role.includes('admin') ? '管理员' : '只读终端'),
+      )
+    },
+  },
+  { title: '配对时间', key: 'createdAt', ellipsis: { tooltip: true } },
+  {
+    title: '最后活跃',
+    key: 'lastSeenAt',
+    render(row) {
+      return row.lastSeenAt || '—'
+    },
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    render(row) {
+      if (row.id === authRecord.value.device_id) {
+        return h(NTag, { size: 'small', type: 'info' }, () => '当前设备')
+      }
+      return h(
+        NPopconfirm,
+        {
+          onPositiveClick: () => revokeDevice(row.id),
+        },
+        {
+          trigger: () =>
+            h(NButton, { size: 'tiny', type: 'error', quaternary: true }, () => '撤销授权'),
+          default: () => '确定撤销该设备的访问授权吗？撤销后该终端将无法访问服务。',
+        },
+      )
+    },
+  },
+]
+
+// ── 5. PC 数据库备份 ──
+const backupStatus = ref<BackupStatus | null>(null)
+const backingUp = ref(false)
+
+async function loadBackupStatus() {
+  try {
+    backupStatus.value = await api.getBackupStatus()
+  } catch (e) {
+    // 忽略
+  }
+}
+
+async function triggerBackup() {
+  backingUp.value = true
+  try {
+    const filename = await api.triggerDatabaseBackup()
+    message.success(`一致性数据库备份成功！文件: ${filename}`)
+    await loadBackupStatus()
+  } catch (e: any) {
+    message.error(`备份失败: ${e?.message || e}`)
+  } finally {
+    backingUp.value = false
+  }
+}
+
+async function openBackupDir() {
+  try {
+    await api.openBackupDirectory()
+  } catch (e: any) {
+    message.error(`打开目录失败: ${e?.message || e}`)
+  }
+}
+
+// ── 6. 运维控制 ──
+const restartingServer = ref(false)
+const restartingBridge = ref(false)
+
+async function handleRestartServer() {
+  dialog.warning({
+    title: '受控重启服务端',
+    content: '确定向云服务端发送重启指令吗？服务端将保存状态并退出，由 systemd 自动拉起恢复。',
+    positiveText: '确认重启',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      restartingServer.value = true
+      try {
+        await api.restartServer()
+        message.info('重启指令已发送，服务端将在几秒内恢复...')
+      } catch (e: any) {
+        message.error(`重启请求失败: ${e?.message || e}`)
+      } finally {
+        restartingServer.value = false
+      }
+    },
+  })
+}
+
+async function handleRestartBridge() {
+  restartingBridge.value = true
+  try {
+    await api.restartBridge()
+    message.success('天勤 Python 桥接进程已重启并完成健康检查')
+  } catch (e: any) {
+    message.error(`重启桥接失败: ${e?.message || e}`)
+  } finally {
+    restartingBridge.value = false
+  }
+}
+
+// ── 7. 品种与精度 ──
+const symbolRows = ref<SymbolRow[]>([])
+const symbolFilter = ref('')
 const filteredSymbols = computed(() => {
   const kw = symbolFilter.value.trim().toUpperCase()
   if (!kw) return symbolRows.value
@@ -97,7 +483,7 @@ async function loadSymbols() {
   try {
     symbolRows.value = await api.getSymbols()
   } catch {
-    // 浏览器预览环境下无后端命令，忽略
+    // 忽略
   }
 }
 
@@ -107,7 +493,6 @@ function onTickChange(row: SymbolRow, value: number | null) {
   api.setSymbolTick(row.code, tick).catch((e) => message.error(String(e)))
 }
 
-/** 按小数位精度取步进（0.02→0.01，1/50→1，0.005→0.001），避免步进随当前值漂移 */
 function tickStep(tick: number): number {
   if (tick <= 0) return 1
   const text = String(tick)
@@ -116,815 +501,607 @@ function tickStep(tick: number): number {
   return Math.pow(10, -(text.length - dot - 1))
 }
 
-/** 品种列只在名称里没体现品种名时才显示，避免“甲醇连续 + 甲醇”重复 */
 function showVariety(row: SymbolRow): boolean {
   const v = row.variety.trim()
   if (!v) return false
   return row.name !== v && !row.name.includes(v)
 }
 
-const logLevels = [
-  { label: 'trace', value: 'trace' },
-  { label: 'debug', value: 'debug' },
-  { label: 'info', value: 'info' },
-  { label: 'warn', value: 'warn' },
-  { label: 'error', value: 'error' },
-]
-
-function cloneConfig(config: Config): Config {
-  const d = JSON.parse(JSON.stringify(config))
-  if (!d.data_source) {
-    d.data_source = {
-      primary_source: 'tqsdk',
-      fallback_enabled: true,
-      tq_account: '',
-      tq_password: '',
-      bridge_port: 8765,
-      auto_spawn_bridge: true,
-      python_path: null,
-    }
-  }
-  return d
-}
-
-async function save() {
-  saving.value = true
-  try {
-    const ds = form.value.data_source
-    await settingsStore.save(form.value)
-    if (ds?.primary_source === 'tqsdk' && settingsStore.status.active_data_source === '天勤') {
-      message.success('设置已保存，天勤数据源已连接并通过健康检查')
-    } else if (ds?.primary_source === 'tqsdk') {
-      message.warning('设置已保存，但天勤尚未通过健康检查；图表可临时使用新浪数据，本地库仍只写入天勤')
-    } else {
-      message.success('设置已保存')
-    }
-  } catch (e) {
-    message.error(String(e))
-  } finally {
-    saving.value = false
-  }
-}
-
-/** 恢复默认设置：先弹窗确认，确认后重置并覆盖当前表单 */
-function confirmReset() {
-  dialog.warning({
-    title: '恢复默认设置',
-    content: '确定将所有设置恢复为默认值吗？当前配置将被覆盖，且无法撤销。',
-    positiveText: '恢复默认',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      try {
-        settingsStore.settings = await api.resetConfig()
-        form.value = cloneConfig(settingsStore.settings)
-        message.success('已恢复默认设置')
-      } catch (e) {
-        message.error(String(e))
-      }
-    },
-  })
-}
-
-async function toggleRunning() {
-  try {
-    await settingsStore.setRunning(!settingsStore.status.running)
-  } catch (e) {
-    message.error(String(e))
-  }
-}
-
-async function openLogDirectory() {
-  try {
-    await api.openLogDirectory()
-  } catch (e) {
-    message.error(String(e))
-  }
-}
-
-/** 读取系统当前的开机自启状态，用于同步开关 */
-async function syncAutoLaunch() {
-  if (!inTauri) return
-  try {
-    autoLaunch.value = await isAutoLaunchEnabled()
-  } catch (e) {
-    console.warn('读取开机自启状态失败', e)
-  }
-}
-
-/** 切换开机自启：写入系统注册项；失败时回滚开关状态 */
-async function toggleAutoLaunch(value: boolean) {
-  if (!inTauri || autoLaunchBusy.value) return
-  autoLaunchBusy.value = true
-  try {
-    if (value) await enableAutoLaunch()
-    else await disableAutoLaunch()
-    autoLaunch.value = value
-    message.success(value ? '已开启开机自启' : '已关闭开机自启')
-  } catch (e) {
-    autoLaunch.value = !value
-    message.error(String(e))
-  } finally {
-    autoLaunchBusy.value = false
-  }
-}
-
 onMounted(async () => {
-  try {
-    await settingsStore.load()
-  } catch {
-    // 浏览器预览环境下无后端命令，保持默认值
+  await Promise.all([
+    loadAuth(),
+    loadClientSettings(),
+    loadBackupStatus(),
+    loadSymbols(),
+  ])
+  if (isAdmin.value) {
+    loadServerSettings()
+    loadDevices()
   }
-  await loadSymbols()
-  form.value = cloneConfig(settingsStore.settings)
-  await syncAutoLaunch()
 })
 </script>
 
 <template>
   <div class="settings-page">
-    <n-tabs type="line" placement="left" class="setting-tabs" default-value="app">
-      <n-tab-pane name="app">
+    <n-tabs type="line" placement="left" class="setting-tabs" default-value="connection">
+      <!-- 1. 服务端连接 -->
+      <n-tab-pane name="connection">
         <template #tab>
           <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="SettingsIcon" /></span>
-            <span>应用</span>
+            <span class="tab-icon"><n-icon :component="Cloud" /></span>
+            <span>服务端连接</span>
           </div>
         </template>
-        <div class="tab-body">
-          <label class="section-title">应用</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                开机自动启动
-                <Tip text="登录 Windows 后自动启动本应用；可在设置界面或系统任务管理器中随时关闭。" />
+        <div class="tab-pane-container">
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <label class="section-title">服务地址与设备凭据</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    服务器 API 地址
+                    <Tip text="权威服务端 API 地址，如 http://127.0.0.1:8780 或云服务器 HTTPS 域名" />
+                  </div>
+                  <n-input
+                    v-model:value="authRecord.server_url"
+                    placeholder="http://127.0.0.1:8780"
+                    style="width: 320px"
+                  />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    设备认证 Token
+                    <Tip text="本设备的认证令牌，配对后由服务端下发，妥善保存在系统凭据管理器中。" />
+                  </div>
+                  <n-input
+                    v-model:value="authRecord.device_token"
+                    type="password"
+                    show-password-on="click"
+                    placeholder="Bearer Token"
+                    style="width: 320px"
+                  />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">设备身份角色</div>
+                  <div style="display: flex; align-items: center; gap: 8px">
+                    <n-tag :type="isAdmin ? 'primary' : 'default'" size="small" round>
+                      {{ isAdmin ? '主管理员 (PC Admin)' : '只读终端 (Read Only)' }}
+                    </n-tag>
+                    <n-text depth="3" style="font-size: 12px">ID: {{ authRecord.device_id || '未配对' }}</n-text>
+                  </div>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">连接与测试</div>
+                  <n-space>
+                    <n-button size="small" :loading="testingConnection" @click="testConnection">
+                      测试连通性
+                    </n-button>
+                    <n-button type="primary" size="small" :loading="savingAuth" @click="saveAuth">
+                      保存配置
+                    </n-button>
+                  </n-space>
+                </div>
               </div>
-              <n-switch
-                :value="autoLaunch"
-                :loading="autoLaunchBusy"
-                @update:value="toggleAutoLaunch"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                启动时自动运行定时任务
-                <Tip text="应用启动后自动开始定时刷新与扫描，无需手动点击启动。" />
-              </div>
-              <n-switch v-model:value="form.app_config.auto_start_scheduler" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                交易信号逻辑
-                <Tip text="默认使用 1.x 原版逻辑；2.0 使用严格N字 + 箱体识别，且信号评分≥3.5才入库和通知。切换后扫描按所选版本运行，两版历史记录互不覆盖。" />
-              </div>
-              <n-radio-group v-model:value="form.app_config.logic_version">
-                <n-radio-button value="1">1.x 原版</n-radio-button>
-                <n-radio-button value="2">2.0 严格</n-radio-button>
-              </n-radio-group>
-            </div>
-          </div>
 
-          <label class="section-title">日志</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                日志级别
-                <Tip text="修改后重启应用生效；RUST_LOG 环境变量仍可整体覆盖。" />
+              <label class="section-title">管理密钥快速配对</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    设备名称
+                    <Tip text="用于在服务端管理列表中标识本台设备，如 '张三的办公电脑'。" />
+                  </div>
+                  <n-input v-model:value="pairingDeviceName" placeholder="Desktop PC" style="width: 320px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    服务端配对 Admin Key
+                    <Tip text="云端 secrets.json 中的 admin_key，仅在初次配对授权时使用。" />
+                  </div>
+                  <n-input
+                    v-model:value="pairingKey"
+                    type="password"
+                    placeholder="输入服务端的 admin_key"
+                    style="width: 320px"
+                  />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label" />
+                  <n-button type="primary" size="small" :loading="pairingBusy" @click="pairDevice">
+                    一键配对并获取令牌
+                  </n-button>
+                </div>
               </div>
-              <n-select v-model:value="form.log.level" :options="logLevels" style="width: 200px" />
             </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                日志存储位置
-                <Tip text="点击查看应用日志文件所在目录。" />
-              </div>
-              <n-button size="small" @click="openLogDirectory">打开日志目录</n-button>
-            </div>
-          </div>
+          </n-scrollbar>
         </div>
       </n-tab-pane>
 
-      <n-tab-pane name="ui">
+      <!-- 2. 终端偏好 -->
+      <n-tab-pane name="client_prefs">
         <template #tab>
           <div class="custom-tab-label">
             <span class="tab-icon"><n-icon :component="ChartCandle" /></span>
-            <span>界面</span>
+            <span>终端偏好</span>
           </div>
         </template>
-        <div class="tab-body">
-          <label class="section-title">界面</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                行情跳动闪烁时长（毫秒）
-                <Tip text="自选表格中价格变化时行背景闪烁的时长。" />
+        <div class="tab-pane-container">
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <label class="section-title">系统与显示</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    开机自动启动
+                    <Tip text="开机后自动启动客户端；可在 Windows 任务管理器中随时管理。" />
+                  </div>
+                  <n-switch :value="autoLaunch" :loading="autoLaunchBusy" @update:value="toggleAutoLaunch" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    K线图默认显示根数
+                    <Tip text="初次进入图表时可视区默认展示的K线数量。" />
+                  </div>
+                  <n-input-number v-model:value="clientSettings.chartDisplayBars" :min="50" :max="1000" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    右侧间隙（根）
+                    <Tip text="图表最新K线距离右边界的留白距离。" />
+                  </div>
+                  <n-input-number v-model:value="clientSettings.chartRightGap" :min="2" :max="50" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    K线最小间距（像素）
+                    <Tip text="图表横向缩放时防止K线过细的最小像素间距。" />
+                  </div>
+                  <n-input-number v-model:value="clientSettings.minBarSpacing" :min="2" :max="30" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    启用K线周期
+                    <Tip text="选择需要在图表切换栏中显示的分析周期。" />
+                  </div>
+                  <n-select
+                    v-model:value="clientSettings.timeframes"
+                    multiple
+                    :options="availableTimeframes"
+                    style="width: 320px"
+                  />
+                </div>
               </div>
-              <n-input-number
-                v-model:value="form.ui.flash_ms"
-                :min="100"
-                :max="3000"
-                style="width: 200px"
-              />
             </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                顶栏呼吸灯保持时长（毫秒）
-                <Tip text="收到行情请求事件后，顶栏“运行中”呼吸灯保持亮起的时间。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.breathe_hold_ms"
-                :min="1000"
-                :max="30000"
-                style="width: 200px"
-              />
+          </n-scrollbar>
+          <!-- 底部固定保存栏 -->
+          <div class="tab-footer-bar">
+            <div class="footer-tip">
+              <n-text depth="3" style="font-size: 12px">偏好保存在本地客户端配置中</n-text>
             </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                K线最小间距（像素）
-                <Tip text="K线图横向拉宽时防止K线细成一条线的最小间距。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.min_bar_spacing"
-                :min="2"
-                :max="30"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                点击进入K线图时展示K线数量
-                <Tip text="点击品种进入K线图时，从最新一根往前展示的K线根数；调大后也会同步加载更多历史K线。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.chart_display_bars"
-                :min="20"
-                :max="2000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                K线图默认向左移动距离（根）
-                <Tip text="进入图表时最新K线右侧预留的空白根数，相当于把图表向左拖动一段；设为 0 表示不预留。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.chart_right_gap"
-                :min="0"
-                :max="200"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                进入K线图默认显示首个信号
-                <Tip text="进入图表时自动在K线图上显示排序最靠前的信号形态；关闭后所有形态默认隐藏。" />
-              </div>
-              <n-switch v-model:value="form.ui.chart_show_first_signal" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                复盘聚焦时将预警K线置于最右侧
-                <Tip text="开启后，复盘统计页点击明细或切换历史信号时，预警K线会贴到K线图右侧倒数第3根（右侧留2根空白），不显示后续走势，避免后视镜判断；关闭时居中显示。" />
-              </div>
-              <n-switch v-model:value="form.ui.chart_review_focus_right" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                状态胶囊完整显示评分门槛
-                <Tip text="达到该评分的形态在列表页和表格中按完整大小与不透明度显示；每低 0.2 分缩小变浅一档，共 5 档。" />
-              </div>
-              <n-input-number
-                v-model:value="form.ui.score_pill_full_score"
-                :min="0.5"
-                :max="5"
-                :step="0.1"
-                style="width: 200px"
-              />
-            </div>
+            <n-button type="primary" size="medium" :loading="savingClientSettings" @click="saveClientSettings">
+              <template #icon><n-icon :component="DeviceFloppy" /></template>
+              保存终端偏好
+            </n-button>
           </div>
         </div>
       </n-tab-pane>
 
-      <n-tab-pane name="notify">
+      <!-- 3. 服务端设置 (管理员) -->
+      <n-tab-pane name="server_settings" :disabled="!isAdmin">
         <template #tab>
           <div class="custom-tab-label">
-            <span class="tab-icon"><n-icon :component="Bell" /></span>
-            <span>通知</span>
+            <span class="tab-icon"><n-icon :component="Server" /></span>
+            <span>服务端设置</span>
           </div>
         </template>
-        <div class="tab-body">
-          <label class="section-title">通知</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                局内新形态通知
-                <Tip text="扫描发现新的“即将触发”形态时，在应用内右下角弹出信号卡片通知。" />
+        <div class="tab-pane-container" v-if="serverSettingsUpdate.scheduler">
+          <!-- 中间滚动区域，使用 Native 级 NScrollbar，消除丑陋原生滚动条 -->
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <label class="section-title">定时调度与形态</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">启动时自动运行定时任务</div>
+                  <n-switch v-model:value="serverSettingsUpdate.appConfig!.auto_start_scheduler" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">信号分析版本</div>
+                  <n-radio-group v-model:value="serverSettingsUpdate.appConfig!.logic_version">
+                    <n-radio-button value="1">1.x 原版</n-radio-button>
+                    <n-radio-button value="2">2.0 严格N字+箱体</n-radio-button>
+                  </n-radio-group>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">数据刷新间隔（秒）</div>
+                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.refresh_interval_secs" :min="10" :max="600" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">形态扫描间隔（秒）</div>
+                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.scan_interval_secs" :min="10" :max="600" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">仅在期货交易时段运行</div>
+                  <n-switch v-model:value="serverSettingsUpdate.scheduler!.trading_only" />
+                </div>
               </div>
-              <n-switch v-model:value="form.notify.in_app_new_pattern" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                新形态通知评分阈值
-                <Tip text="仅当即将触发形态评分达到该阈值时才弹出新形态通知；若本次扫描没有任何达标形态，也不发送扫描邮件。设为 0 表示全部提醒。" />
-              </div>
-              <n-input-number
-                v-model:value="form.notify.new_pattern_min_score"
-                :min="0"
-                :max="5"
-                :step="0.1"
-                :precision="1"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                局内触发价通知
-                <Tip text="实时行情轮询发现最新价已触及形态入场价时弹出通知（做空为跌破入场价，做多为突破入场价）；通知不自动消失，需手动关闭。" />
-              </div>
-              <n-switch v-model:value="form.notify.in_app_entry_trigger" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                系统触发价通知
-                <Tip text="入场价提醒同时发送系统级通知，需要操作系统通知权限。" />
-              </div>
-              <n-switch v-model:value="form.notify.system_entry_trigger" />
-            </div>
-          </div>
 
-          <label class="section-title">收盘前预检测</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                启用收盘前预检测
-                <Tip text="仅对已有 pending 正式候选提前提醒，不生成新的多空方向，也不计入正式信号胜率。" />
+              <label class="section-title">天勤数据源与桥接</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">主力数据源</div>
+                  <n-radio-group v-model:value="serverSettingsUpdate.dataSource!.primary_source">
+                    <n-radio-button value="tqsdk">天勤 (tqsdk)</n-radio-button>
+                    <n-radio-button value="sina">新浪 (sina)</n-radio-button>
+                  </n-radio-group>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">快期账号</div>
+                  <n-input v-model:value="serverSettingsUpdate.dataSource!.tq_account" placeholder="快期账号" style="width: 240px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    快期密码
+                    <Tip text="密码在服务端以 0600 权限单独存储于 secrets.json，从不返回客户端。" />
+                  </div>
+                  <n-space align="center">
+                    <n-input
+                      v-model:value="newTqPassword"
+                      type="password"
+                      placeholder="留空保持不变"
+                      style="width: 200px"
+                    />
+                    <n-tag size="small" type="success" v-if="serverSettings?.dataSource?.tqPasswordConfigured">已配置</n-tag>
+                    <n-tag size="small" type="warning" v-else>未配置</n-tag>
+                  </n-space>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">Python 桥接端口</div>
+                  <n-input-number v-model:value="serverSettingsUpdate.dataSource!.bridge_port" style="width: 180px" />
+                </div>
               </div>
-              <n-switch v-model:value="form.preclose.enabled" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">提前检测时间</div>
-              <n-radio-group v-model:value="form.preclose.lead_secs">
-                <n-radio-button :value="120">提前2分钟</n-radio-button>
-                <n-radio-button :value="180">提前3分钟</n-radio-button>
-              </n-radio-group>
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">开盘观察窗口</div>
-              <n-input-number
-                v-model:value="form.preclose.horizon_minutes"
-                :min="5"
-                :max="240"
-                :step="5"
-                style="width: 160px"
-              />
-              <n-text depth="3">分钟</n-text>
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">应用内预检测提醒</div>
-              <n-switch v-model:value="form.preclose.in_app_notify" />
-            </div>
-          </div>
 
-          <label class="section-title">邮件通知</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">启用邮件</div>
-              <n-switch v-model:value="form.email.enabled" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">收件人（逗号分隔）</div>
-              <n-input
-                v-model:value="form.email.to"
-                placeholder="a@example.com,b@example.com"
-                style="width: 320px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">发件人</div>
-              <n-input v-model:value="form.email.from" placeholder="your@qq.com" style="width: 320px" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">SMTP 主机</div>
-              <n-input v-model:value="form.email.smtp_host" placeholder="smtp.qq.com" style="width: 320px" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">SMTP 端口</div>
-              <n-input-number
-                v-model:value="form.email.smtp_port"
-                :min="1"
-                :max="65535"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">SMTP 账号</div>
-              <n-input v-model:value="form.email.smtp_user" placeholder="your@qq.com" style="width: 320px" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                SMTP 授权码
-                <Tip text="QQ邮箱等需使用授权码而非登录密码；保存后明文写入配置文件，与之前存数据库行为一致。" />
+              <label class="section-title">邮件报警 (SMTP)</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">启用邮件通知</div>
+                  <n-switch v-model:value="serverSettingsUpdate.email!.enabled" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">SMTP 服务器地址</div>
+                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_host" placeholder="smtp.qq.com" style="width: 240px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">SMTP 端口</div>
+                  <n-input-number v-model:value="serverSettingsUpdate.email!.smtp_port" style="width: 180px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">发件人账号</div>
+                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_user" placeholder="user@example.com" style="width: 240px" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">授权码 / 密码</div>
+                  <n-space align="center">
+                    <n-input
+                      v-model:value="newSmtpPassword"
+                      type="password"
+                      placeholder="留空保持不变"
+                      style="width: 200px"
+                    />
+                    <n-tag size="small" type="success" v-if="serverSettings?.email?.smtpPasswordConfigured">已配置</n-tag>
+                    <n-tag size="small" type="warning" v-else>未配置</n-tag>
+                  </n-space>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">接收邮箱</div>
+                  <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" style="width: 240px" />
+                </div>
               </div>
-              <n-input
-                v-model:value="form.email.smtp_password"
-                type="password"
-                show-password-on="click"
-                placeholder="QQ邮箱授权码"
-                style="width: 320px"
-              />
             </div>
+          </n-scrollbar>
+
+          <!-- 底部固定保存栏：固定在底部，不随内容滚动 -->
+          <div class="tab-footer-bar">
+            <div class="footer-tip">
+              <n-text depth="3" style="font-size: 12px">
+                配置版本: rev{{ serverSettings?.configRevision ?? 0 }}
+              </n-text>
+            </div>
+            <n-button
+              type="primary"
+              size="medium"
+              :loading="savingServerSettings"
+              @click="saveServerSettings"
+            >
+              <template #icon>
+                <n-icon :component="DeviceFloppy" />
+              </template>
+              保存服务端设置
+            </n-button>
           </div>
+        </div>
+
+        <div v-else class="tab-empty-tip">
+          <n-spin size="medium" description="正在加载服务端设置..." />
         </div>
       </n-tab-pane>
 
-      <n-tab-pane name="data">
+      <!-- 4. 多端设备管理 (管理员) -->
+      <n-tab-pane name="device_mgr" :disabled="!isAdmin">
+        <template #tab>
+          <div class="custom-tab-label">
+            <span class="tab-icon"><n-icon :component="Devices" /></span>
+            <span>设备管理</span>
+          </div>
+        </template>
+        <div class="tab-pane-container">
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px">
+                <label class="section-title" style="margin: 0">已配对终端设备</label>
+                <n-button size="small" :loading="loadingDevices" @click="loadDevices">
+                  <template #icon><n-icon :component="Refresh" /></template>
+                  刷新设备
+                </n-button>
+              </div>
+              <n-data-table
+                :columns="deviceColumns"
+                :data="deviceList"
+                :loading="loadingDevices"
+                size="small"
+                :pagination="{ pageSize: 10 }"
+              />
+            </div>
+          </n-scrollbar>
+        </div>
+      </n-tab-pane>
+
+      <!-- 5. 数据灾备与备份 (PC) -->
+      <n-tab-pane name="backup">
         <template #tab>
           <div class="custom-tab-label">
             <span class="tab-icon"><n-icon :component="Database" /></span>
-            <span>数据</span>
+            <span>数据库备份</span>
           </div>
         </template>
-        <div class="tab-body">
-          <label class="section-title">数据源</label>
-          <div class="setting-card">
-            <n-alert
-              v-if="form.data_source.primary_source === 'tqsdk' && (!form.data_source.tq_account?.trim() || !form.data_source.tq_password)"
-              type="warning"
-              title="请配置天勤快期账号"
-              :bordered="false"
-              style="margin-bottom: 14px; border-radius: 6px"
-            >
-              当前选择天勤为主力数据源，但账号或密码尚未完整配置。请在下方填写后保存；配置不完整时图表可临时使用新浪数据，但不会写入本地库。
-            </n-alert>
-            <div class="setting-card-row">
-              <div class="row-label">
-                主力数据源
-                <Tip text="选择主行情与K线数据来源。天勤量化（TqSdk）支持毫秒级行情推送与更完整的5分钟K线历史；新浪接口作为免登录的轻量备用源。" />
+        <div class="tab-pane-container">
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <label class="section-title">PC 每日一致性备份</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">备份目录位置</div>
+                  <n-text depth="2" style="font-family: monospace; font-size: 13px">
+                    {{ backupStatus?.backup_dir || '加载中...' }}
+                  </n-text>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">今日备份状态</div>
+                  <n-space align="center">
+                    <n-tag :type="backupStatus?.last_backup_date ? 'success' : 'warning'" size="small" round>
+                      {{ backupStatus?.last_backup_date ? `已备份 (${backupStatus.last_backup_date})` : '今日未备份' }}
+                    </n-tag>
+                    <n-text depth="3" style="font-size: 12px">保留最近 3 份每日快照 (已存 {{ backupStatus?.backup_count ?? 0 }} 份)</n-text>
+                  </n-space>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">备份操作</div>
+                  <n-space>
+                    <n-button type="primary" size="small" :loading="backingUp" @click="triggerBackup">
+                      <template #icon><n-icon :component="Database" /></template>
+                      立即执行快照备份
+                    </n-button>
+                    <n-button size="small" @click="openBackupDir">
+                      <template #icon><n-icon :component="Folder" /></template>
+                      打开备份目录
+                    </n-button>
+                  </n-space>
+                </div>
               </div>
-              <n-radio-group v-model:value="form.data_source.primary_source">
-                <n-radio-button value="tqsdk">天勤量化 (TqSdk)</n-radio-button>
-                <n-radio-button value="sina">新浪财经 (Sina)</n-radio-button>
-              </n-radio-group>
             </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                图表故障临时使用新浪
-                <Tip text="开启后，当天勤不可用时，当前查看品种的图表可临时请求新浪数据；临时数据不写入本地库、不参与策略，天勤恢复后自动切回。" />
-              </div>
-              <n-switch v-model:value="form.data_source.fallback_enabled" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                天勤快期账号
-                <Tip text="在天勤官网（shinnytech.com）免费注册的手机账号；免费用户享有国内全交易所实时与历史K线权限。" />
-              </div>
-              <n-input
-                v-model:value="form.data_source.tq_account"
-                placeholder="手机号 / 账号"
-                style="width: 260px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                天勤快期密码
-                <Tip text="快期账户登录密码；保存后保存在本地配置文件中。" />
-              </div>
-              <n-input
-                v-model:value="form.data_source.tq_password"
-                type="password"
-                show-password-on="click"
-                placeholder="账户密码"
-                style="width: 260px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                自动启动 Python 桥接服务
-                <Tip text="开启后应用启动时自动检测 Python 环境并静默启动 tq_bridge 桥接进程；应用退出时自动安全终止。" />
-              </div>
-              <n-switch v-model:value="form.data_source.auto_spawn_bridge" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                本地桥接端口
-                <Tip text="Python TqSdk 桥接服务监听的本地 HTTP 端口，默认 8765。" />
-              </div>
-              <n-input-number
-                v-model:value="form.data_source.bridge_port"
-                :min="1024"
-                :max="65535"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                自定义 Python 路径（可选）
-                <Tip text="留空则自动从系统 PATH 及常见安装路径探测 python.exe；若有特定 Python 环境可在此填写完整可执行文件路径。" />
-              </div>
-              <n-input
-                :value="form.data_source.python_path ?? ''"
-                placeholder="留空自动探测，例如 C:\Python310\python.exe"
-                style="width: 260px"
-                @update:value="(v: string) => { form.data_source.python_path = v.trim() ? v.trim() : null }"
-              />
-            </div>
-          </div>
-
-          <label class="section-title">定时任务</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                数据刷新间隔（秒）
-                <Tip text="定时增量刷新5分钟K线的间隔，按分钟网格对齐，保存后立即生效。" />
-              </div>
-              <n-input-number
-                v-model:value="form.scheduler.refresh_interval_secs"
-                :min="60"
-                :max="3600"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                扫描间隔（秒）
-                <Tip text="定时运行N形态扫描的间隔；扫描结果会持久化并推送通知。" />
-              </div>
-              <n-input-number
-                v-model:value="form.scheduler.scan_interval_secs"
-                :min="300"
-                :max="7200"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                仅交易时段运行
-                <Tip text="仅在国内期货日盘/夜盘窗口内触发刷新与扫描，避免无效请求。" />
-              </div>
-              <n-switch v-model:value="form.scheduler.trading_only" />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">定时任务当前状态</div>
-              <n-space align="center" :size="12">
-                <n-text :type="settingsStore.status.running ? 'success' : 'warning'">
-                  {{ settingsStore.status.running ? '运行中' : '已暂停' }}
-                </n-text>
-                <n-button
-                  size="small"
-                  :type="settingsStore.status.running ? 'warning' : 'success'"
-                  @click="toggleRunning"
-                >
-                  {{ settingsStore.status.running ? '暂停' : '启动' }}
-                </n-button>
-              </n-space>
-            </div>
-          </div>
-
-          <label class="section-title">数据抓取</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                单请求间隔（毫秒）
-                <Tip text="K线抓取的相邻请求最小间隔，越小越快但越容易被接口限流。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.request_interval_ms"
-                :min="100"
-                :max="10000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                每分钟请求上限
-                <Tip text="K线抓取的每分钟请求预算，超过后会在窗口内排队等待。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.minutely_budget"
-                :min="5"
-                :max="300"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                首抓/回补根数
-                <Tip text="新品种建档及历史深度不足时一次性回填的5分钟K线根数。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.backfill_count"
-                :min="50"
-                :max="2000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                增量抓取根数
-                <Tip text="定时刷新时按距上次数据的时间差估算需补的根数，至少抓取该数量；缺口过大时自动按回补上限拉取。" />
-              </div>
-              <n-input-number
-                v-model:value="form.fetch.incremental_count"
-                :min="3"
-                :max="100"
-                style="width: 200px"
-              />
-            </div>
-          </div>
-
-          <label class="section-title">实时行情</label>
-          <div class="setting-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                轮询间隔（毫秒）
-                <Tip text="交易时段内拉取实时现价的间隔，建议3秒或更长；修改后下一轮即生效。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.poll_interval_ms"
-                :min="1000"
-                :max="30000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                单请求间隔（毫秒）
-                <Tip text="实时行情批量接口的相邻请求最小间隔。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.request_interval_ms"
-                :min="100"
-                :max="5000"
-                style="width: 200px"
-              />
-            </div>
-            <div class="setting-card-row">
-              <div class="row-label">
-                每分钟请求上限
-                <Tip text="实时行情请求的每分钟预算，与K线抓取的预算互不影响。" />
-              </div>
-              <n-input-number
-                v-model:value="form.quote.minutely_budget"
-                :min="10"
-                :max="600"
-                style="width: 200px"
-              />
-            </div>
-          </div>
+          </n-scrollbar>
         </div>
       </n-tab-pane>
 
+      <!-- 6. 服务运维控制 (管理员) -->
+      <n-tab-pane name="ops" :disabled="!isAdmin">
+        <template #tab>
+          <div class="custom-tab-label">
+            <span class="tab-icon"><n-icon :component="Shield" /></span>
+            <span>服务运维</span>
+          </div>
+        </template>
+        <div class="tab-pane-container">
+          <n-scrollbar class="tab-scroll-area">
+            <div class="tab-body-inner">
+              <label class="section-title">受控服务重启</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    重启 ntrend 服务端
+                    <Tip text="云端服务将完成当前正在进行的批处理后受控退出，由 systemd 守护进程安全拉起。" />
+                  </div>
+                  <n-button type="warning" size="small" :loading="restartingServer" @click="handleRestartServer">
+                    重启服务端主进程
+                  </n-button>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    单独重启天勤 Python 桥接
+                    <Tip text="当行情连接卡死或需要重置天勤 Python 进程时使用。" />
+                  </div>
+                  <n-button size="small" :loading="restartingBridge" @click="handleRestartBridge">
+                    重启天勤 Bridge
+                  </n-button>
+                </div>
+              </div>
+            </div>
+          </n-scrollbar>
+        </div>
+      </n-tab-pane>
+
+      <!-- 7. 品种精度设置 -->
       <n-tab-pane name="symbols">
         <template #tab>
           <div class="custom-tab-label">
             <span class="tab-icon"><n-icon :component="Ruler" /></span>
-            <span>品种</span>
+            <span>品种精度</span>
           </div>
         </template>
-        <div class="tab-body">
-          <label class="section-title">品种精度</label>
-          <div class="setting-card symbol-tick-card">
-            <div class="setting-card-row">
-              <div class="row-label">
-                品种最小变动价位（tick）
-                <Tip text="入场价会在预警K线极值基础上按此 tick 偏移（做多=高点+tick，做空=低点-tick）。未显式设置的品种使用内置默认表；填 0 恢复默认。" />
+        <div class="tab-pane-container">
+          <div class="symbol-table-header">
+            <n-input
+              v-model:value="symbolFilter"
+              placeholder="搜索品种代码或名称..."
+              clearable
+              size="small"
+              style="width: 220px"
+            />
+            <span class="symbol-count">共 {{ filteredSymbols.length }} 个品种</span>
+          </div>
+          <n-scrollbar class="symbol-scroll-area">
+            <div class="symbol-list">
+              <div v-for="row in filteredSymbols" :key="row.code" class="symbol-item">
+                <div class="symbol-info">
+                  <span class="sym-code">{{ row.code }}</span>
+                  <span class="sym-name">{{ row.name }}</span>
+                  <span v-if="showVariety(row)" class="sym-variety">{{ row.variety }}</span>
+                </div>
+                <div class="symbol-tick-input">
+                  <span class="tick-label">最小跳动</span>
+                  <n-input-number
+                    :value="row.tick_size"
+                    :min="0"
+                    :step="tickStep(row.tick_size)"
+                    size="small"
+                    style="width: 110px"
+                    @update:value="(val) => onTickChange(row, val)"
+                  />
+                </div>
               </div>
-              <n-input
-                v-model:value="symbolFilter"
-                placeholder="搜索代码 / 名称 / 品种"
-                clearable
-                size="small"
-                style="width: 240px"
-              />
             </div>
-          </div>
-          <div class="symbol-tick-list">
-            <div v-for="row in filteredSymbols" :key="row.code" class="symbol-tick-row">
-              <span class="st-code">{{ row.code }}</span>
-              <span class="st-name">{{ row.name || '—' }}</span>
-              <span v-if="showVariety(row)" class="st-variety">{{ row.variety }}</span>
-              <n-input-number
-                :value="row.tick_size"
-                :min="0"
-                :step="tickStep(row.tick_size)"
-                :precision="3"
-                size="small"
-                style="width: 110px"
-                @update:value="(v: number | null) => onTickChange(row, v)"
-              />
-            </div>
-            <div v-if="!filteredSymbols.length" class="symbol-tick-empty">
-              <n-text depth="3">暂无匹配的品种</n-text>
-            </div>
-          </div>
+          </n-scrollbar>
         </div>
       </n-tab-pane>
-
     </n-tabs>
-
-    <div class="footer">
-      <n-button size="small" quaternary :disabled="saving" @click="confirmReset">
-        <template #icon>
-          <n-icon :component="RotateClockwise" />
-        </template>
-        恢复默认
-      </n-button>
-      <n-button
-        type="primary"
-        :disabled="!dirty || saving"
-        :loading="saving"
-        @click="save"
-      >
-        <template #icon>
-          <n-icon :component="DeviceFloppy" />
-        </template>
-        保存设置
-      </n-button>
-    </div>
   </div>
 </template>
 
 <style scoped>
 .settings-page {
+  height: 100%;
+  max-height: 100%;
+  box-sizing: border-box;
+  background: var(--n-color);
+  padding: 12px 16px 12px 20px;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  height: 100%;
-  box-sizing: border-box;
-  padding: 0;
-  gap: 0;
-  background: #fff;
-  overflow: hidden;
 }
 
 .setting-tabs {
+  height: 100%;
   flex: 1;
   min-height: 0;
-  padding: 8px 12px;
-  --n-tab-border-radius: 6px;
-  --n-text-color-primary: #1f2329;
-  --n-text-color-hover: #1677ff;
-  --n-color-embedded: #f5f7f9;
 }
 
-.setting-tabs :deep(.n-tabs-content) {
+.setting-tabs :deep(.n-tabs-pane-wrapper) {
   height: 100%;
+  overflow: hidden;
 }
 
 .setting-tabs :deep(.n-tab-pane) {
   height: 100%;
-  padding: 0;
+  box-sizing: border-box;
+  padding: 0 !important;
+  overflow: hidden;
 }
 
-.tab-body {
+.custom-tab-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 4px 0;
+}
+
+.tab-icon {
+  display: flex;
+  align-items: center;
+  font-size: 16px;
+}
+
+.tab-pane-container {
+  display: flex;
+  flex-direction: column;
   height: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.tab-scroll-area {
+  flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  padding-right: 10px;
+  height: 100%;
 }
 
-/* 内容区统一使用细滚动条，观感更接近原生应用 */
-.tab-body::-webkit-scrollbar {
-  width: 8px;
+.tab-body-inner {
+  padding: 6px 16px 20px 20px;
+  max-width: 720px;
+  box-sizing: border-box;
 }
 
-.tab-body::-webkit-scrollbar-thumb {
-  background: #d3dae3;
-  border-radius: 4px;
+.tab-footer-bar {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px 10px 20px;
+  max-width: 720px;
+  box-sizing: border-box;
+  background: var(--n-color);
+  border-top: 1px solid var(--n-border-color);
+  z-index: 10;
 }
 
-.tab-body::-webkit-scrollbar-thumb:hover {
-  background: #b9c2cd;
+.footer-tip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.tab-body::-webkit-scrollbar-track {
-  background: transparent;
+.tab-empty-tip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 240px;
 }
 
 .section-title {
   display: block;
-  font-size: 18px;
-  font-weight: 700;
-  color: #1f2329;
-  margin: 2px 0 10px 4px;
+  font-size: 14px;
+  font-weight: 600;
+  margin: 14px 0 10px 0;
+  color: var(--n-text-color);
 }
 
-.tab-body .section-title:not(:first-child) {
-  margin-top: 20px;
+.section-title:first-child {
+  margin-top: 0;
 }
 
 .setting-card {
-  border: 1px solid #eef1f5;
-  border-radius: 10px;
-  background: #fff;
+  border: 1px solid var(--n-border-color);
+  border-radius: 8px;
+  background: var(--n-card-color);
   padding: 4px 16px;
+  margin-bottom: 14px;
 }
 
 .setting-card-row {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 12px 0;
-  border-bottom: 1px solid #f1f3f6;
+  align-items: center;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--n-border-color);
 }
 
 .setting-card-row:last-child {
@@ -935,126 +1112,82 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 14px;
-  color: #3d4757;
-  white-space: nowrap;
+  font-size: 13px;
+  color: var(--n-text-color);
 }
 
 .help-icon {
-  color: #94a3b8;
-  cursor: help;
+  color: var(--n-text-color-3);
+  cursor: pointer;
 }
 
-.symbol-tick-card {
-  margin-bottom: 10px;
+.symbol-table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 16px 12px 20px;
+  max-width: 720px;
+  flex-shrink: 0;
 }
 
-.symbol-tick-list {
-  border: 1px solid #eef1f5;
-  border-radius: 10px;
-  padding: 2px 14px;
-  background: #fff;
+.symbol-count {
+  font-size: 12px;
+  color: var(--n-text-color-3);
 }
 
-.symbol-tick-row {
+.symbol-scroll-area {
+  flex: 1;
+  min-height: 0;
+  padding: 0 16px 20px 20px;
+  max-width: 720px;
+  box-sizing: border-box;
+}
+
+.symbol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.symbol-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border: 1px solid var(--n-border-color);
+  border-radius: 6px;
+  background: var(--n-card-color);
+}
+
+.symbol-info {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 7px 0;
-  border-bottom: 1px solid #f1f3f6;
 }
 
-.symbol-tick-row:last-child {
-  border-bottom: none;
-}
-
-.st-code {
-  flex: none;
-  width: 76px;
-  font-size: 13px;
+.sym-code {
   font-weight: 600;
-  color: #1f2329;
-  font-variant-numeric: tabular-nums;
-}
-
-.st-name {
-  flex: 1;
-  min-width: 0;
+  font-family: monospace;
   font-size: 13px;
-  color: #3d4757;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.st-variety {
-  flex: none;
-  width: 76px;
+.sym-name {
+  font-size: 13px;
+}
+
+.sym-variety {
   font-size: 12px;
-  color: #94a3b8;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  color: var(--n-text-color-3);
 }
 
-.symbol-tick-empty {
-  padding: 18px 0;
-  text-align: center;
-}
-
-.footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex: none;
-  padding: 8px 12px 12px;
-  border-top: 1px solid #f0f2f5;
-}
-
-/* 左侧标签样式：图标 + 文字，参考模板的结构，配色用当前项目的蓝色系 */
-.custom-tab-label {
+.symbol-tick-input {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  font-size: 14px;
-  font-weight: 500;
 }
 
-.tab-icon {
-  font-size: 16px;
-  width: 20px;
-  text-align: center;
-}
-
-.setting-tabs :deep(.n-tabs-tab--active) {
-  color: var(--n-text-color-hover);
-  background-color: rgba(22, 119, 255, 0.08);
-  border-radius: 6px;
-}
-
-.setting-tabs :deep(.n-tabs-rail) {
-  background-color: transparent;
-  padding: 4px;
-}
-
-.setting-tabs :deep(.n-tabs-content) {
-  background-color: transparent;
-  padding-left: 8px;
-}
-
-/* 取消切换 tab 的滑动/淡入动画：颜色、背景与选中文字右移效果保留，只改为瞬时切换 */
-.setting-tabs :deep(.n-tabs-bar),
-.setting-tabs :deep(.n-tabs-tab),
-.setting-tabs :deep(.n-tabs-tab-label),
-.setting-tabs :deep(.n-tabs-pane-wrapper) {
-  transition: none !important;
-}
-</style>
-
-<style>
-/* 长 tooltip 限制宽度并换行，避免弹出层过宽导致窗口出现横向滚动条 */
-.n-popover {
-  max-width: 340px;
+.tick-label {
+  font-size: 12px;
+  color: var(--n-text-color-3);
 }
 </style>

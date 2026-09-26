@@ -2,24 +2,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{Local, NaiveDateTime};
-use n_core::config::Config;
-use n_core::service::Services;
-use n_core::storage;
-use serde::Serialize;
+use chrono::Local;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
-use tokio::time::Duration;
 
+pub mod client;
 mod commands;
 mod state;
 
-use state::{AppState, SchedulerState, KEY_LAST_REFRESH, KEY_LAST_SCAN};
+use client::{BackupScheduler, CredentialStore, KlineMemoryCache, RealtimeClient, RemoteApiClient};
+use state::AppState;
 
 pub static QUITTING: AtomicBool = AtomicBool::new(false);
-
-const DEFAULT_SYMBOLS: &str = "# 每行一个期货代码\nRB0\nAU0\nIF0\n";
 
 /// 日志时间：使用本地时间（北京时间），替代 tracing 默认的 UTC 时间。
 #[derive(Clone, Debug)]
@@ -31,23 +26,17 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
     }
 }
 
-/// 日志过滤规则：读取配置中的日志级别；RUST_LOG 环境变量仍可整体覆盖。
+/// 日志过滤规则：读取环境变量或默认 info
 fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
     if std::env::var("RUST_LOG").is_ok() {
         return tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     }
     let base = format!(
-        "{level},sqlx=warn,sea-orm=warn,sea_orm=warn,hyper=warn,reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn"
+        "{level},reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn"
     );
     tracing_subscriber::EnvFilter::try_new(&base)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sqlx=warn,sea-orm=warn"))
-}
-
-fn peek_log_level(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("log")?.get("level")?.as_str().map(|s| s.to_string())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -62,13 +51,12 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
-        // 开机自启：Windows 写注册表 Run 项，macOS 用 LaunchAgent（当前仅在 Windows 部署）
+        // 开机自启：Windows 写注册表 Run 项，macOS 用 LaunchAgent
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
-        // 记住窗口位置/大小/最大化状态；不保存 VISIBLE（本应用关闭是隐藏到托盘，
-        // 若保存可见性，退出时窗口处于隐藏状态会导致下次启动时窗口不可见）
+        // 记住窗口位置/大小/最大化状态
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
@@ -78,172 +66,37 @@ pub fn run() {
             let setup_t0 = Instant::now();
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
-            let db_path = data_dir.join("ntrend.db");
-            let config_path = data_dir.join("config.json");
-            // 尽早初始化日志，避免之前的 info 丢失；先按文件中的级别 peek，失败则用 info
-            let peek_level = peek_log_level(&config_path).unwrap_or_else(|| "info".to_string());
-            init_logging(&data_dir, &peek_level)?;
+
+            init_logging(&data_dir, "info")?;
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-            tracing::info!("🚀 ntrend v{} 启动 | 数据目录: {} | 日志级别: {}", env!("CARGO_PKG_VERSION"), data_dir.display(), peek_level);
-            let t = Instant::now();
-            let db = tauri::async_runtime::block_on(storage::connect(&db_path))?;
-            tracing::info!("✓ 存储连接就绪 耗时 {}ms | {}", t.elapsed().as_millis(), db_path.display());
-            let t = Instant::now();
-            let config = tauri::async_runtime::block_on(Config::load(&config_path, &db))?;
-            tracing::info!("✓ 配置加载完成 耗时 {}ms | 刷新间隔 {}s 扫描间隔 {}s 交易时段限制: {} 日志级别: {}", t.elapsed().as_millis(), config.scheduler.refresh_interval_secs, config.scheduler.scan_interval_secs, config.scheduler.trading_only, config.log.level);
-            if peek_level != config.log.level {
-                tracing::info!("ℹ 日志级别已在配置中改为 {}，重启后生效（当前仍为 {}）", config.log.level, peek_level);
-            }
-            let t = Instant::now();
-            let services =
-                tauri::async_runtime::block_on(Services::new(db, config.clone(), config_path.clone()))?;
-            let symbol_count = tauri::async_runtime::block_on(async { n_core::storage::repo::list_symbols(&services.db, false).await.map(|v| v.len()).unwrap_or(0) });
-            tracing::info!("✓ 服务初始化完成 耗时 {}ms | 已收录品种 {} 个 | 自启调度: {}", t.elapsed().as_millis(), symbol_count, if config.app_config.auto_start_scheduler { "开启" } else { "关闭" });
+            tracing::info!(
+                "🚀 ntrend v{} 客户端启动 | 数据目录: {}",
+                env!("CARGO_PKG_VERSION"),
+                data_dir.display()
+            );
 
+            // 1. 初始化客户端模块
+            let credentials = Arc::new(CredentialStore::new(&data_dir));
+            let api = Arc::new(RemoteApiClient::new(credentials.clone()));
+            let kline_cache = Arc::new(KlineMemoryCache::new());
+            let realtime = RealtimeClient::new(app.handle().clone(), credentials.clone(), kline_cache.clone());
+            let backup_scheduler = BackupScheduler::new(app.handle().clone(), api.clone(), &data_dir);
 
-            // 首启种子文本（同步读取，不访问 DB）
-            let mut seed_text = DEFAULT_SYMBOLS.to_string();
-            if let Ok(text) = std::fs::read_to_string("symbols.txt") {
-                if !text.trim().is_empty() {
-                    seed_text = text;
-                }
-            }
-            // 轻量同步：读取调度开关与上次成功时间（仅读 2 个 settings key，快）
-            let t = Instant::now();
-            let (auto_start, saved) = tauri::async_runtime::block_on(async {
-                let cfg = services.config().await;
-                let m = n_core::storage::repo::all_settings(&services.db)
-                    .await
-                    .unwrap_or_default();
-                (cfg.app_config.auto_start_scheduler, m)
-            });
-            let last_refresh = saved
-                .get(KEY_LAST_REFRESH)
-                .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
-            let last_scan = saved
-                .get(KEY_LAST_SCAN)
-                .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
-            tracing::info!("✓ 调度状态已恢复 耗时 {}ms | 自启: {} 上次刷新: {} 上次扫描: {}", t.elapsed().as_millis(), if auto_start { "是" } else { "否" }, last_refresh.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "从未".to_string()), last_scan.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "从未".to_string()));
-            let state = Arc::new(AppState {
-                services,
-                scheduler: tokio::sync::RwLock::new(SchedulerState {
-                    running: auto_start,
-                    last_refresh,
-                    last_scan,
-                    // 调度起点先用最近一次成功时间：重启后若已超过间隔，首个 tick 即补跑
-                    refresh_anchor: last_refresh,
-                    scan_anchor: last_scan,
-                }),
-                trigger_email_scheduled: tokio::sync::Mutex::new(
-                    std::collections::HashSet::new(),
-                ),
-                notification_history: std::sync::Mutex::new(Vec::new()),
-                next_notification_id: std::sync::atomic::AtomicU64::new(1),
-            });
-            app.manage(state.clone());
-            // --- 启动耗时后台化：种子/邮箱迁移/精度回填 不再阻塞窗口首绘 ---
-            {
-                let bg_state = state.clone();
-                let seed = seed_text.clone();
-                tauri::async_runtime::spawn(async move {
-                    let t = Instant::now();
-                    match bg_state.services.seed_symbols(&seed).await {
-                        Ok(n) if n > 0 => tracing::info!("后台 seed_symbols 插入 {n} 条 耗时 {}ms", t.elapsed().as_millis()),
-                        Ok(_) => tracing::info!("后台 seed_symbols 跳过(已存在) 耗时 {}ms", t.elapsed().as_millis()),
-                        Err(e) => tracing::warn!("后台 seed_symbols 失败: {e}"),
-                    }
-                });
-            }
-            {
-                let bg_state2 = state.clone();
-                tauri::async_runtime::spawn(async move {
-                    let t = Instant::now();
-                    let cur = bg_state2.services.config().await;
-                    if cur.email.smtp_password.is_empty() && cur.email.from.is_empty() {
-                        if let Ok(imported) = n_core::config::import_email_toml(std::path::Path::new("email.toml")) {
-                            if !imported.smtp_password.is_empty()
-                                || imported.from != n_core::notify::email::EmailSettings::default().from
-                            {
-                                let mut next = cur;
-                                next.email = imported;
-                                if let Err(e) = bg_state2.services.apply_config(next).await {
-                                    tracing::warn!("后台 email 迁移失败: {e}");
-                                } else {
-                                    tracing::info!("后台 email 迁移完成 耗时 {}ms", t.elapsed().as_millis());
-                                }
-                            }
-                        }
-                    }
-                    let t2 = Instant::now();
-                    if let Err(e) = bg_state2.services.backfill_tick_sizes().await {
-                        tracing::warn!("后台 backfill_tick_sizes 失败: {e}");
-                    } else {
-                        tracing::info!("后台 backfill_tick_sizes 完成 耗时 {}ms", t2.elapsed().as_millis());
-                    }
-                });
-            }
-            // 后台补齐品种名称：不阻塞启动，完成后通知前端刷新；成功后打标记避免每次启动重复联网
-            {
-                let enrich_app = app.handle().clone();
-                let enrich_state = state.clone();
-                tauri::async_runtime::spawn(async move {
-                    use n_core::storage::repo;
-                    let already_done = repo::all_settings(&enrich_state.services.db)
-                        .await
-                        .map(|m| m.get("names_enriched").map(String::as_str) == Some("1"))
-                        .unwrap_or(false);
-                    if already_done {
-                        return;
-                    }
-                    match enrich_state.services.needs_name_enrich().await {
-                        Ok(false) => {
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("names_enriched".to_string(), "1".to_string());
-                            let _ = repo::set_settings(&enrich_state.services.db, &map).await;
-                            return;
-                        }
-                        Ok(true) => {}
-                        Err(e) => {
-                            tracing::warn!("检查品种名称失败: {e}");
-                            return;
-                        }
-                    }
-                    match enrich_state.services.enrich_existing_symbols().await {
-                        Ok(n) => {
-                            tracing::info!("已补齐 {n} 个品种的名称");
-                            let mut map = std::collections::HashMap::new();
-                            map.insert("names_enriched".to_string(), "1".to_string());
-                            let _ = repo::set_settings(&enrich_state.services.db, &map).await;
-                            let _ = enrich_app.emit("symbols-updated", n);
-                        }
-                        Err(e) => tracing::warn!("补齐品种名称失败: {e}"),
-                    }
-                });
-            }
-            spawn_scheduler(app.handle().clone(), state.clone());
-            spawn_quote_poller(app.handle().clone(), state.clone());
-            spawn_tq_bar_event_consumer(app.handle().clone(), state.clone());
-            // 2026-09-02 暂停 Finality 独立观测（迭代两个版本后删除）：观测已完成历史使命，新浪最小确认值已固化 30s/75s，暂停写入 bar_observations 以回收 DB 空间
-            // // Finality 独立观测需在 Tokio runtime 内 spawn，直接在 setup 同步上下文调用会 panic (there is no reactor running)，改用 tauri 运行时兜底
-            // {
-            //     let state_for_finality = state.clone();
-            //     tauri::async_runtime::spawn(async move {
-            //         state_for_finality.services.spawn_finality_observer();
-            //     });
-            // }
-            // 监听数据源自动降级与恢复事件，并推送至前端右下角通知
-            {
-                let mut ds_rx = state.services.subscribe_data_source_events();
-                let app_handle_for_ds = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    while let Ok(evt) = ds_rx.recv().await {
-                        let _ = app_handle_for_ds.emit("data-source-failover", &evt);
-                    }
-                });
-            }
+            // 2. 初始化全局客户端状态
+            let state = Arc::new(AppState::new(
+                &data_dir,
+                api,
+                realtime,
+                kline_cache,
+                credentials,
+                backup_scheduler,
+            ));
+            app.manage(state);
+
+            // 3. 设置系统托盘
             setup_tray(app)?;
-            tracing::info!("⏰ 定时调度与实时行情轮询已启动 | 交易时段: {} 轮询间隔 {}ms", if config.scheduler.trading_only { "仅交易时段" } else { "全天" }, config.quote.poll_interval_ms);
-            tracing::info!("✅ 主窗口就绪 总耗时 {}ms | 后台任务异步进行中", setup_t0.elapsed().as_millis());
+
+            tracing::info!("✅ 主窗口就绪 总耗时 {}ms", setup_t0.elapsed().as_millis());
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             Ok(())
         })
@@ -253,7 +106,6 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else if window.label() != "main" {
-                    // 子窗口关闭前立即落盘，此时窗口仍在，save_window_state 才能取到最新几何
                     let _ = window
                         .app_handle()
                         .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
@@ -261,6 +113,17 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::app_info,
+            commands::set_window_size,
+            commands::get_connection_status,
+            commands::get_auth_record,
+            commands::update_auth_record,
+            commands::get_client_settings,
+            commands::update_client_settings,
+            commands::get_meta,
+            commands::get_server_status,
+            commands::record_notification,
+            commands::get_notification_history,
             commands::get_symbols,
             commands::list_groups,
             commands::create_group,
@@ -294,10 +157,6 @@ pub fn run() {
             commands::delete_manual_level,
             commands::get_manual_level_events,
             commands::get_active_events,
-            commands::get_active_preclose_signals,
-            commands::get_active_preclose_candidates,
-            commands::get_preclose_signals,
-            commands::get_preclose_candidates,
             commands::refresh_data_now,
             commands::run_scan_now,
             commands::run_scan_fast_now,
@@ -310,31 +169,42 @@ pub fn run() {
             commands::add_signal_annotation,
             commands::delete_signal_annotation,
             commands::set_signal_decision,
+            commands::get_v2_models,
+            commands::get_v2_dataset_report,
+            commands::get_v2_predictions,
+            commands::set_v2_model_status,
+            commands::backfill_v2_predictions,
+            commands::get_active_preclose_signals,
+            commands::get_active_preclose_candidates,
+            commands::get_preclose_candidates,
+            commands::get_preclose_signals,
             commands::get_config,
             commands::update_config,
+            commands::reset_config,
             commands::set_last_group,
             commands::set_timeframes,
-            commands::reset_config,
-            commands::open_log_directory,
+            commands::get_server_settings,
+            commands::update_server_settings,
             commands::scheduler_status,
             commands::set_scheduler_running,
-            commands::app_info,
-            commands::record_notification,
-            commands::get_notification_history,
-            commands::get_finality_report,
-            commands::get_finality_simulation,
-            commands::get_finality_sentinel_eval,
+            commands::restart_server,
+            commands::restart_bridge,
+            commands::list_devices,
+            commands::revoke_device,
+            commands::pair_device,
+            commands::get_backup_status,
+            commands::trigger_database_backup,
+            commands::open_backup_directory,
             commands::check_symbol_integrity,
             commands::check_all_symbols_integrity,
             commands::repair_symbol_integrity,
-            commands::get_v2_models,
-            commands::set_v2_model_status,
-            commands::get_v2_predictions,
-            commands::backfill_v2_predictions,
-            commands::get_v2_dataset_report,
+            commands::get_finality_report,
+            commands::get_finality_simulation,
+            commands::get_finality_sentinel_eval,
+            commands::open_log_directory,
         ])
         .run(tauri::generate_context!())
-        .expect("运行 N趋势 失败");
+        .expect("运行 N趋势 客户端失败");
 }
 
 fn app_data_dir(app: &tauri::App) -> anyhow::Result<std::path::PathBuf> {
@@ -344,7 +214,7 @@ fn app_data_dir(app: &tauri::App) -> anyhow::Result<std::path::PathBuf> {
 
 fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
-    // 清理 14 天前的旧日志，避免磁盘占满
+    // 清理 14 天前的旧日志
     if let Ok(entries) = std::fs::read_dir(dir) {
         let now = std::time::SystemTime::now();
         for entry in entries.flatten() {
@@ -376,757 +246,6 @@ fn init_logging(dir: &std::path::Path, level: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_scheduler(app: AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        // 15 秒一跳：比 60 秒更接近计划时刻，长时间任务结束后也能尽快补上节奏
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // 启动特例：刷新改为分钟网格对齐后，启动时若不在边界时刻会最多等一个周期才有数据，
-        // 因此在交易时段内的首次 tick 强制刷新一次，之后回到边界对齐节奏
-        let mut startup_refresh_done = false;
-        // 天勤从不可用恢复时，必须重新做一次完整回补，而不是只等待下一个5分钟增量。
-        let mut tq_was_available = false;
-        let mut last_tq_recovery_attempt: Option<Instant> = None;
-        let mut last_trading_status: Option<n_core::session::TradingStatus> = None;
-        loop {
-            ticker.tick().await;
-            let now = Local::now();
-            let cfg = state.services.scheduler_config().await;
-            let tq_required = state.services.config().await.data_source.primary_source == "tqsdk";
-            let tq_available = state.services.data_source.tq_is_available();
-
-            let current_status = n_core::session::SessionCalendar::current_trading_status(&now);
-            if last_trading_status != Some(current_status) {
-                match current_status {
-                    n_core::session::TradingStatus::Trading => {
-                        tracing::info!("☀️ [调度器] 交易时段已开启，恢复常规行情刷新与扫描调度");
-                    }
-                    n_core::session::TradingStatus::HolidayOff => {
-                        tracing::info!("🌙 [调度器] 当前处于法定节假日休市时段，服务进入静默休眠");
-                    }
-                    n_core::session::TradingStatus::PreHolidayNightOff => {
-                        tracing::info!("🌙 [调度器] 当前处于法定节假日前夕（今晚无夜盘），服务进入静默休眠");
-                    }
-                    n_core::session::TradingStatus::WeekendOff => {
-                        tracing::info!("🌙 [调度器] 当前处于周末休市时段，服务进入静默休眠");
-                    }
-                    n_core::session::TradingStatus::DailyIntermission => {
-                        tracing::info!("🌙 [调度器] 当前处于日常非交易时段，服务进入静默休眠");
-                    }
-                }
-                last_trading_status = Some(current_status);
-            }
-
-            // 首次探活成功，以及运行中从降级状态恢复，都走完整回补+缺口修复。
-            // 这一步放在普通调度判定之前，避免 latest_ts 已被实时事件推进后漏掉中间缺口。
-            if tq_required && tq_available && !tq_was_available {
-                let retry_due = last_tq_recovery_attempt
-                    .map(|attempt| attempt.elapsed() >= Duration::from_secs(60))
-                    .unwrap_or(true);
-                if !retry_due {
-                    continue;
-                }
-                last_tq_recovery_attempt = Some(Instant::now());
-                if recover_after_tq_ready(&app, &state).await {
-                    startup_refresh_done = true;
-                    tq_was_available = true;
-                } else {
-                    // 桥接已健康但回补失败：保留重试资格，不把本次恢复视为完成。
-                    tq_was_available = false;
-                }
-                continue;
-            }
-            if tq_required && !startup_refresh_done && tq_available {
-                // 上一次恢复回补失败时，等待退避窗口后再重试，不退回到普通10根增量路径。
-                continue;
-            }
-            if tq_required && !tq_available {
-                last_tq_recovery_attempt = None;
-            }
-            tq_was_available = tq_available;
-
-            let mut action = {
-                let rt = state.scheduler.read().await;
-                if !rt.running {
-                    continue;
-                }
-                let last_refresh = rt
-                    .refresh_anchor
-                    .and_then(|t| t.and_local_timezone(Local).single());
-                let last_scan = rt
-                    .scan_anchor
-                    .and_then(|t| t.and_local_timezone(Local).single());
-                n_core::scheduler::next_action(now, &cfg, last_refresh, last_scan)
-            };
-            if !startup_refresh_done {
-                // 主数据源尚未健康时不消耗“首次刷新”机会，等天勤恢复后由上面的恢复路径处理。
-                if tq_required && !tq_available {
-                    continue;
-                }
-                startup_refresh_done = true;
-                if action == n_core::scheduler::SchedulerAction::None
-                    && n_core::scheduler::is_trading_time(&now)
-                {
-                    action = n_core::scheduler::SchedulerAction::Refresh;
-                }
-            }
-            match action {
-                n_core::scheduler::SchedulerAction::None => {}
-                n_core::scheduler::SchedulerAction::Refresh => {
-                    tick_refresh(&app, &state).await;
-                }
-                n_core::scheduler::SchedulerAction::Scan => {
-                    tick_scan(&app, &state).await;
-                }
-                n_core::scheduler::SchedulerAction::RefreshAndScan => {
-                    tick_refresh(&app, &state).await;
-                    tick_scan(&app, &state).await;
-                }
-            }
-        }
-    });
-}
-
-/// 天勤桥接服务健康后执行一次强制历史回补，并立即修复可恢复的中间缺口。
-async fn recover_after_tq_ready(app: &AppHandle, state: &Arc<AppState>) -> bool {
-    let t0 = Instant::now();
-    tracing::info!("🔄 天勤数据源恢复，启动强制历史回补与缺口检查");
-
-    let refresh_ok = match state.services.refresh_data_with_backfill().await {
-        Ok(stats) => {
-            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
-            if stats.succeeded > 0 {
-                state.note_refresh_success().await;
-                let _ = app.emit("data-updated", &stats);
-            }
-            tracing::info!(
-                "✅ 天勤恢复回补完成 耗时 {}ms | 成功 {} 失败 {}",
-                t0.elapsed().as_millis(),
-                stats.succeeded,
-                stats.failures
-            );
-            stats.succeeded > 0
-        }
-        Err(error) => {
-            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
-            tracing::warn!("⚠ 天勤恢复回补失败，保留待重试状态: {error:#}");
-            false
-        }
-    };
-
-    if !refresh_ok || !state.services.data_source.tq_is_available() {
-        return false;
-    }
-
-    match state.services.repair_all_symbols_integrity().await {
-        Ok(results) => {
-            let repaired: usize = results.iter().map(|result| result.repaired_count).sum();
-            let remaining: usize = results.iter().map(|result| result.remaining_missing).sum();
-            tracing::info!(
-                "✅ 天勤恢复缺口检查完成 | 品种 {} | 自动补齐 {} 根 | 剩余缺口 {} 根",
-                results.len(),
-                repaired,
-                remaining
-            );
-        }
-        Err(error) => {
-            tracing::warn!("⚠ 天勤恢复后的缺口检查失败，下一次恢复/刷新继续重试: {error:#}");
-        }
-    }
-    true
-}
-
-const TRIGGER_EMAIL_PREDICTION_RETRIES: usize = 80;
-
-async fn send_email_background(
-    subject: String,
-    body: String,
-    settings: n_core::notify::email::EmailSettings,
-    label: &'static str,
-) -> bool {
-    match tauri::async_runtime::spawn_blocking(move || {
-        n_core::notify::email::send_summary(&subject, &body, &settings)
-    })
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::error!("{label}邮件发送失败: {error:#}");
-            false
-        }
-        Err(error) => {
-            tracing::error!("{label}邮件任务异常: {error}");
-            false
-        }
-    }
-}
-
-/// 等待触发K线闭合并完成冠军模型推理后发送；最多等待约20分钟。
-/// 同一事件可能同时从实时行情和定时扫描到达，scheduled 集合负责进程内去重。
-fn spawn_trigger_emails(state: Arc<AppState>, event_ids: Vec<i64>) {
-    if event_ids.is_empty() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        let cfg = state.services.config().await;
-        if !cfg.email.enabled || !cfg.email.sendable() {
-            return;
-        }
-        let mut pending = {
-            let mut scheduled = state.trigger_email_scheduled.lock().await;
-            event_ids
-                .into_iter()
-                .filter(|event_id| scheduled.insert(*event_id))
-                .collect::<Vec<_>>()
-        };
-        if pending.is_empty() {
-            return;
-        }
-
-        for attempt in 0..=TRIGGER_EMAIL_PREDICTION_RETRIES {
-            let champion_available =
-                match n_core::v2::prediction::has_champion_model(&state.services.db).await {
-                    Ok(value) => value,
-                    Err(error) => {
-                        tracing::warn!("查询冠军模型失败，稍后重试触发邮件: {error:#}");
-                        true
-                    }
-                };
-            let mut remaining = Vec::new();
-            for event_id in pending {
-                let win_rate =
-                    match n_core::v2::prediction::champion_win_rate(&state.services.db, event_id)
-                        .await
-                    {
-                        Ok(value) => value,
-                        Err(error) => {
-                            tracing::warn!(event_id, "查询模型胜率失败: {error:#}");
-                            None
-                        }
-                    };
-                let ready = win_rate.is_some()
-                    || !champion_available
-                    || attempt == TRIGGER_EMAIL_PREDICTION_RETRIES;
-                if !ready {
-                    remaining.push(event_id);
-                    continue;
-                }
-                let event =
-                    match n_core::storage::repo::pattern_event_by_id(&state.services.db, event_id)
-                        .await
-                    {
-                        Ok(Some(event)) => event,
-                        Ok(None) => {
-                            tracing::warn!(event_id, "触发邮件对应的正式信号已不存在");
-                            continue;
-                        }
-                        Err(error) => {
-                            tracing::warn!(event_id, "读取触发邮件信号失败: {error:#}");
-                            remaining.push(event_id);
-                            continue;
-                        }
-                    };
-                let model = win_rate
-                    .as_ref()
-                    .map(|rate| (rate.model_id.as_str(), rate.p_win));
-                let (subject, body) = n_core::notify::email::event_email_payload_with_model(
-                    n_core::notify::email::EventEmailKind::Trigger,
-                    &event,
-                    model,
-                );
-                tracing::info!(
-                    event_id,
-                    symbol = event.symbol,
-                    has_model_win_rate = win_rate.is_some(),
-                    "准备发送触发邮件"
-                );
-                let _ = send_email_background(subject, body, cfg.email.clone(), "触发信号").await;
-            }
-            pending = remaining;
-            if pending.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(15)).await;
-        }
-    });
-}
-
-fn spawn_preclose_emails(
-    state: Arc<AppState>,
-    updates: Vec<n_core::storage::entities::preclose_signals::Model>,
-) {
-    let signals = updates
-        .into_iter()
-        .filter(|signal| signal.state == "precheck")
-        .collect::<Vec<_>>();
-    if signals.is_empty() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        let cfg = state.services.config().await;
-        if !cfg.email.enabled || !cfg.email.sendable() {
-            return;
-        }
-        for signal in signals {
-            let parent = match n_core::storage::repo::pattern_event_by_id(
-                &state.services.db,
-                signal.parent_event_id,
-            )
-            .await
-            {
-                Ok(Some(parent)) => parent,
-                Ok(None) => {
-                    tracing::warn!(
-                        preclose_id = signal.id,
-                        parent_event_id = signal.parent_event_id,
-                        "预检测邮件对应的正式候选已不存在"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(preclose_id = signal.id, "读取预检测邮件候选失败: {error:#}");
-                    continue;
-                }
-            };
-            let (subject, body) = n_core::notify::email::preclose_email_payload(&signal, &parent);
-            tracing::info!(
-                preclose_id = signal.id,
-                symbol = signal.symbol,
-                "准备发送收盘前预检测邮件"
-            );
-            let _ = send_email_background(subject, body, cfg.email.clone(), "收盘前预检测").await;
-        }
-    });
-}
-
-fn spawn_preclose_candidate_emails(
-    state: Arc<AppState>,
-    updates: Vec<n_core::storage::entities::preclose_candidates::Model>,
-) {
-    // preclose_candidate_tick 会在后续行情跳动时回传同一行；仅首个 emitted_at/last_seen_at
-    // 相等的版本发邮件，避免临时候选刷新造成重复提醒。
-    let candidates = updates
-        .into_iter()
-        .filter(|candidate| {
-            candidate.state == "provisional" && candidate.emitted_at == candidate.last_seen_at
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        let cfg = state.services.config().await;
-        if !cfg.email.enabled || !cfg.email.sendable() {
-            return;
-        }
-        for candidate in candidates {
-            let (subject, body) =
-                n_core::notify::email::preclose_candidate_email_payload(&candidate);
-            tracing::info!(
-                candidate_id = candidate.id,
-                symbol = candidate.symbol,
-                "准备发送临时未收盘扫描邮件"
-            );
-            let _ = send_email_background(subject, body, cfg.email.clone(), "临时未收盘扫描").await;
-        }
-    });
-}
-
-/// 实时现价轮询：交易时段内按配置的轮询间隔批量拉一次
-/// 新浪实时行情并推送 `quote-updated` 事件，前端订阅后原地更新价格。
-/// 与调度器共用“运行/暂停”开关；盘外价格不变化，不发起请求。
-fn spawn_quote_poller(app: AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            // 轮询间隔从配置实时读取，保存设置后下一轮即生效
-            let interval_ms = state.services.config().await.quote.poll_interval_ms;
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-            let now = Local::now();
-            {
-                let rt = state.scheduler.read().await;
-                if !rt.running {
-                    continue;
-                }
-            }
-            if !n_core::scheduler::is_trading_time(&now) {
-                continue;
-            }
-            match state.services.realtime_quotes().await {
-                Ok(snapshots) => {
-                    // 每次轮询后对比形态入场点，命中则广播事件（去重在前端/后端均处理）
-                    match state.services.entry_trigger_hits(&snapshots).await {
-                        Ok(hits) if !hits.is_empty() => {
-                            let event_ids = hits.iter().map(|hit| hit.event_id).collect();
-                            let _ = app.emit("entry-trigger", &hits);
-                            spawn_trigger_emails(state.clone(), event_ids);
-                        }
-                        Err(error) => tracing::warn!("入场价触发检测失败: {error:#}"),
-                        _ => {}
-                    }
-                    match state.services.manual_level_alerts(&snapshots).await {
-                        Ok(alerts) if !alerts.is_empty() => {
-                            let _ = app.emit("manual-level-alert", &alerts);
-                        }
-                        Err(error) => tracing::warn!("关键区域轮询失败: {error:#}"),
-                        _ => {}
-                    }
-                    match state.services.preclose_tick(&snapshots).await {
-                        Ok(updates) if !updates.is_empty() => {
-                            let _ = app.emit("preclose-signal", &updates);
-                            spawn_preclose_emails(state.clone(), updates);
-                        }
-                        Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
-                        _ => {}
-                    }
-                    match state.services.preclose_candidate_tick(&snapshots).await {
-                        Ok(updates) if !updates.is_empty() => {
-                            let _ = app.emit("preclose-candidate", &updates);
-                            spawn_preclose_candidate_emails(state.clone(), updates);
-                        }
-                        Err(error) => tracing::warn!("临时未收盘扫描失败: {error:#}"),
-                        _ => {}
-                    }
-                    let _ = app.emit("quote-updated", &snapshots);
-                }
-                Err(e) => tracing::warn!("实时行情轮询失败: {e}"),
-            }
-        }
-    });
-}
-
-/// 天勤闭合K线快速路径：批量预订阅5m，可靠长轮询事件并仅扫描对应品种。
-/// 入场触发继续由现有3秒实时行情轮询负责。
-fn spawn_tq_bar_event_consumer(app: AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        let mut is_first_subscribe = true;
-        let mut after_id = 0u64;
-        let mut stream_id = String::new();
-        loop {
-            let cfg = state.services.config().await;
-            if cfg.data_source.primary_source != "tqsdk"
-                || !state.services.data_source.tq_is_available()
-            {
-                after_id = 0;
-                stream_id.clear();
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                continue;
-            }
-
-            let codes: Vec<String> =
-                match n_core::storage::repo::list_symbols(&state.services.db, true).await {
-                    Ok(rows) => rows.into_iter().map(|row| row.code).collect(),
-                    Err(error) => {
-                        tracing::warn!("天勤闭合事件订阅读取品种失败: {error}");
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        continue;
-                    }
-                };
-            if codes.is_empty() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            if is_first_subscribe {
-                is_first_subscribe = false;
-                // 冷启动错峰 30s：等 service::refresh_data 的 22*get_kline + subscribe_quotes 排空 worker 队列
-                // 否则单线程 TqDataWorker 会被 subscribe_klines(22*KQ.m@ 35s) 堵死，同期 quotes 12s 超时 queue=1->4
-                tracing::info!(
-                    "[FAST_PATH] 冷启动错峰: 首轮订阅延迟 30s，避免与历史K线抢单线程 worker"
-                );
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
-            let tq = state.services.data_source.tq_client().await;
-            let subscription = match tq.subscribe_klines(&codes, "5m", 1000).await {
-                Ok(response) => response,
-                Err(error) => {
-                    // 快速路径订阅失败仅暂停快速路径，不立即将整个天勤行情源判死（主行情仍可走 tqsdk）
-                    tracing::warn!("天勤K线批量订阅失败，快速路径暂停(不影响主行情源): {error:#}");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-            let stream_changed = stream_id != subscription.stream_id;
-            if stream_changed {
-                stream_id = subscription.stream_id;
-                after_id = 0;
-            }
-            if !subscription.failed.is_empty() {
-                tracing::warn!(
-                    "[FAST_PATH] isolates_failed={:?} fallback=legacy (单品种隔离)",
-                    subscription.failed
-                );
-            }
-            if subscription.subscribed.len() != codes.len() {
-                let subscribed: std::collections::HashSet<&str> =
-                    subscription.subscribed.iter().map(String::as_str).collect();
-                let missing: Vec<&str> = codes
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|code| !subscribed.contains(code))
-                    .collect();
-                tracing::warn!(
-                    "[FAST_PATH_TIMEOUT] subscription_missing={:?} fallback=legacy",
-                    missing
-                );
-            }
-            tracing::info!(
-                "天勤闭合事件快速路径已订阅 {} 个品种(失败{}个) | stream={}",
-                subscription.subscribed.len(),
-                subscription.failed.len(),
-                stream_id
-            );
-            if stream_changed {
-                let stats = state.services.reconcile_tq_finality(&codes).await;
-                tracing::info!(
-                    "事件流初始化 Finality 安全补齐完成 | 成功 {} 失败 {}",
-                    stats.succeeded,
-                    stats.failures
-                );
-            }
-
-            let subscribed_at = Instant::now();
-            loop {
-                if state.services.config().await.data_source.primary_source != "tqsdk"
-                    || !state.services.data_source.tq_is_available()
-                    || subscribed_at.elapsed() > Duration::from_secs(60)
-                {
-                    break;
-                }
-                let response = match tq.poll_closed_bar_events(after_id, 25).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        // 长轮询失败仅中断本轮快速路径，重新订阅即可，不降级主数据源
-                        tracing::warn!(
-                            "天勤闭合事件长轮询失败，快速路径暂停(不影响主行情源): {error:#}"
-                        );
-                        break;
-                    }
-                };
-                if response.stream_id != stream_id {
-                    tracing::warn!(
-                        "天勤事件流实例已变化 {} -> {}，重新建立水位",
-                        stream_id,
-                        response.stream_id
-                    );
-                    stream_id = response.stream_id;
-                    after_id = 0;
-                    break;
-                }
-                if after_id > 0 && response.oldest_event_id > after_id.saturating_add(1) {
-                    tracing::warn!(
-                        "[FAST_PATH_TIMEOUT] event_gap after={} oldest={} latest={} fallback=legacy",
-                        after_id,
-                        response.oldest_event_id,
-                        response.latest_event_id
-                    );
-                    after_id = response.latest_event_id;
-                    continue;
-                }
-
-                for event in response.events {
-                    if event.event_id <= after_id {
-                        continue;
-                    }
-                    if event.event_id != after_id.saturating_add(1) && after_id != 0 {
-                        tracing::warn!(
-                            "[FAST_PATH_TIMEOUT] event_out_of_order expected={} actual={} fallback=legacy",
-                            after_id + 1,
-                            event.event_id
-                        );
-                        after_id = event.event_id;
-                        continue;
-                    }
-                    after_id = event.event_id;
-
-                    let event_age_ms = chrono::DateTime::parse_from_rfc3339(&event.emitted_at)
-                        .ok()
-                        .map(|time| {
-                            (chrono::Utc::now() - time.with_timezone(&chrono::Utc))
-                                .num_milliseconds()
-                                .max(0)
-                        })
-                        .unwrap_or(i64::MAX);
-                    if event_age_ms > 5_000 || event.source != "tqsdk" {
-                        tracing::warn!(
-                            "[FAST_PATH_TIMEOUT] {} bar_end={} age={}ms source={} fallback=legacy",
-                            event.symbol,
-                            event.bar_end,
-                            event_age_ms,
-                            event.source
-                        );
-                        continue;
-                    }
-                    if !state.services.data_source.tq_is_available() {
-                        tracing::warn!(
-                            "[FAST_PATH_TIMEOUT] {} bar_end={} actual_source=fallback fallback=legacy",
-                            event.symbol,
-                            event.bar_end
-                        );
-                        continue;
-                    }
-
-                    let total_started = Instant::now();
-                    match state.services.process_tq_closed_bar_event(&event).await {
-                        Ok(outcome) => {
-                            if let Some(result) = outcome.scan_result {
-                                let signal_count = result.new_warnings.len();
-                                let _ = app.emit("scan-completed", &result);
-                                tracing::info!(
-                                    "[FAST_SCAN] {} bar_end={} proof={:?} pipeline={}ms scan={}ms total={}ms signal={} duplicate_skipped={}",
-                                    event.symbol,
-                                    event.bar_end,
-                                    event.proof,
-                                    outcome.pipeline_ms,
-                                    outcome.scan_ms,
-                                    total_started.elapsed().as_millis(),
-                                    signal_count,
-                                    outcome.duplicate_skipped
-                                );
-                            } else {
-                                tracing::info!(
-                                    "[TQ_BAR_CLOSED] {} 5m_end={} proof={:?} event_lag={}ms pipeline={}ms duplicate_skipped={}",
-                                    event.symbol,
-                                    event.bar_end,
-                                    event.proof,
-                                    event.event_lag_ms,
-                                    outcome.pipeline_ms,
-                                    outcome.duplicate_skipped
-                                );
-                            }
-                        }
-                        Err(error) => tracing::warn!(
-                            "天勤闭合事件处理失败 {} {}: {error:#}，交由定时安全路径补扫",
-                            event.symbol,
-                            event.bar_end
-                        ),
-                    }
-                }
-            }
-        }
-    });
-}
-
-async fn tick_refresh(app: &AppHandle, state: &Arc<AppState>) {
-    let t0 = Instant::now();
-    tracing::info!("⏳ 定时刷新触发 | {}", Local::now().format("%H:%M:%S"));
-    match state.services.refresh_data().await {
-        Ok(stats) => {
-            // 请求完成后才推进调度锚点，避免请求尚未开始就吞掉一次重试机会；
-            // 全量失败由数据源恢复路径负责强制回补，普通调度仍按周期退避。
-            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
-            if stats.succeeded > 0 {
-                state.note_refresh_success().await;
-            }
-            let _ = app.emit("data-updated", &stats);
-            tracing::info!(
-                "✅ 定时刷新完成 耗时 {}ms | 成功 {} 失败 {} | 总计 {}",
-                t0.elapsed().as_millis(),
-                stats.succeeded,
-                stats.failures,
-                stats.succeeded + stats.failures
-            );
-            if stats.failures > 0 {
-                tracing::warn!(
-                    "⚠ 本次刷新有 {} 个品种失败，请检查网络或稍后重试",
-                    stats.failures
-                );
-            }
-        }
-        Err(e) => {
-            state.scheduler.write().await.refresh_anchor = Some(Local::now().naive_local());
-            tracing::error!("❌ 定时刷新失败 耗时 {}ms | {e}", t0.elapsed().as_millis());
-        }
-    }
-}
-
-async fn tick_scan(app: &AppHandle, state: &Arc<AppState>) {
-    let t0 = Instant::now();
-    state.scheduler.write().await.scan_anchor = Some(Local::now().naive_local());
-    tracing::info!("🔍 定时扫描触发 | {}", Local::now().format("%H:%M:%S"));
-    match state.services.run_scan().await {
-        Ok(res) => {
-            state.note_scan_success().await;
-            let _ = app.emit("scan-completed", &res);
-            match state
-                .services
-                .reconcile_preclose_signals(Local::now().naive_local())
-                .await
-            {
-                Ok(updates) if !updates.is_empty() => {
-                    let _ = app.emit("preclose-signal", &updates);
-                }
-                Err(error) => tracing::warn!("收盘前预检测结算失败: {error:#}"),
-                _ => {}
-            }
-            match state
-                .services
-                .reconcile_preclose_candidates(Local::now().naive_local())
-                .await
-            {
-                Ok(updates) if !updates.is_empty() => {
-                    let _ = app.emit("preclose-candidate", &updates);
-                }
-                Err(error) => tracing::warn!("临时未收盘候选结算失败: {error:#}"),
-                _ => {}
-            }
-            tracing::info!(
-                "✅ 定时扫描完成 耗时 {}ms | 扫描 {} 活跃信号 {} 新增预警 {} 新触发 {}",
-                t0.elapsed().as_millis(),
-                res.scanned,
-                res.active_count,
-                res.new_warnings.len(),
-                res.newly_triggered.len()
-            );
-            let cfg = state.services.config().await;
-            let min_score = cfg.notify.new_pattern_min_score;
-            spawn_trigger_emails(
-                state.clone(),
-                res.newly_triggered
-                    .iter()
-                    .filter(|event| event.entry_score >= min_score)
-                    .map(|event| event.id)
-                    .collect(),
-            );
-            if cfg.email.enabled && cfg.email.sendable() {
-                let triggered_ids: std::collections::HashSet<i64> =
-                    res.newly_triggered.iter().map(|e| e.id).collect();
-                let mut emails = Vec::new();
-                for e in res
-                    .new_warnings
-                    .iter()
-                    .filter(|e| e.entry_score >= min_score && !triggered_ids.contains(&e.id))
-                {
-                    emails.push((n_core::notify::email::EventEmailKind::Warning, e));
-                }
-                // 单K锤/针独立邮件(不受评分阈值限制,有就发)
-                for sb in &res.single_bars {
-                    let (subject, body) = n_core::notify::email::single_bar_email_payload(sb);
-                    if let Err(err) =
-                        n_core::notify::email::send_summary(&subject, &body, &cfg.email)
-                    {
-                        tracing::error!("单K邮件发送失败: {err}");
-                    }
-                }
-                for (kind, e) in emails {
-                    let (subject, body) = n_core::notify::email::event_email_payload(kind, e);
-                    tracing::info!(
-                        "[SEND_MAIL] subject='{}' to='{}' symbol='{}'",
-                        subject,
-                        cfg.email.to,
-                        e.symbol
-                    );
-                    if let Err(err) =
-                        n_core::notify::email::send_summary(&subject, &body, &cfg.email)
-                    {
-                        tracing::error!("邮件发送失败: {err}");
-                    }
-                }
-            }
-        }
-        Err(e) => tracing::error!("❌ 定时扫描失败 耗时 {}ms | {e}", t0.elapsed().as_millis()),
-    }
-}
-
 fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     use tauri::menu::{Menu, MenuItem};
 
@@ -1152,7 +271,6 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
             "quit" => {
                 QUITTING.store(true, Ordering::SeqCst);
                 let _ = app.save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
-                n_core::process::SidecarManager::stop();
                 app.exit(0);
             }
             _ => {}
@@ -1178,8 +296,6 @@ fn setup_tray(app: &tauri::App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 打开设置窗口：已存在则聚焦，否则新建独立窗口。
-/// 与主窗口一致使用自定义 titlebar（无系统装饰）。
 fn open_settings_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
         let _ = w.show();
@@ -1199,29 +315,3 @@ fn open_settings_window(app: &tauri::AppHandle) {
     .decorations(false)
     .build();
 }
-
-// 供命令层读取状态使用
-pub(crate) fn fmt_naive(t: NaiveDateTime) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AppInfo {
-    pub name: String,
-    pub version: String,
-}
-
-// build-001800
-
-// layout-003532
-// wheel-004322
-// signal-consistency-005058
-
-// global-zoom-010805
-// margin-8-011518
-// gaps+max-012837
-// pricegap-013445
-// gapfill-convention-1430
-// sessionbreak-gapfilter-1605
-
-// bg-enrich-013841
