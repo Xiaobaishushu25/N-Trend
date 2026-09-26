@@ -3,6 +3,10 @@ name = "n-trend-analyzer"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "n_trend_analyzer"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

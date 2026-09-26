@@ -109,15 +109,15 @@ pub fn run() {
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, _event| {
             #[cfg(desktop)]
             {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    if window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
+                    if _window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
                         api.prevent_close();
-                        let _ = window.hide();
-                    } else if window.label() != "main" {
-                        let _ = window
+                        let _ = _window.hide();
+                    } else if _window.label() != "main" {
+                        let _ = _window
                             .app_handle()
                             .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
                     }
