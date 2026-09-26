@@ -57,6 +57,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ntrend-android-apk
-          path: src-tauri/gen/android/app/build/outputs/apk/arm64/release/*.apk
+          path: src-tauri/gen/android/app/build/outputs/**/*.apk
           if-no-files-found: error
           retention-days: 14
