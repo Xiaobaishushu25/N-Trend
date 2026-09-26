@@ -68,7 +68,7 @@ fn resolve_data_dir() -> PathBuf {
 fn resolve_listen_addr() -> SocketAddr {
     let mut args = std::env::args().skip(1);
     let mut host = "0.0.0.0".to_string();
-    let mut port = 8780u16;
+    let mut port = 8081u16;
 
     while let Some(a) = args.next() {
         if a == "--port" {
@@ -90,7 +90,7 @@ fn resolve_listen_addr() -> SocketAddr {
         }
     }
 
-    format!("{host}:{port}").parse().unwrap_or_else(|_| "0.0.0.0:8780".parse().unwrap())
+    format!("{host}:{port}").parse().unwrap_or_else(|_| "0.0.0.0:8081".parse().unwrap())
 }
 
 fn print_help() {
@@ -98,7 +98,7 @@ fn print_help() {
         r#"ntrend-server (n-headless) - ntrend 权威服务端
 用法:
   cargo run -p n-headless -- --data-dir ./data
-  cargo run -p n-headless -- --data-dir /opt/ntrend/data --host 0.0.0.0 --port 8780
+  cargo run -p n-headless -- --data-dir /opt/ntrend/data --host 0.0.0.0 --port 8081
   cargo run -p n-headless -- --data-dir ./data --check-integrity
   cargo run -p n-headless -- --data-dir ./data --repair-integrity
 "#

@@ -10,7 +10,7 @@ Group=ntrend
 WorkingDirectory=/opt/ntrend
 Environment=RUST_LOG=info
 Environment=DATA_DIR=/opt/ntrend/data
-Environment=BIND_ADDR=0.0.0.0:8780
+Environment=BIND_ADDR=0.0.0.0:8081
 
 ExecStart=/opt/ntrend/bin/n-headless
 Restart=always
