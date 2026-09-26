@@ -90,12 +90,13 @@ jobs:
           text = app_gradle.read_text(encoding="utf-8")
           if 'create("release")' in text:
               raise SystemExit("Release signing already appears configured in app/build.gradle.kts")
+          text = "import java.util.Properties\n" + text
           if not re.search(r'(?m)^android\s*\{', text):
               raise SystemExit("Could not find the android block in app/build.gradle.kts")
           text = re.sub(
               r'(?m)^android\s*\{',
               '''android {
-              val signingProperties = java.util.Properties().apply {
+              val signingProperties = Properties().apply {
                   load(rootProject.file("keystore.properties").inputStream())
               }
               signingConfigs {
