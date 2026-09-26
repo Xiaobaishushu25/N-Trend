@@ -448,6 +448,8 @@ fn find_python_executable(custom: Option<&str>) -> Result<PathBuf> {
     let candidates = [
         r"C:\Users\Xbss\AppData\Local\Python\bin\python.exe",
         r"C:\Users\Xbss\AppData\Local\Python\pythoncore-3.14-64\python.exe",
+        "python3",
+        "/usr/bin/python3",
         "python.exe",
         "python",
         "py.exe",
