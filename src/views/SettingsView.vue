@@ -49,6 +49,7 @@ import {
   Trash,
 } from '@vicons/tabler'
 import { isTauri } from '@tauri-apps/api/core'
+import { emit } from '@tauri-apps/api/event'
 import {
   disable as disableAutoLaunch,
   enable as enableAutoLaunch,
@@ -57,6 +58,8 @@ import {
 import { api } from '../services/api'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
+import { useSymbolsStore } from '../stores/symbols'
+import { useGroupsStore } from '../stores/groups'
 import type {
   AuthRecord,
   BackupStatus,
@@ -178,6 +181,13 @@ async function pairDevice() {
     message.success(`设备配对成功！分配角色: ${res.role}`)
     await testConnection()
     await loadSymbols()
+    await useSymbolsStore().load().catch(() => {})
+    await useGroupsStore().load().catch(() => {})
+    try {
+      await emit('symbols-updated')
+    } catch {
+      // 浏览器预览等非 Tauri 环境静默忽略
+    }
     if (isAdmin.value) {
       await loadServerSettings()
     }

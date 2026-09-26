@@ -31,6 +31,7 @@ import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
 import { useScansStore } from '../stores/scans'
 import { useActionsStore } from '../stores/actions'
+import { useAppStore } from '../stores/app'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
@@ -43,6 +44,7 @@ defineOptions({ name: 'DashboardView' })
 
 const router = useRouter()
 const { isMobile } = usePlatform()
+const appStore = useAppStore()
 const symbolsStore = useSymbolsStore()
 const scansStore = useScansStore()
 const settingsStore = useSettingsStore()
@@ -960,6 +962,16 @@ watch(() => groupsStore.revision, () => {
   if (listDragging.value) return
   loadAll()
 })
+// 在线状态变为连通时，重新拉取分组与全部表格数据
+watch(
+  () => appStore.isOnline,
+  async (online) => {
+    if (online && !listDragging.value) {
+      await groupsStore.load().catch(() => {})
+      await loadAll()
+    }
+  },
+)
 // 标题栏操作完成（刷新/添加品种/刷新名称）后重拉表格；扫描由 scan-completed 事件驱动
 watch(
   () => actionsStore.reloadTick,

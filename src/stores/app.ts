@@ -8,6 +8,8 @@ import {
 import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, api } from '../services/api'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
+import { useGroupsStore } from './groups'
+import { useActionsStore } from './actions'
 import { isMainWindow, notify } from '../utils/notify'
 import { manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 import type { AppInfo, ConnectionStatus, ManualLevelAlert, RecentOutcomeFilters } from '../types'
@@ -95,12 +97,10 @@ export const useAppStore = defineStore('app', {
         await onConnectionStatusChanged(async (status) => {
           this.connectionStatus = status
           if (status === 'connected') {
-            const symbolsStore = useSymbolsStore()
-            if (symbolsStore.symbols.length === 0) {
-              symbolsStore.load().catch(() => {})
-            }
-            const settingsStore = useSettingsStore()
-            settingsStore.refreshStatus().catch(() => {})
+            await useSymbolsStore().load().catch(() => {})
+            await useGroupsStore().load().catch(() => {})
+            useSettingsStore().refreshStatus().catch(() => {})
+            useActionsStore().reloadTick++
           }
         }),
       )
@@ -129,8 +129,10 @@ export const useAppStore = defineStore('app', {
         }),
       )
       this.listeners.push(
-        await listen('symbols-updated', () => {
-          useSymbolsStore().load()
+        await listen('symbols-updated', async () => {
+          await useSymbolsStore().load().catch(() => {})
+          await useGroupsStore().load().catch(() => {})
+          useActionsStore().reloadTick++
         }),
       )
       this.listeners.push(

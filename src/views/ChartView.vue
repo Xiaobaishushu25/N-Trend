@@ -1801,6 +1801,17 @@ watch(symbol, () => {
 
 // 分组/组内顺序在别处被改动（如列表页表格拖拽）时，重拉本页列表
 watch(() => groupsStore.revision, () => loadGroupSymbols())
+watch(
+  () => appStore.isOnline,
+  async (online) => {
+    if (online) {
+      await symbolsStore.load().catch(() => {})
+      await groupsStore.load().catch(() => {})
+      await loadGroupSymbols().catch(() => {})
+      loadSnapshots()
+    }
+  },
+)
 
 onMounted(async () => {
   window.addEventListener('keydown', onReviewKeydown)
