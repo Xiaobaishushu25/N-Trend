@@ -5,6 +5,17 @@ on:
   push:
     branches:
       - feat/mobile
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'crates/n-core/**'
+      - 'crates/n-protocol/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ts'
+      - 'index.html'
+      - 'tsconfig*.json'
+      - '.github/workflows/android.yml'
 
 permissions:
   contents: read

@@ -17,7 +17,7 @@ pub struct AuthRecord {
 impl Default for AuthRecord {
     fn default() -> Self {
         Self {
-            server_url: "http://127.0.0.1:8780".to_string(),
+            server_url: "http://127.0.0.1:8081".to_string(),
             device_id: String::new(),
             device_token: String::new(),
             device_role: "pc_admin".to_string(),

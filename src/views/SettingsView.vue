@@ -102,7 +102,7 @@ const Tip = defineComponent({
 
 // ── 1. 服务端连接状态与配对 ──
 const authRecord = ref<AuthRecord>({
-  server_url: 'http://127.0.0.1:8780',
+  server_url: 'http://127.0.0.1:8081',
   device_id: '',
   device_token: '',
   device_role: 'pc_admin',
@@ -132,6 +132,8 @@ async function loadAuth() {
 async function testConnection() {
   testingConnection.value = true
   try {
+    // 自动同步当前输入的地址与参数
+    await api.updateAuthRecord(authRecord.value)
     const [meta, status] = await Promise.all([api.getMeta(), api.getServerStatus()])
     serverMeta.value = meta
     serverStatus.value = status
@@ -162,6 +164,8 @@ async function pairDevice() {
   }
   pairingBusy.value = true
   try {
+    // 自动保存当前输入的服务端地址，确保 Rust 后端即时使用最新地址发起配对
+    await api.updateAuthRecord(authRecord.value)
     const res = await api.pairDevice({
       deviceName: pairingDeviceName.value.trim() || 'Desktop PC',
       adminKey: pairingKey.value.trim(),
@@ -186,7 +190,7 @@ async function pairDevice() {
 
 // ── 2. 本地终端偏好 ──
 const clientSettings = ref<ClientLocalSettings>({
-  serverUrl: 'http://127.0.0.1:8780',
+  serverUrl: 'http://127.0.0.1:8081',
   deviceId: '',
   deviceName: 'Desktop PC',
   theme: 'dark',
@@ -540,11 +544,11 @@ onMounted(async () => {
                 <div class="setting-card-row">
                   <div class="row-label">
                     服务器 API 地址
-                    <Tip text="权威服务端 API 地址，如 http://127.0.0.1:8780 或云服务器 HTTPS 域名" />
+                    <Tip text="权威服务端 API 地址，如 http://127.0.0.1:8081 或云服务器 HTTPS 域名" />
                   </div>
                   <n-input
                     v-model:value="authRecord.server_url"
-                    placeholder="http://127.0.0.1:8780"
+                    placeholder="http://127.0.0.1:8081"
                     style="width: 320px"
                   />
                 </div>
