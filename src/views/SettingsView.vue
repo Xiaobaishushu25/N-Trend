@@ -559,7 +559,7 @@ onMounted(async () => {
                   <n-input
                     v-model:value="authRecord.server_url"
                     placeholder="http://127.0.0.1:8081"
-                    style="width: 320px"
+                    class="setting-input-wide"
                   />
                 </div>
                 <div class="setting-card-row">
@@ -572,7 +572,7 @@ onMounted(async () => {
                     type="password"
                     show-password-on="click"
                     placeholder="Bearer Token"
-                    style="width: 320px"
+                    class="setting-input-wide"
                   />
                 </div>
                 <div class="setting-card-row">
@@ -604,7 +604,7 @@ onMounted(async () => {
                     设备名称
                     <Tip text="用于在服务端管理列表中标识本台设备，如 '张三的办公电脑'。" />
                   </div>
-                  <n-input v-model:value="pairingDeviceName" placeholder="Desktop PC" style="width: 320px" />
+                  <n-input v-model:value="pairingDeviceName" placeholder="Desktop PC" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
@@ -614,8 +614,10 @@ onMounted(async () => {
                   <n-input
                     v-model:value="pairingKey"
                     type="password"
+                    show-password-on="click"
                     placeholder="输入服务端的 admin_key"
-                    style="width: 320px"
+                    class="setting-input-wide"
+                    @keyup.enter="pairDevice"
                   />
                 </div>
                 <div class="setting-card-row">
@@ -655,21 +657,21 @@ onMounted(async () => {
                     K线图默认显示根数
                     <Tip text="初次进入图表时可视区默认展示的K线数量。" />
                   </div>
-                  <n-input-number v-model:value="clientSettings.chartDisplayBars" :min="50" :max="1000" style="width: 180px" />
+                  <n-input-number v-model:value="clientSettings.chartDisplayBars" :min="50" :max="1000" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
                     右侧间隙（根）
                     <Tip text="图表最新K线距离右边界的留白距离。" />
                   </div>
-                  <n-input-number v-model:value="clientSettings.chartRightGap" :min="2" :max="50" style="width: 180px" />
+                  <n-input-number v-model:value="clientSettings.chartRightGap" :min="2" :max="50" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
                     K线最小间距（像素）
                     <Tip text="图表横向缩放时防止K线过细的最小像素间距。" />
                   </div>
-                  <n-input-number v-model:value="clientSettings.minBarSpacing" :min="2" :max="30" style="width: 180px" />
+                  <n-input-number v-model:value="clientSettings.minBarSpacing" :min="2" :max="30" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
@@ -680,7 +682,7 @@ onMounted(async () => {
                     v-model:value="clientSettings.timeframes"
                     multiple
                     :options="availableTimeframes"
-                    style="width: 320px"
+                    class="setting-input-wide"
                   />
                 </div>
               </div>
@@ -726,11 +728,11 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">数据刷新间隔（秒）</div>
-                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.refresh_interval_secs" :min="10" :max="600" style="width: 180px" />
+                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.refresh_interval_secs" :min="10" :max="600" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">形态扫描间隔（秒）</div>
-                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.scan_interval_secs" :min="10" :max="600" style="width: 180px" />
+                  <n-input-number v-model:value="serverSettingsUpdate.scheduler!.scan_interval_secs" :min="10" :max="600" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">仅在期货交易时段运行</div>
@@ -749,19 +751,19 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">快期账号</div>
-                  <n-input v-model:value="serverSettingsUpdate.dataSource!.tq_account" placeholder="快期账号" style="width: 240px" />
+                  <n-input v-model:value="serverSettingsUpdate.dataSource!.tq_account" placeholder="快期账号" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
                     快期密码
                     <Tip text="密码在服务端以 0600 权限单独存储于 secrets.json，从不返回客户端。" />
                   </div>
-                  <n-space align="center">
+                  <n-space align="center" style="max-width: 480px; width: 100%; justify-content: flex-end">
                     <n-input
                       v-model:value="newTqPassword"
                       type="password"
                       placeholder="留空保持不变"
-                      style="width: 200px"
+                      style="flex: 1; min-width: 180px"
                     />
                     <n-tag size="small" type="success" v-if="serverSettings?.dataSource?.tqPasswordConfigured">已配置</n-tag>
                     <n-tag size="small" type="warning" v-else>未配置</n-tag>
@@ -769,7 +771,7 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">Python 桥接端口</div>
-                  <n-input-number v-model:value="serverSettingsUpdate.dataSource!.bridge_port" style="width: 180px" />
+                  <n-input-number v-model:value="serverSettingsUpdate.dataSource!.bridge_port" class="setting-input-number" />
                 </div>
               </div>
 
@@ -781,24 +783,24 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">SMTP 服务器地址</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_host" placeholder="smtp.qq.com" style="width: 240px" />
+                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_host" placeholder="smtp.qq.com" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">SMTP 端口</div>
-                  <n-input-number v-model:value="serverSettingsUpdate.email!.smtp_port" style="width: 180px" />
+                  <n-input-number v-model:value="serverSettingsUpdate.email!.smtp_port" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">发件人账号</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_user" placeholder="user@example.com" style="width: 240px" />
+                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_user" placeholder="user@example.com" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">授权码 / 密码</div>
-                  <n-space align="center">
+                  <n-space align="center" style="max-width: 480px; width: 100%; justify-content: flex-end">
                     <n-input
                       v-model:value="newSmtpPassword"
                       type="password"
                       placeholder="留空保持不变"
-                      style="width: 200px"
+                      style="flex: 1; min-width: 180px"
                     />
                     <n-tag size="small" type="success" v-if="serverSettings?.email?.smtpPasswordConfigured">已配置</n-tag>
                     <n-tag size="small" type="warning" v-else>未配置</n-tag>
@@ -806,7 +808,7 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">接收邮箱</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" style="width: 240px" />
+                  <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" class="setting-input-wide" />
                 </div>
               </div>
             </div>
@@ -967,7 +969,7 @@ onMounted(async () => {
               placeholder="搜索品种代码或名称..."
               clearable
               size="small"
-              style="width: 220px"
+              style="width: 280px; max-width: 100%"
             />
             <span class="symbol-count">共 {{ filteredSymbols.length }} 个品种</span>
           </div>
@@ -1058,8 +1060,9 @@ onMounted(async () => {
 }
 
 .tab-body-inner {
-  padding: 6px 16px 20px 20px;
-  max-width: 720px;
+  padding: 12px 28px 28px 28px;
+  max-width: 1080px;
+  width: 100%;
   box-sizing: border-box;
 }
 
@@ -1068,8 +1071,9 @@ onMounted(async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 10px 16px 10px 20px;
-  max-width: 720px;
+  padding: 12px 28px;
+  max-width: 1080px;
+  width: 100%;
   box-sizing: border-box;
   background: var(--n-color);
   border-top: 1px solid var(--n-border-color);
@@ -1094,7 +1098,7 @@ onMounted(async () => {
   display: block;
   font-size: 14px;
   font-weight: 600;
-  margin: 14px 0 10px 0;
+  margin: 16px 0 10px 0;
   color: var(--n-text-color);
 }
 
@@ -1106,20 +1110,34 @@ onMounted(async () => {
   border: 1px solid var(--n-border-color);
   border-radius: 8px;
   background: var(--n-card-color);
-  padding: 4px 16px;
-  margin-bottom: 14px;
+  padding: 4px 20px;
+  margin-bottom: 16px;
+  transition: border-color 0.2s;
 }
 
 .setting-card-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 11px 0;
+  gap: 20px;
+  padding: 12px 0;
   border-bottom: 1px solid var(--n-border-color);
 }
 
 .setting-card-row:last-child {
   border-bottom: none;
+}
+
+.setting-input-wide {
+  width: 100% !important;
+  max-width: 480px;
+  min-width: 240px;
+}
+
+.setting-input-number {
+  width: 100% !important;
+  max-width: 200px;
+  min-width: 120px;
 }
 
 .row-label {
@@ -1128,6 +1146,7 @@ onMounted(async () => {
   gap: 6px;
   font-size: 13px;
   color: var(--n-text-color);
+  flex-shrink: 0;
 }
 
 .help-icon {
@@ -1139,8 +1158,10 @@ onMounted(async () => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 4px 16px 12px 20px;
-  max-width: 720px;
+  padding: 12px 28px 12px 28px;
+  max-width: 1080px;
+  width: 100%;
+  box-sizing: border-box;
   flex-shrink: 0;
 }
 
@@ -1152,25 +1173,31 @@ onMounted(async () => {
 .symbol-scroll-area {
   flex: 1;
   min-height: 0;
-  padding: 0 16px 20px 20px;
-  max-width: 720px;
+  padding: 0 28px 28px 28px;
+  max-width: 1080px;
+  width: 100%;
   box-sizing: border-box;
 }
 
 .symbol-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 10px;
 }
 
 .symbol-item {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 12px;
+  padding: 10px 14px;
   border: 1px solid var(--n-border-color);
   border-radius: 6px;
   background: var(--n-card-color);
+  transition: border-color 0.2s;
+}
+
+.symbol-item:hover {
+  border-color: var(--n-primary-color);
 }
 
 .symbol-info {
@@ -1198,6 +1225,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .tick-label {
