@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import {
   NConfigProvider,
   NDialogProvider,
@@ -13,8 +13,15 @@ import { useAppStore } from './stores/app'
 
 const appStore = useAppStore()
 
-/** 全局禁用浏览器默认右键菜单：整个 App 内右键统一走自定义菜单 */
+/** 全局禁用浏览器默认右键菜单：整个 App 内右键统一走自定义菜单，但放行输入框让原生粘贴菜单正常呼出 */
 function preventNativeContextMenu(e: MouseEvent) {
+  const target = e.target as HTMLElement | null
+  if (target) {
+    const tagName = target.tagName?.toLowerCase()
+    if (tagName === 'input' || tagName === 'textarea' || target.isContentEditable) {
+      return
+    }
+  }
   e.preventDefault()
 }
 

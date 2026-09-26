@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, defineComponent, h, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
@@ -27,6 +28,7 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import {
+  ArrowLeft,
   Bell,
   ChartCandle,
   Check,
@@ -35,6 +37,8 @@ import {
   Database,
   DeviceFloppy,
   Devices,
+  Eye,
+  EyeOff,
   Folder,
   Help,
   Key,
@@ -60,6 +64,7 @@ import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
 import { useGroupsStore } from '../stores/groups'
+import { usePlatform } from '../utils/platform'
 import type {
   AuthRecord,
   BackupStatus,
@@ -77,6 +82,16 @@ const settingsStore = useSettingsStore()
 const message = useMessage()
 const dialog = useDialog()
 const inTauri = isTauri()
+const router = useRouter()
+const { isMobile } = usePlatform()
+
+function goBack() {
+  if (window.history.length > 1) {
+    router.back()
+  } else {
+    void router.push({ name: 'dashboard' })
+  }
+}
 
 /** 工具提示组件 */
 const Tip = defineComponent({
@@ -118,6 +133,35 @@ const savingAuth = ref(false)
 const pairingKey = ref('')
 const pairingDeviceName = ref('Desktop PC')
 const pairingBusy = ref(false)
+const showPairingKey = ref(false)
+
+async function pasteServerUrl() {
+  try {
+    const text = await navigator.clipboard?.readText()
+    if (text) {
+      authRecord.value.server_url = text.trim()
+      message.success('已粘贴服务器地址')
+    } else {
+      message.warning('剪贴板为空')
+    }
+  } catch {
+    message.warning('无法自动读取剪贴板，请长按输入框直接粘贴')
+  }
+}
+
+async function pastePairingKey() {
+  try {
+    const text = await navigator.clipboard?.readText()
+    if (text) {
+      pairingKey.value = text.trim()
+      message.success('已从剪贴板粘贴密钥')
+    } else {
+      message.warning('剪贴板为空')
+    }
+  } catch {
+    message.warning('无法自动读取剪贴板，请长按输入框直接粘贴')
+  }
+}
 
 const isAdmin = computed(() => authRecord.value.device_role === 'pc_admin' || authRecord.value.device_role === 'admin')
 
@@ -126,6 +170,8 @@ async function loadAuth() {
     authRecord.value = await api.getAuthRecord()
     if (authRecord.value.device_name) {
       pairingDeviceName.value = authRecord.value.device_name
+    } else if (isMobile.value) {
+      pairingDeviceName.value = '手机端设备'
     }
   } catch (e) {
     // 忽略
@@ -272,6 +318,8 @@ const serverSettings = ref<ServerSettingsDto | null>(null)
 const serverSettingsUpdate = ref<ServerSettingsUpdate>({ configRevision: 0 })
 const newTqPassword = ref('')
 const newSmtpPassword = ref('')
+const showTqPassword = ref(false)
+const showSmtpPassword = ref(false)
 const savingServerSettings = ref(false)
 
 const logLevels = [
@@ -560,8 +608,28 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="settings-page">
-    <n-tabs type="line" placement="left" class="setting-tabs" default-value="connection">
+  <div class="settings-page" :class="{ 'is-mobile-page': isMobile }">
+    <!-- 移动端顶部便捷返回导航 -->
+    <div v-if="isMobile" class="mobile-settings-header">
+      <n-button quaternary circle size="small" class="m-back-btn" title="返回主界面" @click="goBack">
+        <template #icon><n-icon :component="ArrowLeft" size="18" /></template>
+      </n-button>
+      <span class="m-header-title">系统设置</span>
+      <div class="m-header-extra">
+        <n-tag :type="isAdmin ? 'primary' : 'default'" size="tiny" round>
+          {{ isAdmin ? '管理员' : '标准终端' }}
+        </n-tag>
+      </div>
+    </div>
+
+    <n-tabs
+      type="line"
+      :placement="isMobile ? 'top' : 'left'"
+      class="setting-tabs"
+      :class="{ 'is-mobile-tabs': isMobile }"
+      default-value="connection"
+      scrollable
+    >
       <!-- 1. 服务端连接 -->
       <n-tab-pane name="connection">
         <template #tab>
@@ -584,7 +652,14 @@ onMounted(async () => {
                     v-model:value="authRecord.server_url"
                     placeholder="http://127.0.0.1:8081"
                     class="setting-input-wide"
-                  />
+                    clearable
+                  >
+                    <template #suffix>
+                      <n-button quaternary size="tiny" type="primary" title="粘贴地址" @click="pasteServerUrl">
+                        粘贴
+                      </n-button>
+                    </template>
+                  </n-input>
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
@@ -601,7 +676,7 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">设备身份角色</div>
-                  <div style="display: flex; align-items: center; gap: 8px">
+                  <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                     <n-tag :type="isAdmin ? 'primary' : 'default'" size="small" round>
                       {{ isAdmin ? '主管理员 (PC Admin)' : '标准终端 (Standard)' }}
                     </n-tag>
@@ -622,13 +697,31 @@ onMounted(async () => {
               </div>
 
               <label class="section-title">管理密钥快速配对</label>
+              <!-- 帮助提示说明卡片 -->
+              <n-alert type="info" :show-icon="false" class="pairing-alert-tip">
+                <div class="pairing-tip-content">
+                  <div class="tip-line"><b>❓ 服务端配对 Admin Key 是什么？</b></div>
+                  <div class="tip-line text-muted">
+                    这是服务端（云端或本地）在 <code>secrets.json</code> 中配置的管理员主密钥（或通过 <code>NTREND_ADMIN_KEY</code> 设定），仅用于新终端首次接入时的配对鉴权。
+                  </div>
+                  <div class="tip-line" style="margin-top: 6px;"><b>📱 PC 端与手机端用同一个 Key 吗？</b></div>
+                  <div class="tip-line text-muted">
+                    <b>是的，完全用同一个！</b>只要连的是同一个后端服务，PC 端和手机端配对时填写的是<b>同一个服务端的 Admin Key</b>。点击“一键配对”后，服务端会自动为这台手机分发专属的 Token，后续通信无需再输入 Key。
+                  </div>
+                </div>
+              </n-alert>
+
               <div class="setting-card">
                 <div class="setting-card-row">
                   <div class="row-label">
                     设备名称
-                    <Tip text="用于在服务端管理列表中标识本台设备，如 '张三的办公电脑'。" />
+                    <Tip text="用于在服务端管理列表中标识本台设备，如 '我的手机' 或 '张三的办公电脑'。" />
                   </div>
-                  <n-input v-model:value="pairingDeviceName" placeholder="Desktop PC" class="setting-input-wide" />
+                  <n-input
+                    v-model:value="pairingDeviceName"
+                    :placeholder="isMobile ? '手机端设备' : 'Desktop PC'"
+                    class="setting-input-wide"
+                  />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">
@@ -637,16 +730,41 @@ onMounted(async () => {
                   </div>
                   <n-input
                     v-model:value="pairingKey"
-                    type="password"
-                    show-password-on="click"
+                    :type="showPairingKey ? 'text' : 'password'"
                     placeholder="输入服务端的 admin_key"
                     class="setting-input-wide"
+                    clearable
                     @keyup.enter="pairDevice"
-                  />
+                  >
+                    <template #suffix>
+                      <n-space :size="4" align="center">
+                        <n-button
+                          quaternary
+                          circle
+                          size="tiny"
+                          :title="showPairingKey ? '隐藏密钥' : '显示明文'"
+                          @click="showPairingKey = !showPairingKey"
+                        >
+                          <template #icon>
+                            <n-icon :component="showPairingKey ? EyeOff : Eye" size="14" />
+                          </template>
+                        </n-button>
+                        <n-button
+                          quaternary
+                          size="tiny"
+                          type="primary"
+                          title="从剪贴板粘贴"
+                          @click="pastePairingKey"
+                        >
+                          粘贴
+                        </n-button>
+                      </n-space>
+                    </template>
+                  </n-input>
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label" />
-                  <n-button type="primary" size="small" :loading="pairingBusy" @click="pairDevice">
+                  <n-button type="primary" size="medium" :block="isMobile" :loading="pairingBusy" @click="pairDevice">
                     一键配对并获取令牌
                   </n-button>
                 </div>
@@ -669,7 +787,7 @@ onMounted(async () => {
             <div class="tab-body-inner">
               <label class="section-title">系统与显示</label>
               <div class="setting-card">
-                <div class="setting-card-row">
+                <div class="setting-card-row is-switch-row">
                   <div class="row-label">
                     开机自动启动
                     <Tip text="开机后自动启动客户端；可在 Windows 任务管理器中随时管理。" />
@@ -713,11 +831,11 @@ onMounted(async () => {
             </div>
           </n-scrollbar>
           <!-- 底部固定保存栏 -->
-          <div class="tab-footer-bar">
+          <div class="tab-footer-bar" :class="{ 'is-mobile-footer': isMobile }">
             <div class="footer-tip">
               <n-text depth="3" style="font-size: 12px">偏好保存在本地客户端配置中</n-text>
             </div>
-            <n-button type="primary" size="medium" :loading="savingClientSettings" @click="saveClientSettings">
+            <n-button type="primary" :size="isMobile ? 'small' : 'medium'" :block="isMobile" :loading="savingClientSettings" @click="saveClientSettings">
               <template #icon><n-icon :component="DeviceFloppy" /></template>
               保存终端偏好
             </n-button>
@@ -739,13 +857,13 @@ onMounted(async () => {
             <div class="tab-body-inner">
               <label class="section-title">定时调度与形态</label>
               <div class="setting-card">
-                <div class="setting-card-row">
+                <div class="setting-card-row is-switch-row">
                   <div class="row-label">启动时自动运行定时任务</div>
                   <n-switch v-model:value="serverSettingsUpdate.appConfig!.auto_start_scheduler" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">信号分析版本</div>
-                  <n-radio-group v-model:value="serverSettingsUpdate.appConfig!.logic_version">
+                  <n-radio-group v-model:value="serverSettingsUpdate.appConfig!.logic_version" :size="isMobile ? 'small' : 'medium'">
                     <n-radio-button value="1">1.x 原版</n-radio-button>
                     <n-radio-button value="2">2.0 严格N字+箱体</n-radio-button>
                   </n-radio-group>
@@ -758,7 +876,7 @@ onMounted(async () => {
                   <div class="row-label">形态扫描间隔（秒）</div>
                   <n-input-number v-model:value="serverSettingsUpdate.scheduler!.scan_interval_secs" :min="10" :max="600" class="setting-input-number" />
                 </div>
-                <div class="setting-card-row">
+                <div class="setting-card-row is-switch-row">
                   <div class="row-label">仅在期货交易时段运行</div>
                   <n-switch v-model:value="serverSettingsUpdate.scheduler!.trading_only" />
                 </div>
@@ -768,7 +886,7 @@ onMounted(async () => {
               <div class="setting-card">
                 <div class="setting-card-row">
                   <div class="row-label">主力数据源</div>
-                  <n-radio-group v-model:value="serverSettingsUpdate.dataSource!.primary_source">
+                  <n-radio-group v-model:value="serverSettingsUpdate.dataSource!.primary_source" :size="isMobile ? 'small' : 'medium'">
                     <n-radio-button value="tqsdk">天勤 (tqsdk)</n-radio-button>
                     <n-radio-button value="sina">新浪 (sina)</n-radio-button>
                   </n-radio-group>
@@ -782,16 +900,22 @@ onMounted(async () => {
                     快期密码
                     <Tip text="密码在服务端以 0600 权限单独存储于 secrets.json，从不返回客户端。" />
                   </div>
-                  <n-space align="center" style="max-width: 480px; width: 100%; justify-content: flex-end">
+                  <div class="password-row-wrap">
                     <n-input
                       v-model:value="newTqPassword"
-                      type="password"
+                      :type="showTqPassword ? 'text' : 'password'"
                       placeholder="留空保持不变"
-                      style="flex: 1; min-width: 180px"
-                    />
+                      class="setting-input-wide"
+                    >
+                      <template #suffix>
+                        <n-button quaternary circle size="tiny" @click="showTqPassword = !showTqPassword">
+                          <template #icon><n-icon :component="showTqPassword ? EyeOff : Eye" size="14" /></template>
+                        </n-button>
+                      </template>
+                    </n-input>
                     <n-tag size="small" type="success" v-if="serverSettings?.dataSource?.tqPasswordConfigured">已配置</n-tag>
                     <n-tag size="small" type="warning" v-else>未配置</n-tag>
-                  </n-space>
+                  </div>
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">Python 桥接端口</div>
@@ -801,7 +925,7 @@ onMounted(async () => {
 
               <label class="section-title">邮件报警 (SMTP)</label>
               <div class="setting-card">
-                <div class="setting-card-row">
+                <div class="setting-card-row is-switch-row">
                   <div class="row-label">启用邮件通知</div>
                   <n-switch v-model:value="serverSettingsUpdate.email!.enabled" />
                 </div>
@@ -819,16 +943,22 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">授权码 / 密码</div>
-                  <n-space align="center" style="max-width: 480px; width: 100%; justify-content: flex-end">
+                  <div class="password-row-wrap">
                     <n-input
                       v-model:value="newSmtpPassword"
-                      type="password"
+                      :type="showSmtpPassword ? 'text' : 'password'"
                       placeholder="留空保持不变"
-                      style="flex: 1; min-width: 180px"
-                    />
+                      class="setting-input-wide"
+                    >
+                      <template #suffix>
+                        <n-button quaternary circle size="tiny" @click="showSmtpPassword = !showSmtpPassword">
+                          <template #icon><n-icon :component="showSmtpPassword ? EyeOff : Eye" size="14" /></template>
+                        </n-button>
+                      </template>
+                    </n-input>
                     <n-tag size="small" type="success" v-if="serverSettings?.email?.smtpPasswordConfigured">已配置</n-tag>
                     <n-tag size="small" type="warning" v-else>未配置</n-tag>
-                  </n-space>
+                  </div>
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">接收邮箱</div>
@@ -839,7 +969,7 @@ onMounted(async () => {
           </n-scrollbar>
 
           <!-- 底部固定保存栏：固定在底部，不随内容滚动 -->
-          <div class="tab-footer-bar">
+          <div class="tab-footer-bar" :class="{ 'is-mobile-footer': isMobile }">
             <div class="footer-tip">
               <n-text depth="3" style="font-size: 12px">
                 配置版本: rev{{ serverSettings?.configRevision ?? 0 }}
@@ -847,7 +977,8 @@ onMounted(async () => {
             </div>
             <n-button
               type="primary"
-              size="medium"
+              :size="isMobile ? 'small' : 'medium'"
+              :block="isMobile"
               :loading="savingServerSettings"
               @click="saveServerSettings"
             >
@@ -887,6 +1018,7 @@ onMounted(async () => {
                 :data="deviceList"
                 :loading="loadingDevices"
                 size="small"
+                :scroll-x="isMobile ? 560 : undefined"
                 :pagination="{ pageSize: 10 }"
               />
             </div>
@@ -909,7 +1041,7 @@ onMounted(async () => {
               <div class="setting-card">
                 <div class="setting-card-row">
                   <div class="row-label">备份目录位置</div>
-                  <n-text depth="2" style="font-family: monospace; font-size: 13px">
+                  <n-text depth="2" style="font-family: monospace; font-size: 13px; word-break: break-all;">
                     {{ backupStatus?.backup_dir || '加载中...' }}
                   </n-text>
                 </div>
@@ -959,7 +1091,7 @@ onMounted(async () => {
                     重启 ntrend 服务端
                     <Tip text="云端服务将完成当前正在进行的批处理后受控退出，由 systemd 守护进程安全拉起。" />
                   </div>
-                  <n-button type="warning" size="small" :loading="restartingServer" @click="handleRestartServer">
+                  <n-button type="warning" size="small" :block="isMobile" :loading="restartingServer" @click="handleRestartServer">
                     重启服务端主进程
                   </n-button>
                 </div>
@@ -968,7 +1100,7 @@ onMounted(async () => {
                     单独重启天勤 Python 桥接
                     <Tip text="当行情连接卡死或需要重置天勤 Python 进程时使用。" />
                   </div>
-                  <n-button size="small" :loading="restartingBridge" @click="handleRestartBridge">
+                  <n-button size="small" :block="isMobile" :loading="restartingBridge" @click="handleRestartBridge">
                     重启天勤 Bridge
                   </n-button>
                 </div>
@@ -993,7 +1125,7 @@ onMounted(async () => {
               placeholder="搜索品种代码或名称..."
               clearable
               size="small"
-              style="width: 280px; max-width: 100%"
+              class="symbol-filter-input"
             />
             <span class="symbol-count">共 {{ filteredSymbols.length }} 个品种</span>
           </div>
@@ -1037,6 +1169,53 @@ onMounted(async () => {
   flex-direction: column;
 }
 
+.is-mobile-page {
+  padding: 0 !important;
+}
+
+.mobile-settings-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--n-border-color);
+  background: var(--n-card-color);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+.m-back-btn {
+  color: var(--n-text-color);
+}
+
+.m-header-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--n-text-color);
+  flex: 1;
+}
+
+.m-header-extra {
+  flex-shrink: 0;
+}
+
+.pairing-alert-tip {
+  margin-bottom: 14px;
+  border-radius: 8px;
+}
+
+.pairing-tip-content {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.tip-line code {
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
 .setting-tabs {
   height: 100%;
   flex: 1;
@@ -1061,6 +1240,7 @@ onMounted(async () => {
   gap: 8px;
   font-size: 13px;
   padding: 4px 0;
+  white-space: nowrap;
 }
 
 .tab-icon {
@@ -1152,6 +1332,18 @@ onMounted(async () => {
   border-bottom: none;
 }
 
+.password-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 480px;
+  width: 100%;
+}
+
+.password-row-wrap .setting-input-wide {
+  flex: 1;
+}
+
 .setting-input-wide {
   width: 100% !important;
   max-width: 480px;
@@ -1187,6 +1379,11 @@ onMounted(async () => {
   width: 100%;
   box-sizing: border-box;
   flex-shrink: 0;
+}
+
+.symbol-filter-input {
+  width: 280px;
+  max-width: 100%;
 }
 
 .symbol-count {
@@ -1256,4 +1453,178 @@ onMounted(async () => {
   font-size: 12px;
   color: var(--n-text-color-3);
 }
+
+/* 移动端专属类样式（适配仿真与原生） */
+.is-mobile-page .setting-tabs :deep(.n-tabs-nav) {
+  padding: 0 6px;
+  background: var(--n-color);
+  border-bottom: 1px solid var(--n-border-color);
+}
+
+.is-mobile-page .setting-tabs :deep(.n-tabs-wrapper) {
+  overflow-x: auto;
+}
+
+.is-mobile-page .custom-tab-label {
+  gap: 4px;
+  font-size: 12px;
+  padding: 4px 2px;
+}
+
+.is-mobile-page .tab-body-inner {
+  padding: 8px 12px 28px 12px;
+}
+
+.is-mobile-page .setting-card {
+  padding: 4px 12px;
+  margin-bottom: 12px;
+}
+
+.is-mobile-page .setting-card-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.is-mobile-page .setting-card-row.is-switch-row {
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.is-mobile-page .row-label {
+  font-size: 13px;
+  width: 100%;
+  justify-content: flex-start;
+}
+
+.is-mobile-page .setting-input-wide,
+.is-mobile-page .setting-input-number {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
+}
+
+.is-mobile-page .tab-footer-bar {
+  padding: 10px 12px;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.is-mobile-page .tab-footer-bar .footer-tip {
+  justify-content: center;
+}
+
+.is-mobile-page .password-row-wrap {
+  max-width: 100%;
+}
+
+.is-mobile-page .symbol-table-header {
+  padding: 8px 12px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.is-mobile-page .symbol-filter-input {
+  width: 100% !important;
+  max-width: 100% !important;
+}
+
+.is-mobile-page .symbol-scroll-area {
+  padding: 0 12px 20px 12px;
+}
+
+.is-mobile-page .symbol-list {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.is-mobile-page .symbol-item {
+  padding: 8px 12px;
+}
+
+/* 屏幕媒体查询（保证任何<=768px宽度自动生效） */
+@media (max-width: 768px) {
+  .settings-page {
+    padding: 0 !important;
+  }
+  .setting-tabs :deep(.n-tabs-nav) {
+    padding: 0 6px;
+    background: var(--n-color);
+    border-bottom: 1px solid var(--n-border-color);
+  }
+  .setting-tabs :deep(.n-tabs-wrapper) {
+    overflow-x: auto;
+  }
+  .custom-tab-label {
+    gap: 4px;
+    font-size: 12px;
+    padding: 4px 2px;
+  }
+  .tab-body-inner {
+    padding: 8px 12px 28px 12px;
+  }
+  .setting-card {
+    padding: 4px 12px;
+    margin-bottom: 12px;
+  }
+  .setting-card-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 10px 0;
+  }
+  .setting-card-row.is-switch-row {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .row-label {
+    font-size: 13px;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .setting-input-wide,
+  .setting-input-number {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+  }
+  .tab-footer-bar {
+    padding: 10px 12px;
+    flex-direction: column;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .tab-footer-bar .footer-tip {
+    justify-content: center;
+  }
+  .password-row-wrap {
+    max-width: 100%;
+  }
+  .symbol-table-header {
+    padding: 8px 12px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .symbol-filter-input {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+  .symbol-scroll-area {
+    padding: 0 12px 20px 12px;
+  }
+  .symbol-list {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .symbol-item {
+    padding: 8px 12px;
+  }
+}
 </style>
+

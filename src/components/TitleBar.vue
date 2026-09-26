@@ -34,7 +34,11 @@ const { isMobile, isSimulatedMobile, toggleSimulatedMobile, isNativeMobile } = u
 let unlisteners: (() => void)[] = []
 
 const controlsVisible = computed(() => inTauri && props.showWindowControls)
-const barStyle = computed(() => ({ height: `${props.height}px` }))
+const barStyle = computed(() => ({
+  height: `calc(${props.height}px + env(safe-area-inset-top, 0px))`,
+  paddingTop: 'env(safe-area-inset-top, 0px)',
+  boxSizing: 'border-box' as const,
+}))
 
 /** 交互元素（按钮、链接、输入框等）不参与拖拽/双击最大化 */
 function isInteractive(target: EventTarget | null): boolean {
@@ -277,6 +281,7 @@ onBeforeUnmount(() => {
 
 .titlebar.is-mobile {
   padding-left: 6px;
+  padding-right: 4px;
 }
 .titlebar.is-mobile .tb-left {
   gap: 4px;

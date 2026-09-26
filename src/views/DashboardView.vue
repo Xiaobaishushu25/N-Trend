@@ -1016,7 +1016,7 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
   {
     title: '品种',
     key: 'symbol_info',
-    minWidth: 120,
+    minWidth: 80,
     render: (r) =>
       h('div', { class: 'mobile-sym-cell' }, [
         h('div', { class: 'mobile-sym-name-row' }, [
@@ -1029,7 +1029,7 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
   {
     title: '最新价',
     key: 'latest',
-    minWidth: 80,
+    width: 76,
     align: 'right',
     render: (r) =>
       h(
@@ -1041,7 +1041,7 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
   {
     title: '涨跌幅',
     key: 'change',
-    minWidth: 78,
+    width: 72,
     align: 'right',
     render: (r) => {
       if (r.changePct == null) return h('span', { class: 'cell-empty' }, '—')
@@ -1058,7 +1058,7 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
   {
     title: '形态信号',
     key: 'pattern_or_sig',
-    minWidth: 82,
+    width: 80,
     align: 'right',
     render: (r) => {
       const s = r.signal
@@ -1595,10 +1595,18 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
 }
 .is-mobile-layout .watch-table :deep(.n-data-table-td),
 .is-mobile-layout .watch-table :deep(.n-data-table-th) {
-  padding-left: 6px;
-  padding-right: 6px;
+  padding-left: 4px;
+  padding-right: 4px;
   padding-top: 7px;
   padding-bottom: 7px;
+}
+.is-mobile-layout .watch-table :deep(.n-data-table-th:first-child),
+.is-mobile-layout .watch-table :deep(.n-data-table-td:first-child) {
+  padding-left: 6px;
+}
+.is-mobile-layout .watch-table :deep(.n-data-table-th:last-child),
+.is-mobile-layout .watch-table :deep(.n-data-table-td:last-child) {
+  padding-right: 8px;
 }
 </style>
 

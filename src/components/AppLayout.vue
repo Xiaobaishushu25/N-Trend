@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import {
@@ -19,6 +20,7 @@ import {
 } from 'naive-ui'
 import { usePlatform } from '../utils/platform'
 import {
+  ArrowLeft,
   BellX,
   Clock,
   Database,
@@ -271,6 +273,23 @@ function onMobileActionSelect(key: string) {
   else onActionSelect(key)
 }
 
+async function handleStandaloneBack() {
+  try {
+    if (isTauri()) {
+      const win = getCurrentWindow()
+      if (win.label !== 'main') {
+        await win.close()
+        return
+      }
+    }
+  } catch {}
+  if (window.history.length > 1) {
+    router.back()
+  } else {
+    void router.push({ name: 'dashboard' })
+  }
+}
+
 function onActionSelect(key: string) {
   if (key === 'refresh') void actionsStore.refreshData()
   else if (key === 'scan') void actionsStore.scanNow()
@@ -363,9 +382,28 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <n-layout position="absolute" style="--app-header-h: 40px">
+  <n-layout position="absolute" style="--app-header-h: calc(40px + env(safe-area-inset-top, 0px))">
     <TitleBar :title="windowTitle">
-      <template v-if="!isStandaloneWindow" #left>
+      <template v-if="isStandaloneWindow" #left>
+        <div v-if="isMobile" class="standalone-tb-left">
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="返回主界面"
+            class="standalone-back-btn"
+            @click="handleStandaloneBack"
+          >
+            <template #icon>
+              <n-icon :component="ArrowLeft" size="18" />
+            </template>
+          </n-button>
+          <span class="tb-title">{{ windowTitle }}</span>
+        </div>
+        <span v-else class="tb-title">{{ windowTitle }}</span>
+      </template>
+
+      <template v-else #left>
         <div class="brand" :class="{ 'is-mobile-brand': isMobile }">
           <n-icon :component="TrendingUp" :size="isMobile ? 18 : 20" color="#f5c23f" />
           <span class="brand-name">N趋势</span>
@@ -434,7 +472,7 @@ onBeforeUnmount(() => {
                 marginRight: '4px'
               }"
             />
-            {{ appStore.statusBadge.text }}
+            {{ isMobile ? (appStore.connectionStatus === 'connected' ? '在线' : appStore.connectionStatus === 'reconnecting' ? '连中' : appStore.statusBadge.text) : appStore.statusBadge.text }}
             <span v-if="!isMobile && appStore.statusBadge.delay" style="font-size: 11px; margin-left: 4px; opacity: 0.85">
               {{ appStore.statusBadge.delay }}
             </span>
@@ -650,9 +688,9 @@ onBeforeUnmount(() => {
       position="absolute"
       class="app-layout-content"
       :class="{ 'bare-layout-content': bare }"
-      style="top: var(--app-header-h); bottom: 0; left: 0; right: 0;"
+      style="top: var(--app-header-h); bottom: env(safe-area-inset-bottom, 0px); left: env(safe-area-inset-left, 0px); right: env(safe-area-inset-right, 0px);"
       :native-scrollbar="false"
-      :content-style="bare ? 'height: 100%; padding: 0; overflow: hidden;' : isMobile ? 'height: 100%; box-sizing: border-box; padding: 6px;' : 'height: 100%; box-sizing: border-box; padding: 16px;'"
+      :content-style="bare ? 'height: 100%; padding: 0; overflow: hidden;' : isMobile ? 'height: 100%; box-sizing: border-box; padding: 4px 6px;' : 'height: 100%; box-sizing: border-box; padding: 16px;'"
     >
       <!-- 只缓存列表页（DashboardView）：返回时不再全量重载；K线图页不缓存，保持每次进入重置视图 -->
       <router-view v-slot="{ Component }">
@@ -704,6 +742,14 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+.standalone-tb-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.standalone-back-btn {
+  color: inherit;
 }
 .brand-name {
   font-size: 16px;
@@ -899,10 +945,8 @@ onBeforeUnmount(() => {
   height: 10px;
   background: #e2e8f0;
 }
-@media (max-width: 375px) {
-  .status-meta.is-mobile-meta .time-sec {
-    display: none;
-  }
+.status-meta.is-mobile-meta .time-sec {
+  display: none;
 }
 
 /* 状态弹出卡片样式 */
