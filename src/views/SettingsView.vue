@@ -327,7 +327,10 @@ async function loadClientSettings() {
     const s = await api.getClientSettings()
     clientSettings.value = {
       ...s,
+      chartDisplayBars: s.chartDisplayBars ?? (s as any).chart_display_bars ?? 200,
       mobileChartFullscreenBars: s.mobileChartFullscreenBars ?? (s as any).mobile_chart_fullscreen_bars ?? 180,
+      chartRightGap: s.chartRightGap ?? (s as any).chart_right_gap ?? 15,
+      minBarSpacing: s.minBarSpacing ?? (s as any).min_bar_spacing ?? 6,
       logLevel: s.logLevel || 'info',
     }
   } catch (e) {
@@ -345,7 +348,15 @@ async function loadClientSettings() {
 async function saveClientSettings() {
   savingClientSettings.value = true
   try {
-    await api.updateClientSettings(clientSettings.value)
+    const payload = {
+      ...clientSettings.value,
+      chart_display_bars: clientSettings.value.chartDisplayBars,
+      mobile_chart_fullscreen_bars: clientSettings.value.mobileChartFullscreenBars,
+      chart_right_gap: clientSettings.value.chartRightGap,
+      min_bar_spacing: clientSettings.value.minBarSpacing,
+    }
+    await api.updateClientSettings(payload as any)
+    await settingsStore.load()
     message.success('终端偏好已保存')
   } catch (e: any) {
     message.error(`保存失败: ${e?.message || e}`)

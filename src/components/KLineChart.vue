@@ -68,7 +68,11 @@ const legend = ref<HTMLDivElement | null>(null)
 const timeLeft = ref<HTMLDivElement | null>(null)
 const trendVisible = ref(true)
 const settingsStore = useSettingsStore()
-const minBarSpacing = computed(() => settingsStore.settings.ui.min_bar_spacing)
+const minBarSpacing = computed(() => {
+  const ui = settingsStore.settings?.ui as any
+  const spacing = Number(ui?.min_bar_spacing ?? ui?.minBarSpacing)
+  return Number.isFinite(spacing) && spacing > 0 ? spacing : 6
+})
 
 interface EventLabelData {
   time: Time
@@ -719,6 +723,22 @@ interface ChartViewState {
 }
 
 let lastView: ChartViewState | null = null
+
+interface SavedPortraitViewState {
+  from: number
+  to: number
+  span: number
+  symbol: string
+  timeframe: string
+  totalAtCapture: number
+}
+/** 保存进入全屏前竖屏模式的视图状态（视口跨度与位置），用于退出全屏时精准恢复，防止重置或缩水 */
+let portraitSavedView: SavedPortraitViewState | null = null
+/** 全屏切换过渡状态：entering 表示进入全屏过渡期，exiting 表示退出全屏过渡期 */
+let fsTransitionState: 'entering' | 'exiting' | null = null
+let fsTransitionTimer: ReturnType<typeof setTimeout> | null = null
+let lastObservedWidth = 0
+let lastObservedHeight = 0
 /** 最近一次写入图表的数据量：captureView 用它标记视图取自多长的数据，
  *  用于识别“数据不足被撑满”的短数据瞬态（详见 dropStaleView） */
 let lastDataCount = 0
@@ -772,14 +792,21 @@ let priceExtent = 1
 
 /** 进入图表时默认展示的K线根数（从最新一根往前数），由设置界面配置；全屏时优先使用移动端全屏配置 */
 const displayKNum = computed(() => {
+  const ui = settingsStore.settings?.ui as any
   if (props.isFullscreen) {
-    const fsBars = settingsStore.settings.ui.mobile_chart_fullscreen_bars
-    if (fsBars && fsBars > 0) return fsBars
+    const fsBars = Number(ui?.mobile_chart_fullscreen_bars ?? ui?.mobileChartFullscreenBars)
+    if (Number.isFinite(fsBars) && fsBars > 0) return Math.round(fsBars)
   }
-  return Math.max(1, settingsStore.settings.ui.chart_display_bars)
+  const defBars = Number(ui?.chart_display_bars ?? ui?.chartDisplayBars)
+  if (Number.isFinite(defBars) && defBars > 0) return Math.round(defBars)
+  return 140
 })
 /** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，由设置界面配置 */
-const displayRightGap = computed(() => Math.max(0, settingsStore.settings.ui.chart_right_gap))
+const displayRightGap = computed(() => {
+  const ui = settingsStore.settings?.ui as any
+  const gap = Number(ui?.chart_right_gap ?? ui?.chartRightGap)
+  return Number.isFinite(gap) && gap >= 0 ? Math.round(gap) : 10
+})
 /** 右侧留白占可见K线根数的比例上限：数据量少的品种留白按此比例缩水，避免右侧出现大片空白 */
 const right_gap_ratio = 0.1
 
@@ -1241,6 +1268,66 @@ function syncTrendSeries() {
   trendSeries.setData(data)
 }
 
+function updateLastViewFromRange(range: { from: number; to: number } | null) {
+  if (!range || !chart) return
+  const priceApi = chart.priceScale('right')
+  const priceRange = priceApi.getVisibleRange()
+  lastView = {
+    from: range.from,
+    to: range.to,
+    totalAtCapture: props.rows.length,
+    priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
+    priceAutoScale: priceApi.options().autoScale,
+  }
+}
+
+function capturePortraitView() {
+  if (!chart || !candleSeries || props.rows.length === 0) return
+  const logical = chart.timeScale().getVisibleLogicalRange()
+  if (logical) {
+    portraitSavedView = {
+      from: logical.from,
+      to: logical.to,
+      span: Math.max(1, logical.to - logical.from),
+      symbol: props.symbol,
+      timeframe: props.timeframe,
+      totalAtCapture: props.rows.length,
+    }
+  }
+}
+
+function restorePortraitView(): { from: number; to: number } | null {
+  if (!chart || !candleSeries || props.rows.length === 0) return null
+  const total = props.rows.length
+  if (
+    portraitSavedView &&
+    portraitSavedView.symbol === props.symbol &&
+    portraitSavedView.timeframe === props.timeframe
+  ) {
+    const span = Math.min(portraitSavedView.span, total)
+    const maxTo = total - 0.5 + rightGapBars(span)
+    let to: number
+    let from: number
+    const wasAtLatest =
+      portraitSavedView.totalAtCapture > 0 &&
+      portraitSavedView.to >= portraitSavedView.totalAtCapture - 1 - rightGapBars(span) - 1e-3
+    if (wasAtLatest) {
+      to = maxTo
+      from = Math.max(-0.5, to - span)
+    } else {
+      to = Math.min(maxTo, portraitSavedView.to)
+      from = Math.max(-0.5, to - span)
+    }
+    chart.timeScale().setVisibleLogicalRange({ from, to })
+    clampMinBarSpacing({ from, to })
+    const result = { from, to }
+    updateLastViewFromRange(result)
+    return result
+  } else {
+    return applyDefaultView()
+  }
+}
+
 function applyDefaultView(): { from: number; to: number } | null {
   if (!chart) return null
   // 空图表（数据尚未写入）上设置视图会污染时间轴的间距状态，等数据就位后再校准
@@ -1253,7 +1340,9 @@ function applyDefaultView(): { from: number; to: number } | null {
   const from = Math.max(-0.5, to - visible)
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
-  return { from, to }
+  const result = { from, to }
+  updateLastViewFromRange(result)
+  return result
 }
 
 /** 兜底：若K线间距小于 MIN_BAR_SPACING，收窄可见范围直到间距达标（右边缘不动）。
@@ -1813,17 +1902,42 @@ watch(() => props.isMobile, (mobile) => {
 
 watch(() => props.isFullscreen, (fs) => {
   if (!chart || !container.value) return
+  if (fs) {
+    // 进入全屏前，妥善保存当前竖屏视图跨度与位置
+    capturePortraitView()
+    fsTransitionState = 'entering'
+  } else {
+    // 退出全屏，标记过渡期以在尺寸变回竖屏时恢复竖屏视图
+    fsTransitionState = 'exiting'
+  }
+
+  if (fsTransitionTimer) clearTimeout(fsTransitionTimer)
+  fsTransitionTimer = setTimeout(() => {
+    fsTransitionState = null
+    fsTransitionTimer = null
+  }, 800)
+
   nextTick(() => {
     if (!chart || !container.value) return
-    chart.applyOptions({
-      width: container.value.clientWidth,
-      height: container.value.clientHeight,
-      layout: {
-        fontSize: fs ? 10 : (isMobileChart() ? 10 : 12),
-      },
-    })
-    applyPaneHeights()
-    applyDefaultView()
+    const width = container.value.clientWidth
+    const height = container.value.clientHeight
+    if (width > 0 && height > 0) {
+      lastObservedWidth = width
+      lastObservedHeight = height
+      chart.applyOptions({
+        width,
+        height,
+        layout: {
+          fontSize: fs ? 10 : (isMobileChart() ? 10 : 12),
+        },
+      })
+      applyPaneHeights()
+    }
+    if (fs) {
+      applyDefaultView()
+    } else {
+      restorePortraitView()
+    }
   })
 })
 
@@ -2558,9 +2672,17 @@ onMounted(() => {
   resizeObserver = new ResizeObserver((entries) => {
     const el = entries[0].target as HTMLElement
     const mobile = isMobileChart()
+    const width = el.clientWidth
+    const height = el.clientHeight
+    if (width <= 0 || height <= 0) return
+
+    const widthChanged = Math.abs(width - lastObservedWidth) > 2
+    lastObservedWidth = width
+    lastObservedHeight = height
+
     chart?.applyOptions({
-      width: el.clientWidth,
-      height: el.clientHeight,
+      width,
+      height,
       layout: {
         fontSize: props.isFullscreen ? 10 : (mobile ? 10 : 12),
       },
@@ -2572,6 +2694,19 @@ onMounted(() => {
     })
     applyPaneHeights()
     refreshManualLevelOverlay()
+
+    // 若在全屏进入/退出过渡期，或屏幕旋转导致宽度剧烈突变，重新根据当前实际容器尺寸校准目标视图
+    if (fsTransitionState === 'entering') {
+      applyDefaultView()
+    } else if (fsTransitionState === 'exiting') {
+      restorePortraitView()
+    } else if (widthChanged && Math.abs(width - (props.isFullscreen ? 800 : 390)) > 50) {
+      if (props.isFullscreen) {
+        applyDefaultView()
+      } else {
+        restorePortraitView()
+      }
+    }
   })
   resizeObserver.observe(container.value)
   renderData()
@@ -2718,6 +2853,10 @@ onBeforeUnmount(() => {
     chart?.removeSeries(trendSeries)
     trendSeries = null
   }
+  if (fsTransitionTimer) {
+    clearTimeout(fsTransitionTimer)
+    fsTransitionTimer = null
+  }
   chart?.remove()
   chart = null
   candleSeries = null
@@ -2731,6 +2870,10 @@ function toggleTrendVisible() {
 }
 
 function resetView() {
+  if (props.isFullscreen) {
+    return applyDefaultView()
+  }
+  portraitSavedView = null
   return applyDefaultView()
 }
 

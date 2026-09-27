@@ -67,7 +67,12 @@ const routeTimeframe = String(route.query.tf || '') as Timeframe
 const timeframe = ref<Timeframe>(allTimeframes.includes(routeTimeframe) ? routeTimeframe : '15m')
 const settingsStore = useSettingsStore()
 /** 图表加载的历史K线根数：至少保留现有 1200 根窗口，展示根数调大时同步扩容 */
-const chartLoadLimit = computed(() => Math.max(1200, settingsStore.settings.ui.chart_display_bars))
+const chartLoadLimit = computed(() => {
+  const ui = settingsStore.settings?.ui as any
+  const defBars = Number(ui?.chart_display_bars ?? ui?.chartDisplayBars) || 140
+  const fsBars = Number(ui?.mobile_chart_fullscreen_bars ?? ui?.mobileChartFullscreenBars) || 180
+  return Math.max(1200, defBars * 2, fsBars * 2)
+})
 /** 按配置勾选过滤后显示的周期；全部未勾选时回退为全部 */
 const visibleTimeframes = computed<Timeframe[]>(() => {
   const enabled = settingsStore.settings.ui.timeframes
@@ -831,9 +836,6 @@ async function enterMobileFullscreen() {
       await orientation.lock('landscape').catch(() => {})
     }
   } catch {}
-  nextTick(() => {
-    chartRef.value?.resetView?.()
-  })
 }
 
 async function exitMobileFullscreen() {
@@ -854,9 +856,6 @@ async function exitMobileFullscreen() {
       orientation.unlock()
     }
   } catch {}
-  nextTick(() => {
-    chartRef.value?.resetView?.()
-  })
 }
 
 function onDocumentFullscreenChange() {
