@@ -16,11 +16,12 @@ import android.webkit.WebView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    window.decorView.setBackgroundColor(Color.WHITE)
+    window.decorView.setBackgroundColor(Color.parseColor("#14171d"))
     val insetsController = WindowCompat.getInsetsController(window, window.decorView)
     insetsController.isAppearanceLightStatusBars = true
     insetsController.isAppearanceLightNavigationBars = true
@@ -39,10 +40,21 @@ class MainActivity : TauriActivity() {
       @JavascriptInterface
       fun setOrientation(orientation: String) {
         runOnUiThread {
+          val insetsController = WindowCompat.getInsetsController(window, window.decorView)
           when (orientation) {
-            "landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            "portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-            else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            "landscape" -> {
+              requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+              insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+              insetsController.hide(WindowInsetsCompat.Type.statusBars())
+            }
+            "portrait" -> {
+              requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+              insetsController.show(WindowInsetsCompat.Type.statusBars())
+            }
+            else -> {
+              requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+              insetsController.show(WindowInsetsCompat.Type.statusBars())
+            }
           }
         }
       }
@@ -53,4 +65,4 @@ class MainActivity : TauriActivity() {
 
 for main_activity in main_activities:
     main_activity.write_text(code, encoding="utf-8")
-    print(f"Patched {main_activity} with window insets, light status bar, and AndroidBridge orientation support")
+    print(f"Patched {main_activity} with window insets, light status bar, immersive fullscreen, and AndroidBridge orientation support")

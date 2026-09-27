@@ -1300,24 +1300,26 @@ function updateVolPaneTop() {
   if (!chart || !container.value) return
   const h = container.value.clientHeight
   if (h <= 0) return
+  const ratio = props.isFullscreen ? 0.86 : 0.82
   try {
     const pane0 = chart.paneSize(0)
-    if (pane0 && pane0.height > h * 0.65 && pane0.height < h * 0.92) {
+    if (pane0 && pane0.height > h * 0.65 && pane0.height < h * 0.95) {
       volPaneTop.value = pane0.height
       return
     }
   } catch {}
-  volPaneTop.value = Math.round(h * 0.82)
+  volPaneTop.value = Math.round(h * ratio)
 }
 
-/** 分配窗格高度：桌面端与移动端均稳定保持 82%/18%（成交量保持紧凑高度，保证K线有充足高度，绝不退化为1:1） */
+/** 分配窗格高度：全屏时 86%/14% 最大化K线高度与优良宽高比；默认 82%/18% */
 function applyPaneHeights() {
   if (!chart) return
   const panes = chart.panes()
   if (panes.length < 2) return
 
-  panes[0].setStretchFactor(820)
-  panes[1].setStretchFactor(180)
+  const isFs = props.isFullscreen
+  panes[0].setStretchFactor(isFs ? 860 : 820)
+  panes[1].setStretchFactor(isFs ? 140 : 180)
 
   updateVolPaneTop()
 }
@@ -1809,13 +1811,16 @@ watch(() => props.isMobile, (mobile) => {
   chart.priceScale('vol', 1).applyOptions({ visible: !isM })
 })
 
-watch(() => props.isFullscreen, () => {
+watch(() => props.isFullscreen, (fs) => {
   if (!chart || !container.value) return
   nextTick(() => {
     if (!chart || !container.value) return
     chart.applyOptions({
       width: container.value.clientWidth,
       height: container.value.clientHeight,
+      layout: {
+        fontSize: fs ? 10 : (isMobileChart() ? 10 : 12),
+      },
     })
     applyPaneHeights()
     applyDefaultView()
@@ -2439,6 +2444,7 @@ onMounted(() => {
     layout: {
       background: { type: ColorType.Solid, color: '#ffffff' },
       textColor: '#64748b',
+      fontSize: props.isFullscreen ? 10 : (isMobileChart() ? 10 : 12),
     },
     grid: {
       vertLines: { color: 'rgba(226, 232, 240, 0.6)' },
@@ -2551,9 +2557,13 @@ onMounted(() => {
 
   resizeObserver = new ResizeObserver((entries) => {
     const el = entries[0].target as HTMLElement
-    chart?.applyOptions({ width: el.clientWidth, height: el.clientHeight })
     const mobile = isMobileChart()
     chart?.applyOptions({
+      width: el.clientWidth,
+      height: el.clientHeight,
+      layout: {
+        fontSize: props.isFullscreen ? 10 : (mobile ? 10 : 12),
+      },
       rightPriceScale: { visible: !mobile },
     })
     chart?.priceScale('vol', 1).applyOptions({ visible: !mobile })

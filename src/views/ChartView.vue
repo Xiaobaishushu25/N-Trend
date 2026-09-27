@@ -2642,13 +2642,26 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="mfs-header-right">
+            <div class="mfs-header-tfs">
+              <button
+                v-for="t in visibleTimeframes"
+                :key="t"
+                type="button"
+                class="mfs-htf-btn"
+                :class="{ active: timeframe === t }"
+                @click="timeframe = t"
+              >
+                {{ t === '1d' ? '日K' : t }}
+              </button>
+            </div>
+
             <button
               type="button"
               class="mfs-icon-btn mfs-close-btn"
               @click="exitMobileFullscreen"
               title="退出全屏"
             >
-              <n-icon :component="X" :size="17" />
+              <n-icon :component="X" :size="15" />
             </button>
           </div>
         </div>
@@ -3256,22 +3269,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 移动端全屏底部周期栏 -->
-        <div v-if="isMobileFullscreen" class="mfs-bottombar">
-          <div class="mfs-bb-left">
-            <button
-              v-for="t in visibleTimeframes"
-              :key="t"
-              type="button"
-              class="mfs-bb-tf"
-              :class="{ active: timeframe === t }"
-              @click="timeframe = t"
-            >
-              {{ t === '1d' ? '日K' : t }}
-              <span v-if="timeframe === t" class="mfs-bb-tf-active-bar" />
-            </button>
-          </div>
-        </div>
+
       </div>
 
       <div
@@ -6381,42 +6379,44 @@ onBeforeUnmount(() => {
   max-height: 100vh !important;
   margin: 0 !important;
   padding: 0 !important;
-  background-color: #14171d !important;
+  padding-left: max(22px, env(safe-area-inset-left)) !important;
+  padding-right: max(8px, env(safe-area-inset-right)) !important;
+  background-color: #131722 !important;
   display: flex !important;
   flex-direction: column !important;
   overflow: hidden !important;
 }
 
-/* 顶部沉浸行情信息栏 */
+/* 顶部沉浸行情信息栏 - 超紧凑 32px 高度 */
 .mfs-header {
-  flex: 0 0 44px;
-  height: 44px;
-  background: #191c24;
-  border-bottom: 1px solid #282c37;
+  flex: 0 0 32px;
+  height: 32px;
+  background: #151820;
+  border-bottom: 1px solid #232732;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px;
+  padding: 0 6px;
   user-select: none;
-  gap: 8px;
+  gap: 6px;
   z-index: 20;
 }
 
 .mfs-header-left {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   flex-shrink: 0;
 }
 
 .mfs-nav-btn {
-  width: 26px;
-  height: 28px;
-  border-radius: 4px;
+  width: 20px;
+  height: 22px;
+  border-radius: 3px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.04);
   color: #94a3b8;
-  font-size: 16px;
+  font-size: 13px;
   font-weight: 700;
   display: flex;
   align-items: center;
@@ -6435,8 +6435,8 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 1px 4px;
+  border-radius: 3px;
   transition: background 0.15s;
 }
 
@@ -6446,28 +6446,28 @@ onBeforeUnmount(() => {
 }
 
 .mfs-sym-name {
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 700;
   color: #f8fafc;
-  line-height: 1.2;
+  line-height: 1.15;
   white-space: nowrap;
 }
 
 .mfs-sym-meta {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   line-height: 1;
 }
 
 .mfs-sym-code {
-  font-size: 10px;
+  font-size: 9px;
   color: #94a3b8;
   font-family: Consolas, monospace;
 }
 
 .mfs-sym-badge {
-  font-size: 9px;
+  font-size: 8px;
   color: #cbd5e1;
   background: rgba(255, 255, 255, 0.1);
   border-radius: 2px;
@@ -6481,7 +6481,7 @@ onBeforeUnmount(() => {
 .mfs-header-center {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   flex: 1 1 auto;
   min-width: 0;
   justify-content: center;
@@ -6492,26 +6492,26 @@ onBeforeUnmount(() => {
   flex-direction: column;
   align-items: flex-end;
   flex-shrink: 0;
-  line-height: 1.1;
+  line-height: 1.05;
 }
 
 .mfs-price-val {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 800;
   font-family: Consolas, monospace;
 }
 
 .mfs-price-changes {
   display: flex;
-  gap: 4px;
-  font-size: 10px;
+  gap: 3px;
+  font-size: 9px;
   font-weight: 600;
   font-family: Consolas, monospace;
 }
 
 .mfs-stats-grid {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   align-items: center;
   flex-wrap: nowrap;
   overflow: hidden;
@@ -6520,15 +6520,15 @@ onBeforeUnmount(() => {
 .mfs-stat-col {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   flex-shrink: 0;
 }
 
 .mfs-stat-item {
   display: flex;
-  gap: 4px;
-  font-size: 10px;
-  line-height: 1.2;
+  gap: 3px;
+  font-size: 8.5px;
+  line-height: 1.15;
 }
 
 .mfs-stat-item .lbl {
@@ -6556,10 +6556,49 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
 }
 
-.mfs-icon-btn {
-  width: 28px;
-  height: 28px;
+/* 顶部右上角时间周期切换 */
+.mfs-header-tfs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 1.5px;
   border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.mfs-htf-btn {
+  height: 20px;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s;
+  line-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mfs-htf-btn:hover {
+  color: #f1f5f9;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.mfs-htf-btn.active {
+  background: #ff6d00;
+  color: #fff;
+  font-weight: 700;
+}
+
+.mfs-icon-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 3px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(255, 255, 255, 0.04);
   color: #cbd5e1;
@@ -6570,48 +6609,37 @@ onBeforeUnmount(() => {
   transition: all 0.15s;
 }
 
-.mfs-icon-btn:hover,
-.mfs-icon-btn:active {
-  background: rgba(255, 255, 255, 0.12);
-  color: #fff;
-}
-
-.mfs-heart-btn.is-active {
-  color: #f59e0b;
-  border-color: rgba(245, 158, 11, 0.4);
-}
-
 .mfs-close-btn {
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.12);
   border: none;
   color: #fff;
 }
 
 .mfs-close-btn:hover,
 .mfs-close-btn:active {
-  background: rgba(239, 68, 68, 0.8);
+  background: rgba(239, 68, 68, 0.85);
 }
 
-/* 全屏形态与指标副栏 */
+/* 全屏形态与指标副栏 - 紧凑 20px 高度 */
 .mfs-subbar {
-  flex: 0 0 26px;
-  height: 26px;
-  background: #151820;
-  border-bottom: 1px solid #232732;
+  flex: 0 0 20px;
+  height: 20px;
+  background: #11141a;
+  border-bottom: 1px solid #1c202a;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 8px;
-  font-size: 11px;
+  padding: 0 6px;
+  font-size: 9.5px;
   z-index: 20;
-  gap: 6px;
+  gap: 4px;
 }
 
 .mfs-sub-left {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   flex: 1 1 auto;
   min-width: 0;
   overflow-x: auto;
@@ -6625,10 +6653,10 @@ onBeforeUnmount(() => {
 .mfs-pat-chip {
   display: flex;
   align-items: center;
-  gap: 3px;
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 10px;
+  gap: 2px;
+  padding: 0.5px 5px;
+  border-radius: 2px;
+  font-size: 9px;
   font-weight: 700;
   cursor: pointer;
   flex-shrink: 0;
@@ -6645,7 +6673,7 @@ onBeforeUnmount(() => {
 }
 
 .mfs-sub-state {
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 600;
   flex-shrink: 0;
 }
@@ -6653,8 +6681,8 @@ onBeforeUnmount(() => {
 .mfs-sub-levels {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 10px;
+  gap: 4px;
+  font-size: 9px;
   color: #94a3b8;
   flex-shrink: 0;
 }
@@ -6666,15 +6694,15 @@ onBeforeUnmount(() => {
 }
 
 .mfs-singlebar-chip {
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-size: 10px;
+  padding: 0.5px 4px;
+  border-radius: 2px;
+  font-size: 9px;
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .mfs-singlebar-desc {
-  font-size: 10px;
+  font-size: 9px;
   color: #94a3b8;
   white-space: nowrap;
 }
@@ -6682,20 +6710,20 @@ onBeforeUnmount(() => {
 .mfs-recent-chip {
   background: rgba(255, 255, 255, 0.08);
   color: #cbd5e1;
-  padding: 1px 5px;
-  border-radius: 3px;
-  font-size: 10px;
+  padding: 0.5px 4px;
+  border-radius: 2px;
+  font-size: 9px;
   flex-shrink: 0;
 }
 
 .mfs-recent-dir {
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .mfs-sub-score {
-  font-size: 10px;
+  font-size: 9px;
   color: #94a3b8;
   flex-shrink: 0;
 }
@@ -6706,21 +6734,21 @@ onBeforeUnmount(() => {
 }
 
 .mfs-recent-stat {
-  font-size: 10px;
-  padding: 0 4px;
+  font-size: 9px;
+  padding: 0 3px;
   border-radius: 2px;
   flex-shrink: 0;
 }
 
 .mfs-sub-neutral {
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
   color: #e2e8f0;
   flex-shrink: 0;
 }
 
 .mfs-sub-tip {
-  font-size: 10px;
+  font-size: 9px;
   color: #64748b;
   white-space: nowrap;
 }
@@ -6728,13 +6756,13 @@ onBeforeUnmount(() => {
 .mfs-sub-right {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 2px;
   flex-shrink: 0;
 }
 
 .mfs-sub-btn {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6742,7 +6770,7 @@ onBeforeUnmount(() => {
   background: transparent;
   color: #94a3b8;
   cursor: pointer;
-  border-radius: 3px;
+  border-radius: 2px;
   transition: all 0.15s;
 }
 
@@ -6760,7 +6788,7 @@ onBeforeUnmount(() => {
   color: #475569;
 }
 
-/* 图表主体与悬浮导航按钮 */
+/* 图表主体 */
 .chart-canvas-wrapper {
   position: relative;
   flex: 1 1 0;
@@ -6776,155 +6804,6 @@ onBeforeUnmount(() => {
   width: 100%;
   height: 100%;
   position: relative;
-}
-
-.mfs-chart-nav-btn {
-  position: absolute;
-  top: 45%;
-  transform: translateY(-50%);
-  z-index: 15;
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: rgba(24, 28, 38, 0.65);
-  backdrop-filter: blur(4px);
-  border: 1px solid rgba(255, 255, 255, 0.15);
-  color: rgba(255, 255, 255, 0.85);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.15s;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-}
-
-.mfs-chart-nav-btn:hover,
-.mfs-chart-nav-btn:active {
-  background: rgba(35, 41, 55, 0.85);
-  color: #fff;
-  transform: translateY(-50%) scale(1.08);
-}
-
-.mfs-nav-left {
-  left: 8px;
-}
-
-.mfs-nav-right {
-  right: 8px;
-}
-
-.mfs-chart-fastforward-btn {
-  position: absolute;
-  left: 14px;
-  bottom: 80px;
-  z-index: 15;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: rgba(249, 115, 22, 0.88);
-  border: none;
-  color: #fff;
-  box-shadow: 0 2px 8px rgba(249, 115, 22, 0.4);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.mfs-chart-fastforward-btn:hover,
-.mfs-chart-fastforward-btn:active {
-  background: rgb(234, 88, 12);
-  transform: scale(1.08);
-}
-
-/* 全屏底部周期栏 */
-.mfs-bottombar {
-  flex: 0 0 36px;
-  height: 36px;
-  background: #191c24;
-  border-top: 1px solid #282c37;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 6px;
-  z-index: 20;
-  gap: 6px;
-}
-
-.mfs-bb-left {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.mfs-bb-left::-webkit-scrollbar {
-  display: none;
-}
-
-.mfs-bb-tf {
-  position: relative;
-  padding: 6px 10px;
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: color 0.15s;
-}
-
-.mfs-bb-tf:hover {
-  color: #e2e8f0;
-}
-
-.mfs-bb-tf.active {
-  color: #ff6d00;
-  font-weight: 700;
-}
-
-.mfs-bb-tf-active-bar {
-  position: absolute;
-  bottom: 0;
-  left: 18%;
-  right: 18%;
-  height: 2px;
-  background: #ff6d00;
-  border-radius: 1px;
-}
-
-.mfs-bb-right {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-shrink: 0;
-}
-
-.mfs-bb-btn {
-  padding: 3px 8px;
-  height: 24px;
-  border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #cbd5e1;
-  font-size: 11px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.mfs-bb-btn:hover,
-.mfs-bb-btn:active {
-  background: rgba(255, 255, 255, 0.12);
-  color: #fff;
 }
 
 /* 全屏下拉弹窗样式 */
