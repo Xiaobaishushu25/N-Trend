@@ -366,7 +366,7 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         }
       }
 
-      // 3. Latest price line & left badge on mobile with transparency
+      // 3. Latest price line & left badge on mobile (solid opaque)
       const curPrice = this.latestPrice()
       if (curPrice != null && Number.isFinite(curPrice)) {
         const curY = this.source.priceToCoordinate(curPrice)
@@ -375,7 +375,7 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           const data = this.source.data()
           const lastCandle = data.length > 0 ? (data[data.length - 1] as any) : null
           const isUp = lastCandle ? curPrice >= lastCandle.open : true
-          const color = isUp ? 'rgba(224, 49, 49, 0.78)' : 'rgba(15, 157, 88, 0.78)'
+          const color = isUp ? '#e03131' : '#0f9d58'
           const lineColor = isUp ? '#e03131' : '#0f9d58'
 
           // Horizontal price line
@@ -387,14 +387,17 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           context.lineTo(width, curYRound)
           context.stroke()
 
-          // Price badge on the LEFT edge
+          // Price badge on the LEFT edge (solid opaque, high contrast)
           context.setLineDash([])
           const text = formatP(curPrice)
-          const tagW = Math.max(46, context.measureText(text).width + 8)
-          const tagH = 15
+          const textW = context.measureText(text).width
+          const tagW = Math.max(48, textW + 10)
+          const tagH = 17
           const tagX = 4
           const tagY = Math.max(2, Math.min(height - tagH - 2, curY - tagH / 2))
 
+          context.shadowColor = 'rgba(0, 0, 0, 0.25)'
+          context.shadowBlur = 3
           context.fillStyle = color
           context.beginPath()
           if (typeof (context as any).roundRect === 'function') {
@@ -403,40 +406,62 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
             context.rect(tagX, tagY, tagW, tagH)
           }
           context.fill()
+          context.shadowBlur = 0
 
           context.fillStyle = '#ffffff'
-          context.font = '600 10px Consolas, -apple-system, sans-serif'
+          context.font = '700 10.5px Consolas, -apple-system, sans-serif'
           context.textAlign = 'center'
           context.textBaseline = 'middle'
           context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
         }
       }
 
-      // 4. Hovered crosshair price badge on LEFT edge with white transparent background
+      // 4. Hovered crosshair price badge on LEFT edge (solid dark background, 100% opaque, high contrast)
       const chY = this.crosshairY()
       const chPrice = this.crosshairPrice()
       if (chY != null && chPrice != null && chY >= 0 && chY <= height) {
         context.setLineDash([])
         const text = formatP(chPrice)
-        const tagW = Math.max(48, context.measureText(text).width + 10)
-        const tagH = 16
+        context.font = '700 11px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+        const textW = context.measureText(text).width
+        const tagW = Math.max(52, textW + 12)
+        const tagH = 19
         const tagX = 4
         const tagY = Math.max(2, Math.min(height - tagH - 2, chY - tagH / 2))
 
-        context.fillStyle = 'rgba(255, 255, 255, 0.9)'
-        context.strokeStyle = 'rgba(148, 163, 184, 0.65)'
-        context.lineWidth = 1
+        // Solid opaque background with crisp shadow
+        context.shadowColor = 'rgba(15, 23, 42, 0.45)'
+        context.shadowBlur = 5
+        context.shadowOffsetY = 1
+        context.fillStyle = '#0f172a'
         context.beginPath()
         if (typeof (context as any).roundRect === 'function') {
-          ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+          ;(context as any).roundRect(tagX, tagY, tagW, tagH, 4)
         } else {
           context.rect(tagX, tagY, tagW, tagH)
         }
         context.fill()
+        context.shadowBlur = 0
+        context.shadowOffsetY = 0
+
+        // Crisp white border
+        context.strokeStyle = 'rgba(255, 255, 255, 0.35)'
+        context.lineWidth = 1
         context.stroke()
 
+        // Right indicator triangle pointing to the crosshair line
+        const arrowX = tagX + tagW
+        const arrowY = tagY + tagH / 2
         context.fillStyle = '#0f172a'
-        context.font = '600 10px Consolas, -apple-system, sans-serif'
+        context.beginPath()
+        context.moveTo(arrowX, arrowY - 3.5)
+        context.lineTo(arrowX + 3.5, arrowY)
+        context.lineTo(arrowX, arrowY + 3.5)
+        context.closePath()
+        context.fill()
+
+        // High-contrast white text
+        context.fillStyle = '#ffffff'
         context.textAlign = 'center'
         context.textBaseline = 'middle'
         context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
@@ -779,9 +804,9 @@ function getPricePrecision(rows: KlineRow[]): number {
   return 0
 }
 
-/** 价格轴上下留白：K线最高/最低点与图表边框之间的空隙比例。手机端顶部加大留白(18%)，彻底避免高K线与图例重叠 */
+/** 价格轴上下留白：K线最高/最低点与图表边框之间的空隙比例。手机端图例已独占一行，设为紧凑的 8% 避免浪费空间 */
 function getPriceScaleTop(): number {
-  return isMobileChart() ? 0.18 : 0.09
+  return isMobileChart() ? 0.08 : 0.09
 }
 const PRICE_SCALE_BOTTOM = 0.06
 
@@ -1260,15 +1285,22 @@ function updatePriceExtent() {
   priceExtent = Math.max(1e-9, hi - lo)
 }
 
-/** 分配窗格高度：蜡烛图 78%，成交量 22% */
+/** 分配窗格高度：桌面端 78%/22%；移动端给成交量留足高度(60-90px)，避免K线蜡烛图过分狭长纵向拉伸 */
 function applyPaneHeights() {
   if (!chart || !container.value) return
   const h = container.value.clientHeight
   if (h <= 0) return
   const panes = chart.panes()
   if (panes.length >= 2) {
-    panes[0].setHeight(Math.round(h * 0.78))
-    panes[1].setHeight(Math.max(40, Math.round(h * 0.22)))
+    const mobile = isMobileChart()
+    if (mobile) {
+      const volH = Math.max(60, Math.min(90, Math.round(h * 0.23)))
+      panes[1].setHeight(volH)
+      panes[0].setHeight(Math.max(60, h - volH))
+    } else {
+      panes[0].setHeight(Math.round(h * 0.78))
+      panes[1].setHeight(Math.max(40, Math.round(h * 0.22)))
+    }
   }
 }
 

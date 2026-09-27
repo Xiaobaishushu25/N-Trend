@@ -633,28 +633,108 @@ watch(isMobile, (mobile) => {
   }
 })
 
-/** 触控手势滑动切换品种 */
+/** 触控手势滑动切换品种（绑定至红框概要卡片区域，支持防误触） */
 let touchStartX = 0
 let touchStartY = 0
-function handleTouchStart(e: TouchEvent) {
+let touchStartTime = 0
+const isSwipingCard = ref(false)
+let suppressCardClick = false
+
+function handleCardTouchStart(e: TouchEvent) {
   if (e.touches.length === 1) {
     touchStartX = e.touches[0].clientX
     touchStartY = e.touches[0].clientY
+    touchStartTime = Date.now()
+    isSwipingCard.value = false
   }
 }
-function handleTouchEnd(e: TouchEvent) {
+
+function handleCardTouchMove(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    const dx = e.touches[0].clientX - touchStartX
+    const dy = e.touches[0].clientY - touchStartY
+    if (Math.abs(dx) > 25 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      isSwipingCard.value = true
+    }
+  }
+}
+
+function handleCardTouchEnd(e: TouchEvent) {
   if (e.changedTouches.length === 1) {
     const dx = e.changedTouches[0].clientX - touchStartX
     const dy = e.changedTouches[0].clientY - touchStartY
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    const dt = Date.now() - touchStartTime
+    if (Math.abs(dx) > 35 && Math.abs(dx) > Math.abs(dy) * 1.2 && dt < 800) {
+      // 成功判定为横滑切换品种
+      suppressCardClick = true
+      setTimeout(() => {
+        suppressCardClick = false
+        isSwipingCard.value = false
+      }, 300)
       if (dx < 0) {
         switchSymbol(1)
       } else {
         switchSymbol(-1)
       }
+    } else {
+      isSwipingCard.value = false
     }
   }
 }
+
+function handleCardClickCapture(e: MouseEvent) {
+  if (suppressCardClick) {
+    e.stopPropagation()
+    e.preventDefault()
+  }
+}
+
+/** 移动端底部决策看板状态与数据 */
+const mobilePanelTab = ref<'signal' | 'market' | 'levels'>('signal')
+const mobilePanelCollapsed = ref(false)
+
+const mobileMarketStats = computed(() => {
+  const rows = displayRows.value
+  if (!rows || !rows.length) return null
+  const last = rows[rows.length - 1]
+  const todayStr = last.ts ? last.ts.split(' ')[0] : ''
+  const todayRows = todayStr ? rows.filter((r) => r.ts && r.ts.startsWith(todayStr)) : []
+  const high = todayRows.length ? Math.max(...todayRows.map((r) => r.high)) : last.high
+  const low = todayRows.length ? Math.min(...todayRows.map((r) => r.low)) : last.low
+  const open = todayRows.length ? todayRows[0].open : last.open
+  const prevClose = todayRows.length > 1 ? todayRows[0].open : (last.close - (quotePoints.value || 0))
+  const amplitude = prevClose ? ((high - low) / prevClose) * 100 : 0
+  return {
+    open,
+    high,
+    low,
+    prevClose: Number.isFinite(prevClose) ? Number(prevClose).toFixed(1) : '—',
+    volume: last.volume,
+    openInterest: last.hold,
+    amplitude: amplitude.toFixed(2),
+  }
+})
+
+const mobileNearestLevels = computed(() => {
+  const cur = quotePrice.value
+  if (cur == null || !Number.isFinite(cur)) return []
+  const levels = activeManualLevels.value.map((l) => {
+    const mid = (l.zone_low + l.zone_high) / 2
+    const diff = mid - cur
+    const role = manualLevelEffectiveRole(l)
+    return {
+      id: l.id,
+      name: manualLevelDisplayName(l.name),
+      roleText: manualLevelRoleText(role),
+      role,
+      zone: `${l.zone_low.toFixed(1)} ~ ${l.zone_high.toFixed(1)}`,
+      mid,
+      diff,
+      diffText: diff > 0 ? `+${diff.toFixed(1)}` : diff.toFixed(1),
+    }
+  })
+  return levels.sort((a, b) => Math.abs(a.diff) - Math.abs(b.diff)).slice(0, 3)
+})
 
 /** 左侧品种列表开关与行情快照（手机端默认收起） */
 const showList = ref(!isMobile.value)
@@ -1910,7 +1990,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="chart-page">
-    <div class="topbar" @touchstart.passive="handleTouchStart" @touchend.passive="handleTouchEnd">
+    <div class="topbar">
       <!-- 桌面端顶部导航栏：保持原有完整布局与全部按钮不变 -->
       <template v-if="!isMobile">
         <div class="topbar-left">
@@ -2305,8 +2385,16 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="chart-col" @wheel.prevent="handleChartWheel">
-        <!-- 移动端顶部信息与形态卡片（稍微缩小K线高度，提供品种信息与最新活跃形态） -->
-        <div v-if="isMobile" class="mobile-summary-card">
+        <!-- 移动端顶部信息与形态卡片（红框区域：支持滑动切换品种并防误触） -->
+        <div
+          v-if="isMobile"
+          class="mobile-summary-card"
+          :class="{ 'is-swiping': isSwipingCard }"
+          @touchstart.passive="handleCardTouchStart"
+          @touchmove.passive="handleCardTouchMove"
+          @touchend.passive="handleCardTouchEnd"
+          @click.capture="handleCardClickCapture"
+        >
           <!-- 第1行：品种导航与行情概览 -->
           <div class="msc-symbol-row">
             <div class="msc-sym-nav">
@@ -2467,6 +2555,180 @@ onBeforeUnmount(() => {
           class="chart-empty"
           description="暂无K线数据，请先在列表页刷新数据"
         />
+
+        <!-- 移动端专属多维决策看板（利用缩减K线空白腾出的约五分之一高度，整合形态决策、盘口行情与关键支撑压力） -->
+        <div v-if="isMobile && !reviewMode" class="mobile-decision-panel" :class="{ 'is-collapsed': mobilePanelCollapsed }">
+          <div class="mdp-header">
+            <div class="mdp-tabs">
+              <button
+                type="button"
+                class="mdp-tab"
+                :class="{ active: mobilePanelTab === 'signal' }"
+                @click="mobilePanelTab = 'signal'; mobilePanelCollapsed = false"
+              >
+                <span>信号决策</span>
+                <span v-if="topActivePattern" class="mdp-tab-dot" />
+              </button>
+              <button
+                type="button"
+                class="mdp-tab"
+                :class="{ active: mobilePanelTab === 'market' }"
+                @click="mobilePanelTab = 'market'; mobilePanelCollapsed = false"
+              >
+                <span>行情盘口</span>
+              </button>
+              <button
+                type="button"
+                class="mdp-tab"
+                :class="{ active: mobilePanelTab === 'levels' }"
+                @click="mobilePanelTab = 'levels'; mobilePanelCollapsed = false"
+              >
+                <span>支撑压力</span>
+                <span v-if="activeManualLevels.length" class="mdp-tab-badge">{{ activeManualLevels.length }}</span>
+              </button>
+            </div>
+            <button
+              type="button"
+              class="mdp-collapse-btn"
+              :title="mobilePanelCollapsed ? '展开决策看板' : '折叠看板以增加K线显示高度'"
+              @click="mobilePanelCollapsed = !mobilePanelCollapsed"
+            >
+              <span class="mdp-collapse-icon">{{ mobilePanelCollapsed ? '▲' : '▼' }}</span>
+              <span>{{ mobilePanelCollapsed ? '展开看板' : '收起' }}</span>
+            </button>
+          </div>
+
+          <div v-show="!mobilePanelCollapsed" class="mdp-body">
+            <!-- Tab 1: 信号决策 -->
+            <div v-if="mobilePanelTab === 'signal'" class="mdp-content">
+              <div v-if="topActivePattern" class="mdp-signal-box">
+                <div class="mdp-box-top">
+                  <div class="mdp-box-title">
+                    <span class="mdp-badge" :class="topActivePattern.direction === 'up' ? 'badge-up' : 'badge-down'">
+                      {{ dirText(topActivePattern.direction) }} {{ levelSuffix(topActivePattern.level) }}
+                    </span>
+                    <span class="mdp-state" :class="stateType(topActivePattern.state)">
+                      ● {{ sigLabel(topActivePattern.state) }}
+                    </span>
+                    <span v-if="pwinFor(topActivePattern.number) != null" class="mdp-pwin">
+                      胜率 <b>{{ (pwinFor(topActivePattern.number)! * 100).toFixed(0) }}%</b>
+                    </span>
+                    <span v-else class="mdp-score">
+                      评分 <b>{{ topActivePattern.score.toFixed(1) }}</b>
+                    </span>
+                  </div>
+                  <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                    全部形态({{ signals.length }}) ›
+                  </button>
+                </div>
+                <div class="mdp-grid-4">
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">入场点位</span>
+                    <b class="mdp-cell-val">{{ topActivePattern.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">止损价</span>
+                    <b class="mdp-cell-val is-stop">{{ topActivePattern.stop.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">目标价</span>
+                    <b class="mdp-cell-val is-target">{{ topActivePattern.target.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">盈亏比(RR)</span>
+                    <b class="mdp-cell-val is-rr">{{ topActivePattern.rr.toFixed(1) }}</b>
+                  </div>
+                </div>
+                <div class="mdp-tip-row">
+                  <span class="mdp-tip-icon">💡</span>
+                  <span class="mdp-tip-text">
+                    {{ topActivePattern.state === 'triggered' ? '已触发区间，注意防守止损位' : '预警跟踪中，等待突破确认入场' }}
+                    <template v-if="quotePrice != null">
+                      · 距止损约 {{ Math.abs(quotePrice - topActivePattern.stop).toFixed(1) }} 点
+                    </template>
+                  </span>
+                </div>
+              </div>
+
+              <div v-else-if="topSingleBar" class="mdp-signal-box">
+                <div class="mdp-box-top">
+                  <span class="mdp-badge is-singlebar" :style="singleBarBadgeStyle(topSingleBar.kind)">
+                    单K · {{ topSingleBar.label }}
+                  </span>
+                  <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                    形态详情 ›
+                  </button>
+                </div>
+                <div class="mdp-singlebar-desc">{{ singleBarTitle(topSingleBar) }}</div>
+              </div>
+
+              <div v-else class="mdp-empty-box">
+                <span class="mdp-empty-text">当前暂无活跃形态，系统实时多周期自动扫描中</span>
+                <button type="button" class="mdp-empty-btn" @click="showMobileInfo = true">查看历史形态</button>
+              </div>
+            </div>
+
+            <!-- Tab 2: 行情盘口 -->
+            <div v-else-if="mobilePanelTab === 'market'" class="mdp-content">
+              <div v-if="mobileMarketStats" class="mdp-market-grid">
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">今开</span>
+                  <span class="mkt-val">{{ mobileMarketStats.open.toFixed(1) }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">最高</span>
+                  <span class="mkt-val is-up">{{ mobileMarketStats.high.toFixed(1) }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">最低</span>
+                  <span class="mkt-val is-down">{{ mobileMarketStats.low.toFixed(1) }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">昨收</span>
+                  <span class="mkt-val">{{ mobileMarketStats.prevClose }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">最新价</span>
+                  <span class="mkt-val" :style="{ color: quoteColor }">{{ quotePrice != null ? quotePrice.toFixed(1) : '—' }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">日内振幅</span>
+                  <span class="mkt-val">{{ mobileMarketStats.amplitude }}%</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">成交量</span>
+                  <span class="mkt-val">{{ mobileMarketStats.volume ?? '—' }}</span>
+                </div>
+                <div class="mdp-mkt-item">
+                  <span class="mkt-lbl">持仓量</span>
+                  <span class="mkt-val">{{ mobileMarketStats.openInterest ?? '—' }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Tab 3: 支撑压力 -->
+            <div v-else class="mdp-content">
+              <div v-if="mobileNearestLevels.length" class="mdp-levels-list">
+                <div v-for="l in mobileNearestLevels" :key="l.id" class="mdp-level-row">
+                  <div class="mdp-lvl-left">
+                    <span class="mdp-lvl-badge" :class="l.role === 'support' ? 'is-sup' : 'is-res'">
+                      {{ l.roleText }}
+                    </span>
+                    <span class="mdp-lvl-name">#K{{ l.id }} {{ l.name }}</span>
+                    <span class="mdp-lvl-zone">{{ l.zone }}</span>
+                  </div>
+                  <div class="mdp-lvl-right" :class="l.diff >= 0 ? 'is-above' : 'is-below'">
+                    {{ l.diff >= 0 ? '高于现价' : '低于现价' }} {{ Math.abs(l.diff).toFixed(1) }}点
+                  </div>
+                </div>
+              </div>
+              <div v-else class="mdp-empty-box">
+                <span class="mdp-empty-text">当前周期暂未绘制关键区域</span>
+                <button type="button" class="mdp-empty-btn" @click="toggleManualLevelDraw">新建关键区域</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div
@@ -4612,32 +4874,32 @@ onBeforeUnmount(() => {
     overflow: hidden;
   }
   .topbar {
-    padding: 4px 6px;
-    height: 40px;
+    padding: 3px 4px;
+    height: 36px;
     align-items: center;
     justify-content: space-between;
     overflow-x: hidden;
-    gap: 4px;
-    flex: 0 0 40px;
+    gap: 2px;
+    flex: 0 0 36px;
     box-sizing: border-box;
   }
   .m-topbar-left {
     display: flex;
     align-items: center;
-    gap: 3px;
+    gap: 2px;
     flex: 0 0 auto;
     flex-shrink: 0;
   }
   .m-topbar-center {
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     flex: 1 1 auto;
     min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
-    padding: 0 2px;
+    padding: 0 1px;
   }
   .m-topbar-center::-webkit-scrollbar {
     display: none;
@@ -4645,7 +4907,7 @@ onBeforeUnmount(() => {
   .m-topbar-right {
     display: flex;
     align-items: center;
-    gap: 3px;
+    gap: 2px;
     flex: 0 0 auto;
     flex-shrink: 0;
   }
@@ -4653,14 +4915,14 @@ onBeforeUnmount(() => {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 2px;
-    height: 28px;
-    padding: 0 6px;
+    gap: 1.5px;
+    height: 26px;
+    padding: 0 4.5px;
     border: 1px solid #e2e8f0;
-    border-radius: 6px;
+    border-radius: 5px;
     background: #fff;
     color: #475569;
-    font-size: 11.5px;
+    font-size: 11px;
     font-weight: 500;
     cursor: pointer;
     transition: all 0.15s;
@@ -4682,7 +4944,8 @@ onBeforeUnmount(() => {
     border-color: #93c5fd;
   }
   .m-back-btn {
-    padding: 0 6px;
+    width: 26px;
+    padding: 0;
   }
   .m-review-exit-btn {
     background: #fff1f2;
@@ -4691,19 +4954,20 @@ onBeforeUnmount(() => {
   }
   .m-tf-group {
     background: #f1f5f9;
-    padding: 2px;
-    border-radius: 6px;
-    gap: 2px;
+    padding: 1.5px 2px;
+    border-radius: 5px;
+    gap: 1.5px;
     display: inline-flex;
     align-items: center;
     white-space: nowrap;
     flex-shrink: 0;
   }
   .m-tf-btn {
-    height: 24px;
-    padding: 0 6px;
+    height: 23px;
+    padding: 0 4.5px;
+    min-width: 25px;
     font-size: 11px;
-    border-radius: 4px;
+    border-radius: 3.5px;
     border: none;
     background: transparent;
     color: #64748b;
@@ -4711,6 +4975,7 @@ onBeforeUnmount(() => {
     cursor: pointer;
     white-space: nowrap;
     flex-shrink: 0;
+    text-align: center;
   }
   .m-tf-btn.active {
     background: #fff;
@@ -4719,8 +4984,9 @@ onBeforeUnmount(() => {
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   }
   .m-tf-more {
-    height: 24px;
-    padding: 0 4px;
+    height: 23px;
+    width: 20px;
+    padding: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4826,6 +5092,14 @@ onBeforeUnmount(() => {
     flex-direction: column;
     overflow: hidden;
     flex: 0 0 auto;
+    transition: transform 0.12s ease-out, box-shadow 0.15s ease, border-color 0.15s ease;
+    user-select: none;
+    touch-action: pan-y;
+  }
+  .mobile-summary-card.is-swiping {
+    box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15);
+    border-color: #93c5fd;
+    transform: scale(0.99);
   }
   .msc-symbol-row {
     display: flex;
@@ -5159,6 +5433,333 @@ onBeforeUnmount(() => {
     height: 100%;
     display: flex;
     flex-direction: column;
+  }
+
+  /* 移动端专属决策看板样式（固定178px统一高度，彻底杜绝Tab切换时K线缩放跳动） */
+  .mobile-decision-panel {
+    margin: 3px 4px 3px 4px;
+    background: #fff;
+    border-radius: 8px;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 -1px 4px rgba(15, 23, 42, 0.03);
+    flex: 0 0 178px;
+    height: 178px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: height 0.2s cubic-bezier(0.16, 1, 0.3, 1), flex-basis 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .mobile-decision-panel.is-collapsed {
+    flex: 0 0 30px;
+    height: 30px;
+    margin-bottom: 2px;
+  }
+  .mdp-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 2px 6px;
+    height: 30px;
+    flex: 0 0 30px;
+    background: #fafbfc;
+    border-bottom: 1px solid #f1f5f9;
+    box-sizing: border-box;
+  }
+  .mdp-tabs {
+    display: flex;
+    gap: 3px;
+  }
+  .mdp-tab {
+    position: relative;
+    border: none;
+    background: transparent;
+    font-size: 11px;
+    font-weight: 500;
+    color: #64748b;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    transition: all 0.15s;
+    line-height: 1;
+  }
+  .mdp-tab.active {
+    color: #2563eb;
+    font-weight: 700;
+    background: #eff6ff;
+  }
+  .mdp-tab-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #ef4444;
+  }
+  .mdp-tab-badge {
+    font-size: 9px;
+    padding: 1px 4px;
+    border-radius: 99px;
+    background: #e2e8f0;
+    color: #475569;
+    line-height: 1;
+  }
+  .mdp-collapse-btn {
+    border: none;
+    background: transparent;
+    font-size: 10px;
+    color: #94a3b8;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+  .mdp-collapse-btn:active {
+    background: #f1f5f9;
+    color: #64748b;
+  }
+  .mdp-collapse-icon {
+    font-size: 8px;
+  }
+  .mdp-body {
+    flex: 1 1 0;
+    min-height: 0;
+    height: 148px;
+    padding: 7px 9px;
+    box-sizing: border-box;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .mdp-content {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 0;
+  }
+  .mdp-signal-box {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .mdp-box-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .mdp-box-title {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .mdp-badge {
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 1.5px 5px;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .mdp-state {
+    font-size: 10.5px;
+    font-weight: 600;
+  }
+  .mdp-pwin {
+    font-size: 10.5px;
+    color: #7c3aed;
+    background: rgba(124, 58, 237, 0.08);
+    padding: 1.5px 5px;
+    border-radius: 4px;
+    font-weight: 500;
+  }
+  .mdp-pwin b {
+    font-weight: 700;
+  }
+  .mdp-score {
+    font-size: 10.5px;
+    color: #64748b;
+  }
+  .mdp-score b {
+    color: #0f172a;
+    font-weight: 700;
+  }
+  .mdp-more-link {
+    border: none;
+    background: transparent;
+    color: #2563eb;
+    font-size: 10.5px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 0;
+  }
+  .mdp-grid-4 {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+  }
+  .mdp-cell {
+    background: #f8fafc;
+    border: 1px solid #f1f5f9;
+    border-radius: 4px;
+    padding: 3px 4px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .mdp-cell-lbl {
+    font-size: 9px;
+    color: #94a3b8;
+    margin-bottom: 1px;
+  }
+  .mdp-cell-val {
+    font-size: 11.5px;
+    font-weight: 700;
+    font-family: Consolas, monospace;
+    color: #0f172a;
+  }
+  .mdp-cell-val.is-stop {
+    color: #10b981;
+  }
+  .mdp-cell-val.is-target {
+    color: #ef4444;
+  }
+  .mdp-cell-val.is-rr {
+    color: #2563eb;
+  }
+  .mdp-tip-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    color: #475569;
+    background: #f8fafc;
+    padding: 3px 6px;
+    border-radius: 4px;
+  }
+  .mdp-tip-icon {
+    font-size: 11px;
+  }
+  .mdp-tip-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mdp-singlebar-desc {
+    font-size: 11px;
+    color: #475569;
+    padding: 4px 6px;
+    background: #f8fafc;
+    border-radius: 4px;
+  }
+  .mdp-empty-box {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 4px;
+  }
+  .mdp-empty-text {
+    font-size: 11px;
+    color: #94a3b8;
+  }
+  .mdp-empty-btn {
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    color: #2563eb;
+    font-size: 10.5px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .mdp-market-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+  }
+  .mdp-mkt-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 2px;
+    background: #f8fafc;
+    border: 1px solid #f1f5f9;
+    border-radius: 4px;
+    text-align: center;
+  }
+  .mkt-lbl {
+    color: #94a3b8;
+    font-size: 9.5px;
+    margin-bottom: 2px;
+  }
+  .mkt-val {
+    font-family: Consolas, monospace;
+    font-weight: 700;
+    color: #0f172a;
+    font-size: 11px;
+    line-height: 1.2;
+  }
+  .mkt-val.is-up {
+    color: #ef4444;
+  }
+  .mkt-val.is-down {
+    color: #10b981;
+  }
+  .mdp-levels-list {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .mdp-level-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 3px 6px;
+    background: #f8fafc;
+    border-radius: 4px;
+    font-size: 10.5px;
+  }
+  .mdp-lvl-left {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .mdp-lvl-badge {
+    font-size: 9px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  .mdp-lvl-badge.is-sup {
+    background: rgba(16, 185, 129, 0.12);
+    color: #059669;
+  }
+  .mdp-lvl-badge.is-res {
+    background: rgba(239, 68, 68, 0.12);
+    color: #ef4444;
+  }
+  .mdp-lvl-name {
+    color: #334155;
+    font-weight: 600;
+  }
+  .mdp-lvl-zone {
+    color: #94a3b8;
+    font-size: 10px;
+    font-family: Consolas, monospace;
+  }
+  .mdp-lvl-right {
+    font-family: Consolas, monospace;
+    font-weight: 600;
+    font-size: 10px;
+  }
+  .mdp-lvl-right.is-above {
+    color: #ef4444;
+  }
+  .mdp-lvl-right.is-below {
+    color: #059669;
   }
 }
 
