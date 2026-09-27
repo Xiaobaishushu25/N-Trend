@@ -14,13 +14,21 @@ import {
   NTab,
   NTabs,
   NText,
+  useMessage,
+  type DataTableColumn,
   type DataTableColumns,
 } from 'naive-ui'
 import {
+  ArrowDown,
+  ArrowUp,
   DeviceFloppy,
+  Eye,
+  EyeOff,
   FolderPlus,
   GripVertical,
+  LayoutColumns,
   Lock,
+  RotateClockwise,
   Settings,
   Star,
   Trash,
@@ -43,6 +51,7 @@ import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, Preclos
 defineOptions({ name: 'DashboardView' })
 
 const router = useRouter()
+const message = useMessage()
 const { isMobile } = usePlatform()
 const appStore = useAppStore()
 const symbolsStore = useSymbolsStore()
@@ -1007,29 +1016,199 @@ onBeforeUnmount(() => {
   precloseTimer = null
   tableSortable?.destroy()
   tableSortable = null
+  columnSortable?.destroy()
+  columnSortable = null
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
   for (const fn of unlisteners) fn()
 })
 
-const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
-  {
+// ── 移动端表格列配置与自定义顺序 ──
+export type MobileColumnKey = 'symbol_info' | 'latest' | 'change' | 'pattern' | 'state' | 'singleBar'
+
+const MOBILE_COLUMN_ORDER_KEY = 'ntrend_mobile_col_order_v1'
+const MOBILE_COLUMN_VISIBILITY_KEY = 'ntrend_mobile_col_vis_v1'
+
+const DEFAULT_MOBILE_COLUMN_ORDER: MobileColumnKey[] = [
+  'symbol_info',
+  'latest',
+  'change',
+  'pattern',
+  'state',
+  'singleBar',
+]
+
+const MOBILE_COLUMN_META: Record<MobileColumnKey, { title: string; desc: string }> = {
+  symbol_info: { title: '品种', desc: '品种名称与合约代码' },
+  latest: { title: '最新价', desc: '最新成交价及涨跌色' },
+  change: { title: '涨跌幅', desc: '当日涨跌百分比胶囊' },
+  pattern: { title: '形态', desc: 'N字/箱体形态识别信号' },
+  state: { title: '状态', desc: '信号触发与时效状态' },
+  singleBar: { title: '十字星', desc: '十字星/单K形态识别' },
+}
+
+function loadMobileColumnOrder(): MobileColumnKey[] {
+  try {
+    const saved = localStorage.getItem(MOBILE_COLUMN_ORDER_KEY)
+    if (saved) {
+      const parsed = JSON.parse(saved)
+      if (Array.isArray(parsed)) {
+        // 兼容旧版键名
+        const normalized = parsed.map((k) => (k === 'pattern_or_sig' ? 'pattern' : k))
+        const validKeys = normalized.filter((k): k is MobileColumnKey =>
+          DEFAULT_MOBILE_COLUMN_ORDER.includes(k as MobileColumnKey),
+        )
+        const uniqueKeys = [...new Set(validKeys)]
+        // 自动补充新增的列（如 state、singleBar）
+        for (const defKey of DEFAULT_MOBILE_COLUMN_ORDER) {
+          if (!uniqueKeys.includes(defKey)) {
+            uniqueKeys.push(defKey)
+          }
+        }
+        return uniqueKeys
+      }
+    }
+  } catch {}
+  return [...DEFAULT_MOBILE_COLUMN_ORDER]
+}
+
+function loadMobileColumnVisibility(): Record<MobileColumnKey, boolean> {
+  try {
+    const saved = localStorage.getItem(MOBILE_COLUMN_VISIBILITY_KEY)
+    if (saved) {
+      const parsed = JSON.parse(saved)
+      if (typeof parsed === 'object' && parsed !== null) {
+        const res = {} as Record<MobileColumnKey, boolean>
+        for (const key of DEFAULT_MOBILE_COLUMN_ORDER) {
+          res[key] = (parsed as Record<string, boolean>)[key] !== false
+        }
+        return res
+      }
+    }
+  } catch {}
+  return {
+    symbol_info: true,
+    latest: true,
+    change: true,
+    pattern: true,
+    state: true,
+    singleBar: true,
+  }
+}
+
+const mobileColumnOrder = ref<MobileColumnKey[]>(loadMobileColumnOrder())
+const mobileColumnVisible = ref<Record<MobileColumnKey, boolean>>(loadMobileColumnVisibility())
+const showMobileColumnModal = ref(false)
+const columnListEl = ref<HTMLElement | null>(null)
+let columnSortable: Sortable | null = null
+
+watch(
+  mobileColumnOrder,
+  (val) => {
+    try {
+      localStorage.setItem(MOBILE_COLUMN_ORDER_KEY, JSON.stringify(val))
+    } catch {}
+  },
+  { deep: true },
+)
+
+watch(
+  mobileColumnVisible,
+  (val) => {
+    try {
+      localStorage.setItem(MOBILE_COLUMN_VISIBILITY_KEY, JSON.stringify(val))
+    } catch {}
+  },
+  { deep: true },
+)
+
+watch(showMobileColumnModal, async (open) => {
+  if (open) {
+    await nextTick()
+    if (columnListEl.value) {
+      columnSortable?.destroy()
+      columnSortable = Sortable.create(columnListEl.value, {
+        animation: 150,
+        handle: '.col-drag-handle',
+        draggable: '.col-edit-item',
+        ghostClass: 'col-item-ghost',
+        onEnd: (evt) => {
+          if (evt.oldIndex == null || evt.newIndex == null || evt.oldIndex === evt.newIndex) return
+          const arr = [...mobileColumnOrder.value]
+          const [moved] = arr.splice(evt.oldIndex, 1)
+          arr.splice(evt.newIndex, 0, moved)
+          mobileColumnOrder.value = arr
+        },
+      })
+    }
+  } else {
+    columnSortable?.destroy()
+    columnSortable = null
+  }
+})
+
+function moveMobileColumn(index: number, direction: 'up' | 'down') {
+  const targetIndex = direction === 'up' ? index - 1 : index + 1
+  if (targetIndex < 0 || targetIndex >= mobileColumnOrder.value.length) return
+  const arr = [...mobileColumnOrder.value]
+  const item = arr.splice(index, 1)[0]
+  arr.splice(targetIndex, 0, item)
+  mobileColumnOrder.value = arr
+}
+
+function toggleMobileColumnVisible(key: MobileColumnKey) {
+  const current = mobileColumnVisible.value[key] !== false
+  if (current) {
+    const visibleCount = mobileColumnOrder.value.filter(
+      (k) => mobileColumnVisible.value[k] !== false,
+    ).length
+    if (visibleCount <= 1) {
+      message?.warning?.('至少需要保留一列显示')
+      return
+    }
+  }
+  mobileColumnVisible.value = {
+    ...mobileColumnVisible.value,
+    [key]: !current,
+  }
+}
+
+function resetMobileColumns() {
+  mobileColumnOrder.value = [...DEFAULT_MOBILE_COLUMN_ORDER]
+  mobileColumnVisible.value = {
+    symbol_info: true,
+    latest: true,
+    change: true,
+    pattern: true,
+    state: true,
+    singleBar: true,
+  }
+  message?.success?.('已恢复默认列展现顺序')
+}
+
+const mobileColumnDefs: Record<MobileColumnKey, DataTableColumn<WatchRow>> = {
+  symbol_info: {
     title: '品种',
     key: 'symbol_info',
     minWidth: 80,
+    width: 88,
     render: (r) =>
       h('div', { class: 'mobile-sym-cell' }, [
         h('div', { class: 'mobile-sym-name-row' }, [
           r.symbol.is_followed ? h(Star, { class: 'cell-star-icon mobile-star' }) : null,
-          h('span', { class: 'mobile-sym-name' }, r.symbol.name && r.symbol.name !== r.symbol.code ? r.symbol.name : r.symbol.code),
+          h(
+            'span',
+            { class: 'mobile-sym-name' },
+            r.symbol.name && r.symbol.name !== r.symbol.code ? r.symbol.name : r.symbol.code,
+          ),
         ]),
         h('span', { class: 'mobile-sym-code' }, r.symbol.code),
       ]),
   },
-  {
+  latest: {
     title: '最新价',
     key: 'latest',
-    width: 76,
+    width: 72,
     align: 'right',
     render: (r) =>
       h(
@@ -1038,10 +1217,10 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
         fmt(r.latest, 1),
       ),
   },
-  {
+  change: {
     title: '涨跌幅',
     key: 'change',
-    width: 72,
+    width: 70,
     align: 'right',
     render: (r) => {
       if (r.changePct == null) return h('span', { class: 'cell-empty' }, '—')
@@ -1055,38 +1234,74 @@ const mobileColumns = computed<DataTableColumns<WatchRow>>(() => [
       )
     },
   },
-  {
-    title: '形态信号',
-    key: 'pattern_or_sig',
-    width: 80,
-    align: 'right',
+  pattern: {
+    title: '形态',
+    key: 'pattern',
+    width: 72,
+    align: 'center',
     render: (r) => {
       const s = r.signal
-      if (s) {
-        return h(
-          'span',
-          {
-            class: ['mobile-sig-pill', s.direction === 'up' ? 'is-up' : 'is-down'],
-            title: `${patternLabel(s)} · ${stateLabel(s.state)}`,
-          },
-          patternLabel(s),
-        )
-      }
-      const sb = scansStore.singleBars.get(r.symbol.code)
-      if (sb) {
-        return h(
-          'span',
-          {
-            style: singleBarBadgeStyle(sb.kind) + 'padding: 1px 5px; font-size: 10px; border-radius: 4px; display: inline-block;',
-            title: singleBarTitle(sb),
-          },
-          sb.label,
-        )
-      }
-      return h('span', { class: 'cell-empty' }, '—')
+      if (!s) return h('span', { class: 'cell-empty' }, '—')
+      return h(
+        'span',
+        {
+          class: ['mobile-sig-pill', s.direction === 'up' ? 'is-up' : 'is-down'],
+          title: `${patternLabel(s)} · ${stateLabel(s.state)} · 评分 ${s.entry_score.toFixed(1)}`,
+        },
+        patternLabel(s),
+      )
     },
   },
-])
+  state: {
+    title: '状态',
+    key: 'state',
+    width: 76,
+    align: 'center',
+    render: (r) => {
+      const sig = r.signal
+      if (!sig) return h('span', { class: 'cell-empty' }, '—')
+      return h(
+        'span',
+        {
+          class: ['mobile-state-pill', `is-${stateCls(sig.state)}`],
+          title: `${sig.state} · 评分 ${sig.entry_score.toFixed(1)}`,
+        },
+        stateLabel(sig.state),
+      )
+    },
+  },
+  singleBar: {
+    title: '十字星',
+    key: 'singleBar',
+    width: 70,
+    align: 'center',
+    render: (r) => {
+      const sb = scansStore.singleBars.get(r.symbol.code)
+      if (!sb) return h('span', { class: 'cell-empty' }, '—')
+      return h(
+        'span',
+        {
+          class: 'cell-singlebar mobile-singlebar-badge',
+          style:
+            singleBarBadgeStyle(sb.kind) +
+            'padding: 1px 5px; font-size: 10.5px; white-space: nowrap; line-height: 16px; border-radius: 4px; display: inline-block;',
+          title: singleBarTitle(sb),
+        },
+        sb.label,
+      )
+    },
+  },
+}
+
+const mobileColumns = computed<DataTableColumns<WatchRow>>(() => {
+  return mobileColumnOrder.value
+    .filter((k) => mobileColumnVisible.value[k] !== false)
+    .map((k) => mobileColumnDefs[k])
+})
+
+const mobileTableScrollX = computed(() => {
+  return mobileColumns.value.reduce((acc, col) => acc + (Number(col.width) || 75), 0)
+})
 
 const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
   return isMobile.value ? mobileColumns.value : columns
@@ -1154,6 +1369,18 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
           size="tiny"
           quaternary
           circle
+          title="自定义列展现顺序与显隐"
+          class="mobile-grp-btn"
+          @click="showMobileColumnModal = true"
+        >
+          <template #icon>
+            <n-icon :component="LayoutColumns" size="16" />
+          </template>
+        </n-button>
+        <n-button
+          size="tiny"
+          quaternary
+          circle
           title="新建分组"
           class="mobile-grp-btn"
           @click="openCreateGroup"
@@ -1189,6 +1416,7 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
         :loading="loading"
         :row-props="rowProps"
         :row-key="(r: WatchRow) => r.symbol.code"
+        :scroll-x="isMobile ? mobileTableScrollX : undefined"
         size="small"
         :bordered="false"
         flex-height
@@ -1315,6 +1543,84 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
             完成
           </n-button>
         </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 移动端自定义列展现顺序与显隐弹窗 -->
+    <n-modal
+      v-model:show="showMobileColumnModal"
+      preset="card"
+      title="自定义列展现顺序"
+      size="small"
+      style="width: calc(100vw - 32px); max-width: 360px; border-radius: 12px"
+    >
+      <div class="col-modal-wrap">
+        <div class="col-modal-hint">
+          <n-icon :component="GripVertical" :size="14" />
+          <span>长按手柄拖拽或点击上下箭头调整列顺序</span>
+        </div>
+        <div ref="columnListEl" class="col-edit-list">
+          <div
+            v-for="(key, index) in mobileColumnOrder"
+            :key="key"
+            class="col-edit-item"
+            :class="{ 'is-hidden-item': mobileColumnVisible[key] === false }"
+          >
+            <div class="col-drag-handle" title="按住拖拽排序">
+              <n-icon :component="GripVertical" :size="18" />
+            </div>
+            <div class="col-item-info">
+              <div class="col-item-title-row">
+                <span class="col-item-title">{{ MOBILE_COLUMN_META[key].title }}</span>
+                <span v-if="key === 'singleBar'" class="col-item-badge">单K</span>
+                <span v-if="mobileColumnVisible[key] === false" class="col-item-hidden-badge">已隐藏</span>
+              </div>
+              <span class="col-item-desc">{{ MOBILE_COLUMN_META[key].desc }}</span>
+            </div>
+            <div class="col-item-actions">
+              <button
+                type="button"
+                class="col-btn-arrow"
+                :disabled="index === 0"
+                title="上移"
+                @click.stop="moveMobileColumn(index, 'up')"
+              >
+                <n-icon :component="ArrowUp" :size="15" />
+              </button>
+              <button
+                type="button"
+                class="col-btn-arrow"
+                :disabled="index === mobileColumnOrder.length - 1"
+                title="下移"
+                @click.stop="moveMobileColumn(index, 'down')"
+              >
+                <n-icon :component="ArrowDown" :size="15" />
+              </button>
+              <button
+                type="button"
+                class="col-btn-vis"
+                :class="{ 'is-hidden': mobileColumnVisible[key] === false }"
+                :title="mobileColumnVisible[key] === false ? '点击显示' : '点击隐藏'"
+                @click.stop="toggleMobileColumnVisible(key)"
+              >
+                <n-icon :component="mobileColumnVisible[key] === false ? EyeOff : Eye" :size="16" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <div class="col-modal-footer">
+          <n-button size="small" quaternary @click="resetMobileColumns">
+            <template #icon>
+              <n-icon :component="RotateClockwise" />
+            </template>
+            恢复默认
+          </n-button>
+          <n-button size="small" type="primary" @click="showMobileColumnModal = false">
+            完成
+          </n-button>
+        </div>
       </template>
     </n-modal>
   </div>
@@ -1608,6 +1914,142 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
 .is-mobile-layout .watch-table :deep(.n-data-table-td:last-child) {
   padding-right: 8px;
 }
+
+/* 自定义列与顺序弹窗样式 */
+.col-modal-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.col-modal-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #64748b;
+  background: #f8fafc;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #f1f5f9;
+}
+.col-edit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+.col-edit-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+.col-edit-item.is-hidden-item {
+  background: #f8fafc;
+  opacity: 0.6;
+  border-style: dashed;
+}
+.col-drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  cursor: grab;
+  padding: 2px;
+  touch-action: none;
+}
+.col-drag-handle:active {
+  cursor: grabbing;
+}
+.col-item-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.col-item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.col-item-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+}
+.col-item-badge {
+  font-size: 10px;
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.12);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.col-item-hidden-badge {
+  font-size: 10px;
+  color: #94a3b8;
+  background: #f1f5f9;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.col-item-desc {
+  font-size: 11px;
+  color: #64748b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.col-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.col-btn-arrow,
+.col-btn-vis {
+  background: #f1f5f9;
+  border: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 0;
+}
+.col-btn-arrow:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+.col-btn-arrow:not(:disabled):active,
+.col-btn-vis:active {
+  background: #e2e8f0;
+}
+.col-btn-vis.is-hidden {
+  color: #94a3b8;
+  background: #f8fafc;
+}
+.col-item-ghost {
+  opacity: 0.5;
+  background: #e0f2fe !important;
+  border-color: #0284c7 !important;
+}
+.col-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
 </style>
 
 <!--
@@ -1899,6 +2341,48 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
   color: #0b723e;
   background-color: rgba(15, 157, 88, 0.08);
   border: 1px solid rgba(15, 157, 88, 0.2);
+}
+
+/* 移动端状态胶囊 */
+.watch-table .mobile-state-pill {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.watch-table .mobile-state-pill.is-pending {
+  color: #1677ff;
+  background: rgba(22, 119, 255, 0.1);
+  border: 1px solid rgba(22, 119, 255, 0.2);
+}
+.watch-table .mobile-state-pill.is-triggered {
+  color: #059669;
+  background: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+}
+.watch-table .mobile-state-pill.is-stale {
+  color: #d97706;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+.watch-table .mobile-state-pill.is-expired {
+  color: #64748b;
+  background: rgba(148, 163, 184, 0.1);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+.watch-table .mobile-state-pill.is-muted {
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.08);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+}
+
+/* 移动端单K / 十字星标签 */
+.watch-table .mobile-singlebar-badge {
+  font-size: 10.5px;
+  font-weight: 500;
+  display: inline-block;
 }
 </style>
 
