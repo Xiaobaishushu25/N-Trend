@@ -154,3 +154,14 @@ body {
   border-radius: 4px;
   padding: 1px 6px;
 }
+
+/* ===== 移动端 Popover & Tooltip 视口防溢出保护 ===== */
+@media (max-width: 768px) {
+  .n-popover:not(.n-popover--raw),
+  .n-tooltip {
+    max-width: calc(100vw - 24px) !important;
+    word-break: break-word;
+    box-sizing: border-box;
+  }
+}
+

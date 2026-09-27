@@ -334,7 +334,7 @@ fn open_settings_window(app: &tauri::AppHandle) {
         tauri::WebviewUrl::App("index.html#/settings".into()),
     )
     .title("设置")
-    .inner_size(760.0, 640.0)
+    .inner_size(820.0, 640.0)
     .min_inner_size(680.0, 520.0)
     .resizable(true)
     .decorations(false)

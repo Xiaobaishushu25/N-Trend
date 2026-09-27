@@ -54,6 +54,7 @@ const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
 const { isMobile, isNativeMobile } = usePlatform()
 const showMobileSearch = ref(false)
+const showMobileStatusModal = ref(false)
 
 const activeDataSource = computed(() => {
   return (
@@ -505,38 +506,27 @@ onBeforeUnmount(() => {
             {{ activeDataSource }}
           </n-tag>
 
-          <!-- 数据时间 & 形态时间 (PC端与移动端自适应，点击弹出系统运行明细) -->
-          <n-popover trigger="click" placement="bottom" :show-arrow="false">
+          <!-- 数据时间 & 形态时间 (PC端使用Popover，移动端使用居中模态弹窗，解决偏左溢出被截断问题) -->
+          <n-popover v-if="!isMobile" trigger="click" placement="bottom" :show-arrow="false">
             <template #trigger>
               <div
                 class="status-meta"
-                :class="{ 'is-mobile-meta': isMobile }"
                 data-titlebar-ignore
                 title="点击查看完整系统运行状态"
               >
                 <div class="status-item">
                   <span class="dot dot-data" />
-                  <span class="status-label" :class="{ 'mobile-label-data': isMobile }">{{ isMobile ? '数' : '数据' }}</span>
+                  <span class="status-label">数据</span>
                   <span class="status-value" :class="{ empty: !settingsStore.status.last_refresh }">
-                    <template v-if="!isMobile">
-                      {{ shortTime(settingsStore.status.last_refresh) }}
-                    </template>
-                    <template v-else>
-                      <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_refresh).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_refresh).sec }}</span>
-                    </template>
+                    {{ shortTime(settingsStore.status.last_refresh) }}
                   </span>
                 </div>
                 <div class="status-divider" />
                 <div class="status-item">
                   <span class="dot dot-scan" />
-                  <span class="status-label" :class="{ 'mobile-label-scan': isMobile }">{{ isMobile ? '形' : '形态' }}</span>
+                  <span class="status-label">形态</span>
                   <span class="status-value" :class="{ empty: !settingsStore.status.last_scan }">
-                    <template v-if="!isMobile">
-                      {{ shortTime(settingsStore.status.last_scan) }}
-                    </template>
-                    <template v-else>
-                      <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_scan).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_scan).sec }}</span>
-                    </template>
+                    {{ shortTime(settingsStore.status.last_scan) }}
                   </span>
                 </div>
               </div>
@@ -572,6 +562,30 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </n-popover>
+
+          <div
+            v-else
+            class="status-meta is-mobile-meta"
+            data-titlebar-ignore
+            title="点击查看完整系统运行状态"
+            @click="showMobileStatusModal = true"
+          >
+            <div class="status-item">
+              <span class="dot dot-data" />
+              <span class="status-label mobile-label-data">数</span>
+              <span class="status-value" :class="{ empty: !settingsStore.status.last_refresh }">
+                <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_refresh).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_refresh).sec }}</span>
+              </span>
+            </div>
+            <div class="status-divider" />
+            <div class="status-item">
+              <span class="dot dot-scan" />
+              <span class="status-label mobile-label-scan">形</span>
+              <span class="status-value" :class="{ empty: !settingsStore.status.last_scan }">
+                <span class="time-hm">{{ parseTimeParts(settingsStore.status.last_scan).hm }}</span><span class="time-sec">{{ parseTimeParts(settingsStore.status.last_scan).sec }}</span>
+              </span>
+            </div>
+          </div>
         </div>
       </template>
 
@@ -733,6 +747,43 @@ onBeforeUnmount(() => {
       >
         添加
       </n-button>
+    </div>
+  </n-modal>
+
+  <!-- 移动端专用的系统运行状态模态弹窗（解决标题栏 Popover 在窄屏下偏左溢出被截断的问题） -->
+  <n-modal
+    v-model:show="showMobileStatusModal"
+    preset="card"
+    title="系统运行状态"
+    size="small"
+    style="width: calc(100vw - 32px); max-width: 340px; border-radius: 12px"
+  >
+    <template #header-extra>
+      <n-tag size="tiny" round :bordered="false" :type="appStore.isOnline ? 'success' : 'error'">
+        {{ appStore.statusBadge.text }}
+      </n-tag>
+    </template>
+    <div class="status-quick-card status-modal-card">
+      <div class="sq-row">
+        <span class="sq-k">服务器连接</span>
+        <span class="sq-v">{{ appStore.serverUrl || '未配置' }} {{ appStore.statusBadge.delay ? `(${appStore.statusBadge.delay})` : '' }}</span>
+      </div>
+      <div class="sq-row">
+        <span class="sq-k">实时数据源</span>
+        <span class="sq-v font-bold">{{ activeDataSource }}</span>
+      </div>
+      <div class="sq-row">
+        <span class="sq-k">最近数据刷新</span>
+        <span class="sq-v font-mono">{{ settingsStore.status.last_refresh || '—' }}</span>
+      </div>
+      <div class="sq-row">
+        <span class="sq-k">最近形态扫描</span>
+        <span class="sq-v font-mono">{{ settingsStore.status.last_scan || '—' }}</span>
+      </div>
+      <div class="sq-row">
+        <span class="sq-k">调度引擎</span>
+        <span class="sq-v">{{ settingsStore.status.running ? '运行中 (实时推送/轮询)' : '已暂停' }}</span>
+      </div>
     </div>
   </n-modal>
 </template>
@@ -995,5 +1046,9 @@ onBeforeUnmount(() => {
 }
 .sq-v.font-bold {
   font-weight: 600;
+}
+.status-modal-card {
+  min-width: unset;
+  padding: 4px 0;
 }
 </style>

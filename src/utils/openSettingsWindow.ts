@@ -27,7 +27,7 @@ export async function openSettingsWindow() {
     const webview = new WebviewWindow("settings", {
       url: "/#/settings",
       title: "设置",
-      width: 760,
+      width: 820,
       height: 640,
       minWidth: 680,
       minHeight: 520,

@@ -2163,7 +2163,7 @@ onBeforeUnmount(() => {
               {{ t }}
             </button>
             <n-popover
-              placement="bottom"
+              placement="bottom-end"
               trigger="click"
               :show-arrow="false"
               style="padding: 0"

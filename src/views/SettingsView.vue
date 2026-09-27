@@ -84,23 +84,61 @@ const inTauri = isTauri()
 const router = useRouter()
 const { isMobile } = usePlatform()
 
-/** 工具提示组件 */
+/** 工具提示组件：自适应视口位置，防止在移动端偏左或偏右被裁剪溢出 */
 const Tip = defineComponent({
   name: 'Tip',
   props: { text: { type: String, required: true } },
   setup(props) {
+    const triggerRef = ref<HTMLElement | null>(null)
+    const placement = ref<'bottom-start' | 'bottom-end' | 'bottom'>('bottom-start')
+
+    const updatePlacement = () => {
+      if (!triggerRef.value) return
+      const rect = triggerRef.value.getBoundingClientRect()
+      const winW = window.innerWidth || document.documentElement.clientWidth || 360
+      // 如果触发器靠近屏幕左侧（例如前 40%），采用 bottom-start 靠左对齐，避免向左溢出屏幕
+      // 如果靠近屏幕右侧（后 40%），采用 bottom-end 靠右对齐，避免向右溢出屏幕
+      if (rect.left < winW * 0.4) {
+        placement.value = 'bottom-start'
+      } else if (rect.right > winW * 0.6) {
+        placement.value = 'bottom-end'
+      } else {
+        placement.value = 'bottom'
+      }
+    }
+
+    onMounted(() => {
+      updatePlacement()
+    })
+
     return () =>
       h(
         NTooltip,
-        { trigger: 'hover' },
         {
-          trigger: () => h(NIcon, { component: Help, size: 15, class: 'help-icon' }),
+          trigger: isMobile.value ? 'click' : 'hover',
+          placement: placement.value,
+          onUpdateShow: (show: boolean) => {
+            if (show) updatePlacement()
+          },
+        },
+        {
+          trigger: () =>
+            h(
+              'span',
+              {
+                ref: triggerRef,
+                class: 'tip-trigger-wrap',
+                onClick: updatePlacement,
+                onTouchstart: updatePlacement,
+              },
+              [h(NIcon, { component: Help, size: 15, class: 'help-icon' })],
+            ),
           default: () =>
             h(
               'div',
               {
                 style:
-                  'max-width: 280px; white-space: normal; line-height: 1.5; word-break: break-word;',
+                  'max-width: min(260px, calc(100vw - 36px)); white-space: normal; line-height: 1.5; word-break: break-word;',
               },
               props.text,
             ),
@@ -846,7 +884,7 @@ onMounted(async () => {
                     style="width: 180px"
                   />
                 </div>
-                <div class="setting-card-row" v-if="!isMobile">
+                <div class="setting-card-row">
                   <div class="row-label">
                     本地日志目录
                     <Tip text="打开存放本地每日运行日志文件 (ntrend.log.YYYY-MM-DD) 的应用数据目录。" />
@@ -1384,9 +1422,25 @@ onMounted(async () => {
   flex-shrink: 0;
 }
 
+.tip-trigger-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  padding: 1px 3px;
+  border-radius: 4px;
+}
+
+.tip-trigger-wrap:hover .help-icon,
+.tip-trigger-wrap:active .help-icon {
+  color: var(--n-primary-color, #2080f0);
+}
+
 .help-icon {
   color: var(--n-text-color-3);
   cursor: pointer;
+  transition: color 0.15s ease;
 }
 
 .symbol-table-header {
