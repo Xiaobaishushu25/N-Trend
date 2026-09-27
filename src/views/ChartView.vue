@@ -689,6 +689,62 @@ function handleCardClickCapture(e: MouseEvent) {
   }
 }
 
+/** 触控手势滑动切换品种（绑定至移动端底部决策看板区域） */
+let panelTouchStartX = 0
+let panelTouchStartY = 0
+let panelTouchStartTime = 0
+const isSwipingPanel = ref(false)
+let suppressPanelClick = false
+
+function handlePanelTouchStart(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    panelTouchStartX = e.touches[0].clientX
+    panelTouchStartY = e.touches[0].clientY
+    panelTouchStartTime = Date.now()
+    isSwipingPanel.value = false
+  }
+}
+
+function handlePanelTouchMove(e: TouchEvent) {
+  if (e.touches.length === 1) {
+    const dx = e.touches[0].clientX - panelTouchStartX
+    const dy = e.touches[0].clientY - panelTouchStartY
+    if (Math.abs(dx) > 25 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      isSwipingPanel.value = true
+    }
+  }
+}
+
+function handlePanelTouchEnd(e: TouchEvent) {
+  if (e.changedTouches.length === 1) {
+    const dx = e.changedTouches[0].clientX - panelTouchStartX
+    const dy = e.changedTouches[0].clientY - panelTouchStartY
+    const dt = Date.now() - panelTouchStartTime
+    if (Math.abs(dx) > 35 && Math.abs(dx) > Math.abs(dy) * 1.2 && dt < 800) {
+      // 成功判定为横滑切换品种
+      suppressPanelClick = true
+      setTimeout(() => {
+        suppressPanelClick = false
+        isSwipingPanel.value = false
+      }, 300)
+      if (dx < 0) {
+        switchSymbol(1)
+      } else {
+        switchSymbol(-1)
+      }
+    } else {
+      isSwipingPanel.value = false
+    }
+  }
+}
+
+function handlePanelClickCapture(e: MouseEvent) {
+  if (suppressPanelClick) {
+    e.stopPropagation()
+    e.preventDefault()
+  }
+}
+
 /** 移动端底部决策看板状态与数据 */
 const mobilePanelTab = ref<'signal' | 'market' | 'levels'>('signal')
 const mobilePanelCollapsed = ref(false)
@@ -2556,8 +2612,16 @@ onBeforeUnmount(() => {
           description="暂无K线数据，请先在列表页刷新数据"
         />
 
-        <!-- 移动端专属多维决策看板（利用缩减K线空白腾出的约五分之一高度，整合形态决策、盘口行情与关键支撑压力） -->
-        <div v-if="isMobile && !reviewMode" class="mobile-decision-panel" :class="{ 'is-collapsed': mobilePanelCollapsed }">
+        <!-- 移动端专属多维决策看板（利用缩减K线空白腾出的约五分之一高度，整合形态决策、盘口行情与关键支撑压力；支持左右滑动切换品种） -->
+        <div
+          v-if="isMobile && !reviewMode"
+          class="mobile-decision-panel"
+          :class="{ 'is-collapsed': mobilePanelCollapsed, 'is-swiping': isSwipingPanel }"
+          @touchstart.passive="handlePanelTouchStart"
+          @touchmove.passive="handlePanelTouchMove"
+          @touchend.passive="handlePanelTouchEnd"
+          @click.capture="handlePanelClickCapture"
+        >
           <div class="mdp-header">
             <div class="mdp-tabs">
               <button
@@ -2604,7 +2668,15 @@ onBeforeUnmount(() => {
               <div v-if="topActivePattern" class="mdp-signal-box">
                 <div class="mdp-box-top">
                   <div class="mdp-box-title">
-                    <span class="mdp-badge" :class="topActivePattern.direction === 'up' ? 'badge-up' : 'badge-down'">
+                    <span
+                      class="mdp-badge"
+                      :class="[
+                        topActivePattern.direction === 'up' ? 'badge-up' : 'badge-down',
+                        { 'is-hidden-badge': isHidden(topActivePattern.number) },
+                      ]"
+                      :title="isHidden(topActivePattern.number) ? '点击在K线图上绘制该形态' : '点击关闭该形态在K线图的绘制'"
+                      @click.stop="togglePattern(topActivePattern.number)"
+                    >
                       {{ dirText(topActivePattern.direction) }} {{ levelSuffix(topActivePattern.level) }}
                     </span>
                     <span class="mdp-state" :class="stateType(topActivePattern.state)">
@@ -2617,9 +2689,21 @@ onBeforeUnmount(() => {
                       评分 <b>{{ topActivePattern.score.toFixed(1) }}</b>
                     </span>
                   </div>
-                  <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
-                    全部形态({{ signals.length }}) ›
-                  </button>
+                  <div class="mdp-box-actions">
+                    <button
+                      type="button"
+                      class="mdp-draw-toggle"
+                      :class="{ 'is-hidden': isHidden(topActivePattern.number) }"
+                      :title="isHidden(topActivePattern.number) ? '点击在K线图上开启绘制' : '点击关闭在K线图上的绘制'"
+                      @click.stop="togglePattern(topActivePattern.number)"
+                    >
+                      <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" size="13" />
+                      <span>{{ isHidden(topActivePattern.number) ? '图表未绘' : '图表已绘' }}</span>
+                    </button>
+                    <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                      全部({{ signals.length }}) ›
+                    </button>
+                  </div>
                 </div>
                 <div class="mdp-grid-4">
                   <div class="mdp-cell">
@@ -2645,6 +2729,73 @@ onBeforeUnmount(() => {
                     {{ topActivePattern.state === 'triggered' ? '已触发区间，注意防守止损位' : '预警跟踪中，等待突破确认入场' }}
                     <template v-if="quotePrice != null">
                       · 距止损约 {{ Math.abs(quotePrice - topActivePattern.stop).toFixed(1) }} 点
+                    </template>
+                  </span>
+                </div>
+              </div>
+
+              <div v-else-if="topRecentPattern" class="mdp-signal-box">
+                <div class="mdp-box-top">
+                  <div class="mdp-box-title">
+                    <span class="mdp-badge is-recent-badge">最近</span>
+                    <span
+                      class="mdp-badge"
+                      :class="[
+                        topRecentPattern.direction === 'up' ? 'badge-up' : 'badge-down',
+                        { 'is-hidden-badge': !isRecentShown(topRecentPattern.number) },
+                      ]"
+                      :title="isRecentShown(topRecentPattern.number) ? '点击在K线图上关闭该形态绘制' : '点击在K线图上绘制该形态'"
+                      @click.stop="toggleRecentPattern(topRecentPattern.number)"
+                    >
+                      {{ dirText(topRecentPattern.direction) }} {{ levelSuffix(topRecentPattern.level) }}
+                    </span>
+                    <span class="mdp-state" :class="recentPatternStatus(topRecentPattern).cls">
+                      ● {{ recentPatternStatus(topRecentPattern).text }}
+                    </span>
+                    <span class="mdp-score">
+                      评分 <b>{{ topRecentPattern.score.toFixed(1) }}</b>
+                    </span>
+                  </div>
+                  <div class="mdp-box-actions">
+                    <button
+                      type="button"
+                      class="mdp-draw-toggle"
+                      :class="{ 'is-hidden': !isRecentShown(topRecentPattern.number) }"
+                      :title="isRecentShown(topRecentPattern.number) ? '点击在K线图上关闭该形态绘制' : '点击在K线图上绘制该形态'"
+                      @click.stop="toggleRecentPattern(topRecentPattern.number)"
+                    >
+                      <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" size="13" />
+                      <span>{{ isRecentShown(topRecentPattern.number) ? '图表已绘' : '图表未绘' }}</span>
+                    </button>
+                    <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                      形态详情 ›
+                    </button>
+                  </div>
+                </div>
+                <div class="mdp-grid-4">
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">入场点位</span>
+                    <b class="mdp-cell-val">{{ topRecentPattern.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">止损价</span>
+                    <b class="mdp-cell-val is-stop">{{ topRecentPattern.stop.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">目标价</span>
+                    <b class="mdp-cell-val is-target">{{ topRecentPattern.target.toFixed(1) }}</b>
+                  </div>
+                  <div class="mdp-cell">
+                    <span class="mdp-cell-lbl">盈亏比(RR)</span>
+                    <b class="mdp-cell-val is-rr">{{ topRecentPattern.rr.toFixed(1) }}</b>
+                  </div>
+                </div>
+                <div class="mdp-tip-row">
+                  <span class="mdp-tip-icon">🕒</span>
+                  <span class="mdp-tip-text">
+                    历史形态 · {{ topRecentPattern.outcome === 'win' ? '已止盈' : topRecentPattern.outcome === 'loss' ? '已止损' : '已结束' }}
+                    <template v-if="topRecentPattern.warning_ts || topRecentPattern.trigger_ts">
+                      · {{ fmtRecentTime(topRecentPattern.warning_ts || topRecentPattern.trigger_ts || '') }}
                     </template>
                   </span>
                 </div>
@@ -5448,6 +5599,9 @@ onBeforeUnmount(() => {
     flex-direction: column;
     overflow: hidden;
     transition: height 0.2s cubic-bezier(0.16, 1, 0.3, 1), flex-basis 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: pan-y;
   }
   .mobile-decision-panel.is-collapsed {
     flex: 0 0 30px;
@@ -5555,12 +5709,52 @@ onBeforeUnmount(() => {
     align-items: center;
     gap: 4px;
   }
+  .mdp-box-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .mdp-draw-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    line-height: 1;
+    padding: 2.5px 6px;
+    border-radius: 4px;
+    border: 1px solid #bfdbfe;
+    background: #eff6ff;
+    color: #2563eb;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .mdp-draw-toggle:active {
+    opacity: 0.8;
+    transform: scale(0.96);
+  }
+  .mdp-draw-toggle.is-hidden {
+    border-color: #cbd5e1;
+    background: #f8fafc;
+    color: #94a3b8;
+  }
   .mdp-badge {
     font-size: 10.5px;
     font-weight: 700;
     padding: 1.5px 5px;
     border-radius: 4px;
     white-space: nowrap;
+    cursor: pointer;
+    transition: opacity 0.15s ease, filter 0.15s ease;
+  }
+  .mdp-badge.is-hidden-badge {
+    opacity: 0.5;
+    border: 1px dashed currentColor !important;
+  }
+  .mdp-badge.is-recent-badge {
+    background: #f1f5f9;
+    color: #475569;
+    border: 1px solid #e2e8f0;
   }
   .mdp-state {
     font-size: 10.5px;
