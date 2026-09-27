@@ -61,6 +61,7 @@ const emit = defineEmits<{
   (e: 'preview-manual-level', id: number, input: ManualLevelInput | null): void
   (e: 'manual-level-draw-mode', active: boolean): void
   (e: 'toggle-fullscreen'): void
+  (e: 'crosshair-candle', candle: { time: string; open: number; high: number; low: number; close: number } | null): void
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
@@ -1505,19 +1506,28 @@ function focusRow(): KlineRow | null {
   return focusIndex >= 0 && focusIndex < props.rows.length ? props.rows[focusIndex] : null
 }
 
-/** 图例显示当前焦点K线的开高低收 */
+/** 图例显示当前焦点K线的开高低收，并向外同步当前高亮K线数据 */
 function renderFocusLegend() {
-  if (!legend.value) return
   const row = focusRow()
   if (!row) {
-    legend.value.innerHTML = 'N趋势 K线'
+    if (legend.value) legend.value.innerHTML = 'N趋势 K线'
+    emit('crosshair-candle', null)
     return
   }
   const time = toTs(row.ts) as Time
-  legend.value.innerHTML = formatLegend(
-    { time, open: row.open, high: row.high, low: row.low, close: row.close },
-    time,
-  )
+  if (legend.value) {
+    legend.value.innerHTML = formatLegend(
+      { time, open: row.open, high: row.high, low: row.low, close: row.close },
+      time,
+    )
+  }
+  emit('crosshair-candle', {
+    time: row.ts,
+    open: row.open,
+    high: row.high,
+    low: row.low,
+    close: row.close,
+  })
 }
 
 /** 更新焦点K线的十字光标与图例；数据尚未就绪时清除光标 */
@@ -2639,7 +2649,7 @@ onMounted(() => {
   }
 
   chart.subscribeCrosshairMove((param) => {
-    if (!legend.value || !candleSeries) return
+    if (!candleSeries) return
     if (!param.time || !param.point) {
       isHovering = false
       hoveredTime = null
@@ -2648,6 +2658,7 @@ onMounted(() => {
       innerPricePrimitive?.update()
       if (focusPinnedByKeys) syncFocus()
       else renderFocusLegend()
+      emit('crosshair-candle', null)
       return
     }
     crosshairY.value = param.point.y
@@ -2659,12 +2670,22 @@ onMounted(() => {
       hoveredTime = null
       innerPricePrimitive?.update()
       renderFocusLegend()
+      emit('crosshair-candle', null)
       return
     }
     isHovering = true
     hoveredTime = param.time as Time
     focusPinnedByKeys = false
-    legend.value.innerHTML = formatLegend(d, param.time as Time)
+    if (legend.value) {
+      legend.value.innerHTML = formatLegend(d, param.time as Time)
+    }
+    emit('crosshair-candle', {
+      time: formatTime(param.time as Time),
+      open: d.open,
+      high: d.high,
+      low: d.low,
+      close: d.close,
+    })
   })
 
   container.value.addEventListener('wheel', handleWheel, { passive: false })
@@ -2893,7 +2914,7 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
 
 <template>
   <div class="kline-wrap" @pointerdown="handleManualLevelCanvasPointerDown">
-    <div ref="legend" class="legend">N趋势 K线</div>
+    <div v-if="!isFullscreen" ref="legend" class="legend">N趋势 K线</div>
     <div class="chart-canvas-area">
       <div ref="timeLeft" class="time-left"></div>
       <div ref="container" class="kline-canvas"></div>

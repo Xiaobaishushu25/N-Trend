@@ -909,6 +909,51 @@ const topRecentPattern = computed<PatternDto | null>(() => {
   return recentHistorySignals.value.length ? recentHistorySignals.value[0] : null
 })
 
+interface ActiveCandleInfo {
+  time: string
+  open: number
+  high: number
+  low: number
+  close: number
+}
+const hoveredCandle = ref<ActiveCandleInfo | null>(null)
+function handleCrosshairCandle(c: ActiveCandleInfo | null) {
+  hoveredCandle.value = c
+}
+
+const activeCandle = computed(() => {
+  if (hoveredCandle.value) {
+    return {
+      ...hoveredCandle.value,
+      isHover: true,
+      up: hoveredCandle.value.close >= hoveredCandle.value.open,
+    }
+  }
+  const rows = displayRows.value
+  if (!rows || rows.length === 0) return null
+  const last = rows[rows.length - 1]
+  return {
+    time: last.ts,
+    open: last.open,
+    high: last.high,
+    low: last.low,
+    close: last.close,
+    isHover: false,
+    up: last.close >= last.open,
+  }
+})
+
+function fmtCandleTime(ts?: string): string {
+  if (!ts) return '--'
+  return ts.replace(/^\d{4}-/, '')
+}
+
+function fmtCandlePrice(val?: number): string {
+  if (val == null || !Number.isFinite(val)) return '--'
+  const s = String(val)
+  return s.includes('.') ? val.toFixed(1) : String(val)
+}
+
 function recentPatternStatus(p: PatternDto): { text: string; cls: string } {
   if (p.outcome === 'win') {
     const r = p.r_multiple != null ? ` +${p.r_multiple.toFixed(1)}R` : ''
@@ -2665,9 +2710,24 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 移动端全屏形态与指标副栏 (参考截图) -->
+        <!-- 移动端全屏形态与指标副栏：一分为二，左边K线详细数据，右边形态数据 -->
         <div v-if="isMobileFullscreen" class="mfs-subbar">
-          <div class="mfs-sub-left">
+          <!-- 左半边：K线详细数据（时间、开高低收） -->
+          <div class="mfs-sub-kline" :title="activeCandle?.isHover ? '光标所在K线' : '最新K线'">
+            <span class="mfs-kd-time">{{ fmtCandleTime(activeCandle?.time) }}</span>
+            <div class="mfs-kd-ohlc">
+              <span class="mfs-kd-item"><span class="mfs-kd-lbl">开</span><b :class="activeCandle?.up ? 'c-up' : 'c-down'">{{ fmtCandlePrice(activeCandle?.open) }}</b></span>
+              <span class="mfs-kd-item"><span class="mfs-kd-lbl">高</span><b :class="activeCandle?.up ? 'c-up' : 'c-down'">{{ fmtCandlePrice(activeCandle?.high) }}</b></span>
+              <span class="mfs-kd-item"><span class="mfs-kd-lbl">低</span><b :class="activeCandle?.up ? 'c-up' : 'c-down'">{{ fmtCandlePrice(activeCandle?.low) }}</b></span>
+              <span class="mfs-kd-item"><span class="mfs-kd-lbl">收</span><b :class="activeCandle?.up ? 'c-up' : 'c-down'">{{ fmtCandlePrice(activeCandle?.close) }}</b></span>
+            </div>
+          </div>
+
+          <!-- 中间细微竖向分割线 -->
+          <div class="mfs-sub-divider"></div>
+
+          <!-- 右半边：形态数据与操作 -->
+          <div class="mfs-sub-pattern">
             <template v-if="topActivePattern">
               <n-popover trigger="click" placement="bottom-start" class="mfs-patterns-popover">
                 <template #trigger>
@@ -2737,13 +2797,13 @@ onBeforeUnmount(() => {
               </span>
 
               <div class="mfs-sub-levels">
-                <span>入:<b>{{ topActivePattern.entry.toFixed(1) }}</b></span>
-                <span>损:<b>{{ topActivePattern.stop.toFixed(1) }}</b></span>
-                <span>标:<b>{{ topActivePattern.target.toFixed(1) }}</b></span>
-                <span>RR:<b>{{ topActivePattern.rr.toFixed(1) }}</b></span>
-                <span>评分:<b>{{ topActivePattern.score.toFixed(1) }}</b></span>
+                <span>入 <b>{{ topActivePattern.entry.toFixed(1) }}</b></span>
+                <span>损 <b>{{ topActivePattern.stop.toFixed(1) }}</b></span>
+                <span>标 <b>{{ topActivePattern.target.toFixed(1) }}</b></span>
+                <span>RR <b>{{ topActivePattern.rr.toFixed(1) }}</b></span>
+                <span>评分 <b>{{ topActivePattern.score.toFixed(1) }}</b></span>
                 <span v-if="pwinFor(topActivePattern.number) != null">
-                  胜率:<b>{{ (pwinFor(topActivePattern.number)! * 100).toFixed(0) }}%</b>
+                  胜率 <b>{{ (pwinFor(topActivePattern.number)! * 100).toFixed(0) }}%</b>
                 </span>
               </div>
             </template>
@@ -2773,51 +2833,51 @@ onBeforeUnmount(() => {
               <span class="mfs-sub-neutral">多空趋势</span>
               <span class="mfs-sub-tip">MA20 趋势跟踪 · 暂无活跃形态</span>
             </template>
-          </div>
 
-          <div class="mfs-sub-right">
-            <n-popover trigger="click" placement="bottom-end">
-              <template #trigger>
-                <button type="button" class="mfs-sub-btn" title="形态决策说明与指南">
-                  <n-icon :component="Help" :size="15" />
-                </button>
-              </template>
-              <div class="mfs-tip-popover">
-                <div v-if="topActivePattern">
-                  <div class="mfs-tip-title">{{ dirText(topActivePattern.direction) }}形态决策建议</div>
-                  <div class="mfs-tip-desc">
-                    {{ topActivePattern.state === 'triggered' ? '已触发突破入场位，严格按照止损点防守，关注目标位止盈。' : '形态预警中，密切关注价格是否有效突破入场价。' }}
+            <div class="mfs-sub-actions">
+              <button
+                v-if="topActivePattern"
+                type="button"
+                class="mfs-sub-btn mfs-draw-eye"
+                :class="{ 'is-hidden-eye': isHidden(topActivePattern.number) }"
+                @click="togglePattern(topActivePattern.number)"
+                :title="isHidden(topActivePattern.number) ? '开启图表绘制' : '关闭图表绘制'"
+              >
+                <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" :size="14" />
+              </button>
+              <button
+                v-else-if="topRecentPattern"
+                type="button"
+                class="mfs-sub-btn mfs-draw-eye"
+                :class="{ 'is-hidden-eye': !isRecentShown(topRecentPattern.number) }"
+                @click="toggleRecentPattern(topRecentPattern.number)"
+                :title="isRecentShown(topRecentPattern.number) ? '关闭图表绘制' : '开启图表绘制'"
+              >
+                <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" :size="14" />
+              </button>
+
+              <n-popover trigger="click" placement="bottom-end">
+                <template #trigger>
+                  <button type="button" class="mfs-sub-btn" title="形态决策说明与指南">
+                    <n-icon :component="Help" :size="14" />
+                  </button>
+                </template>
+                <div class="mfs-tip-popover">
+                  <div v-if="topActivePattern">
+                    <div class="mfs-tip-title">{{ dirText(topActivePattern.direction) }}形态决策建议</div>
+                    <div class="mfs-tip-desc">
+                      {{ topActivePattern.state === 'triggered' ? '已触发突破入场位，严格按照止损点防守，关注目标位止盈。' : '形态预警中，密切关注价格是否有效突破入场价。' }}
+                    </div>
+                    <div v-if="quotePrice != null" class="mfs-tip-stop">
+                      当前价距止损约 {{ Math.abs(quotePrice - topActivePattern.stop).toFixed(1) }} 点
+                    </div>
                   </div>
-                  <div v-if="quotePrice != null" class="mfs-tip-stop">
-                    当前价距止损约 {{ Math.abs(quotePrice - topActivePattern.stop).toFixed(1) }} 点
+                  <div v-else>
+                    当前周期暂无活跃形态，可尝试切换其他分析周期（如 15m / 30m / 1h / 1d）观察。
                   </div>
                 </div>
-                <div v-else>
-                  当前周期暂无活跃形态，可尝试切换其他分析周期（如 15m / 30m / 1h / 1d）观察。
-                </div>
-              </div>
-            </n-popover>
-
-            <button
-              v-if="topActivePattern"
-              type="button"
-              class="mfs-sub-btn mfs-draw-eye"
-              :class="{ 'is-hidden-eye': isHidden(topActivePattern.number) }"
-              @click="togglePattern(topActivePattern.number)"
-              :title="isHidden(topActivePattern.number) ? '开启图表绘制' : '关闭图表绘制'"
-            >
-              <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" :size="15" />
-            </button>
-            <button
-              v-else-if="topRecentPattern"
-              type="button"
-              class="mfs-sub-btn mfs-draw-eye"
-              :class="{ 'is-hidden-eye': !isRecentShown(topRecentPattern.number) }"
-              @click="toggleRecentPattern(topRecentPattern.number)"
-              :title="isRecentShown(topRecentPattern.number) ? '关闭图表绘制' : '开启图表绘制'"
-            >
-              <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" :size="15" />
-            </button>
+              </n-popover>
+            </div>
           </div>
         </div>
 
@@ -2987,6 +3047,7 @@ onBeforeUnmount(() => {
             @update-manual-level="handleUpdateManualLevel"
             @preview-manual-level="handleManualLevelPreview"
             @manual-level-draw-mode="onManualLevelDrawMode"
+            @crosshair-candle="handleCrosshairCandle"
             :loading="klinesStore.loading"
           />
           <n-empty
@@ -5891,6 +5952,9 @@ onBeforeUnmount(() => {
     font-weight: 500;
   }
 
+
+
+
   .main {
     position: relative;
     padding: 0;
@@ -6380,18 +6444,18 @@ onBeforeUnmount(() => {
   padding: 0 !important;
   padding-left: max(22px, env(safe-area-inset-left)) !important;
   padding-right: max(8px, env(safe-area-inset-right)) !important;
-  background-color: #131722 !important;
+  background-color: #ffffff !important;
   display: flex !important;
   flex-direction: column !important;
   overflow: hidden !important;
 }
 
-/* 顶部沉浸行情信息栏 - 超紧凑 32px 高度 */
+/* 顶部沉浸行情信息栏 - 超紧凑 32px 高度 (明亮清晰主题) */
 .mfs-header {
   flex: 0 0 32px;
   height: 32px;
-  background: #151820;
-  border-bottom: 1px solid #232732;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -6412,9 +6476,9 @@ onBeforeUnmount(() => {
   width: 20px;
   height: 22px;
   border-radius: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #94a3b8;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
   font-size: 13px;
   font-weight: 700;
   display: flex;
@@ -6426,8 +6490,8 @@ onBeforeUnmount(() => {
 
 .mfs-nav-btn:hover,
 .mfs-nav-btn:active {
-  background: rgba(255, 255, 255, 0.12);
-  color: #f8fafc;
+  background: #e2e8f0;
+  color: #0f172a;
 }
 
 .mfs-sym-box {
@@ -6441,13 +6505,13 @@ onBeforeUnmount(() => {
 
 .mfs-sym-box:hover,
 .mfs-sym-box:active {
-  background: rgba(255, 255, 255, 0.08);
+  background: #f1f5f9;
 }
 
 .mfs-sym-name {
   font-size: 12px;
   font-weight: 700;
-  color: #f8fafc;
+  color: #0f172a;
   line-height: 1.15;
   white-space: nowrap;
 }
@@ -6461,20 +6525,21 @@ onBeforeUnmount(() => {
 
 .mfs-sym-code {
   font-size: 9px;
-  color: #94a3b8;
+  color: #64748b;
   font-family: Consolas, monospace;
 }
 
 .mfs-sym-badge {
   font-size: 8px;
-  color: #cbd5e1;
-  background: rgba(255, 255, 255, 0.1);
+  color: #475569;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
   border-radius: 2px;
   padding: 0 2px;
 }
 
 .mfs-sym-arrow {
-  color: #64748b;
+  color: #94a3b8;
 }
 
 .mfs-header-center {
@@ -6531,11 +6596,11 @@ onBeforeUnmount(() => {
 }
 
 .mfs-stat-item .lbl {
-  color: #94a3b8;
+  color: #64748b;
 }
 
 .mfs-stat-item .val {
-  color: #e2e8f0;
+  color: #1e293b;
   font-weight: 600;
   font-family: Consolas, monospace;
 }
@@ -6560,10 +6625,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-  background: rgba(0, 0, 0, 0.25);
+  background: #f1f5f9;
   padding: 1.5px;
   border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid #e2e8f0;
 }
 
 .mfs-htf-btn {
@@ -6571,7 +6636,7 @@ onBeforeUnmount(() => {
   padding: 0 6px;
   border: none;
   background: transparent;
-  color: #94a3b8;
+  color: #64748b;
   font-size: 10px;
   font-weight: 600;
   border-radius: 3px;
@@ -6584,8 +6649,8 @@ onBeforeUnmount(() => {
 }
 
 .mfs-htf-btn:hover {
-  color: #f1f5f9;
-  background: rgba(255, 255, 255, 0.08);
+  color: #0f172a;
+  background: #e2e8f0;
 }
 
 .mfs-htf-btn.active {
@@ -6598,9 +6663,9 @@ onBeforeUnmount(() => {
   width: 20px;
   height: 20px;
   border-radius: 3px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: #cbd5e1;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6610,42 +6675,117 @@ onBeforeUnmount(() => {
 
 .mfs-close-btn {
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.12);
-  border: none;
-  color: #fff;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  color: #475569;
 }
 
 .mfs-close-btn:hover,
 .mfs-close-btn:active {
-  background: rgba(239, 68, 68, 0.85);
+  background: #fee2e2;
+  color: #ef4444;
+  border-color: #fecaca;
 }
 
-/* 全屏形态与指标副栏 - 紧凑 20px 高度 */
+/* 全屏形态与指标副栏 - 紧凑清晰明亮 25px 高度 */
 .mfs-subbar {
-  flex: 0 0 20px;
-  height: 20px;
-  background: #11141a;
-  border-bottom: 1px solid #1c202a;
+  flex: 0 0 25px;
+  height: 25px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 6px;
-  font-size: 9.5px;
+  padding: 0 8px;
+  font-size: 10px;
   z-index: 20;
-  gap: 4px;
+  gap: 0;
+  box-sizing: border-box;
 }
 
-.mfs-sub-left {
+/* 左半边：K线详细数据 */
+.mfs-sub-kline {
   display: flex;
   align-items: center;
-  gap: 4px;
-  flex: 1 1 auto;
+  gap: 6px;
+  flex: 1 1 50%;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
+  user-select: none;
 }
 
-.mfs-sub-left::-webkit-scrollbar {
+.mfs-sub-kline::-webkit-scrollbar {
+  display: none;
+}
+
+.mfs-kd-time {
+  color: #475569;
+  font-size: 9.5px;
+  font-family: Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.mfs-kd-ohlc {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.mfs-kd-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.mfs-kd-lbl {
+  color: #64748b;
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.mfs-kd-item b {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: Consolas, monospace;
+}
+
+.mfs-kd-item b.c-up {
+  color: #ef4444;
+}
+
+.mfs-kd-item b.c-down {
+  color: #10b981;
+}
+
+/* 中间分割线 */
+.mfs-sub-divider {
+  width: 1px;
+  height: 14px;
+  background: #cbd5e1;
+  margin: 0 6px;
+  flex-shrink: 0;
+}
+
+/* 右半边：形态数据 */
+.mfs-sub-pattern {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  flex: 1 1 50%;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  user-select: none;
+}
+
+.mfs-sub-pattern::-webkit-scrollbar {
   display: none;
 }
 
@@ -6653,26 +6793,28 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 0.5px 5px;
-  border-radius: 2px;
-  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 9.5px;
   font-weight: 700;
   cursor: pointer;
   flex-shrink: 0;
 }
 
 .mfs-pat-chip.is-up {
-  background: rgba(239, 68, 68, 0.18);
-  color: #f87171;
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+  border: 1px solid rgba(239, 68, 68, 0.25);
 }
 
 .mfs-pat-chip.is-down {
-  background: rgba(16, 185, 129, 0.18);
-  color: #34d399;
+  background: rgba(16, 185, 129, 0.12);
+  color: #059669;
+  border: 1px solid rgba(16, 185, 129, 0.25);
 }
 
 .mfs-sub-state {
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 600;
   flex-shrink: 0;
 }
@@ -6680,79 +6822,89 @@ onBeforeUnmount(() => {
 .mfs-sub-levels {
   display: flex;
   align-items: center;
-  gap: 4px;
-  font-size: 9px;
-  color: #94a3b8;
+  gap: 3px;
+  font-size: 9.5px;
+  color: #64748b;
   flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.mfs-sub-levels span {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  padding: 0 3px;
+  border-radius: 2px;
 }
 
 .mfs-sub-levels b {
-  color: #f1f5f9;
-  font-weight: 600;
+  color: #0f172a;
+  font-weight: 700;
   font-family: Consolas, monospace;
 }
 
 .mfs-singlebar-chip {
-  padding: 0.5px 4px;
+  padding: 1px 4px;
   border-radius: 2px;
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .mfs-singlebar-desc {
-  font-size: 9px;
-  color: #94a3b8;
+  font-size: 9.5px;
+  color: #475569;
   white-space: nowrap;
 }
 
 .mfs-recent-chip {
-  background: rgba(255, 255, 255, 0.08);
-  color: #cbd5e1;
-  padding: 0.5px 4px;
+  background: #e2e8f0;
+  color: #334155;
+  padding: 1px 4px;
   border-radius: 2px;
-  font-size: 9px;
+  font-size: 9.5px;
+  font-weight: 600;
   flex-shrink: 0;
 }
 
 .mfs-recent-dir {
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 700;
   flex-shrink: 0;
 }
 
 .mfs-sub-score {
-  font-size: 9px;
-  color: #94a3b8;
+  font-size: 9.5px;
+  color: #64748b;
   flex-shrink: 0;
 }
 
 .mfs-sub-score b {
-  color: #f1f5f9;
+  color: #0f172a;
   font-family: Consolas, monospace;
+  font-weight: 700;
 }
 
 .mfs-recent-stat {
-  font-size: 9px;
+  font-size: 9.5px;
   padding: 0 3px;
   border-radius: 2px;
   flex-shrink: 0;
 }
 
 .mfs-sub-neutral {
-  font-size: 9px;
+  font-size: 9.5px;
   font-weight: 700;
-  color: #e2e8f0;
+  color: #475569;
   flex-shrink: 0;
 }
 
 .mfs-sub-tip {
-  font-size: 9px;
-  color: #64748b;
+  font-size: 9.5px;
+  color: #94a3b8;
   white-space: nowrap;
 }
 
-.mfs-sub-right {
+.mfs-sub-actions {
   display: flex;
   align-items: center;
   gap: 2px;
@@ -6760,31 +6912,31 @@ onBeforeUnmount(() => {
 }
 
 .mfs-sub-btn {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border: none;
-  background: transparent;
-  color: #94a3b8;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  color: #64748b;
   cursor: pointer;
-  border-radius: 2px;
+  border-radius: 3px;
   transition: all 0.15s;
 }
 
 .mfs-sub-btn:hover,
 .mfs-sub-btn:active {
-  background: rgba(255, 255, 255, 0.08);
-  color: #fff;
+  background: #f1f5f9;
+  color: #0f172a;
 }
 
 .mfs-draw-eye {
-  color: #f59e0b;
+  color: #d97706;
 }
 
 .mfs-draw-eye.is-hidden-eye {
-  color: #475569;
+  color: #94a3b8;
 }
 
 /* 图表主体 */
@@ -6815,17 +6967,17 @@ onBeforeUnmount(() => {
 
 .mfs-dropdown-search {
   padding: 6px;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid #e2e8f0;
 }
 
 .mfs-search-input {
   width: 100%;
   box-sizing: border-box;
-  background: #0f172a;
-  border: 1px solid #334155;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
   border-radius: 4px;
   padding: 4px 8px;
-  color: #f8fafc;
+  color: #0f172a;
   font-size: 12px;
   outline: none;
 }
@@ -6847,7 +6999,7 @@ onBeforeUnmount(() => {
 
 .mfs-dropdown-item:hover,
 .mfs-dropdown-item.active {
-  background: rgba(255, 255, 255, 0.08);
+  background: #f1f5f9;
 }
 
 .mfs-di-left {
@@ -6858,13 +7010,13 @@ onBeforeUnmount(() => {
 
 .mfs-di-name {
   font-size: 12px;
-  color: #f8fafc;
+  color: #0f172a;
   font-weight: 600;
 }
 
 .mfs-di-code {
   font-size: 10px;
-  color: #94a3b8;
+  color: #64748b;
   font-family: Consolas, monospace;
 }
 
@@ -6876,7 +7028,7 @@ onBeforeUnmount(() => {
 
 .mfs-di-exch {
   font-size: 10px;
-  color: #64748b;
+  color: #94a3b8;
 }
 
 .mfs-di-star {
@@ -6893,9 +7045,9 @@ onBeforeUnmount(() => {
 .mfs-pats-header {
   font-size: 12px;
   font-weight: 700;
-  color: #94a3b8;
+  color: #334155;
   margin-bottom: 6px;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid #e2e8f0;
   padding-bottom: 4px;
 }
 
@@ -6904,7 +7056,7 @@ onBeforeUnmount(() => {
   font-weight: 600;
   color: #64748b;
   margin: 8px 0 4px;
-  border-top: 1px dashed #334155;
+  border-top: 1px dashed #e2e8f0;
   padding-top: 6px;
 }
 
@@ -6914,9 +7066,9 @@ onBeforeUnmount(() => {
   gap: 4px;
   padding: 6px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.03);
+  background: #f8fafc;
   margin-bottom: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid #e2e8f0;
 }
 
 .mfs-pat-item.is-hidden-item {
@@ -6942,18 +7094,18 @@ onBeforeUnmount(() => {
 
 .mfs-pi-score {
   font-size: 10px;
-  color: #94a3b8;
+  color: #64748b;
 }
 
 .mfs-pi-levels {
   display: flex;
   gap: 6px;
   font-size: 10px;
-  color: #94a3b8;
+  color: #64748b;
 }
 
 .mfs-pi-levels b {
-  color: #f1f5f9;
+  color: #0f172a;
   font-family: Consolas, monospace;
 }
 
@@ -6965,16 +7117,16 @@ onBeforeUnmount(() => {
   padding: 2px 6px;
   border-radius: 3px;
   font-size: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: transparent;
-  color: #cbd5e1;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #475569;
   cursor: pointer;
 }
 
 .mfs-pi-draw-btn.active {
   background: rgba(245, 158, 11, 0.15);
-  color: #f59e0b;
-  border-color: rgba(245, 158, 11, 0.3);
+  color: #b45309;
+  border-color: rgba(245, 158, 11, 0.4);
 }
 
 .mfs-tip-popover {
@@ -6985,12 +7137,12 @@ onBeforeUnmount(() => {
 
 .mfs-tip-title {
   font-weight: 700;
-  color: #f8fafc;
+  color: #0f172a;
   margin-bottom: 4px;
 }
 
 .mfs-tip-desc {
-  color: #cbd5e1;
+  color: #475569;
   margin-bottom: 4px;
 }
 
@@ -7007,9 +7159,9 @@ onBeforeUnmount(() => {
 .mfs-depth-title {
   font-size: 12px;
   font-weight: 700;
-  color: #f8fafc;
+  color: #0f172a;
   margin-bottom: 8px;
-  border-bottom: 1px solid #334155;
+  border-bottom: 1px solid #e2e8f0;
   padding-bottom: 4px;
 }
 </style>
