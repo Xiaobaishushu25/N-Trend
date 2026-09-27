@@ -10,7 +10,7 @@ import {
   NPopover,
   NScrollbar,
 } from 'naive-ui'
-import { Adjustments, ArrowLeft, ChevronRight, Eye, EyeOff, InfoCircle, List, Plus, Settings, Star, X } from '@vicons/tabler'
+import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronsRight, Eye, EyeOff, GridDots, Heart, Help, InfoCircle, List, Maximize, Pencil, Plus, Settings, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
@@ -399,9 +399,15 @@ function exitReviewMode() {
 }
 
 function onReviewKeydown(e: KeyboardEvent) {
-  if (e.key === 'Escape' && reviewMode.value) {
-    exitReviewMode()
-    return
+  if (e.key === 'Escape') {
+    if (isMobileFullscreen.value) {
+      exitMobileFullscreen()
+      return
+    }
+    if (reviewMode.value) {
+      exitReviewMode()
+      return
+    }
   }
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return
   if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return
@@ -771,6 +777,84 @@ const mobileMarketStats = computed(() => {
   }
 })
 
+function fmtVol(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return '—'
+  if (Math.abs(v) >= 10000) {
+    return (v / 10000).toFixed(1) + '万'
+  }
+  return String(Math.round(v))
+}
+
+const mobileDailyHoldDelta = computed(() => {
+  const rows = displayRows.value
+  if (!rows || rows.length < 2) return null
+  const last = rows[rows.length - 1]
+  const todayStr = last.ts ? last.ts.split(' ')[0] : ''
+  const todayRows = todayStr ? rows.filter((r) => r.ts && r.ts.startsWith(todayStr)) : []
+  if (todayRows.length >= 2 && todayRows[todayRows.length - 1].hold != null && todayRows[0].hold != null) {
+    return todayRows[todayRows.length - 1].hold! - todayRows[0].hold!
+  }
+  return null
+})
+
+/** 移动端全屏看盘状态与交互控制 */
+const isMobileFullscreen = ref(false)
+const mfsSearchQuery = ref('')
+
+const filteredMfsSymbols = computed(() => {
+  const list = visibleSymbols.value
+  const q = mfsSearchQuery.value.trim().toLowerCase()
+  if (!q) return list
+  return list.filter((s) => s.code.toLowerCase().includes(q) || s.name.toLowerCase().includes(q))
+})
+
+function switchSymbolTo(code: string) {
+  if (code === symbol.value) return
+  router.replace({ name: 'chart', params: { symbol: code } })
+}
+
+async function enterMobileFullscreen() {
+  isMobileFullscreen.value = true
+  try {
+    if (document.documentElement.requestFullscreen) {
+      await document.documentElement.requestFullscreen()
+    }
+  } catch {}
+  try {
+    const orientation = (screen as any).orientation
+    if (orientation && orientation.lock) {
+      await orientation.lock('landscape').catch(() => {})
+    }
+  } catch {}
+  nextTick(() => {
+    chartRef.value?.resetView?.()
+  })
+}
+
+async function exitMobileFullscreen() {
+  isMobileFullscreen.value = false
+  try {
+    if (document.fullscreenElement && document.exitFullscreen) {
+      await document.exitFullscreen()
+    }
+  } catch {}
+  try {
+    const orientation = (screen as any).orientation
+    if (orientation && orientation.unlock) {
+      orientation.unlock()
+    }
+  } catch {}
+  nextTick(() => {
+    chartRef.value?.resetView?.()
+  })
+}
+
+function onDocumentFullscreenChange() {
+  if (!document.fullscreenElement && isMobileFullscreen.value) {
+    exitMobileFullscreen()
+  }
+}
+
 const mobileNearestLevels = computed(() => {
   const cur = quotePrice.value
   if (cur == null || !Number.isFinite(cur)) return []
@@ -799,6 +883,8 @@ const chartRef = ref<{
   toggleManualLevelDraw: () => boolean
   trendVisible?: boolean
   toggleTrendVisible?: () => boolean
+  scrollLogical?: (delta: number) => void
+  resetView?: () => { from: number; to: number } | null
 } | null>(null)
 
 const isTrendVisible = computed(() => chartRef.value?.trendVisible ?? true)
@@ -1951,6 +2037,7 @@ watch(
 
 onMounted(async () => {
   window.addEventListener('keydown', onReviewKeydown)
+  document.addEventListener('fullscreenchange', onDocumentFullscreenChange)
   void refreshV2Predictions()
   unlisteners.push(
     await onScanCompleted((result) => {
@@ -2038,6 +2125,10 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onReviewKeydown)
+  document.removeEventListener('fullscreenchange', onDocumentFullscreenChange)
+  if (isMobileFullscreen.value) {
+    void exitMobileFullscreen()
+  }
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
   for (const fn of unlisteners) fn()
@@ -2252,6 +2343,16 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="m-topbar-right">
+          <!-- 移动端全屏查看K线 -->
+          <button
+            type="button"
+            class="m-tb-btn m-fullscreen-btn"
+            @click="enterMobileFullscreen"
+            title="全屏展示K线图"
+          >
+            <n-icon :component="Maximize" :size="15" />
+          </button>
+
           <!-- 移动端工具与操作菜单 -->
           <n-popover
             placement="bottom-end"
@@ -2267,6 +2368,10 @@ onBeforeUnmount(() => {
             </template>
             <div class="m-tools-menu">
               <div class="m-tools-group-title">图表显示</div>
+              <div class="m-tools-item" @click="enterMobileFullscreen">
+                <span class="m-tools-label">全屏展示K线图</span>
+                <span class="m-tools-badge is-active">全屏</span>
+              </div>
               <div class="m-tools-item" @click="toggleChartTrend">
                 <span class="m-tools-label">MA20 趋势线</span>
                 <span class="m-tools-badge" :class="{ 'is-active': isTrendVisible }">
@@ -2440,10 +2545,310 @@ onBeforeUnmount(() => {
         </n-scrollbar>
       </div>
 
-      <div class="chart-col" @wheel.prevent="handleChartWheel">
-        <!-- 移动端顶部信息与形态卡片（红框区域：支持滑动切换品种并防误触） -->
+      <div
+        class="chart-col"
+        :class="{ 'is-mobile-fullscreen': isMobileFullscreen }"
+        @wheel.prevent="handleChartWheel"
+      >
+        <!-- 移动端全屏顶部沉浸栏 (参考截图) -->
+        <div v-if="isMobileFullscreen" class="mfs-header">
+          <div class="mfs-header-left">
+            <button
+              type="button"
+              class="mfs-nav-btn"
+              title="上一个品种"
+              aria-label="上一个品种"
+              @click="switchSymbol(-1)"
+            >‹</button>
+
+            <n-popover trigger="click" placement="bottom-start" class="mfs-sym-popover">
+              <template #trigger>
+                <div class="mfs-sym-box" title="点击快速切换品种">
+                  <span class="mfs-sym-name">{{ currentSymbol?.name || symbol }}</span>
+                  <div class="mfs-sym-meta">
+                    <span class="mfs-sym-code">{{ symbol }}</span>
+                    <span v-if="currentSymbol?.exchange" class="mfs-sym-badge">{{ currentSymbol.exchange }}</span>
+                    <n-icon :component="ChevronDown" :size="12" class="mfs-sym-arrow" />
+                  </div>
+                </div>
+              </template>
+              <div class="mfs-sym-dropdown">
+                <div class="mfs-dropdown-search">
+                  <input v-model="mfsSearchQuery" placeholder="搜索品种..." class="mfs-search-input" />
+                </div>
+                <div class="mfs-dropdown-list">
+                  <div
+                    v-for="s in filteredMfsSymbols"
+                    :key="s.code"
+                    class="mfs-dropdown-item"
+                    :class="{ active: s.code === symbol }"
+                    @click="switchSymbolTo(s.code)"
+                  >
+                    <div class="mfs-di-left">
+                      <span class="mfs-di-name">{{ s.name }}</span>
+                      <span class="mfs-di-code">{{ s.code }}</span>
+                    </div>
+                    <div class="mfs-di-right">
+                      <span v-if="s.exchange" class="mfs-di-exch">{{ s.exchange }}</span>
+                      <n-icon v-if="s.is_followed" :component="Star" :size="12" class="mfs-di-star" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </n-popover>
+
+            <button
+              type="button"
+              class="mfs-nav-btn"
+              title="下一个品种"
+              aria-label="下一个品种"
+              @click="switchSymbol(1)"
+            >›</button>
+          </div>
+
+          <div class="mfs-header-center">
+            <div class="mfs-price-block">
+              <span class="mfs-price-val" :style="{ color: quoteColor }">
+                {{ quotePrice != null ? quotePrice.toFixed(1) : '—' }}
+              </span>
+              <div class="mfs-price-changes">
+                <span class="mfs-change-pct" :style="{ color: quoteColor }">
+                  {{ fmtChange(snapshot?.change_pct) }}
+                </span>
+                <span v-if="quotePoints != null" class="mfs-change-pts" :style="{ color: quoteColor }">
+                  {{ fmtSigned(quotePoints) }}
+                </span>
+              </div>
+            </div>
+            <div v-if="mobileMarketStats" class="mfs-stats-grid">
+              <div class="mfs-stat-col">
+                <div class="mfs-stat-item"><span class="lbl">今开</span><span class="val">{{ mobileMarketStats.open.toFixed(1) }}</span></div>
+                <div class="mfs-stat-item"><span class="lbl">成交量</span><span class="val">{{ fmtVol(mobileMarketStats.volume) }}</span></div>
+              </div>
+              <div class="mfs-stat-col">
+                <div class="mfs-stat-item"><span class="lbl">最高</span><span class="val is-up">{{ mobileMarketStats.high.toFixed(1) }}</span></div>
+                <div class="mfs-stat-item"><span class="lbl">持仓</span><span class="val">{{ fmtVol(mobileMarketStats.openInterest) }}</span></div>
+              </div>
+              <div class="mfs-stat-col">
+                <div class="mfs-stat-item"><span class="lbl">最低</span><span class="val is-down">{{ mobileMarketStats.low.toFixed(1) }}</span></div>
+                <div class="mfs-stat-item">
+                  <span class="lbl">日增仓</span>
+                  <span class="val" :class="mobileDailyHoldDelta && mobileDailyHoldDelta > 0 ? 'is-up' : mobileDailyHoldDelta && mobileDailyHoldDelta < 0 ? 'is-down' : ''">
+                    {{ mobileDailyHoldDelta != null ? fmtSigned(mobileDailyHoldDelta) : '—' }}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mfs-header-right">
+            <button
+              type="button"
+              class="mfs-icon-btn mfs-heart-btn"
+              :class="{ 'is-active': currentSymbol?.is_followed }"
+              @click="currentSymbol && handleToggleFollow(currentSymbol)"
+              :title="currentSymbol?.is_followed ? '取消自选' : '加入自选'"
+            >
+              <n-icon :component="Heart" :size="17" />
+            </button>
+
+            <n-popover placement="bottom-end" trigger="click" :show-arrow="false">
+              <template #trigger>
+                <button type="button" class="mfs-icon-btn" title="图表工具与指标">
+                  <n-icon :component="Pencil" :size="16" />
+                </button>
+              </template>
+              <div class="m-tools-menu">
+                <div class="m-tools-group-title">指标与图层</div>
+                <div class="m-tools-item" @click="toggleChartTrend">
+                  <span class="m-tools-label">MA20 趋势线</span>
+                  <span class="m-tools-badge" :class="{ 'is-active': isTrendVisible }">{{ isTrendVisible ? '已显示' : '已隐藏' }}</span>
+                </div>
+                <div class="m-tools-item" @click="showExtremes = !showExtremes">
+                  <span class="m-tools-label">最高/最低价标记</span>
+                  <span class="m-tools-badge" :class="{ 'is-active': showExtremes }">{{ showExtremes ? '已标记' : '已隐藏' }}</span>
+                </div>
+                <div class="m-tools-item" @click="toggleManualLevelDraw">
+                  <span class="m-tools-label">手动关键区域</span>
+                  <span class="m-tools-badge" :class="{ 'is-active': manualLevelDrawMode }">{{ manualLevelDrawMode ? '绘制中' : '新建绘制' }}</span>
+                </div>
+              </div>
+            </n-popover>
+
+            <button type="button" class="mfs-icon-btn" @click="showList = true" title="品种列表">
+              <n-icon :component="GridDots" :size="17" />
+            </button>
+
+            <button
+              type="button"
+              class="mfs-icon-btn mfs-close-btn"
+              @click="exitMobileFullscreen"
+              title="退出全屏"
+            >
+              <n-icon :component="X" :size="17" />
+            </button>
+          </div>
+        </div>
+
+        <!-- 移动端全屏形态与指标副栏 (参考截图) -->
+        <div v-if="isMobileFullscreen" class="mfs-subbar">
+          <div class="mfs-sub-left">
+            <template v-if="topActivePattern">
+              <n-popover trigger="click" placement="bottom-start" class="mfs-patterns-popover">
+                <template #trigger>
+                  <div class="mfs-pat-chip" :class="topActivePattern.direction === 'up' ? 'is-up' : 'is-down'">
+                    <span>{{ dirText(topActivePattern.direction) }}形态 {{ levelSuffix(topActivePattern.level) }}</span>
+                    <n-icon :component="ChevronDown" :size="11" />
+                  </div>
+                </template>
+                <div class="mfs-patterns-dropdown">
+                  <div class="mfs-pats-header">当前活跃形态信号 ({{ signals.length }})</div>
+                  <div
+                    v-for="sig in signals"
+                    :key="sig.number"
+                    class="mfs-pat-item"
+                    :class="{ 'is-hidden-item': isHidden(sig.number) }"
+                  >
+                    <div class="mfs-pi-info">
+                      <span class="mfs-pi-dir" :class="sig.direction === 'up' ? 'badge-up' : 'badge-down'">
+                        {{ dirText(sig.direction) }} {{ levelSuffix(sig.level) }}
+                      </span>
+                      <span class="mfs-pi-state" :class="stateType(sig.state)">● {{ sigLabel(sig.state) }}</span>
+                      <span class="mfs-pi-score">评分 <b>{{ sig.score.toFixed(1) }}</b></span>
+                    </div>
+                    <div class="mfs-pi-levels">
+                      <span>入 <b>{{ sig.entry.toFixed(1) }}</b></span>
+                      <span>损 <b>{{ sig.stop.toFixed(1) }}</b></span>
+                      <span>标 <b>{{ sig.target.toFixed(1) }}</b></span>
+                      <span>RR <b>{{ sig.rr.toFixed(1) }}</b></span>
+                    </div>
+                    <button
+                      type="button"
+                      class="mfs-pi-draw-btn"
+                      :class="{ active: !isHidden(sig.number) }"
+                      @click.stop="togglePattern(sig.number)"
+                    >
+                      <n-icon :component="isHidden(sig.number) ? EyeOff : Eye" :size="13" />
+                      <span>{{ isHidden(sig.number) ? '未绘' : '已绘' }}</span>
+                    </button>
+                  </div>
+                  <div v-if="recentHistorySignals.length" class="mfs-pats-sub-header">历史形态回溯</div>
+                  <div
+                    v-for="hs in recentHistorySignals.slice(0, 3)"
+                    :key="hs.number"
+                    class="mfs-pat-item is-history"
+                  >
+                    <div class="mfs-pi-info">
+                      <span class="mfs-pi-dir" :class="hs.direction === 'up' ? 'badge-up' : 'badge-down'">
+                        {{ dirText(hs.direction) }} {{ levelSuffix(hs.level) }}
+                      </span>
+                      <span class="mfs-pi-score">评分 {{ hs.score.toFixed(1) }}</span>
+                    </div>
+                    <button
+                      type="button"
+                      class="mfs-pi-draw-btn"
+                      :class="{ active: isRecentShown(hs.number) }"
+                      @click.stop="toggleRecentPattern(hs.number)"
+                    >
+                      <n-icon :component="isRecentShown(hs.number) ? Eye : EyeOff" :size="13" />
+                      <span>{{ isRecentShown(hs.number) ? '已绘' : '绘制' }}</span>
+                    </button>
+                  </div>
+                </div>
+              </n-popover>
+
+              <span class="mfs-sub-state" :class="stateType(topActivePattern.state)">
+                ● {{ sigLabel(topActivePattern.state) }}
+              </span>
+
+              <div class="mfs-sub-levels">
+                <span>入:<b>{{ topActivePattern.entry.toFixed(1) }}</b></span>
+                <span>损:<b>{{ topActivePattern.stop.toFixed(1) }}</b></span>
+                <span>标:<b>{{ topActivePattern.target.toFixed(1) }}</b></span>
+                <span>RR:<b>{{ topActivePattern.rr.toFixed(1) }}</b></span>
+                <span>评分:<b>{{ topActivePattern.score.toFixed(1) }}</b></span>
+                <span v-if="pwinFor(topActivePattern.number) != null">
+                  胜率:<b>{{ (pwinFor(topActivePattern.number)! * 100).toFixed(0) }}%</b>
+                </span>
+              </div>
+            </template>
+
+            <!-- 若无活跃形态，但有单K异动 -->
+            <template v-else-if="topSingleBar">
+              <span class="mfs-singlebar-chip" :style="singleBarBadgeStyle(topSingleBar.kind)">
+                单K · {{ topSingleBar.label }}
+              </span>
+              <span class="mfs-singlebar-desc">{{ singleBarTitle(topSingleBar) }}</span>
+            </template>
+
+            <!-- 若无活跃形态，有最近形态 -->
+            <template v-else-if="topRecentPattern">
+              <span class="mfs-recent-chip">最近形态</span>
+              <span class="mfs-recent-dir" :class="topRecentPattern.direction === 'up' ? 'badge-up' : 'badge-down'">
+                {{ dirText(topRecentPattern.direction) }} {{ levelSuffix(topRecentPattern.level) }}
+              </span>
+              <span class="mfs-sub-score">评分 <b>{{ topRecentPattern.score.toFixed(1) }}</b></span>
+              <span class="mfs-recent-stat" :class="recentPatternStatus(topRecentPattern).cls">
+                {{ recentPatternStatus(topRecentPattern).text }}
+              </span>
+            </template>
+
+            <!-- 都无时显示多空趋势 -->
+            <template v-else>
+              <span class="mfs-sub-neutral">多空趋势</span>
+              <span class="mfs-sub-tip">MA20 趋势跟踪 · 暂无活跃形态</span>
+            </template>
+          </div>
+
+          <div class="mfs-sub-right">
+            <n-popover trigger="click" placement="bottom-end">
+              <template #trigger>
+                <button type="button" class="mfs-sub-btn" title="形态决策说明与指南">
+                  <n-icon :component="Help" :size="15" />
+                </button>
+              </template>
+              <div class="mfs-tip-popover">
+                <div v-if="topActivePattern">
+                  <div class="mfs-tip-title">{{ dirText(topActivePattern.direction) }}形态决策建议</div>
+                  <div class="mfs-tip-desc">
+                    {{ topActivePattern.state === 'triggered' ? '已触发突破入场位，严格按照止损点防守，关注目标位止盈。' : '形态预警中，密切关注价格是否有效突破入场价。' }}
+                  </div>
+                  <div v-if="quotePrice != null" class="mfs-tip-stop">
+                    当前价距止损约 {{ Math.abs(quotePrice - topActivePattern.stop).toFixed(1) }} 点
+                  </div>
+                </div>
+                <div v-else>
+                  当前周期暂无活跃形态，可尝试切换其他分析周期（如 15m / 30m / 1h / 1d）观察。
+                </div>
+              </div>
+            </n-popover>
+
+            <button
+              v-if="topActivePattern"
+              type="button"
+              class="mfs-sub-btn mfs-draw-eye"
+              :class="{ 'is-hidden-eye': isHidden(topActivePattern.number) }"
+              @click="togglePattern(topActivePattern.number)"
+              :title="isHidden(topActivePattern.number) ? '开启图表绘制' : '关闭图表绘制'"
+            >
+              <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" :size="15" />
+            </button>
+            <button
+              v-else-if="topRecentPattern"
+              type="button"
+              class="mfs-sub-btn mfs-draw-eye"
+              :class="{ 'is-hidden-eye': !isRecentShown(topRecentPattern.number) }"
+              @click="toggleRecentPattern(topRecentPattern.number)"
+              :title="isRecentShown(topRecentPattern.number) ? '关闭图表绘制' : '开启图表绘制'"
+            >
+              <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" :size="15" />
+            </button>
+          </div>
+        </div>
+
+        <!-- 移动端顶部信息与形态卡片（红框区域：支持滑动切换品种并防误触，非全屏时显示） -->
         <div
-          v-if="isMobile"
+          v-if="isMobile && !isMobileFullscreen"
           class="mobile-summary-card"
           :class="{ 'is-swiping': isSwipingCard }"
           @touchstart.passive="handleCardTouchStart"
@@ -2586,35 +2991,67 @@ onBeforeUnmount(() => {
         >
           {{ klinesStore.chartMessage || '当前图表使用临时数据源，数据不会写入本地库或参与策略。' }}
         </div>
-        <KLineChart
-          v-if="symbol && klinesStore.rows.length"
-          ref="chartRef"
-          :symbol="symbol"
-          :timeframe="timeframe"
-          :rows="displayRows"
-          :signals="visibleSignals"
-          :show-extremes="showExtremes"
-          :review-exit="reviewExit"
-          :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
-           :trend-points="trendPoints"
-          :single-bars="chartSingleBars"
-           :manual-levels="visibleManualLevels"
-           :is-mobile="isMobile"
-           @create-manual-level="handleCreateManualLevel"
-           @update-manual-level="handleUpdateManualLevel"
-           @preview-manual-level="handleManualLevelPreview"
-           @manual-level-draw-mode="onManualLevelDrawMode"
-           :loading="klinesStore.loading"
-        />
-        <n-empty
-          v-else
-          class="chart-empty"
-          description="暂无K线数据，请先在列表页刷新数据"
-        />
+        <div class="chart-canvas-wrapper" :class="{ 'is-fullscreen-canvas': isMobileFullscreen }">
+          <!-- 全屏浮动导航按钮（参考截图） -->
+          <template v-if="isMobileFullscreen">
+            <button
+              type="button"
+              class="mfs-chart-nav-btn mfs-nav-left"
+              @click="chartRef?.scrollLogical?.(-25)"
+              title="向左平移查看历史K线"
+            >
+              <n-icon :component="ChevronLeft" :size="20" />
+            </button>
+            <button
+              type="button"
+              class="mfs-chart-nav-btn mfs-nav-right"
+              @click="chartRef?.scrollLogical?.(25)"
+              title="向右平移查看最新K线"
+            >
+              <n-icon :component="ChevronRight" :size="20" />
+            </button>
+            <button
+              type="button"
+              class="mfs-chart-fastforward-btn"
+              @click="chartRef?.resetView?.()"
+              title="回到最新K线"
+            >
+              <n-icon :component="ChevronsRight" :size="16" />
+            </button>
+          </template>
+
+          <KLineChart
+            v-if="symbol && klinesStore.rows.length"
+            ref="chartRef"
+            :symbol="symbol"
+            :timeframe="timeframe"
+            :rows="displayRows"
+            :signals="visibleSignals"
+            :show-extremes="showExtremes"
+            :review-exit="reviewExit"
+            :focus-ts="reviewFocusTs" :focus-key="reviewFocusKey"
+            :trend-points="trendPoints"
+            :single-bars="chartSingleBars"
+            :manual-levels="visibleManualLevels"
+            :is-mobile="isMobile"
+            :is-fullscreen="isMobileFullscreen"
+            @toggle-fullscreen="enterMobileFullscreen"
+            @create-manual-level="handleCreateManualLevel"
+            @update-manual-level="handleUpdateManualLevel"
+            @preview-manual-level="handleManualLevelPreview"
+            @manual-level-draw-mode="onManualLevelDrawMode"
+            :loading="klinesStore.loading"
+          />
+          <n-empty
+            v-else
+            class="chart-empty"
+            description="暂无K线数据，请先在列表页刷新数据"
+          />
+        </div>
 
         <!-- 移动端专属多维决策看板（利用缩减K线空白腾出的约五分之一高度，整合形态决策、盘口行情与关键支撑压力；支持左右滑动切换品种） -->
         <div
-          v-if="isMobile && !reviewMode"
+          v-if="isMobile && !reviewMode && !isMobileFullscreen"
           class="mobile-decision-panel"
           :class="{ 'is-collapsed': mobilePanelCollapsed, 'is-swiping': isSwipingPanel }"
           @touchstart.passive="handlePanelTouchStart"
@@ -2878,6 +3315,56 @@ onBeforeUnmount(() => {
                 <button type="button" class="mdp-empty-btn" @click="toggleManualLevelDraw">新建关键区域</button>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- 移动端全屏底部周期与工具栏 (参考截图) -->
+        <div v-if="isMobileFullscreen" class="mfs-bottombar">
+          <div class="mfs-bb-left">
+            <button
+              v-for="t in visibleTimeframes"
+              :key="t"
+              type="button"
+              class="mfs-bb-tf"
+              :class="{ active: timeframe === t }"
+              @click="timeframe = t"
+            >
+              {{ t === '1d' ? '日K' : t }}
+              <span v-if="timeframe === t" class="mfs-bb-tf-active-bar" />
+            </button>
+          </div>
+
+          <div class="mfs-bb-right">
+            <button
+              type="button"
+              class="mfs-bb-btn"
+              @click="chartRef?.resetView?.()"
+              title="复位到默认K线根数"
+            >
+              <span>复位</span>
+            </button>
+
+            <!-- 盘口快照 Popover -->
+            <n-popover placement="top-end" trigger="click" :show-arrow="false">
+              <template #trigger>
+                <button type="button" class="mfs-bb-btn" title="查看盘口与关键数据">
+                  <span>盘口</span>
+                </button>
+              </template>
+              <div class="mfs-depth-popover">
+                <div class="mfs-depth-title">行情盘口与关键数据</div>
+                <div v-if="mobileMarketStats" class="mdp-market-grid">
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">今开</span><span class="mkt-val">{{ mobileMarketStats.open.toFixed(1) }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">最高</span><span class="mkt-val is-up">{{ mobileMarketStats.high.toFixed(1) }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">最低</span><span class="mkt-val is-down">{{ mobileMarketStats.low.toFixed(1) }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">昨收</span><span class="mkt-val">{{ mobileMarketStats.prevClose }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">最新价</span><span class="mkt-val" :style="{ color: quoteColor }">{{ quotePrice != null ? quotePrice.toFixed(1) : '—' }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">日内振幅</span><span class="mkt-val">{{ mobileMarketStats.amplitude }}%</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">成交量</span><span class="mkt-val">{{ fmtVol(mobileMarketStats.volume) }}</span></div>
+                  <div class="mdp-mkt-item"><span class="mkt-lbl">持仓量</span><span class="mkt-val">{{ fmtVol(mobileMarketStats.openInterest) }}</span></div>
+                </div>
+              </div>
+            </n-popover>
           </div>
         </div>
       </div>
@@ -5965,5 +6452,772 @@ onBeforeUnmount(() => {
 @keyframes slideInRight {
   from { transform: translateX(100%); }
   to { transform: translateX(0); }
+}
+
+/* ========================================================
+   移动端沉浸式全屏看盘布局（参考交易终端全局视野）
+   ======================================================== */
+.chart-col.is-mobile-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 99999 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  max-height: 100vh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  background-color: #14171d !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+}
+
+/* 顶部沉浸行情信息栏 */
+.mfs-header {
+  flex: 0 0 44px;
+  height: 44px;
+  background: #191c24;
+  border-bottom: 1px solid #282c37;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  user-select: none;
+  gap: 8px;
+  z-index: 20;
+}
+
+.mfs-header-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mfs-nav-btn {
+  width: 26px;
+  height: 28px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #94a3b8;
+  font-size: 16px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mfs-nav-btn:hover,
+.mfs-nav-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #f8fafc;
+}
+
+.mfs-sym-box {
+  display: flex;
+  flex-direction: column;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+
+.mfs-sym-box:hover,
+.mfs-sym-box:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.mfs-sym-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: #f8fafc;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.mfs-sym-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1;
+}
+
+.mfs-sym-code {
+  font-size: 10px;
+  color: #94a3b8;
+  font-family: Consolas, monospace;
+}
+
+.mfs-sym-badge {
+  font-size: 9px;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
+.mfs-sym-arrow {
+  color: #64748b;
+}
+
+.mfs-header-center {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: center;
+}
+
+.mfs-price-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  flex-shrink: 0;
+  line-height: 1.1;
+}
+
+.mfs-price-val {
+  font-size: 16px;
+  font-weight: 800;
+  font-family: Consolas, monospace;
+}
+
+.mfs-price-changes {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: Consolas, monospace;
+}
+
+.mfs-stats-grid {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.mfs-stat-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.mfs-stat-item {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.mfs-stat-item .lbl {
+  color: #94a3b8;
+}
+
+.mfs-stat-item .val {
+  color: #e2e8f0;
+  font-weight: 600;
+  font-family: Consolas, monospace;
+}
+
+.mfs-stat-item .val.is-up {
+  color: #ef4444;
+}
+
+.mfs-stat-item .val.is-down {
+  color: #10b981;
+}
+
+.mfs-header-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.mfs-icon-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #cbd5e1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mfs-icon-btn:hover,
+.mfs-icon-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+.mfs-heart-btn.is-active {
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+.mfs-close-btn {
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  color: #fff;
+}
+
+.mfs-close-btn:hover,
+.mfs-close-btn:active {
+  background: rgba(239, 68, 68, 0.8);
+}
+
+/* 全屏形态与指标副栏 */
+.mfs-subbar {
+  flex: 0 0 26px;
+  height: 26px;
+  background: #151820;
+  border-bottom: 1px solid #232732;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+  font-size: 11px;
+  z-index: 20;
+  gap: 6px;
+}
+
+.mfs-sub-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.mfs-sub-left::-webkit-scrollbar {
+  display: none;
+}
+
+.mfs-pat-chip {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mfs-pat-chip.is-up {
+  background: rgba(239, 68, 68, 0.18);
+  color: #f87171;
+}
+
+.mfs-pat-chip.is-down {
+  background: rgba(16, 185, 129, 0.18);
+  color: #34d399;
+}
+
+.mfs-sub-state {
+  font-size: 10px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.mfs-sub-levels {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.mfs-sub-levels b {
+  color: #f1f5f9;
+  font-weight: 600;
+  font-family: Consolas, monospace;
+}
+
+.mfs-singlebar-chip {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.mfs-singlebar-desc {
+  font-size: 10px;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.mfs-recent-chip {
+  background: rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.mfs-recent-dir {
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.mfs-sub-score {
+  font-size: 10px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+
+.mfs-sub-score b {
+  color: #f1f5f9;
+  font-family: Consolas, monospace;
+}
+
+.mfs-recent-stat {
+  font-size: 10px;
+  padding: 0 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.mfs-sub-neutral {
+  font-size: 10px;
+  font-weight: 700;
+  color: #e2e8f0;
+  flex-shrink: 0;
+}
+
+.mfs-sub-tip {
+  font-size: 10px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.mfs-sub-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mfs-sub-btn {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: all 0.15s;
+}
+
+.mfs-sub-btn:hover,
+.mfs-sub-btn:active {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.mfs-draw-eye {
+  color: #f59e0b;
+}
+
+.mfs-draw-eye.is-hidden-eye {
+  color: #475569;
+}
+
+/* 图表主体与悬浮导航按钮 */
+.chart-canvas-wrapper {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.chart-canvas-wrapper.is-fullscreen-canvas {
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.mfs-chart-nav-btn {
+  position: absolute;
+  top: 45%;
+  transform: translateY(-50%);
+  z-index: 15;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(24, 28, 38, 0.65);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.mfs-chart-nav-btn:hover,
+.mfs-chart-nav-btn:active {
+  background: rgba(35, 41, 55, 0.85);
+  color: #fff;
+  transform: translateY(-50%) scale(1.08);
+}
+
+.mfs-nav-left {
+  left: 8px;
+}
+
+.mfs-nav-right {
+  right: 8px;
+}
+
+.mfs-chart-fastforward-btn {
+  position: absolute;
+  left: 14px;
+  bottom: 80px;
+  z-index: 15;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(249, 115, 22, 0.88);
+  border: none;
+  color: #fff;
+  box-shadow: 0 2px 8px rgba(249, 115, 22, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mfs-chart-fastforward-btn:hover,
+.mfs-chart-fastforward-btn:active {
+  background: rgb(234, 88, 12);
+  transform: scale(1.08);
+}
+
+/* 全屏底部周期栏 */
+.mfs-bottombar {
+  flex: 0 0 36px;
+  height: 36px;
+  background: #191c24;
+  border-top: 1px solid #282c37;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px;
+  z-index: 20;
+  gap: 6px;
+}
+
+.mfs-bb-left {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.mfs-bb-left::-webkit-scrollbar {
+  display: none;
+}
+
+.mfs-bb-tf {
+  position: relative;
+  padding: 6px 10px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color 0.15s;
+}
+
+.mfs-bb-tf:hover {
+  color: #e2e8f0;
+}
+
+.mfs-bb-tf.active {
+  color: #ff6d00;
+  font-weight: 700;
+}
+
+.mfs-bb-tf-active-bar {
+  position: absolute;
+  bottom: 0;
+  left: 18%;
+  right: 18%;
+  height: 2px;
+  background: #ff6d00;
+  border-radius: 1px;
+}
+
+.mfs-bb-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.mfs-bb-btn {
+  padding: 3px 8px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #cbd5e1;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.mfs-bb-btn:hover,
+.mfs-bb-btn:active {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+/* 全屏下拉弹窗样式 */
+.mfs-sym-dropdown {
+  width: 240px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+}
+
+.mfs-dropdown-search {
+  padding: 6px;
+  border-bottom: 1px solid #334155;
+}
+
+.mfs-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  padding: 4px 8px;
+  color: #f8fafc;
+  font-size: 12px;
+  outline: none;
+}
+
+.mfs-dropdown-list {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 260px;
+}
+
+.mfs-dropdown-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.mfs-dropdown-item:hover,
+.mfs-dropdown-item.active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.mfs-di-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mfs-di-name {
+  font-size: 12px;
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.mfs-di-code {
+  font-size: 10px;
+  color: #94a3b8;
+  font-family: Consolas, monospace;
+}
+
+.mfs-di-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.mfs-di-exch {
+  font-size: 10px;
+  color: #64748b;
+}
+
+.mfs-di-star {
+  color: #f59e0b;
+}
+
+.mfs-patterns-dropdown {
+  width: 320px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.mfs-pats-header {
+  font-size: 12px;
+  font-weight: 700;
+  color: #94a3b8;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #334155;
+  padding-bottom: 4px;
+}
+
+.mfs-pats-sub-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+  margin: 8px 0 4px;
+  border-top: 1px dashed #334155;
+  padding-top: 6px;
+}
+
+.mfs-pat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  margin-bottom: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.mfs-pat-item.is-hidden-item {
+  opacity: 0.65;
+}
+
+.mfs-pi-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.mfs-pi-dir {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.mfs-pi-state {
+  font-size: 10px;
+}
+
+.mfs-pi-score {
+  font-size: 10px;
+  color: #94a3b8;
+}
+
+.mfs-pi-levels {
+  display: flex;
+  gap: 6px;
+  font-size: 10px;
+  color: #94a3b8;
+}
+
+.mfs-pi-levels b {
+  color: #f1f5f9;
+  font-family: Consolas, monospace;
+}
+
+.mfs-pi-draw-btn {
+  align-self: flex-end;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: transparent;
+  color: #cbd5e1;
+  cursor: pointer;
+}
+
+.mfs-pi-draw-btn.active {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.mfs-tip-popover {
+  max-width: 260px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.mfs-tip-title {
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 4px;
+}
+
+.mfs-tip-desc {
+  color: #cbd5e1;
+  margin-bottom: 4px;
+}
+
+.mfs-tip-stop {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+.mfs-depth-popover {
+  width: 280px;
+  padding: 4px;
+}
+
+.mfs-depth-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 8px;
+  border-bottom: 1px solid #334155;
+  padding-bottom: 4px;
 }
 </style>

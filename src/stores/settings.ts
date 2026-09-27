@@ -53,6 +53,7 @@ const defaultConfig = (): Config => ({
     breathe_hold_ms: 5000,
     min_bar_spacing: 8,
     chart_display_bars: 140,
+    mobile_chart_fullscreen_bars: 180,
     chart_right_gap: 10,
     chart_show_first_signal: true,
     score_pill_full_score: 3.5,

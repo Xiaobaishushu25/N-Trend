@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { NSpin, NTooltip } from 'naive-ui'
+import { NIcon, NSpin, NTooltip } from 'naive-ui'
+import { Maximize } from '@vicons/tabler'
 import {
   CandlestickSeries,
   ColorType,
@@ -51,6 +52,7 @@ const props = defineProps<{
   trendPoints?: TrendPointDto[]
   manualLevels?: ManualLevelDto[]
   isMobile?: boolean
+  isFullscreen?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -58,6 +60,7 @@ const emit = defineEmits<{
   (e: 'update-manual-level', id: number, input: ManualLevelInput, settled: (saved: ManualLevelDto | null) => void): void
   (e: 'preview-manual-level', id: number, input: ManualLevelInput | null): void
   (e: 'manual-level-draw-mode', active: boolean): void
+  (e: 'toggle-fullscreen'): void
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
@@ -767,8 +770,14 @@ let priceExtent = 1
 
 // 已修复：进入K线图被放大成巨大K线的根因是空图表上执行视图设置导致 barSpacing 污染（详见 git 历史）；保留修复逻辑，已移除调试面板代码
 
-/** 进入图表时默认展示的K线根数（从最新一根往前数），由设置界面配置 */
-const displayKNum = computed(() => Math.max(1, settingsStore.settings.ui.chart_display_bars))
+/** 进入图表时默认展示的K线根数（从最新一根往前数），由设置界面配置；全屏时优先使用移动端全屏配置 */
+const displayKNum = computed(() => {
+  if (props.isFullscreen) {
+    const fsBars = settingsStore.settings.ui.mobile_chart_fullscreen_bars
+    if (fsBars && fsBars > 0) return fsBars
+  }
+  return Math.max(1, settingsStore.settings.ui.chart_display_bars)
+})
 /** 默认视图右侧留出的空白上限（以K线根数为单位），相当于把图表向左拖一段，由设置界面配置 */
 const displayRightGap = computed(() => Math.max(0, settingsStore.settings.ui.chart_right_gap))
 /** 右侧留白占可见K线根数的比例上限：数据量少的品种留白按此比例缩水，避免右侧出现大片空白 */
@@ -1285,23 +1294,54 @@ function updatePriceExtent() {
   priceExtent = Math.max(1e-9, hi - lo)
 }
 
-/** 分配窗格高度：桌面端 78%/22%；移动端给成交量留足高度(60-90px)，避免K线蜡烛图过分狭长纵向拉伸 */
-function applyPaneHeights() {
+const volPaneTop = ref(0)
+
+function updateVolPaneTop() {
   if (!chart || !container.value) return
-  const h = container.value.clientHeight
-  if (h <= 0) return
-  const panes = chart.panes()
-  if (panes.length >= 2) {
-    const mobile = isMobileChart()
-    if (mobile) {
-      const volH = Math.max(60, Math.min(90, Math.round(h * 0.23)))
-      panes[1].setHeight(volH)
-      panes[0].setHeight(Math.max(60, h - volH))
-    } else {
-      panes[0].setHeight(Math.round(h * 0.78))
-      panes[1].setHeight(Math.max(40, Math.round(h * 0.22)))
+  try {
+    const pane0 = chart.paneSize(0)
+    if (pane0 && pane0.height > 0) {
+      volPaneTop.value = pane0.height
+      return
     }
+  } catch {}
+  const h = container.value.clientHeight
+  if (h > 0) {
+    volPaneTop.value = Math.round(h * 0.82)
   }
+}
+
+/** 分配窗格高度：桌面端 82%/18%；移动端 82%/18%（成交量保持紧凑高度，保证K线有充足高度，绝不退化为1:1） */
+function applyPaneHeights() {
+  if (!chart) return
+  const panes = chart.panes()
+  if (panes.length < 2) return
+
+  const mobile = isMobileChart()
+  const h = container.value?.clientHeight || 0
+
+  if (h > 0) {
+    const volH = mobile
+      ? Math.max(38, Math.min(75, Math.round(h * 0.18)))
+      : Math.max(40, Math.round(h * 0.18))
+    const kH = Math.max(60, h - volH)
+
+    // 优先通过 setStretchFactor 稳定相对比例权重（82:18），无论窗口/DOM渲染顺序如何都不会退化成 1:1
+    panes[0].setStretchFactor(kH)
+    panes[1].setStretchFactor(volH)
+
+    // 结合精确像素设置
+    try {
+      panes[1].setHeight(volH)
+      panes[0].setHeight(kH)
+    } catch {}
+  } else {
+    // 容器尚未完成布局时的容错兜底：直接显式设置权重，防止 lightweight-charts 默认 1000:1000 导致 1:1
+    panes[0].setStretchFactor(820)
+    panes[1].setStretchFactor(180)
+  }
+
+  updateVolPaneTop()
 }
 
 /** 保存当前视图作为全局缩放状态（横轴 + 价格轴）。 */
@@ -1789,6 +1829,19 @@ watch(() => props.isMobile, (mobile) => {
     rightPriceScale: { visible: !isM },
   })
   chart.priceScale('vol', 1).applyOptions({ visible: !isM })
+})
+
+watch(() => props.isFullscreen, () => {
+  if (!chart || !container.value) return
+  nextTick(() => {
+    if (!chart || !container.value) return
+    chart.applyOptions({
+      width: container.value.clientWidth,
+      height: container.value.clientHeight,
+    })
+    applyPaneHeights()
+    applyDefaultView()
+  })
 })
 
 function syncEventLabels() {
@@ -2689,7 +2742,22 @@ function toggleTrendVisible() {
   return trendVisible.value
 }
 
-defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisible })
+function resetView() {
+  return applyDefaultView()
+}
+
+function scrollLogical(deltaBars: number) {
+  if (!chart) return
+  const ts = chart.timeScale()
+  const logical = ts.getVisibleLogicalRange()
+  if (!logical) return
+  ts.setVisibleLogicalRange({
+    from: logical.from + deltaBars,
+    to: logical.to + deltaBars,
+  })
+}
+
+defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisible, scrollLogical, resetView })
 </script>
 
 <template>
@@ -2774,6 +2842,19 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
         ←/→ 切换焦点K线<br />Ctrl+滚轮 缩放<br />滚轮 切换品种<br />拖拽 平移<br />双击价格轴 复位
       </n-tooltip>
     </div>
+    <!-- 移动端成交量右上角全屏快捷按钮（仅保留图标，位于成交量区域右上角） -->
+    <button
+      v-if="isMobileChart() && !isFullscreen && volPaneTop > 0"
+      type="button"
+      class="kline-vol-fullscreen-btn"
+      :style="{ top: `${volPaneTop + 4}px` }"
+      @click.stop="emit('toggle-fullscreen')"
+      @pointerdown.stop
+      @touchstart.stop
+      title="全屏看盘"
+    >
+      <n-icon :component="Maximize" :size="13" />
+    </button>
     </div>
   </div>
 </template>
@@ -2923,6 +3004,32 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
   cursor: help;
   user-select: none;
   transition: background 0.15s, color 0.15s;
+}
+.kline-vol-fullscreen-btn {
+  position: absolute;
+  right: 6px;
+  z-index: 10;
+  width: 22px;
+  height: 20px;
+  border-radius: 4px;
+  background: rgba(241, 245, 249, 0.92);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #475569;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+.kline-vol-fullscreen-btn:active,
+.kline-vol-fullscreen-btn:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+  border-color: rgba(100, 116, 139, 0.5);
+  transform: scale(1.05);
 }
 .manual-level-overlay {
   position: absolute;

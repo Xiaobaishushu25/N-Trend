@@ -421,6 +421,8 @@ export interface UiConfig {
   min_bar_spacing: number
   /** 点击进入K线图时默认展示的K线根数 */
   chart_display_bars: number
+  /** 移动端全屏时默认展示的K线根数 */
+  mobile_chart_fullscreen_bars?: number
   /** K线图默认向左移动距离（根） */
   chart_right_gap: number
   /** 进入K线图时默认显示首个信号形态 */
@@ -748,6 +750,8 @@ export interface ClientLocalSettings {
   deviceName: string
   theme: string
   chartDisplayBars: number
+  mobileChartFullscreenBars?: number
+  mobile_chart_fullscreen_bars?: number
   chartRightGap: number
   minBarSpacing: number
   timeframes: string[]

@@ -280,6 +280,7 @@ const clientSettings = ref<ClientLocalSettings>({
   deviceName: 'Desktop PC',
   theme: 'dark',
   chartDisplayBars: 200,
+  mobileChartFullscreenBars: 180,
   chartRightGap: 15,
   minBarSpacing: 6,
   timeframes: ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
@@ -326,6 +327,7 @@ async function loadClientSettings() {
     const s = await api.getClientSettings()
     clientSettings.value = {
       ...s,
+      mobileChartFullscreenBars: s.mobileChartFullscreenBars ?? (s as any).mobile_chart_fullscreen_bars ?? 180,
       logLevel: s.logLevel || 'info',
     }
   } catch (e) {
@@ -841,6 +843,13 @@ onMounted(async () => {
                     <Tip text="初次进入图表时可视区默认展示的K线数量。" />
                   </div>
                   <n-input-number v-model:value="clientSettings.chartDisplayBars" :min="50" :max="1000" class="setting-input-number" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    {{ isMobile ? '全屏时默认展示的K线根数' : '全屏默认K线根数（移动端）' }}
+                    <Tip text="移动端在K线图进入全屏展示时，可视区默认展示的K线数量。" />
+                  </div>
+                  <n-input-number v-model:value="clientSettings.mobileChartFullscreenBars" :min="30" :max="1000" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">

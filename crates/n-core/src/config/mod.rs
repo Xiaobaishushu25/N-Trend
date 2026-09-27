@@ -345,6 +345,9 @@ pub struct UiConfig {
     pub min_bar_spacing: u64,
     /// 点击进入K线图时默认展示的K线根数（从最新一根往前数）
     pub chart_display_bars: u64,
+    /// 移动端全屏时默认展示的K线根数
+    #[serde(default = "default_mobile_chart_fullscreen_bars")]
+    pub mobile_chart_fullscreen_bars: u64,
     /// K线图默认向左移动距离（根），即默认视图右侧留出的空白上限
     pub chart_right_gap: u64,
     /// 进入K线图时默认显示排序最靠前的信号形态
@@ -369,6 +372,7 @@ impl Default for UiConfig {
             breathe_hold_ms: 5000,
             min_bar_spacing: 8,
             chart_display_bars: 140,
+            mobile_chart_fullscreen_bars: 180,
             chart_right_gap: 10,
             chart_show_first_signal: true,
             score_pill_full_score: 3.5,
@@ -515,6 +519,10 @@ fn default_chart_show_first_signal() -> bool {
     true
 }
 
+fn default_mobile_chart_fullscreen_bars() -> u64 {
+    180
+}
+
 fn default_score_pill_full_score() -> f64 {
     3.5
 }
@@ -553,6 +561,7 @@ mod tests {
         assert_eq!(back.ui.breathe_hold_ms, 5000);
         assert_eq!(back.ui.min_bar_spacing, 8);
         assert_eq!(back.ui.chart_display_bars, 140);
+        assert_eq!(back.ui.mobile_chart_fullscreen_bars, 180);
         assert_eq!(back.ui.chart_right_gap, 10);
         assert_eq!(back.ui.chart_show_first_signal, true);
         assert_eq!(back.ui.score_pill_full_score, 3.5);

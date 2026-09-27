@@ -200,6 +200,8 @@ pub struct ClientLocalSettings {
     pub theme: String,
     #[serde(alias = "chart_display_bars")]
     pub chart_display_bars: usize,
+    #[serde(default = "default_mobile_chart_fullscreen_bars", alias = "mobile_chart_fullscreen_bars", alias = "mobileChartFullscreenBars")]
+    pub mobile_chart_fullscreen_bars: usize,
     #[serde(alias = "chart_right_gap")]
     pub chart_right_gap: usize,
     #[serde(alias = "min_bar_spacing")]
@@ -217,6 +219,10 @@ pub struct ClientLocalSettings {
     pub log_level: String,
 }
 
+fn default_mobile_chart_fullscreen_bars() -> usize {
+    180
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -229,6 +235,7 @@ impl Default for ClientLocalSettings {
             device_name: "Desktop PC".to_string(),
             theme: "dark".to_string(),
             chart_display_bars: 200,
+            mobile_chart_fullscreen_bars: 180,
             chart_right_gap: 15,
             min_bar_spacing: 6.0,
             timeframes: vec![

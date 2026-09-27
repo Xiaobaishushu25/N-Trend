@@ -584,6 +584,7 @@ pub async fn get_config(state: State<'_, Arc<AppState>>) -> Result<Value, String
         "breathe_hold_ms": 5000,
         "min_bar_spacing": local.min_bar_spacing,
         "chart_display_bars": local.chart_display_bars,
+        "mobile_chart_fullscreen_bars": local.mobile_chart_fullscreen_bars,
         "chart_right_gap": local.chart_right_gap,
         "chart_show_first_signal": true,
         "score_pill_full_score": 3.5,
@@ -680,6 +681,9 @@ pub async fn update_config(
         let mut local = state.local_settings.write().await;
         if let Some(v) = ui.get("chart_display_bars").or_else(|| ui.get("chartDisplayBars")).and_then(|v| v.as_u64()) {
             local.chart_display_bars = v as usize;
+        }
+        if let Some(v) = ui.get("mobile_chart_fullscreen_bars").or_else(|| ui.get("mobileChartFullscreenBars")).and_then(|v| v.as_u64()) {
+            local.mobile_chart_fullscreen_bars = v as usize;
         }
         if let Some(v) = ui.get("chart_right_gap").or_else(|| ui.get("chartRightGap")).and_then(|v| v.as_u64()) {
             local.chart_right_gap = v as usize;
