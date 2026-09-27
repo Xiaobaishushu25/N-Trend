@@ -1626,7 +1626,7 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
   font-weight: 500;
 }
 .watch-table .cell-price {
-  font-weight: 600;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
 }
 .watch-table .cell-pct {
@@ -1861,7 +1861,7 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
 }
 .watch-table .mobile-price {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-weight: 600;
+  font-weight: 700;
   font-size: 13px;
 }
 .watch-table .mobile-pill-pct {

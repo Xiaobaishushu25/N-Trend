@@ -28,7 +28,6 @@ import {
   type DataTableColumns,
 } from 'naive-ui'
 import {
-  ArrowLeft,
   Bell,
   ChartCandle,
   Check,
@@ -84,14 +83,6 @@ const dialog = useDialog()
 const inTauri = isTauri()
 const router = useRouter()
 const { isMobile } = usePlatform()
-
-function goBack() {
-  if (window.history.length > 1) {
-    router.back()
-  } else {
-    void router.push({ name: 'dashboard' })
-  }
-}
 
 /** 工具提示组件 */
 const Tip = defineComponent({
@@ -256,10 +247,31 @@ const clientSettings = ref<ClientLocalSettings>({
   timeframes: ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
   lastGroupId: null,
   desktopNotificationEnabled: true,
+  logLevel: 'info',
 })
 const autoLaunch = ref(false)
 const autoLaunchBusy = ref(false)
 const savingClientSettings = ref(false)
+const openingLogDir = ref(false)
+
+const clientLogLevelOptions = [
+  { label: 'DEBUG (调试详细)', value: 'debug' },
+  { label: 'INFO (常规信息)', value: 'info' },
+  { label: 'WARN (警告提示)', value: 'warn' },
+  { label: 'ERROR (仅错误)', value: 'error' },
+]
+
+async function handleOpenLogDirectory() {
+  openingLogDir.value = true
+  try {
+    await api.openLogDirectory()
+    message.success('已打开日志目录')
+  } catch (e: any) {
+    message.error(`打开日志目录失败: ${e?.message || e}`)
+  } finally {
+    openingLogDir.value = false
+  }
+}
 
 const availableTimeframes = [
   { label: '5分钟 (5m)', value: '5m' },
@@ -273,7 +285,11 @@ const availableTimeframes = [
 
 async function loadClientSettings() {
   try {
-    clientSettings.value = await api.getClientSettings()
+    const s = await api.getClientSettings()
+    clientSettings.value = {
+      ...s,
+      logLevel: s.logLevel || 'info',
+    }
   } catch (e) {
     // 忽略
   }
@@ -609,19 +625,6 @@ onMounted(async () => {
 
 <template>
   <div class="settings-page" :class="{ 'is-mobile-page': isMobile }">
-    <!-- 移动端顶部便捷返回导航 -->
-    <div v-if="isMobile" class="mobile-settings-header">
-      <n-button quaternary circle size="small" class="m-back-btn" title="返回主界面" @click="goBack">
-        <template #icon><n-icon :component="ArrowLeft" size="18" /></template>
-      </n-button>
-      <span class="m-header-title">系统设置</span>
-      <div class="m-header-extra">
-        <n-tag :type="isAdmin ? 'primary' : 'default'" size="tiny" round>
-          {{ isAdmin ? '管理员' : '标准终端' }}
-        </n-tag>
-      </div>
-    </div>
-
     <n-tabs
       type="line"
       :placement="isMobile ? 'top' : 'left'"
@@ -828,6 +831,32 @@ onMounted(async () => {
                   />
                 </div>
               </div>
+
+              <label class="section-title">本地日志与存储</label>
+              <div class="setting-card">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    客户端日志级别
+                    <Tip text="设置本地 PC 端日志记录级别，保存后重启应用生效；也可通过 RUST_LOG 环境变量整体覆盖。" />
+                  </div>
+                  <n-select
+                    v-model:value="clientSettings.logLevel"
+                    :options="clientLogLevelOptions"
+                    class="setting-input-number"
+                    style="width: 180px"
+                  />
+                </div>
+                <div class="setting-card-row" v-if="!isMobile">
+                  <div class="row-label">
+                    本地日志目录
+                    <Tip text="打开存放本地每日运行日志文件 (ntrend.log.YYYY-MM-DD) 的应用数据目录。" />
+                  </div>
+                  <n-button size="small" :loading="openingLogDir" @click="handleOpenLogDirectory">
+                    <template #icon><n-icon :component="Folder" /></template>
+                    打开日志目录
+                  </n-button>
+                </div>
+              </div>
             </div>
           </n-scrollbar>
           <!-- 底部固定保存栏 -->
@@ -963,6 +992,22 @@ onMounted(async () => {
                 <div class="setting-card-row">
                   <div class="row-label">接收邮箱</div>
                   <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" class="setting-input-wide" />
+                </div>
+              </div>
+
+              <label class="section-title">服务端日志级别</label>
+              <div class="setting-card" v-if="serverSettingsUpdate.log">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    服务端日志级别
+                    <Tip text="设置云端服务端进程的全局日志输出级别。" />
+                  </div>
+                  <n-select
+                    v-model:value="serverSettingsUpdate.log.level"
+                    :options="logLevels"
+                    class="setting-input-number"
+                    style="width: 180px"
+                  />
                 </div>
               </div>
             </div>
@@ -1171,32 +1216,6 @@ onMounted(async () => {
 
 .is-mobile-page {
   padding: 0 !important;
-}
-
-.mobile-settings-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--n-border-color);
-  background: var(--n-card-color);
-  flex-shrink: 0;
-  z-index: 10;
-}
-
-.m-back-btn {
-  color: var(--n-text-color);
-}
-
-.m-header-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--n-text-color);
-  flex: 1;
-}
-
-.m-header-extra {
-  flex-shrink: 0;
 }
 
 .pairing-alert-tip {

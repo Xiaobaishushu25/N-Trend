@@ -755,6 +755,7 @@ export interface ClientLocalSettings {
   desktopNotificationEnabled: boolean
   backupDir?: string | null
   lastBackupDate?: string | null
+  logLevel?: string
 }
 
 export interface MetaDto {

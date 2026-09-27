@@ -928,7 +928,7 @@ function onListMove(evt: {
 function onSymbolRowClick(code: string) {
   if (reviewMode.value) return
   if (symbolSuppressClick) return
-  router.push({ name: 'chart', params: { symbol: code } })
+  router.replace({ name: 'chart', params: { symbol: code } })
   if (isMobile.value) {
     showList.value = false
   }
@@ -1032,8 +1032,8 @@ async function handleDeleteSymbol(code: string) {
     // 删除的正是当前查看的品种时，跳到组内第一个品种；组空了回列表页
     if (symbol.value === code) {
       const first = visibleSymbols.value[0]
-      if (first) router.push({ name: 'chart', params: { symbol: first.code } })
-      else router.push({ name: 'dashboard' })
+      if (first) router.replace({ name: 'chart', params: { symbol: first.code } })
+      else router.replace({ name: 'dashboard' })
     }
   } catch (err) {
     notify.error(String(err))
@@ -1274,7 +1274,7 @@ function switchSymbol(dir: number) {
   const idx = list.findIndex((s) => s.code === symbol.value)
   const next = list[(idx + dir + list.length) % list.length]
   if (next && next.code !== symbol.value) {
-    router.push({ name: 'chart', params: { symbol: next.code } })
+    router.replace({ name: 'chart', params: { symbol: next.code } })
   }
 }
 
@@ -3814,11 +3814,11 @@ onBeforeUnmount(() => {
   color: #94a3b8;
 }
 .info-latest-value {
-  font-size: 30px;
+  font-size: 26px;
   line-height: 1.15;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.2px;
   white-space: nowrap;
 }
 .info-points {
@@ -4612,19 +4612,21 @@ onBeforeUnmount(() => {
     overflow: hidden;
   }
   .topbar {
-    padding: 4px 8px;
-    height: 42px;
+    padding: 4px 6px;
+    height: 40px;
     align-items: center;
     justify-content: space-between;
     overflow-x: hidden;
     gap: 4px;
-    flex: 0 0 42px;
+    flex: 0 0 40px;
+    box-sizing: border-box;
   }
   .m-topbar-left {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
     flex: 0 0 auto;
+    flex-shrink: 0;
   }
   .m-topbar-center {
     display: flex;
@@ -4632,30 +4634,43 @@ onBeforeUnmount(() => {
     justify-content: center;
     flex: 1 1 auto;
     min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    padding: 0 2px;
+  }
+  .m-topbar-center::-webkit-scrollbar {
+    display: none;
   }
   .m-topbar-right {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 3px;
     flex: 0 0 auto;
+    flex-shrink: 0;
   }
   .m-tb-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 3px;
-    height: 30px;
-    padding: 0 8px;
+    gap: 2px;
+    height: 28px;
+    padding: 0 6px;
     border: 1px solid #e2e8f0;
     border-radius: 6px;
     background: #fff;
     color: #475569;
-    font-size: 12px;
+    font-size: 11.5px;
     font-weight: 500;
     cursor: pointer;
     transition: all 0.15s;
     user-select: none;
     line-height: 1;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .m-tb-btn span {
+    white-space: nowrap;
   }
   .m-tb-btn:active {
     background: #f1f5f9;
@@ -4677,21 +4692,25 @@ onBeforeUnmount(() => {
   .m-tf-group {
     background: #f1f5f9;
     padding: 2px;
-    border-radius: 7px;
+    border-radius: 6px;
     gap: 2px;
     display: inline-flex;
     align-items: center;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .m-tf-btn {
-    height: 26px;
-    padding: 0 7px;
+    height: 24px;
+    padding: 0 6px;
     font-size: 11px;
-    border-radius: 5px;
+    border-radius: 4px;
     border: none;
     background: transparent;
     color: #64748b;
     font-weight: 500;
     cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .m-tf-btn.active {
     background: #fff;
@@ -4700,8 +4719,8 @@ onBeforeUnmount(() => {
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   }
   .m-tf-more {
-    height: 26px;
-    padding: 0 5px;
+    height: 24px;
+    padding: 0 4px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -4709,6 +4728,7 @@ onBeforeUnmount(() => {
     background: transparent;
     color: #94a3b8;
     cursor: pointer;
+    flex-shrink: 0;
   }
 
   /* 移动端工具弹出层 */
@@ -4797,11 +4817,11 @@ onBeforeUnmount(() => {
 
   /* 移动端顶部信息与形态卡片 */
   .mobile-summary-card {
-    margin: 0 4px 6px 4px;
+    margin: 0 4px 5px 4px;
     background: #fff;
     border-radius: 8px;
     border: 1px solid #e2e8f0;
-    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -4811,20 +4831,20 @@ onBeforeUnmount(() => {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 6px 10px;
+    padding: 5px 8px;
     border-bottom: 1px solid #f1f5f9;
   }
   .msc-sym-nav {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
   }
   .msc-nav-arrow {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 24px;
-    height: 24px;
+    width: 22px;
+    height: 22px;
     border: 1px solid #e2e8f0;
     border-radius: 4px;
     background: #f8fafc;
@@ -4841,45 +4861,45 @@ onBeforeUnmount(() => {
   .msc-sym-title {
     display: flex;
     align-items: baseline;
-    gap: 5px;
+    gap: 4px;
     cursor: pointer;
   }
   .msc-sym-name {
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 700;
     color: #0f172a;
   }
   .msc-sym-code {
-    font-size: 12px;
+    font-size: 11.5px;
     color: #64748b;
     font-family: Consolas, monospace;
   }
   .msc-sym-exch {
-    font-size: 10px;
+    font-size: 9.5px;
     color: #94a3b8;
     background: #f1f5f9;
-    padding: 1px 4px;
+    padding: 1px 3px;
     border-radius: 3px;
   }
   .msc-quote-group {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
   }
   .msc-price {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
   }
   .msc-change-pill {
     font-size: 11px;
     font-weight: 600;
-    padding: 1px 6px;
+    padding: 1px 5px;
     border-radius: 4px;
     font-variant-numeric: tabular-nums;
   }
   .msc-points {
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
@@ -4887,99 +4907,125 @@ onBeforeUnmount(() => {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 7px 10px;
+    padding: 6px 8px;
     background: #fafbfc;
     cursor: pointer;
     transition: background 0.15s;
     font-size: 11px;
-    gap: 8px;
+    gap: 6px;
+    min-height: 30px;
+    box-sizing: border-box;
   }
   .msc-pattern-row:active {
     background: #f1f5f9;
   }
   .msc-pattern-row.is-up {
     border-left: 3px solid #ef4444;
+    background: linear-gradient(90deg, rgba(239, 68, 68, 0.05) 0%, #fafbfc 30%);
   }
   .msc-pattern-row.is-down {
     border-left: 3px solid #10b981;
+    background: linear-gradient(90deg, rgba(16, 185, 129, 0.05) 0%, #fafbfc 30%);
   }
   .msc-pat-left {
     display: flex;
     align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
+    gap: 5px;
+    flex-wrap: nowrap;
     flex: 1 1 auto;
     min-width: 0;
+    overflow: hidden;
   }
   .msc-pat-right {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 5px;
     flex: 0 0 auto;
   }
   .msc-pat-dir {
     font-size: 11px;
     font-weight: 600;
-    padding: 1px 5px;
+    padding: 1.5px 5px;
     border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .badge-up {
-    background: rgba(239, 68, 68, 0.1);
+    background: rgba(239, 68, 68, 0.12);
     color: #ef4444;
   }
   .badge-down {
-    background: rgba(16, 185, 129, 0.1);
-    color: #10b981;
+    background: rgba(16, 185, 129, 0.12);
+    color: #059669;
   }
   .msc-pat-state {
-    font-size: 11px;
-    font-weight: 500;
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .msc-pat-score {
-    font-size: 11px;
+    font-size: 10.5px;
     color: #64748b;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .msc-pat-score b {
-    color: #334155;
+    color: #1e293b;
+    font-weight: 700;
   }
   .msc-pat-levels {
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 11px;
+    gap: 4px;
+    font-size: 10px;
     color: #64748b;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .msc-pat-levels span {
+    background: rgba(241, 245, 249, 0.9);
+    padding: 1px 4px;
+    border-radius: 3px;
+    border: 1px solid #e2e8f0;
   }
   .msc-pat-levels b {
-    color: #1e293b;
+    color: #0f172a;
+    font-weight: 600;
   }
   .msc-pat-more {
     display: flex;
     align-items: center;
     color: #94a3b8;
-    margin-left: 4px;
+    margin-left: 2px;
   }
   .msc-singlebar-badge {
-    font-size: 11px;
-    padding: 1px 6px;
+    font-size: 10.5px;
+    padding: 1.5px 5px;
     border-radius: 4px;
     font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .msc-recent-tag {
     font-size: 10px;
-    padding: 1px 5px;
+    padding: 1.5px 5px;
     border-radius: 4px;
-    background: #f1f5f9;
+    background: #e2e8f0;
     color: #475569;
-    font-weight: 500;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .msc-status-pill {
     font-size: 10.5px;
     font-weight: 600;
-    padding: 1px 6px;
+    padding: 1.5px 5px;
     border-radius: 4px;
     white-space: nowrap;
-    line-height: 1.4;
+    line-height: 1.2;
+    flex-shrink: 0;
   }
   .status-win {
     background: rgba(239, 68, 68, 0.1);
@@ -5010,6 +5056,8 @@ onBeforeUnmount(() => {
     color: #94a3b8;
     font-size: 10.5px;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .msc-pat-arrow {
     color: #cbd5e1;
@@ -5071,6 +5119,37 @@ onBeforeUnmount(() => {
     animation: slideInRight 0.22s cubic-bezier(0.16, 1, 0.3, 1);
     background: #fff;
     overflow-y: auto;
+  }
+  .info-col.is-mobile-drawer .info-card {
+    padding: 12px 14px;
+  }
+  .info-col.is-mobile-drawer .info-quote {
+    gap: 8px;
+    margin-top: 10px;
+    justify-content: space-between;
+  }
+  .info-col.is-mobile-drawer .info-quote-item:first-child {
+    flex: 1.35 1 0;
+    align-items: flex-start;
+  }
+  .info-col.is-mobile-drawer .info-quote-item:nth-child(2) {
+    flex: 0.95 1 0;
+    align-items: center;
+  }
+  .info-col.is-mobile-drawer .info-quote-item:nth-child(3) {
+    flex: 1.1 1 0;
+    align-items: flex-end;
+  }
+  .info-col.is-mobile-drawer .info-latest-value {
+    font-size: 22px;
+    letter-spacing: -0.3px;
+  }
+  .info-col.is-mobile-drawer .info-points {
+    font-size: 14px;
+  }
+  .info-col.is-mobile-drawer .info-change {
+    font-size: 13px;
+    padding: 2px 8px;
   }
   .chart-col {
     flex: 1 1 0;

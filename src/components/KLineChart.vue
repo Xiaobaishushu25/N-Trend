@@ -8,6 +8,7 @@ import {
   HistogramSeries,
   LineSeries,
   LineStyle,
+  TrackingModeExitMode,
   createChart,
   createSeriesMarkers,
   type CandlestickData,
@@ -16,6 +17,7 @@ import {
   type IPrimitivePaneView,
   type ISeriesPrimitive,
   type PrimitivePaneViewZOrder,
+  type SeriesAttachedParameter,
   type IChartApi,
   type IPriceLine,
   type ISeriesMarkersPluginApi,
@@ -255,6 +257,25 @@ class GapPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
+function hexToRgba(color: string, alpha: number): string {
+  if (!color) return `rgba(0, 0, 0, ${alpha})`
+  if (color.startsWith('rgba')) return color
+  if (color.startsWith('rgb(')) {
+    return color.replace('rgb(', 'rgba(').replace(')', `, ${alpha})`)
+  }
+  let clean = color.replace('#', '')
+  if (clean.length === 3) {
+    clean = clean.split('').map((c) => c + c).join('')
+  }
+  if (clean.length === 6) {
+    const r = parseInt(clean.substring(0, 2), 16)
+    const g = parseInt(clean.substring(2, 4), 16)
+    const b = parseInt(clean.substring(4, 6), 16)
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`
+  }
+  return color
+}
+
 class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
   constructor(
     private chart: IChartApi,
@@ -264,6 +285,7 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
     private precision: () => number,
     private crosshairY: () => number | null,
     private crosshairPrice: () => number | null,
+    private priceLines?: () => { price: number; color: string; title: string }[],
   ) {}
 
   draw(target: CanvasRenderingTarget2D) {
@@ -314,7 +336,37 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         context.fillText(text, 6, yRound)
       }
 
-      // 2. Latest price line & right badge on mobile
+      // 2. Active price lines (最高, 最低, 入场, 目标, 止损等) placed on LEFT with transparency
+      const lines = this.priceLines ? this.priceLines() : []
+      for (const line of lines) {
+        if (!line.price || !Number.isFinite(line.price)) continue
+        const y = this.source.priceToCoordinate(line.price)
+        if (y != null && y >= 0 && y <= height) {
+          context.setLineDash([])
+          const text = `${line.title} ${formatP(line.price)}`
+          const tagW = Math.max(38, context.measureText(text).width + 8)
+          const tagH = 14
+          const tagX = 4
+          const tagY = Math.max(2, Math.min(height - tagH - 2, y - tagH / 2))
+
+          context.fillStyle = hexToRgba(line.color, 0.72)
+          context.beginPath()
+          if (typeof (context as any).roundRect === 'function') {
+            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+          } else {
+            context.rect(tagX, tagY, tagW, tagH)
+          }
+          context.fill()
+
+          context.fillStyle = '#ffffff'
+          context.font = '600 9.5px Consolas, -apple-system, sans-serif'
+          context.textAlign = 'center'
+          context.textBaseline = 'middle'
+          context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
+        }
+      }
+
+      // 3. Latest price line & left badge on mobile with transparency
       const curPrice = this.latestPrice()
       if (curPrice != null && Number.isFinite(curPrice)) {
         const curY = this.source.priceToCoordinate(curPrice)
@@ -323,23 +375,24 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           const data = this.source.data()
           const lastCandle = data.length > 0 ? (data[data.length - 1] as any) : null
           const isUp = lastCandle ? curPrice >= lastCandle.open : true
-          const color = isUp ? '#e03131' : '#0f9d58'
+          const color = isUp ? 'rgba(224, 49, 49, 0.78)' : 'rgba(15, 157, 88, 0.78)'
+          const lineColor = isUp ? '#e03131' : '#0f9d58'
 
           // Horizontal price line
-          context.strokeStyle = color
+          context.strokeStyle = lineColor
           context.lineWidth = 1
           context.setLineDash([2, 3])
           context.beginPath()
           context.moveTo(0, curYRound)
-          context.lineTo(width - 50, curYRound)
+          context.lineTo(width, curYRound)
           context.stroke()
 
-          // Price badge on the right edge
+          // Price badge on the LEFT edge
           context.setLineDash([])
           const text = formatP(curPrice)
           const tagW = Math.max(46, context.measureText(text).width + 8)
           const tagH = 15
-          const tagX = width - tagW - 2
+          const tagX = 4
           const tagY = Math.max(2, Math.min(height - tagH - 2, curY - tagH / 2))
 
           context.fillStyle = color
@@ -359,7 +412,7 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         }
       }
 
-      // 3. Hovered crosshair price badge on right edge
+      // 4. Hovered crosshair price badge on LEFT edge with white transparent background
       const chY = this.crosshairY()
       const chPrice = this.crosshairPrice()
       if (chY != null && chPrice != null && chY >= 0 && chY <= height) {
@@ -367,10 +420,12 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         const text = formatP(chPrice)
         const tagW = Math.max(48, context.measureText(text).width + 10)
         const tagH = 16
-        const tagX = width - tagW - 2
+        const tagX = 4
         const tagY = Math.max(2, Math.min(height - tagH - 2, chY - tagH / 2))
 
-        context.fillStyle = '#1e293b'
+        context.fillStyle = 'rgba(255, 255, 255, 0.9)'
+        context.strokeStyle = 'rgba(148, 163, 184, 0.65)'
+        context.lineWidth = 1
         context.beginPath()
         if (typeof (context as any).roundRect === 'function') {
           ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
@@ -378,8 +433,9 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           context.rect(tagX, tagY, tagW, tagH)
         }
         context.fill()
+        context.stroke()
 
-        context.fillStyle = '#ffffff'
+        context.fillStyle = '#0f172a'
         context.font = '600 10px Consolas, -apple-system, sans-serif'
         context.textAlign = 'center'
         context.textBaseline = 'middle'
@@ -406,6 +462,7 @@ class InnerPriceAxisPaneView implements IPrimitivePaneView {
 
 class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
   private view: InnerPriceAxisPaneView
+  private _requestUpdate?: () => void
   constructor(
     chart: IChartApi,
     source: ISeriesApi<'Candlestick'>,
@@ -414,6 +471,7 @@ class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
     precision: () => number,
     crosshairY: () => number | null,
     crosshairPrice: () => number | null,
+    priceLines?: () => { price: number; color: string; title: string }[],
   ) {
     const renderer = new InnerPriceAxisPaneRenderer(
       chart,
@@ -423,8 +481,18 @@ class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
       precision,
       crosshairY,
       crosshairPrice,
+      priceLines,
     )
     this.view = new InnerPriceAxisPaneView(renderer)
+  }
+  attached(param: SeriesAttachedParameter<Time>) {
+    this._requestUpdate = param.requestUpdate
+  }
+  detached() {
+    this._requestUpdate = undefined
+  }
+  update() {
+    this._requestUpdate?.()
   }
   paneViews(): readonly IPrimitivePaneView[] {
     return [this.view]
@@ -990,6 +1058,25 @@ function buildMarkers(): SeriesMarker<Time>[] {
   return markers
 }
 
+function getActivePriceLines(): { price: number; color: string; title: string }[] {
+  const list: { price: number; color: string; title: string }[] = []
+  if (props.showExtremes) {
+    const { high, low } = visibleExtremes()
+    if (high) list.push({ price: high.high, color: '#e03131', title: '最高' })
+    if (low) list.push({ price: low.low, color: '#0f9d58', title: '最低' })
+  }
+  for (const s of props.signals) {
+    if (s.entry > 0) list.push({ price: s.entry, color: '#1565c0', title: '入场' })
+    if (s.stop > 0) list.push({ price: s.stop, color: '#e53935', title: '止损' })
+    if (s.target > 0) list.push({ price: s.target, color: '#2e7d32', title: '目标' })
+  }
+  const ex = props.reviewExit
+  if (ex?.price && ex.price > 0) {
+    list.push({ price: ex.price, color: '#7c3aed', title: '出场' })
+  }
+  return list
+}
+
 function syncPriceLines() {
   if (!candleSeries) return
   for (const line of priceLines) candleSeries.removePriceLine(line)
@@ -1004,16 +1091,18 @@ function syncPriceLines() {
   if (ex?.price && ex.price > 0) {
     lines.push({ price: ex.price, color: '#7c3aed', title: '出场' })
   }
+  const isM = isMobileChart()
   priceLines = lines.map((l) =>
     candleSeries!.createPriceLine({
       price: l.price,
       color: l.color,
       lineWidth: 1,
       lineStyle: 2,
-      axisLabelVisible: true,
-      title: l.title,
+      axisLabelVisible: !isM,
+      title: isM ? '' : l.title,
     }),
   )
+  innerPricePrimitive?.update()
 }
 
 /** 在当前可视区间画出最高价/最低价虚线 */
@@ -1026,25 +1115,29 @@ function syncExtremes() {
   const lines: { price: number; color: string; title: string }[] = []
   if (high) lines.push({ price: high.high, color: '#e03131', title: '最高' })
   if (low) lines.push({ price: low.low, color: '#0f9d58', title: '最低' })
+  const isM = isMobileChart()
   extremeLines = lines.map((l) =>
     candleSeries!.createPriceLine({
       price: l.price,
       color: l.color,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
-      axisLabelVisible: true,
-      title: l.title,
+      axisLabelVisible: !isM,
+      title: isM ? '' : l.title,
     }),
   )
+  innerPricePrimitive?.update()
 }
 
 /** 可视区间变化时重算最高/最低点 */
 function onVisibleRangeChange() {
   syncFocusFollowWithView()
   refreshManualLevelOverlay()
-  if (!props.showExtremes) return
-  syncExtremes()
-  markersApi?.setMarkers(buildMarkers())
+  if (props.showExtremes) {
+    syncExtremes()
+    markersApi?.setMarkers(buildMarkers())
+  }
+  innerPricePrimitive?.update()
 }
 
 /** 画出每个N形态的 S0→S1→S2 连线；箱体只画上下轨横线 */
@@ -1141,8 +1234,12 @@ function clampMinBarSpacing(pendingRange?: { from: number; to: number }) {
   if (!width || total <= 0) return
   const ts = chart.timeScale()
   const logical = pendingRange ?? ts.getVisibleLogicalRange()
-  if (!logical || ts.options().barSpacing >= minBarSpacing.value) return
-  const maxSpan = width / minBarSpacing.value
+  if (!logical) return
+  // 手机端屏幕较窄，间距必须允许展示用户配置的默认根数；桌面端也至少保证 displayKNum 不被强制截断
+  const minSpacing = isMobileChart()
+    ? Math.min(1.5, width / Math.max(1, displayKNum.value))
+    : minBarSpacing.value
+  const maxSpan = Math.max(displayKNum.value, width / minSpacing)
   const span = logical.to - logical.from
   if (span <= maxSpan) return
   const from = Math.max(-0.5, logical.to - maxSpan)
@@ -2346,6 +2443,7 @@ onMounted(() => {
     () => getPricePrecision(props.rows),
     () => crosshairY.value,
     () => crosshairPrice.value,
+    getActivePriceLines,
   )
   candleSeries.attachPrimitive(innerPricePrimitive)
 
@@ -2364,16 +2462,19 @@ onMounted(() => {
       hoveredTime = null
       crosshairY.value = null
       crosshairPrice.value = null
+      innerPricePrimitive?.update()
       if (focusPinnedByKeys) syncFocus()
       else renderFocusLegend()
       return
     }
     crosshairY.value = param.point.y
     crosshairPrice.value = candleSeries.coordinateToPrice(param.point.y)
+    innerPricePrimitive?.update()
     const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
     if (!d) {
       isHovering = false
       hoveredTime = null
+      innerPricePrimitive?.update()
       renderFocusLegend()
       return
     }

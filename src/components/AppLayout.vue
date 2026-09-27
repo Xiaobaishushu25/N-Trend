@@ -75,7 +75,7 @@ const isStandaloneWindow = computed(
 )
 const windowTitle = computed(() =>
   route.name === 'settings'
-    ? '设置'
+    ? '系统设置'
     : route.name === 'review'
       ? '复盘统计'
       : route.name === 'notifications'

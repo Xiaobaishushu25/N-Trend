@@ -213,6 +213,12 @@ pub struct ClientLocalSettings {
     pub backup_dir: Option<String>,
     #[serde(alias = "last_backup_date")]
     pub last_backup_date: Option<String>,
+    #[serde(default = "default_log_level", alias = "log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl Default for ClientLocalSettings {
@@ -238,6 +244,7 @@ impl Default for ClientLocalSettings {
             desktop_notification_enabled: true,
             backup_dir: None,
             last_backup_date: None,
+            log_level: "info".to_string(),
         }
     }
 }

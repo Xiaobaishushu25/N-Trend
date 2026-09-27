@@ -75,7 +75,17 @@ pub fn run() {
             let data_dir = app_data_dir(app)?;
             std::fs::create_dir_all(&data_dir)?;
 
-            init_logging(&data_dir, "info")?;
+            let settings_path = data_dir.join("client_settings.json");
+            let mut log_level = "info".to_string();
+            if let Ok(content) = std::fs::read_to_string(&settings_path) {
+                if let Ok(saved) = serde_json::from_str::<n_protocol::config::ClientLocalSettings>(&content) {
+                    if !saved.log_level.trim().is_empty() {
+                        log_level = saved.log_level;
+                    }
+                }
+            }
+
+            init_logging(&data_dir, &log_level)?;
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             tracing::info!(
                 "🚀 ntrend v{} 客户端启动 | 数据目录: {}",
