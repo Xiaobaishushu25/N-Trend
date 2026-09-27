@@ -1,7 +1,10 @@
 package com.ntrend.app
 
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.os.Bundle
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -21,5 +24,21 @@ class MainActivity : TauriActivity() {
       view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
       insets
     }
+  }
+
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    webView.addJavascriptInterface(object {
+      @JavascriptInterface
+      fun setOrientation(orientation: String) {
+        runOnUiThread {
+          when (orientation) {
+            "landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            "portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+          }
+        }
+      }
+    }, "AndroidBridge")
   }
 }

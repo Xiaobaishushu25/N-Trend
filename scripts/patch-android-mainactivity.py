@@ -8,11 +8,15 @@ if not main_activities:
 
 code = """package com.ntrend.app
 
+import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.os.Bundle
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import app.tauri.plugin.TauriActivity
 
 class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -29,9 +33,25 @@ class MainActivity : TauriActivity() {
       insets
     }
   }
+
+  override fun onWebViewCreate(webView: WebView) {
+    super.onWebViewCreate(webView)
+    webView.addJavascriptInterface(object {
+      @JavascriptInterface
+      fun setOrientation(orientation: String) {
+        runOnUiThread {
+          when (orientation) {
+            "landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            "portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+          }
+        }
+      }
+    }, "AndroidBridge")
+  }
 }
 """
 
 for main_activity in main_activities:
     main_activity.write_text(code, encoding="utf-8")
-    print(f"Patched {main_activity} with window insets and light status bar support")
+    print(f"Patched {main_activity} with window insets, light status bar, and AndroidBridge orientation support")

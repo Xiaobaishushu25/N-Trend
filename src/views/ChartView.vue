@@ -816,6 +816,11 @@ function switchSymbolTo(code: string) {
 async function enterMobileFullscreen() {
   isMobileFullscreen.value = true
   try {
+    if (window.AndroidBridge && typeof window.AndroidBridge.setOrientation === 'function') {
+      window.AndroidBridge.setOrientation('landscape')
+    }
+  } catch {}
+  try {
     if (document.documentElement.requestFullscreen) {
       await document.documentElement.requestFullscreen()
     }
@@ -833,6 +838,11 @@ async function enterMobileFullscreen() {
 
 async function exitMobileFullscreen() {
   isMobileFullscreen.value = false
+  try {
+    if (window.AndroidBridge && typeof window.AndroidBridge.setOrientation === 'function') {
+      window.AndroidBridge.setOrientation('portrait')
+    }
+  } catch {}
   try {
     if (document.fullscreenElement && document.exitFullscreen) {
       await document.exitFullscreen()
@@ -2343,16 +2353,6 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="m-topbar-right">
-          <!-- 移动端全屏查看K线 -->
-          <button
-            type="button"
-            class="m-tb-btn m-fullscreen-btn"
-            @click="enterMobileFullscreen"
-            title="全屏展示K线图"
-          >
-            <n-icon :component="Maximize" :size="15" />
-          </button>
-
           <!-- 移动端工具与操作菜单 -->
           <n-popover
             placement="bottom-end"
@@ -2642,43 +2642,6 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="mfs-header-right">
-            <button
-              type="button"
-              class="mfs-icon-btn mfs-heart-btn"
-              :class="{ 'is-active': currentSymbol?.is_followed }"
-              @click="currentSymbol && handleToggleFollow(currentSymbol)"
-              :title="currentSymbol?.is_followed ? '取消自选' : '加入自选'"
-            >
-              <n-icon :component="Heart" :size="17" />
-            </button>
-
-            <n-popover placement="bottom-end" trigger="click" :show-arrow="false">
-              <template #trigger>
-                <button type="button" class="mfs-icon-btn" title="图表工具与指标">
-                  <n-icon :component="Pencil" :size="16" />
-                </button>
-              </template>
-              <div class="m-tools-menu">
-                <div class="m-tools-group-title">指标与图层</div>
-                <div class="m-tools-item" @click="toggleChartTrend">
-                  <span class="m-tools-label">MA20 趋势线</span>
-                  <span class="m-tools-badge" :class="{ 'is-active': isTrendVisible }">{{ isTrendVisible ? '已显示' : '已隐藏' }}</span>
-                </div>
-                <div class="m-tools-item" @click="showExtremes = !showExtremes">
-                  <span class="m-tools-label">最高/最低价标记</span>
-                  <span class="m-tools-badge" :class="{ 'is-active': showExtremes }">{{ showExtremes ? '已标记' : '已隐藏' }}</span>
-                </div>
-                <div class="m-tools-item" @click="toggleManualLevelDraw">
-                  <span class="m-tools-label">手动关键区域</span>
-                  <span class="m-tools-badge" :class="{ 'is-active': manualLevelDrawMode }">{{ manualLevelDrawMode ? '绘制中' : '新建绘制' }}</span>
-                </div>
-              </div>
-            </n-popover>
-
-            <button type="button" class="mfs-icon-btn" @click="showList = true" title="品种列表">
-              <n-icon :component="GridDots" :size="17" />
-            </button>
-
             <button
               type="button"
               class="mfs-icon-btn mfs-close-btn"
@@ -2992,34 +2955,6 @@ onBeforeUnmount(() => {
           {{ klinesStore.chartMessage || '当前图表使用临时数据源，数据不会写入本地库或参与策略。' }}
         </div>
         <div class="chart-canvas-wrapper" :class="{ 'is-fullscreen-canvas': isMobileFullscreen }">
-          <!-- 全屏浮动导航按钮（参考截图） -->
-          <template v-if="isMobileFullscreen">
-            <button
-              type="button"
-              class="mfs-chart-nav-btn mfs-nav-left"
-              @click="chartRef?.scrollLogical?.(-25)"
-              title="向左平移查看历史K线"
-            >
-              <n-icon :component="ChevronLeft" :size="20" />
-            </button>
-            <button
-              type="button"
-              class="mfs-chart-nav-btn mfs-nav-right"
-              @click="chartRef?.scrollLogical?.(25)"
-              title="向右平移查看最新K线"
-            >
-              <n-icon :component="ChevronRight" :size="20" />
-            </button>
-            <button
-              type="button"
-              class="mfs-chart-fastforward-btn"
-              @click="chartRef?.resetView?.()"
-              title="回到最新K线"
-            >
-              <n-icon :component="ChevronsRight" :size="16" />
-            </button>
-          </template>
-
           <KLineChart
             v-if="symbol && klinesStore.rows.length"
             ref="chartRef"
@@ -3102,7 +3037,12 @@ onBeforeUnmount(() => {
           <div v-show="!mobilePanelCollapsed" class="mdp-body">
             <!-- Tab 1: 信号决策 -->
             <div v-if="mobilePanelTab === 'signal'" class="mdp-content">
-              <div v-if="topActivePattern" class="mdp-signal-box">
+              <div
+                v-if="topActivePattern"
+                class="mdp-signal-box is-clickable"
+                :title="isHidden(topActivePattern.number) ? '点击在K线图上绘制该形态' : '点击关闭该形态在K线图的绘制'"
+                @click="togglePattern(topActivePattern.number)"
+              >
                 <div class="mdp-box-top">
                   <div class="mdp-box-title">
                     <span
@@ -3111,8 +3051,6 @@ onBeforeUnmount(() => {
                         topActivePattern.direction === 'up' ? 'badge-up' : 'badge-down',
                         { 'is-hidden-badge': isHidden(topActivePattern.number) },
                       ]"
-                      :title="isHidden(topActivePattern.number) ? '点击在K线图上绘制该形态' : '点击关闭该形态在K线图的绘制'"
-                      @click.stop="togglePattern(topActivePattern.number)"
                     >
                       {{ dirText(topActivePattern.direction) }} {{ levelSuffix(topActivePattern.level) }}
                     </span>
@@ -3134,10 +3072,9 @@ onBeforeUnmount(() => {
                       :title="isHidden(topActivePattern.number) ? '点击在K线图上开启绘制' : '点击关闭在K线图上的绘制'"
                       @click.stop="togglePattern(topActivePattern.number)"
                     >
-                      <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" size="13" />
-                      <span>{{ isHidden(topActivePattern.number) ? '图表未绘' : '图表已绘' }}</span>
+                      <n-icon :component="isHidden(topActivePattern.number) ? EyeOff : Eye" :size="15" />
                     </button>
-                    <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                    <button type="button" class="mdp-more-link" @click.stop="showMobileInfo = true">
                       全部({{ signals.length }}) ›
                     </button>
                   </div>
@@ -3171,18 +3108,20 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div v-else-if="topRecentPattern" class="mdp-signal-box">
+              <div
+                v-else-if="topRecentPattern"
+                class="mdp-signal-box is-clickable"
+                :title="isRecentShown(topRecentPattern.number) ? '点击在K线图上关闭该形态绘制' : '点击在K线图上绘制该形态'"
+                @click="toggleRecentPattern(topRecentPattern.number)"
+              >
                 <div class="mdp-box-top">
                   <div class="mdp-box-title">
-                    <span class="mdp-badge is-recent-badge">最近</span>
                     <span
                       class="mdp-badge"
                       :class="[
                         topRecentPattern.direction === 'up' ? 'badge-up' : 'badge-down',
                         { 'is-hidden-badge': !isRecentShown(topRecentPattern.number) },
                       ]"
-                      :title="isRecentShown(topRecentPattern.number) ? '点击在K线图上关闭该形态绘制' : '点击在K线图上绘制该形态'"
-                      @click.stop="toggleRecentPattern(topRecentPattern.number)"
                     >
                       {{ dirText(topRecentPattern.direction) }} {{ levelSuffix(topRecentPattern.level) }}
                     </span>
@@ -3201,10 +3140,9 @@ onBeforeUnmount(() => {
                       :title="isRecentShown(topRecentPattern.number) ? '点击在K线图上关闭该形态绘制' : '点击在K线图上绘制该形态'"
                       @click.stop="toggleRecentPattern(topRecentPattern.number)"
                     >
-                      <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" size="13" />
-                      <span>{{ isRecentShown(topRecentPattern.number) ? '图表已绘' : '图表未绘' }}</span>
+                      <n-icon :component="isRecentShown(topRecentPattern.number) ? Eye : EyeOff" :size="15" />
                     </button>
-                    <button type="button" class="mdp-more-link" @click="showMobileInfo = true">
+                    <button type="button" class="mdp-more-link" @click.stop="showMobileInfo = true">
                       形态详情 ›
                     </button>
                   </div>
@@ -3318,7 +3256,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 移动端全屏底部周期与工具栏 (参考截图) -->
+        <!-- 移动端全屏底部周期栏 -->
         <div v-if="isMobileFullscreen" class="mfs-bottombar">
           <div class="mfs-bb-left">
             <button
@@ -3332,39 +3270,6 @@ onBeforeUnmount(() => {
               {{ t === '1d' ? '日K' : t }}
               <span v-if="timeframe === t" class="mfs-bb-tf-active-bar" />
             </button>
-          </div>
-
-          <div class="mfs-bb-right">
-            <button
-              type="button"
-              class="mfs-bb-btn"
-              @click="chartRef?.resetView?.()"
-              title="复位到默认K线根数"
-            >
-              <span>复位</span>
-            </button>
-
-            <!-- 盘口快照 Popover -->
-            <n-popover placement="top-end" trigger="click" :show-arrow="false">
-              <template #trigger>
-                <button type="button" class="mfs-bb-btn" title="查看盘口与关键数据">
-                  <span>盘口</span>
-                </button>
-              </template>
-              <div class="mfs-depth-popover">
-                <div class="mfs-depth-title">行情盘口与关键数据</div>
-                <div v-if="mobileMarketStats" class="mdp-market-grid">
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">今开</span><span class="mkt-val">{{ mobileMarketStats.open.toFixed(1) }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">最高</span><span class="mkt-val is-up">{{ mobileMarketStats.high.toFixed(1) }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">最低</span><span class="mkt-val is-down">{{ mobileMarketStats.low.toFixed(1) }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">昨收</span><span class="mkt-val">{{ mobileMarketStats.prevClose }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">最新价</span><span class="mkt-val" :style="{ color: quoteColor }">{{ quotePrice != null ? quotePrice.toFixed(1) : '—' }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">日内振幅</span><span class="mkt-val">{{ mobileMarketStats.amplitude }}%</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">成交量</span><span class="mkt-val">{{ fmtVol(mobileMarketStats.volume) }}</span></div>
-                  <div class="mdp-mkt-item"><span class="mkt-lbl">持仓量</span><span class="mkt-val">{{ fmtVol(mobileMarketStats.openInterest) }}</span></div>
-                </div>
-              </div>
-            </n-popover>
           </div>
         </div>
       </div>
@@ -6185,6 +6090,16 @@ onBeforeUnmount(() => {
     display: flex;
     flex-direction: column;
     gap: 5px;
+    border-radius: 6px;
+    padding: 3px 4px;
+    transition: background-color 0.15s ease;
+  }
+  .mdp-signal-box.is-clickable {
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .mdp-signal-box.is-clickable:active {
+    background: #f1f5f9;
   }
   .mdp-box-top {
     display: flex;
@@ -6205,10 +6120,9 @@ onBeforeUnmount(() => {
   .mdp-draw-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
-    font-size: 10px;
+    justify-content: center;
     line-height: 1;
-    padding: 2.5px 6px;
+    padding: 2.5px 4px;
     border-radius: 4px;
     border: 1px solid #bfdbfe;
     background: #eff6ff;

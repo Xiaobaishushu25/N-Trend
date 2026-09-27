@@ -1298,48 +1298,26 @@ const volPaneTop = ref(0)
 
 function updateVolPaneTop() {
   if (!chart || !container.value) return
+  const h = container.value.clientHeight
+  if (h <= 0) return
   try {
     const pane0 = chart.paneSize(0)
-    if (pane0 && pane0.height > 0) {
+    if (pane0 && pane0.height > h * 0.65 && pane0.height < h * 0.92) {
       volPaneTop.value = pane0.height
       return
     }
   } catch {}
-  const h = container.value.clientHeight
-  if (h > 0) {
-    volPaneTop.value = Math.round(h * 0.82)
-  }
+  volPaneTop.value = Math.round(h * 0.82)
 }
 
-/** 分配窗格高度：桌面端 82%/18%；移动端 82%/18%（成交量保持紧凑高度，保证K线有充足高度，绝不退化为1:1） */
+/** 分配窗格高度：桌面端与移动端均稳定保持 82%/18%（成交量保持紧凑高度，保证K线有充足高度，绝不退化为1:1） */
 function applyPaneHeights() {
   if (!chart) return
   const panes = chart.panes()
   if (panes.length < 2) return
 
-  const mobile = isMobileChart()
-  const h = container.value?.clientHeight || 0
-
-  if (h > 0) {
-    const volH = mobile
-      ? Math.max(38, Math.min(75, Math.round(h * 0.18)))
-      : Math.max(40, Math.round(h * 0.18))
-    const kH = Math.max(60, h - volH)
-
-    // 优先通过 setStretchFactor 稳定相对比例权重（82:18），无论窗口/DOM渲染顺序如何都不会退化成 1:1
-    panes[0].setStretchFactor(kH)
-    panes[1].setStretchFactor(volH)
-
-    // 结合精确像素设置
-    try {
-      panes[1].setHeight(volH)
-      panes[0].setHeight(kH)
-    } catch {}
-  } else {
-    // 容器尚未完成布局时的容错兜底：直接显式设置权重，防止 lightweight-charts 默认 1000:1000 导致 1:1
-    panes[0].setStretchFactor(820)
-    panes[1].setStretchFactor(180)
-  }
+  panes[0].setStretchFactor(820)
+  panes[1].setStretchFactor(180)
 
   updateVolPaneTop()
 }
