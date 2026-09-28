@@ -990,6 +990,13 @@ function updateCountdown() {
     return
   }
   const width = container.value.clientWidth
+  // 如果最新K线完全脱离可视区域（例如用户向左翻看较远的历史K线），则隐藏倒计时
+  if (x < 0 || x > width + 40) {
+    el.style.display = 'none'
+    return
+  }
+  el.style.top = 'auto'
+  el.style.right = 'auto'
   el.style.left = `${Math.min(Math.max(56, x), Math.max(56, width - 56))}px`
   el.style.bottom = `${chart.timeScale().height() + 6}px`
   el.style.display = 'block'
@@ -1200,6 +1207,7 @@ function onVisibleRangeChange() {
     markersApi?.setMarkers(buildMarkers())
   }
   innerPricePrimitive?.update()
+  updateCountdown()
 }
 
 /** 画出每个N形态的 S0→S1→S2 连线；箱体只画上下轨横线 */
@@ -3332,8 +3340,6 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
     touch-action: none;
   }
   .time-left {
-    top: 6px;
-    right: 8px;
     font-size: 10px;
     padding: 2px 6px;
   }
