@@ -85,6 +85,8 @@ pub async fn update_client_settings(
     state.save_local_settings().await
 }
 
+
+
 #[tauri::command]
 pub async fn get_meta(state: State<'_, Arc<AppState>>) -> Result<MetaDto, String> {
     state.api.get_meta().await.map_err(|e| e.message)
@@ -400,6 +402,13 @@ pub async fn get_active_events(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Value, String> {
     state.api.get_active_events().await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_active_single_bars(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Value, String> {
+    state.api.get_active_single_bars().await.map_err(|e| e.message)
 }
 
 // ── Actions ──

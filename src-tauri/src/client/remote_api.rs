@@ -379,6 +379,10 @@ impl RemoteApiClient {
         self.execute(self.request(Method::GET, "signals/active")).await
     }
 
+    pub async fn get_active_single_bars(&self) -> Result<Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "signals/active-single-bars")).await
+    }
+
     // ── Actions ──
 
     pub async fn refresh_data_now(&self) -> Result<RefreshStats, ApiErrorResponse> {

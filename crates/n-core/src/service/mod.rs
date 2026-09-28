@@ -1421,6 +1421,8 @@ pub struct Services {
     data_cycle_lock: Mutex<()>,
     /// 统一原子化行情写入与派生管道（Issue 02）。
     pub pipeline: RawPipeline,
+    /// 活跃单K（上影锤/下影锤）形态缓存
+    pub active_single_bars: Arc<RwLock<HashMap<String, crate::analyze::model::SingleBarAlert>>>,
 }
 
 impl Services {
@@ -1528,6 +1530,7 @@ impl Services {
             scan_lock: Mutex::new(()),
             data_cycle_lock: Mutex::new(()),
             pipeline,
+            active_single_bars: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -3892,6 +3895,24 @@ impl Services {
                 });
                 continue;
             }
+            if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
+                let (kind_s, label) = match sig.kind {
+                    crate::analyze::indicators::BareKind::Hammer => ("hammer", "下影锤"), // 长下影，实体在上
+                    crate::analyze::indicators::BareKind::Needle => ("needle", "上影锤"), // 长上影，实体在下
+                };
+                let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
+                single_bars.push(crate::analyze::model::SingleBarAlert {
+                    symbol: sym.code.clone(),
+                    timeframe: "15m".to_string(),
+                    kind: kind_s.to_string(),
+                    label: label.to_string(),
+                    trigger_bar_ts: sig.bar_ts.clone(),
+                    expire_bar_ts: expire,
+                    price: sig.price,
+                    high: sig.high,
+                    low: sig.low,
+                });
+            }
             let watermark = if delete_fast_events {
                 let latest = bars15.last().expect("bars15 length checked");
                 let bar_end = latest.dt.to_bar_ts();
@@ -3919,24 +3940,6 @@ impl Services {
                 None
             };
             scanned += 1;
-            if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
-                let (kind_s, label) = match sig.kind {
-                    crate::analyze::indicators::BareKind::Hammer => ("hammer", "下影锤"), // 长下影，实体在上
-                    crate::analyze::indicators::BareKind::Needle => ("needle", "上影锤"), // 长上影，实体在下
-                };
-                let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
-                single_bars.push(crate::analyze::model::SingleBarAlert {
-                    symbol: sym.code.clone(),
-                    timeframe: "15m".to_string(),
-                    kind: kind_s.to_string(),
-                    label: label.to_string(),
-                    trigger_bar_ts: sig.bar_ts.clone(),
-                    expire_bar_ts: expire,
-                    price: sig.price,
-                    high: sig.high,
-                    low: sig.low,
-                });
-            }
             let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
             let candidates = event::replay_warnings(&sym.code, &bars15, tick);
             let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
@@ -4027,6 +4030,15 @@ impl Services {
             &signals,
             &failed,
         );
+        {
+            let mut cache = self.active_single_bars.write().await;
+            for sb in &single_bars {
+                cache.insert(sb.symbol.clone(), sb.clone());
+            }
+            let now_str = crate::analyze::time::now_display();
+            cache.retain(|_, v| v.expire_bar_ts > now_str);
+        }
+
         Ok(ScanResult {
             scanned,
             active_count,
@@ -4037,6 +4049,53 @@ impl Services {
             failed,
             single_bars,
         })
+    }
+
+    /// 获取当前仍处于活跃有效期的单K（上影锤/下影锤）形态列表
+    pub async fn get_active_single_bars(&self) -> Result<Vec<crate::analyze::model::SingleBarAlert>> {
+        let now_str = crate::analyze::time::now_display();
+        {
+            let mut cache = self.active_single_bars.write().await;
+            cache.retain(|_, v| v.expire_bar_ts > now_str);
+            if !cache.is_empty() {
+                return Ok(cache.values().cloned().collect());
+            }
+        }
+
+        // 缓存为空时（例如服务刚重启），尝试从已启用品种的最新15m K线直接检测
+        let symbols = repo::list_symbols(&self.db, true).await?;
+        let mut results = Vec::new();
+        for sym in symbols {
+            if let Ok(bars15) = self.bars_for(&sym.code, "15m").await {
+                if bars15.len() >= ATR_PERIOD + 2 {
+                    if let Some(sig) = crate::analyze::indicators::detect_bare_prev(&bars15) {
+                        let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
+                        if expire > now_str {
+                            let (kind_s, label) = match sig.kind {
+                                crate::analyze::indicators::BareKind::Hammer => ("hammer", "下影锤"),
+                                crate::analyze::indicators::BareKind::Needle => ("needle", "上影锤"),
+                            };
+                            results.push(crate::analyze::model::SingleBarAlert {
+                                symbol: sym.code,
+                                timeframe: "15m".to_string(),
+                                kind: kind_s.to_string(),
+                                label: label.to_string(),
+                                trigger_bar_ts: sig.bar_ts,
+                                expire_bar_ts: expire,
+                                price: sig.price,
+                                high: sig.high,
+                                low: sig.low,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let mut cache = self.active_single_bars.write().await;
+        for sb in &results {
+            cache.insert(sb.symbol.clone(), sb.clone());
+        }
+        Ok(results)
     }
 
     /// 清理历史遗留的重复事件：与复盘统计去重同口径，族内只保留首见一条，

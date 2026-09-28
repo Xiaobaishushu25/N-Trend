@@ -326,11 +326,17 @@ async function loadClientSettings() {
   try {
     const s = await api.getClientSettings()
     clientSettings.value = {
-      ...s,
-      chartDisplayBars: s.chartDisplayBars ?? (s as any).chart_display_bars ?? 200,
-      mobileChartFullscreenBars: s.mobileChartFullscreenBars ?? (s as any).mobile_chart_fullscreen_bars ?? 180,
-      chartRightGap: s.chartRightGap ?? (s as any).chart_right_gap ?? 15,
-      minBarSpacing: s.minBarSpacing ?? (s as any).min_bar_spacing ?? 6,
+      serverUrl: s.serverUrl ?? (s as any).server_url ?? 'http://127.0.0.1:8081',
+      deviceId: s.deviceId ?? (s as any).device_id ?? '',
+      deviceName: s.deviceName ?? (s as any).device_name ?? (isMobile.value ? '移动端设备' : 'Desktop PC'),
+      theme: s.theme || 'dark',
+      chartDisplayBars: Number(s.chartDisplayBars ?? (s as any).chart_display_bars) || 200,
+      mobileChartFullscreenBars: Number(s.mobileChartFullscreenBars ?? (s as any).mobile_chart_fullscreen_bars) || 180,
+      chartRightGap: Number(s.chartRightGap ?? (s as any).chart_right_gap) || 15,
+      minBarSpacing: Number(s.minBarSpacing ?? (s as any).min_bar_spacing) || 6,
+      timeframes: Array.isArray(s.timeframes) && s.timeframes.length > 0 ? s.timeframes : ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
+      lastGroupId: s.lastGroupId ?? (s as any).last_group_id ?? null,
+      desktopNotificationEnabled: s.desktopNotificationEnabled ?? (s as any).desktop_notification_enabled ?? true,
       logLevel: s.logLevel || 'info',
     }
   } catch (e) {
@@ -348,15 +354,50 @@ async function loadClientSettings() {
 async function saveClientSettings() {
   savingClientSettings.value = true
   try {
-    const payload = {
-      ...clientSettings.value,
-      chart_display_bars: clientSettings.value.chartDisplayBars,
-      mobile_chart_fullscreen_bars: clientSettings.value.mobileChartFullscreenBars,
-      chart_right_gap: clientSettings.value.chartRightGap,
-      min_bar_spacing: clientSettings.value.minBarSpacing,
+    const raw = clientSettings.value
+    const chartDisplayBars = Math.max(30, Math.min(1000, Math.round(Number(raw.chartDisplayBars) || 200)))
+    const mobileChartFullscreenBars = Math.max(30, Math.min(1000, Math.round(Number(raw.mobileChartFullscreenBars) || 180)))
+    const chartRightGap = Math.max(2, Math.min(50, Math.round(Number(raw.chartRightGap) || 15)))
+    const minBarSpacing = Math.max(2, Math.min(30, Number(raw.minBarSpacing) || 6))
+
+    // 规整为纯净属性对象，杜绝由于同时包含 camelCase 和 snake_case 别名触发 Serde duplicate field 报错
+    const payload: ClientLocalSettings = {
+      serverUrl: raw.serverUrl || 'http://127.0.0.1:8081',
+      deviceId: raw.deviceId || '',
+      deviceName: raw.deviceName || (isMobile.value ? '移动端设备' : 'Desktop PC'),
+      theme: raw.theme || 'dark',
+      chartDisplayBars,
+      mobileChartFullscreenBars,
+      chartRightGap,
+      minBarSpacing,
+      timeframes: Array.isArray(raw.timeframes) && raw.timeframes.length > 0 ? raw.timeframes : ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
+      lastGroupId: raw.lastGroupId ?? null,
+      desktopNotificationEnabled: raw.desktopNotificationEnabled ?? true,
+      logLevel: raw.logLevel || 'info',
     }
-    await api.updateClientSettings(payload as any)
-    await settingsStore.load()
+    await api.updateClientSettings(payload)
+
+    // 即时更新 pinia store 中的 UI 设置，使图表视图立即生效
+    if (settingsStore.settings?.ui) {
+      const ui = settingsStore.settings.ui as any
+      ui.chart_display_bars = chartDisplayBars
+      ui.chartDisplayBars = chartDisplayBars
+      ui.mobile_chart_fullscreen_bars = mobileChartFullscreenBars
+      ui.mobileChartFullscreenBars = mobileChartFullscreenBars
+      ui.chart_right_gap = chartRightGap
+      ui.chartRightGap = chartRightGap
+      ui.min_bar_spacing = minBarSpacing
+      ui.minBarSpacing = minBarSpacing
+      ui.timeframes = payload.timeframes
+    }
+
+    // 静默尝试从服务端同步最新状态（若服务端离线或未配对则忽略，不阻碍本地偏好保存）
+    try {
+      await settingsStore.load()
+    } catch {
+      // 忽略服务端状态请求异常
+    }
+
     message.success('终端偏好已保存')
   } catch (e: any) {
     message.error(`保存失败: ${e?.message || e}`)
@@ -364,6 +405,7 @@ async function saveClientSettings() {
     savingClientSettings.value = false
   }
 }
+
 
 async function toggleAutoLaunch(enabled: boolean) {
   if (!inTauri) return

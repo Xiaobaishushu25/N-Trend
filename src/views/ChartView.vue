@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import draggable from 'vuedraggable'
 import {
   NButton,
@@ -819,7 +819,12 @@ function switchSymbolTo(code: string) {
 }
 
 async function enterMobileFullscreen() {
+  if (isMobileFullscreen.value) return
   isMobileFullscreen.value = true
+  try {
+    // 压入全屏历史记录状态：以便系统手势/物理返回键能精准拦截退出全屏，而不是直接跳回首页主列表
+    window.history.pushState({ ...(window.history.state || {}), mobileFullscreen: true }, '')
+  } catch {}
   try {
     if (window.AndroidBridge && typeof window.AndroidBridge.setOrientation === 'function') {
       window.AndroidBridge.setOrientation('landscape')
@@ -838,8 +843,17 @@ async function enterMobileFullscreen() {
   } catch {}
 }
 
-async function exitMobileFullscreen() {
+async function exitMobileFullscreen(syncHistory: boolean | unknown = true) {
+  if (!isMobileFullscreen.value) return
   isMobileFullscreen.value = false
+  const shouldSync = typeof syncHistory === 'boolean' ? syncHistory : true
+  if (shouldSync) {
+    try {
+      if (window.history.state?.mobileFullscreen) {
+        window.history.back()
+      }
+    } catch {}
+  }
   try {
     if (window.AndroidBridge && typeof window.AndroidBridge.setOrientation === 'function') {
       window.AndroidBridge.setOrientation('portrait')
@@ -858,11 +872,26 @@ async function exitMobileFullscreen() {
   } catch {}
 }
 
-function onDocumentFullscreenChange() {
-  if (!document.fullscreenElement && isMobileFullscreen.value) {
-    exitMobileFullscreen()
+function onPopState(_event: PopStateEvent) {
+  if (isMobileFullscreen.value) {
+    // 拦截系统返回：先退出横屏全屏，保留在当前品种竖屏图表界面
+    void exitMobileFullscreen(false)
   }
 }
+
+function onDocumentFullscreenChange() {
+  if (!document.fullscreenElement && isMobileFullscreen.value) {
+    void exitMobileFullscreen(true)
+  }
+}
+
+onBeforeRouteLeave((_to, _from) => {
+  if (isMobileFullscreen.value) {
+    // 路由准备离开时（若触发了后退）：先退出全屏，留在当前品种竖屏K线界面
+    void exitMobileFullscreen(false)
+    return false
+  }
+})
 
 const mobileNearestLevels = computed(() => {
   const cur = quotePrice.value
@@ -2091,6 +2120,7 @@ watch(
 
 onMounted(async () => {
   window.addEventListener('keydown', onReviewKeydown)
+  window.addEventListener('popstate', onPopState)
   document.addEventListener('fullscreenchange', onDocumentFullscreenChange)
   void refreshV2Predictions()
   unlisteners.push(
@@ -2179,9 +2209,10 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onReviewKeydown)
+  window.removeEventListener('popstate', onPopState)
   document.removeEventListener('fullscreenchange', onDocumentFullscreenChange)
   if (isMobileFullscreen.value) {
-    void exitMobileFullscreen()
+    void exitMobileFullscreen(false)
   }
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()

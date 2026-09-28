@@ -79,6 +79,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/quotes", get(quotes::get_market_snapshot))
         // 信号与复盘
         .route("/signals/active", get(signals::get_active_events))
+        .route(
+            "/signals/active-single-bars",
+            get(signals::get_active_single_bars),
+        )
         .route("/signals/preclose", get(signals::get_preclose_signals))
         .route(
             "/signals/preclose-candidates",

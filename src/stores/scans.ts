@@ -68,14 +68,25 @@ export const useScansStore = defineStore('scans', {
     async refreshLatestSignals() {
       if (this.latest) {
         this.latestSignals = activeSignals(this.latest.signals)
+        if (this.singleBars.size === 0) {
+          api.getActiveSingleBars().then((bars) => {
+            if (bars?.length) this.upsertSingleBars(bars)
+          }).catch(() => {})
+        }
         return
       }
       if (latestRefreshPromise) return latestRefreshPromise
 
       latestRefreshPromise = (async () => {
         try {
-          const cached = await api.getActiveEvents()
+          const [cached, activeSingleBars] = await Promise.all([
+            api.getActiveEvents(),
+            api.getActiveSingleBars().catch(() => [] as SingleBarEvent[]),
+          ])
           this.latestSignals = activeSignals(cached as unknown as PatternEvent[])
+          if (activeSingleBars?.length) {
+            this.upsertSingleBars(activeSingleBars)
+          }
         } catch {
           // 缓存读取失败时仍允许下面安排一次后台扫描恢复数据。
           this.latestSignals = []

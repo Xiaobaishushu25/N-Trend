@@ -56,6 +56,19 @@ pub async fn get_active_events(
     }
 }
 
+pub async fn get_active_single_bars(
+    State(ctx): State<Arc<ServerContext>>,
+    _device: AuthDevice,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
+    match ctx.services.get_active_single_bars().await {
+        Ok(bars) => Ok(Json(serde_json::to_value(bars).unwrap_or_default())),
+        Err(e) => {
+            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取活跃单K形态失败: {e}"), "");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+        }
+    }
+}
+
 pub async fn get_preclose_signals(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,

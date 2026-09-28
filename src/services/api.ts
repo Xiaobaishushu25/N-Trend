@@ -34,6 +34,7 @@ import type {
   SignalAnnotation,
   SignalDecision,
   SignalUserData,
+  SingleBarEvent,
   SymbolRow,
   TrendPointDto,
   ConnectionStatus,
@@ -101,6 +102,7 @@ export const api = {
 
   refreshDataNow: () => invoke<RefreshStats>('refresh_data_now'),
   getActiveEvents: () => invoke<PatternEvent[]>('get_active_events'),
+  getActiveSingleBars: () => invoke<SingleBarEvent[]>('get_active_single_bars'),
   getActivePrecloseSignals: () => invoke<PrecloseSignal[]>('get_active_preclose_signals'),
   getActivePrecloseCandidates: () => invoke<PrecloseCandidate[]>('get_active_preclose_candidates'),
   getPrecloseSignals: () => invoke<PrecloseSignal[]>('get_preclose_signals'),
@@ -188,7 +190,8 @@ export const api = {
   getAuthRecord: () => invoke<AuthRecord>('get_auth_record'),
   updateAuthRecord: (record: AuthRecord) => invoke<void>('update_auth_record', { record }),
   getClientSettings: () => invoke<ClientLocalSettings>('get_client_settings'),
-  updateClientSettings: (settings: ClientLocalSettings) => invoke<void>('update_client_settings', { settings }),
+  updateClientSettings: (settings: ClientLocalSettings) =>
+    invoke<void>('update_client_settings', { settings }),
   getMeta: () => invoke<MetaDto>('get_meta'),
   getServerStatus: () => invoke<ServerStatusDto>('get_server_status'),
   getServerSettings: () => invoke<ServerSettingsDto>('get_server_settings'),

@@ -45,7 +45,7 @@ import { notify } from '../utils/notify'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
 import { usePlatform } from '../utils/platform'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, PrecloseSignal, SymbolRow } from '../types'
+import type { GroupRow, MarketSnapshot, PatternEvent, PrecloseCandidate, PrecloseSignal, SingleBarEvent, SymbolRow } from '../types'
 
 // 显式声明组件名：配合 AppLayout 里的 keep-alive include 缓存本页面
 defineOptions({ name: 'DashboardView' })
@@ -167,12 +167,16 @@ async function loadAll() {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
     }
     // 信号（缓存秒级）与行情快照并行，互不阻塞
-    const [signals, snapshots, preclose, candidates] = await Promise.all([
+    const [signals, snapshots, preclose, candidates, activeSingleBars] = await Promise.all([
       scansStore.refreshLatestSignals().then(() => scansStore.latestSignals),
       api.getMarketSnapshot().catch(() => [] as MarketSnapshot[]),
       api.getActivePrecloseSignals().catch(() => [] as PrecloseSignal[]),
       api.getActivePrecloseCandidates().catch(() => [] as PrecloseCandidate[]),
+      api.getActiveSingleBars().catch(() => [] as SingleBarEvent[]),
     ])
+    if (activeSingleBars?.length) {
+      scansStore.upsertSingleBars(activeSingleBars)
+    }
     precloseSignals.value = preclose
     precloseCandidates.value = candidates
     const bySymbol = new Map<string, PatternEvent[]>()

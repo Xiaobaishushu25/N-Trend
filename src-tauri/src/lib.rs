@@ -179,6 +179,7 @@ pub fn run() {
             commands::delete_manual_level,
             commands::get_manual_level_events,
             commands::get_active_events,
+            commands::get_active_single_bars,
             commands::refresh_data_now,
             commands::run_scan_now,
             commands::run_scan_fast_now,

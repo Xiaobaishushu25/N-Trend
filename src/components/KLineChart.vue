@@ -284,7 +284,56 @@ function hexToRgba(color: string, alpha: number): string {
   return color
 }
 
-class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
+class InnerPriceAxisGridPaneRenderer implements IPrimitivePaneRenderer {
+  constructor(
+    private chart: IChartApi,
+    private source: ISeriesApi<'Candlestick'>,
+    private isMobile: () => boolean,
+  ) {}
+
+  draw(target: CanvasRenderingTarget2D) {
+    if (!this.isMobile()) return
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const width = mediaSize.width
+      const height = mediaSize.height
+
+      const priceApi = this.chart.priceScale('right')
+      const priceRange = priceApi.getVisibleRange()
+      if (!priceRange || priceRange.to <= priceRange.from) return
+
+      context.save()
+      const yRatios = [0.12, 0.34, 0.56, 0.78, 0.95]
+      for (const ratio of yRatios) {
+        const y = height * ratio
+        const p = this.source.coordinateToPrice(y)
+        if (p == null) continue
+        const yRound = Math.round(y) + 0.5
+        // Faint horizontal dashed grid line across the whole chart width
+        context.strokeStyle = 'rgba(226, 232, 240, 0.75)'
+        context.lineWidth = 1
+        context.setLineDash([3, 4])
+        context.beginPath()
+        context.moveTo(0, yRound)
+        context.lineTo(width, yRound)
+        context.stroke()
+      }
+      context.restore()
+    })
+  }
+}
+
+class InnerPriceAxisGridPaneView implements IPrimitivePaneView {
+  constructor(private paneRenderer: InnerPriceAxisGridPaneRenderer) {}
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'bottom'
+  }
+}
+
+class InnerPriceAxisBadgePaneRenderer implements IPrimitivePaneRenderer {
   constructor(
     private chart: IChartApi,
     private source: ISeriesApi<'Candlestick'>,
@@ -312,9 +361,9 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
 
       context.save()
 
-      // 1. Draw 5 horizontal inner grid lines & left-aligned price labels
+      // 1. Subtle price label on the left edge inside the chart (for the 5 grid lines)
       const yRatios = [0.12, 0.34, 0.56, 0.78, 0.95]
-      context.font = '500 10px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+      context.font = '500 9.5px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
       context.textAlign = 'left'
       context.textBaseline = 'middle'
 
@@ -324,21 +373,9 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         if (p == null) continue
 
         const yRound = Math.round(y) + 0.5
-
-        // Faint horizontal dashed grid line across the whole chart width
-        context.strokeStyle = 'rgba(226, 232, 240, 0.75)'
-        context.lineWidth = 1
-        context.setLineDash([3, 4])
-        context.beginPath()
-        context.moveTo(0, yRound)
-        context.lineTo(width, yRound)
-        context.stroke()
-
-        // Subtle price label on the left edge inside the chart
-        context.setLineDash([])
         const text = formatP(p)
         const textW = context.measureText(text).width
-        context.fillStyle = 'rgba(255, 255, 255, 0.75)'
+        context.fillStyle = 'rgba(255, 255, 255, 0.85)'
         context.fillRect(4, yRound - 6, textW + 4, 12)
         context.fillStyle = '#64748b'
         context.fillText(text, 6, yRound)
@@ -352,22 +389,22 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         if (y != null && y >= 0 && y <= height) {
           context.setLineDash([])
           const text = `${line.title} ${formatP(line.price)}`
-          const tagW = Math.max(38, context.measureText(text).width + 8)
-          const tagH = 14
+          context.font = '600 9px Consolas, -apple-system, sans-serif'
+          const tagW = Math.max(34, context.measureText(text).width + 6)
+          const tagH = 13
           const tagX = 4
           const tagY = Math.max(2, Math.min(height - tagH - 2, y - tagH / 2))
 
-          context.fillStyle = hexToRgba(line.color, 0.72)
+          context.fillStyle = hexToRgba(line.color, 0.82)
           context.beginPath()
           if (typeof (context as any).roundRect === 'function') {
-            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 2.5)
           } else {
             context.rect(tagX, tagY, tagW, tagH)
           }
           context.fill()
 
           context.fillStyle = '#ffffff'
-          context.font = '600 9.5px Consolas, -apple-system, sans-serif'
           context.textAlign = 'center'
           context.textBaseline = 'middle'
           context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
@@ -398,9 +435,10 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           // Price badge on the LEFT edge (solid opaque, high contrast)
           context.setLineDash([])
           const text = formatP(curPrice)
+          context.font = '700 9.5px Consolas, -apple-system, sans-serif'
           const textW = context.measureText(text).width
-          const tagW = Math.max(48, textW + 10)
-          const tagH = 17
+          const tagW = Math.max(38, textW + 8)
+          const tagH = 15
           const tagX = 4
           const tagY = Math.max(2, Math.min(height - tagH - 2, curY - tagH / 2))
 
@@ -409,7 +447,7 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           context.fillStyle = color
           context.beginPath()
           if (typeof (context as any).roundRect === 'function') {
-            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 3)
+            ;(context as any).roundRect(tagX, tagY, tagW, tagH, 2.5)
           } else {
             context.rect(tagX, tagY, tagW, tagH)
           }
@@ -417,34 +455,33 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
           context.shadowBlur = 0
 
           context.fillStyle = '#ffffff'
-          context.font = '700 10.5px Consolas, -apple-system, sans-serif'
           context.textAlign = 'center'
           context.textBaseline = 'middle'
           context.fillText(text, tagX + tagW / 2, tagY + tagH / 2 + 0.5)
         }
       }
 
-      // 4. Hovered crosshair price badge on LEFT edge (solid dark background, 100% opaque, high contrast)
+      // 4. Hovered crosshair price badge on LEFT edge (放在顶层渲染，尺寸精简更小巧，避免被K线遮挡)
       const chY = this.crosshairY()
       const chPrice = this.crosshairPrice()
       if (chY != null && chPrice != null && chY >= 0 && chY <= height) {
         context.setLineDash([])
         const text = formatP(chPrice)
-        context.font = '700 11px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+        context.font = '600 9.5px Consolas, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
         const textW = context.measureText(text).width
-        const tagW = Math.max(52, textW + 12)
-        const tagH = 19
+        const tagW = Math.max(38, textW + 8)
+        const tagH = 15
         const tagX = 4
         const tagY = Math.max(2, Math.min(height - tagH - 2, chY - tagH / 2))
 
         // Solid opaque background with crisp shadow
         context.shadowColor = 'rgba(15, 23, 42, 0.45)'
-        context.shadowBlur = 5
+        context.shadowBlur = 4
         context.shadowOffsetY = 1
         context.fillStyle = '#0f172a'
         context.beginPath()
         if (typeof (context as any).roundRect === 'function') {
-          ;(context as any).roundRect(tagX, tagY, tagW, tagH, 4)
+          ;(context as any).roundRect(tagX, tagY, tagW, tagH, 2.5)
         } else {
           context.rect(tagX, tagY, tagW, tagH)
         }
@@ -453,8 +490,8 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         context.shadowOffsetY = 0
 
         // Crisp white border
-        context.strokeStyle = 'rgba(255, 255, 255, 0.35)'
-        context.lineWidth = 1
+        context.strokeStyle = 'rgba(255, 255, 255, 0.4)'
+        context.lineWidth = 0.8
         context.stroke()
 
         // Right indicator triangle pointing to the crosshair line
@@ -462,9 +499,9 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
         const arrowY = tagY + tagH / 2
         context.fillStyle = '#0f172a'
         context.beginPath()
-        context.moveTo(arrowX, arrowY - 3.5)
-        context.lineTo(arrowX + 3.5, arrowY)
-        context.lineTo(arrowX, arrowY + 3.5)
+        context.moveTo(arrowX, arrowY - 2.5)
+        context.lineTo(arrowX + 2.5, arrowY)
+        context.lineTo(arrowX, arrowY + 2.5)
         context.closePath()
         context.fill()
 
@@ -480,21 +517,19 @@ class InnerPriceAxisPaneRenderer implements IPrimitivePaneRenderer {
   }
 }
 
-class InnerPriceAxisPaneView implements IPrimitivePaneView {
-  private paneRenderer: InnerPriceAxisPaneRenderer
-  constructor(renderer: InnerPriceAxisPaneRenderer) {
-    this.paneRenderer = renderer
-  }
+class InnerPriceAxisBadgePaneView implements IPrimitivePaneView {
+  constructor(private paneRenderer: InnerPriceAxisBadgePaneRenderer) {}
   renderer(): IPrimitivePaneRenderer | null {
     return this.paneRenderer
   }
   zOrder(): PrimitivePaneViewZOrder {
-    return 'bottom'
+    return 'top'
   }
 }
 
 class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
-  private view: InnerPriceAxisPaneView
+  private gridView: InnerPriceAxisGridPaneView
+  private badgeView: InnerPriceAxisBadgePaneView
   private _requestUpdate?: () => void
   constructor(
     chart: IChartApi,
@@ -506,7 +541,8 @@ class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
     crosshairPrice: () => number | null,
     priceLines?: () => { price: number; color: string; title: string }[],
   ) {
-    const renderer = new InnerPriceAxisPaneRenderer(
+    const gridRenderer = new InnerPriceAxisGridPaneRenderer(chart, source, isMobile)
+    const badgeRenderer = new InnerPriceAxisBadgePaneRenderer(
       chart,
       source,
       isMobile,
@@ -516,7 +552,8 @@ class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
       crosshairPrice,
       priceLines,
     )
-    this.view = new InnerPriceAxisPaneView(renderer)
+    this.gridView = new InnerPriceAxisGridPaneView(gridRenderer)
+    this.badgeView = new InnerPriceAxisBadgePaneView(badgeRenderer)
   }
   attached(param: SeriesAttachedParameter<Time>) {
     this._requestUpdate = param.requestUpdate
@@ -528,7 +565,7 @@ class InnerPriceAxisPrimitive implements ISeriesPrimitive<Time> {
     this._requestUpdate?.()
   }
   paneViews(): readonly IPrimitivePaneView[] {
-    return [this.view]
+    return [this.gridView, this.badgeView]
   }
 }
 
