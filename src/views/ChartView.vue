@@ -1055,12 +1055,16 @@ function liveBucketLabel(date: Date, timeframe: string): string | null {
 
 /** 用实时报价刷新当前正在形成的K线；进入新桶时把前一根自动转为“已收未落地” */
 function updateLiveBar(latest: number) {
-  if (!symbol.value) return
-  const label = liveBucketLabel(new Date(), timeframe.value)
+  if (!symbol.value || !Number.isFinite(latest) || latest <= 0) return
+  const curSymbol = symbol.value
+  const curTf = timeframe.value
+  const label = liveBucketLabel(new Date(), curTf)
   if (!label) return
-  const arr = [...liveBars.value]
+
+  // 严格过滤出属于当前品种与周期的实时K线
+  const arr = liveBars.value.filter((b) => b.symbol === curSymbol && b.timeframe === curTf)
   const last = arr[arr.length - 1]
-  if (last && last.ts === label) {
+  if (last && last.symbol === curSymbol && last.timeframe === curTf && last.ts === label) {
     if (last.close === latest) return
     arr[arr.length - 1] = {
       ...last,
@@ -1070,14 +1074,22 @@ function updateLiveBar(latest: number) {
     }
   } else {
     // 桶起点基准：优先用库内同桶成形K线（定时/手动刷新已落库，带真实开盘与成交量），
-    // 否则用前一根收盘价保证连续——避免首笔实时报价来晚了导致
-    // “开盘价离前收很远、看起来像跳空”的假缺口
-    const prev = displayRows.value[displayRows.value.length - 1]
-    const seed = prev && prev.ts === label ? prev : null
-    const open = seed ? seed.open : prev ? prev.close : latest
+    // 否则用前一根收盘价保证连续。
+    // 严格检查 prev 是否确实属于当前品种且价格在合理范围内，彻底阻断跨品种价格污染！
+    const currentRows = displayRows.value
+    const prev = currentRows.length ? currentRows[currentRows.length - 1] : null
+    const isPrevValid =
+      prev != null &&
+      prev.symbol === curSymbol &&
+      prev.timeframe === curTf &&
+      Number.isFinite(prev.close) &&
+      prev.close > 0
+
+    const seed = isPrevValid && prev.ts === label ? prev : null
+    const open = seed ? seed.open : (isPrevValid ? prev.close : latest)
     arr.push({
-      symbol: symbol.value,
-      timeframe: timeframe.value,
+      symbol: curSymbol,
+      timeframe: curTf,
       ts: label,
       open,
       high: seed ? Math.max(seed.high, latest) : Math.max(open, latest),
@@ -1096,8 +1108,19 @@ function updateLiveBar(latest: number) {
 
 /** 展示序列：历史完整K线 + 实时拼出的K线（时间戳重叠时以后者更新、保留库内成交量） */
 const displayRows = computed<KlineRow[]>(() => {
-  const rows = klinesStore.rows
-  const live = liveBars.value
+  const sym = symbol.value
+  const tf = timeframe.value
+  // 必须严格校验 store 内的数据是否属于当前品种与周期，若仍在加载或属于旧品种，决不能返回给当前图表
+  const isStoreMatch =
+    klinesStore.symbol === sym &&
+    klinesStore.timeframe === tf &&
+    klinesStore.rows.length > 0 &&
+    klinesStore.rows[0].symbol === sym &&
+    klinesStore.rows[0].timeframe === tf
+
+  const rows = isStoreMatch ? klinesStore.rows : []
+  // 实时K线也必须严格过滤出当前品种与周期
+  const live = liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf)
   if (!live.length) return rows
   const liveByTs = new Map(live.map((b) => [b.ts, b]))
   const rowByTs = new Map(rows.map((r) => [r.ts, r]))
@@ -2217,6 +2240,8 @@ onBeforeUnmount(() => {
   for (const timer of flashTimers.values()) clearTimeout(timer)
   flashTimers.clear()
   for (const fn of unlisteners) fn()
+  liveBars.value = []
+  klinesStore.clear()
 })
 </script>
 
@@ -3059,7 +3084,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="chart-canvas-wrapper" :class="{ 'is-fullscreen-canvas': isMobileFullscreen }">
           <KLineChart
-            v-if="symbol && klinesStore.rows.length"
+            v-if="symbol && (displayRows.length || klinesStore.loading)"
             ref="chartRef"
             :symbol="symbol"
             :timeframe="timeframe"
@@ -3082,7 +3107,7 @@ onBeforeUnmount(() => {
             :loading="klinesStore.loading"
           />
           <n-empty
-            v-else
+            v-else-if="!klinesStore.loading"
             class="chart-empty"
             description="暂无K线数据，请先在列表页刷新数据"
           />

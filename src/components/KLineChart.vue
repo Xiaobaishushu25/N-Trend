@@ -755,12 +755,15 @@ interface ChartViewState {
   from: number
   to: number
   totalAtCapture: number
+  symbol: string
+  timeframe: string
   /** 手动缩放后的价格区间；自动缩放状态下仅作快照，不强制恢复。 */
   priceRange: { from: number; to: number } | null
   priceAutoScale: boolean
 }
 
 let lastView: ChartViewState | null = null
+let isRestoringView = false
 
 interface SavedPortraitViewState {
   from: number
@@ -1235,7 +1238,7 @@ function syncExtremes() {
   innerPricePrimitive?.update()
 }
 
-/** 可视区间变化时重算最高/最低点 */
+/** 可视区间变化时重算最高/最低点，并记录用户手动缩放与平移状态 */
 function onVisibleRangeChange() {
   syncFocusFollowWithView()
   refreshManualLevelOverlay()
@@ -1245,6 +1248,16 @@ function onVisibleRangeChange() {
   }
   innerPricePrimitive?.update()
   updateCountdown()
+
+  if (!isRestoringView && chart && candleSeries && candleSeries.data().length > 0) {
+    const logical = chart.timeScale().getVisibleLogicalRange()
+    if (logical && Number.isFinite(logical.from) && Number.isFinite(logical.to)) {
+      updateLastViewFromRange(logical)
+      if (isMobileChart() && !props.isFullscreen) {
+        capturePortraitView()
+      }
+    }
+  }
 }
 
 /** 画出每个N形态的 S0→S1→S2 连线；箱体只画上下轨横线 */
@@ -1322,6 +1335,8 @@ function updateLastViewFromRange(range: { from: number; to: number } | null) {
     from: range.from,
     to: range.to,
     totalAtCapture: props.rows.length,
+    symbol: props.symbol,
+    timeframe: props.timeframe,
     priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
     priceAutoScale: priceApi.options().autoScale,
   }
@@ -1364,8 +1379,9 @@ function restorePortraitView(): { from: number; to: number } | null {
       to = Math.min(maxTo, portraitSavedView.to)
       from = Math.max(-0.5, to - span)
     }
+    isRestoringView = true
     chart.timeScale().setVisibleLogicalRange({ from, to })
-    clampMinBarSpacing({ from, to })
+    isRestoringView = false
     const result = { from, to }
     updateLastViewFromRange(result)
     return result
@@ -1384,8 +1400,10 @@ function applyDefaultView(): { from: number; to: number } | null {
   // 右边界放在最后一根K线右侧留出空白（最后一根K线中心在逻辑坐标 total-1 处）
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - visible)
+  isRestoringView = true
   chart.timeScale().setVisibleLogicalRange({ from, to })
   clampMinBarSpacing({ from, to })
+  isRestoringView = false
   const result = { from, to }
   updateLastViewFromRange(result)
   return result
@@ -1470,6 +1488,8 @@ function captureView() {
     from: logical.from,
     to: logical.to,
     totalAtCapture: lastDataCount,
+    symbol: props.symbol,
+    timeframe: props.timeframe,
     priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
     priceAutoScale: priceApi.options().autoScale,
   }
@@ -1481,6 +1501,14 @@ function captureView() {
  *  若继续沿用该跨度，图表会卡在“几根巨大K线”的放大状态。此时回到默认视图。 */
 function dropStaleView(total: number) {
   if (!lastView) return
+  // 同一品种与周期且只是实时拼桶数据正常增长，绝不能丢弃用户视图
+  if (
+    lastView.symbol === props.symbol &&
+    lastView.timeframe === props.timeframe &&
+    total - lastView.totalAtCapture < Math.max(10, displayKNum.value / 2)
+  ) {
+    return
+  }
   const span = lastView.to - lastView.from
   const capturedTotal = lastView.totalAtCapture
   if (
@@ -1499,8 +1527,6 @@ function restoreView(): { from: number; to: number } | null {
   if (!chart) return null
   if (!candleSeries || candleSeries.data().length === 0) return null
   const priceApi = chart.priceScale('right')
-  //   `== 恢复视图: 行${props.rows.length} 保存${lastView ? lastView.from.toFixed(2) + '~' + lastView.to.toFixed(2) : 'null'}`,
-  // )
   dropStaleView(props.rows.length)
   if (!lastView) {
     priceApi.setAutoScale(true)
@@ -1512,7 +1538,10 @@ function restoreView(): { from: number; to: number } | null {
   let to = lastView.to
   if (total > 0) {
     const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
-    if (span >= total) {
+    const wasAtLatest =
+      lastView.totalAtCapture > 0 &&
+      lastView.to >= lastView.totalAtCapture - 1 - rightGapBars(Math.min(span, total)) - 1e-3
+    if (wasAtLatest || span >= total) {
       to = maxTo
       from = Math.max(-0.5, to - span)
     } else {
@@ -1520,15 +1549,22 @@ function restoreView(): { from: number; to: number } | null {
       to = from + span
     }
   }
+  isRestoringView = true
   chart.timeScale().setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing({ from, to })
-  if (!lastView.priceAutoScale && lastView.priceRange) {
+  isRestoringView = false
+
+  // 跨品种时绝对不能恢复旧品种的价格区间，强制开启自动缩放
+  if (lastView.symbol !== props.symbol) {
+    priceApi.setAutoScale(true)
+  } else if (!lastView.priceAutoScale && lastView.priceRange) {
     priceApi.setAutoScale(false)
     priceApi.setVisibleRange(lastView.priceRange)
   } else {
     priceApi.setAutoScale(true)
   }
-  return { from, to }
+  const result = { from, to }
+  updateLastViewFromRange(result)
+  return result
 }
 
 /** 切换品种/周期时：保留当前缩放级别（可见K线根数），但视图贴到新数据最右端并留出右侧空白 */
@@ -1540,11 +1576,14 @@ function applySwitchView(span: number): { from: number; to: number } | null {
   const visible = Math.min(span, total)
   const to = total - 0.5 + rightGapBars(visible)
   const from = Math.max(-0.5, to - span)
+  isRestoringView = true
   chart.timeScale().setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing({ from, to })
+  isRestoringView = false
   // 纵轴自动适配新品种的价格区间，避免因价格水平不同导致画面空白
   chart.priceScale('right').setAutoScale(true)
-  return { from, to }
+  const result = { from, to }
+  updateLastViewFromRange(result)
+  return result
 }
 
 function focusRow(): KlineRow | null {
@@ -1671,14 +1710,17 @@ function centerFocusView(index: number) {
       else from = to - span
     }
   }
+  isRestoringView = true
   ts.setVisibleLogicalRange({ from, to })
-  clampMinBarSpacing({ from, to })
+  isRestoringView = false
   const priceApi = chart.priceScale('right')
   const priceRange = priceApi.getVisibleRange()
   lastView = {
     from,
     to,
     totalAtCapture: total,
+    symbol: props.symbol,
+    timeframe: props.timeframe,
     priceRange: priceRange ? { from: priceRange.from, to: priceRange.to } : null,
     priceAutoScale: priceApi.options().autoScale,
   }
@@ -2024,14 +2066,20 @@ let prevTimeframe: string | null = null
  *  切换品种/周期时后端尚未返回新数据前，组件会先收到「旧数据+新品种」的中间态，
  *  用它判断可以避免中间态提前消耗掉切换状态、导致新数据到达后被当成普通刷新 */
 function rowsMatchRequest(): boolean {
+  if (!props.rows.length) return false
   const first = props.rows[0]
+  const last = props.rows[props.rows.length - 1]
   if (!first || first.timeframe !== props.timeframe) return false
-  if (first.symbol === props.symbol) return true
+  if (!last || last.timeframe !== props.timeframe) return false
+
   // 换月/连续合约：品种字母前缀相同即视为同一品种（如 MA001 vs MA、MA2409 vs MA001）
-  // 避免因合约月份后缀变化导致 rows 被判为中间态而跳过渲染，进而导致换月后必不聚焦
-  const a = first.symbol.replace(/[^A-Za-z]/g, '')
   const b = props.symbol.replace(/[^A-Za-z]/g, '')
-  return !!a && !!b && a === b
+  const checkSym = (sym: string) => {
+    if (sym === props.symbol) return true
+    const a = sym.replace(/[^A-Za-z]/g, '')
+    return !!a && !!b && a === b
+  }
+  return checkSym(first.symbol) && checkSym(last.symbol)
 }
 
 /** 数据变化时：沿用当前缩放/平移状态（无记录则默认视图）；
@@ -2061,26 +2109,112 @@ function renderData() {
   const isSwitch = prevSymbol !== props.symbol || prevTimeframe !== props.timeframe
   prevSymbol = props.symbol
   prevTimeframe = props.timeframe
-  captureView()
-  updatePriceExtent()
-  candleSeries.setData(buildCandles())
-  volumeSeries.setData(buildVolumes())
-  lastDataCount = props.rows.length
-  syncGaps()
-  syncRollovers()
-  syncManualLevels()
-  refreshManualLevelOverlay()
-  // setVisibleLogicalRange 要到下一绘制帧才反映到查询结果；后续自动跟随必须
-  // 直接沿用本次提交的目标范围，不能立即回读尚未更新的旧范围。
+
+  // 判断是否可以进行轻量级单根更新/追加（实时拼桶场景，避免整表重建打断缩放手势或重置画布）
+  const seriesData = candleSeries.data()
+  const seriesLen = seriesData.length
+  const rowsLen = props.rows.length
+  const isIncrementalUpdate =
+    !isSwitch &&
+    seriesLen > 0 &&
+    rowsLen >= seriesLen &&
+    rowsLen - seriesLen <= 1 &&
+    lastDataCount === seriesLen &&
+    (rowsLen === seriesLen
+      ? (toTs(props.rows[rowsLen - 1].ts) as Time) === seriesData[seriesLen - 1].time
+      : (toTs(props.rows[rowsLen - 2].ts) as Time) === seriesData[seriesLen - 1].time)
+
   let targetRange: { from: number; to: number } | null = null
-  if (isSwitch) {
-    dropStaleView(props.rows.length)
-    const span = lastView
-      ? Math.min(lastView.to - lastView.from, props.rows.length)
-      : Math.min(displayKNum.value, props.rows.length)
-    targetRange = applySwitchView(span)
+
+  if (isIncrementalUpdate) {
+    updatePriceExtent()
+    if (rowsLen === seriesLen) {
+      // 场景 1：当前拼桶K线内部价格跳动（同一根K线的高/低/收变动）
+      const lastRow = props.rows[rowsLen - 1]
+      candleSeries.update({
+        time: toTs(lastRow.ts) as Time,
+        open: lastRow.open,
+        high: lastRow.high,
+        low: lastRow.low,
+        close: lastRow.close,
+      })
+      volumeSeries.update({
+        time: toTs(lastRow.ts) as Time,
+        value: lastRow.volume,
+        color: lastRow.close >= lastRow.open ? 'rgba(224, 49, 49, 0.45)' : 'rgba(15, 157, 88, 0.45)',
+      })
+    } else {
+      // 场景 2：新桶成形（追加了一根新K线），同时前一根K线已收盘落定
+      if (rowsLen >= 2) {
+        const prevRow = props.rows[rowsLen - 2]
+        candleSeries.update({
+          time: toTs(prevRow.ts) as Time,
+          open: prevRow.open,
+          high: prevRow.high,
+          low: prevRow.low,
+          close: prevRow.close,
+        })
+        volumeSeries.update({
+          time: toTs(prevRow.ts) as Time,
+          value: prevRow.volume,
+          color: prevRow.close >= prevRow.open ? 'rgba(224, 49, 49, 0.45)' : 'rgba(15, 157, 88, 0.45)',
+        })
+      }
+      const lastRow = props.rows[rowsLen - 1]
+      candleSeries.update({
+        time: toTs(lastRow.ts) as Time,
+        open: lastRow.open,
+        high: lastRow.high,
+        low: lastRow.low,
+        close: lastRow.close,
+      })
+      volumeSeries.update({
+        time: toTs(lastRow.ts) as Time,
+        value: lastRow.volume,
+        color: lastRow.close >= lastRow.open ? 'rgba(224, 49, 49, 0.45)' : 'rgba(15, 157, 88, 0.45)',
+      })
+
+      // 追加新K线后：如果用户之前处于最右侧最新K线，平滑推进1格并保留用户的缩放跨度
+      const span = lastView ? Math.max(1, lastView.to - lastView.from) : Math.min(displayKNum.value, rowsLen)
+      const wasAtLatest =
+        lastView != null &&
+        lastView.totalAtCapture > 0 &&
+        lastView.to >= lastView.totalAtCapture - 1 - rightGapBars(Math.min(span, rowsLen)) - 1e-3
+      if (wasAtLatest) {
+        const maxTo = rowsLen - 0.5 + rightGapBars(Math.min(span, rowsLen))
+        const to = maxTo
+        const from = Math.max(-0.5, to - span)
+        isRestoringView = true
+        chart.timeScale().setVisibleLogicalRange({ from, to })
+        isRestoringView = false
+        targetRange = { from, to }
+        updateLastViewFromRange(targetRange)
+      }
+    }
+    lastDataCount = rowsLen
+    refreshManualLevelOverlay()
   } else {
-    targetRange = restoreView()
+    isRestoringView = true
+    captureView()
+    updatePriceExtent()
+    candleSeries.setData(buildCandles())
+    volumeSeries.setData(buildVolumes())
+    lastDataCount = props.rows.length
+    syncGaps()
+    syncRollovers()
+    syncManualLevels()
+    refreshManualLevelOverlay()
+
+    if (isSwitch) {
+      dropStaleView(props.rows.length)
+      const span = lastView
+        ? Math.min(lastView.to - lastView.from, props.rows.length)
+        : Math.min(displayKNum.value, props.rows.length)
+      targetRange = applySwitchView(span)
+    } else {
+      targetRange = restoreView()
+    }
+    isRestoringView = false
   }
   const lastTsForHover = props.rows.length ? (toTs(props.rows[props.rows.length - 1].ts) as Time) : null
   const hoveringOnHistory = isHovering && hoveredTime != null && lastTsForHover != null && hoveredTime !== lastTsForHover
@@ -2127,7 +2261,7 @@ function renderData() {
     nextTick(() => {
       if (focusIndex === savedIdx && chart) centerFocusView(savedIdx)
     })
-  } else if (shouldAutoFollow) ensureFocusVisible(targetRange ?? undefined)
+  } else if (shouldAutoFollow && !isIncrementalUpdate) ensureFocusVisible(targetRange ?? undefined)
   else if (pendingFocusTs) {
     // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
     scheduleFocusRetry()
@@ -2179,18 +2313,25 @@ function handleWheel(e: WheelEvent) {
   let from = center - span * xRatio
   let to = from + span
   from = Math.max(-0.5, from)
-  to = Math.min(total - 0.5, to)
+  const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
+  to = Math.min(maxTo, to)
   if (to - from < minSpan) {
     from = Math.max(-0.5, to - minSpan)
   }
   timeScale.setVisibleLogicalRange({ from, to })
 
   // 横轴已到极限时纵轴同步停止，避免无限缩放
-  if (clamped) return
+  if (clamped) {
+    updateLastViewFromRange({ from, to })
+    return
+  }
 
   const priceApi = chart.priceScale('right')
   const pr = priceApi.getVisibleRange()
-  if (!pr || pr.to <= pr.from || priceExtent <= 0) return
+  if (!pr || pr.to <= pr.from || priceExtent <= 0) {
+    updateLastViewFromRange({ from, to })
+    return
+  }
   const minP = priceExtent * 0.002
   const maxP = priceExtent * 1.2
   const spanP = Math.min(maxP, Math.max(minP, (pr.to - pr.from) * factor))
@@ -2198,6 +2339,7 @@ function handleWheel(e: WheelEvent) {
   const fromP = centerP - spanP * (1 - yRatio)
   priceApi.setAutoScale(false)
   priceApi.setVisibleRange({ from: fromP, to: fromP + spanP })
+  updateLastViewFromRange({ from, to })
 }
 
 function rowIndexAtCoordinate(x: number): number {
@@ -2742,7 +2884,8 @@ onMounted(() => {
     const height = el.clientHeight
     if (width <= 0 || height <= 0) return
 
-    const widthChanged = Math.abs(width - lastObservedWidth) > 2
+    const prevWidth = lastObservedWidth
+    const widthChanged = prevWidth > 0 && Math.abs(width - prevWidth) > 2
     lastObservedWidth = width
     lastObservedHeight = height
 
@@ -2761,12 +2904,12 @@ onMounted(() => {
     applyPaneHeights()
     refreshManualLevelOverlay()
 
-    // 若在全屏进入/退出过渡期，或屏幕旋转导致宽度剧烈突变，重新根据当前实际容器尺寸校准目标视图
+    // 若在全屏进入/退出过渡期，或移动端屏幕旋转导致宽度剧烈突变，重新根据当前实际容器尺寸校准目标视图
     if (fsTransitionState === 'entering') {
       applyDefaultView()
     } else if (fsTransitionState === 'exiting') {
       restorePortraitView()
-    } else if (widthChanged && Math.abs(width - (props.isFullscreen ? 800 : 390)) > 50) {
+    } else if (mobile && widthChanged && Math.abs(width - prevWidth) > 150) {
       if (props.isFullscreen) {
         applyDefaultView()
       } else {
@@ -2928,6 +3071,7 @@ onBeforeUnmount(() => {
   candleSeries = null
   volumeSeries = null
   priceLines = []
+  lastView = null
 })
 
 function toggleTrendVisible() {
