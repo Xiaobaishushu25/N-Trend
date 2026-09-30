@@ -1316,6 +1316,8 @@ pub struct ChartKlineResponse {
     /// tqsdk / sina_consistent / sina_mismatch / sina_unverified / tqsdk_recovery_pending
     pub status: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_bar: Option<KlineDto>,
 }
 
 #[derive(Debug, Clone)]
@@ -3464,6 +3466,7 @@ impl Services {
                 rows: self.get_klines(symbol, timeframe, limit).await?,
                 status: "tqsdk".to_string(),
                 message: String::new(),
+                partial_bar: None,
             });
         }
 
@@ -3487,14 +3490,26 @@ impl Services {
                 }
             }
 
+            let rows = self.get_klines(symbol, timeframe, limit).await?;
+            let mut partial_bar = None;
+            if crate::scheduler::is_trading_time(&chrono::Local::now()) {
+                if let Some(p) = self.get_partial_kline(symbol, timeframe).await {
+                    let latest_closed = rows.last().map(|r| r.ts.as_str());
+                    if latest_closed.map_or(true, |last_ts| p.ts.as_str() > last_ts) {
+                        partial_bar = Some(p);
+                    }
+                }
+            }
+
             return Ok(ChartKlineResponse {
-                rows: self.get_klines(symbol, timeframe, limit).await?,
+                rows,
                 status: if recovery_pending {
                     "tqsdk_recovery_pending".to_string()
                 } else {
                     "tqsdk".to_string()
                 },
                 message: recovery_message,
+                partial_bar,
             });
         }
 
@@ -3504,6 +3519,7 @@ impl Services {
                 status: "tq_unavailable".to_string(),
                 message: "天勤暂不可用，已关闭新浪临时图表回退；当前仅显示本地最后一段数据。"
                     .to_string(),
+                partial_bar: None,
             });
         }
 
@@ -3602,6 +3618,44 @@ impl Services {
             rows,
             status: entry.status,
             message,
+            partial_bar: None,
+        })
+    }
+
+    /// 获取当前交易时段内正在进行的实时K线（未闭合 Bar）。
+    /// 仅从天勤内存中读取末端行，带自适应快速超时（<=1.2s），失败静默返回 None。
+    pub async fn get_partial_kline(&self, symbol: &str, timeframe: &str) -> Option<KlineDto> {
+        let period = match timeframe {
+            "5m" | "5" => "5",
+            "15m" | "15" => "15",
+            "30m" | "30" => "30",
+            "60m" | "60" => "60",
+            "120m" => "120m",
+            "240m" => "240m",
+            "1d" | "day" => "1d",
+            _ => return None,
+        };
+
+        let tq = self.data_source.tq_client().await;
+        let query = tq.fetch_minute_raw(symbol, period, 1);
+        let res = tokio::time::timeout(std::time::Duration::from_millis(1200), query)
+            .await
+            .ok()?
+            .ok()?;
+        let last = res.klines.into_iter().last()?;
+
+        Some(KlineDto {
+            symbol: symbol.to_string(),
+            timeframe: timeframe.to_string(),
+            ts: last.datetime,
+            open: last.open,
+            high: last.high,
+            low: last.low,
+            close: last.close,
+            volume: last.volume,
+            hold: last.hold,
+            source: "partial".to_string(),
+            rollover: false,
         })
     }
 

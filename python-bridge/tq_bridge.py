@@ -1149,6 +1149,8 @@ async def handle_kline(request: web.Request) -> web.Response:
         "15m": 900, "15": 900,
         "30m": 1800, "30": 1800,
         "60m": 3600, "60": 3600, "1h": 3600,
+        "120m": 7200, "2h": 7200,
+        "240m": 14400, "4h": 14400,
         "1d": 86400, "d": 86400, "day": 86400,
     }
     duration_secs = duration_map.get(period, 300)

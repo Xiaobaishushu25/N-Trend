@@ -60,6 +60,20 @@ pub async fn get_chart_klines(
                 .await
                 .unwrap_or(1);
 
+            let partial_bar = res.partial_bar.map(|p| KlineDto {
+                symbol: p.symbol,
+                timeframe: p.timeframe,
+                ts: p.ts,
+                open: p.open,
+                high: p.high,
+                low: p.low,
+                close: p.close,
+                volume: p.volume,
+                hold: p.hold,
+                source: p.source,
+                rollover: p.rollover,
+            });
+
             Ok(Json(ChartKlineResponse {
                 rows,
                 status: res.status,
@@ -70,6 +84,7 @@ pub async fn get_chart_klines(
                 has_more: Some(true),
                 next_before,
                 full_reload_required: Some(false),
+                partial_bar,
             }))
         }
         Err(e) => {

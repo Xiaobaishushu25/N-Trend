@@ -3,5 +3,5 @@ resolver = "2"
 members = ["crates/n-protocol", "crates/n-core", "crates/n-headless", "src-tauri"]
 
 [workspace.package]
-version = "3.0.0"
+version = "3.0.1"
 edition = "2021"

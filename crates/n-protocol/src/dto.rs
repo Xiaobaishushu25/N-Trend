@@ -64,6 +64,8 @@ pub struct ChartKlineResponse {
     pub next_before: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "fullReloadRequired")]
     pub full_reload_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "partialBar")]
+    pub partial_bar: Option<KlineDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

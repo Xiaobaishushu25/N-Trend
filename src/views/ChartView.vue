@@ -13,7 +13,7 @@ import {
 import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronsRight, Eye, EyeOff, GridDots, Heart, Help, InfoCircle, List, Maximize, Pencil, Plus, Settings, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
 import { useGroupsStore } from '../stores/groups'
@@ -1527,6 +1527,11 @@ async function loadSnapshots() {
   try {
     const list = await api.getMarketSnapshot()
     snapshots.value = Object.fromEntries(list.map((s) => [s.code, s]))
+    // 若当前品种已有实时价格，同步尝试推进实时K线，避免首屏静态等待
+    const curLatest = symbol.value ? snapshots.value[symbol.value]?.latest : null
+    if (curLatest != null) {
+      updateLiveBar(curLatest)
+    }
   } catch {
     // 快照加载失败不影响看图
   }
@@ -2116,6 +2121,13 @@ watch([symbol, timeframe], async () => {
   if (symbol.value) {
     void manualLevelsStore.load(symbol.value, timeframe.value)
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
+    if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
+      liveBars.value = [klinesStore.partialBar]
+    }
+    const curLatest = snapshots.value[symbol.value]?.latest
+    if (curLatest != null) {
+      updateLiveBar(curLatest)
+    }
     await loadTrendLine()
     scansStore.refreshLatestSignals()
   }
@@ -2174,7 +2186,7 @@ onMounted(async () => {
     }),
   )
   unlisteners.push(
-    await onDataUpdated(() => {
+    await onDataUpdated(async () => {
       // 数据库刷新后实时临时桶已经转正，清掉残留，避免旧收盘继续覆盖历史K线
       liveBars.value = []
       loadSnapshots()
@@ -2182,7 +2194,14 @@ onMounted(async () => {
       loadRecentPatterns()
       // 定时入库后静默重载完整K线，让刚收盘的实时桶转正为历史K线
       if (symbol.value) {
-        klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+        await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+        if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
+          liveBars.value = [klinesStore.partialBar]
+        }
+        const curLatest = snapshots.value[symbol.value]?.latest
+        if (curLatest != null) {
+          updateLiveBar(curLatest)
+        }
         loadTrendLine()
       }
     }),
@@ -2207,6 +2226,30 @@ onMounted(async () => {
       snapshots.value = next
     }),
   )
+  unlisteners.push(
+    await onKlinePartial((payload) => {
+      if (payload.symbol === symbol.value && payload.timeframe === timeframe.value && payload.bar) {
+        const bar = payload.bar as KlineRow
+        const arr = liveBars.value.filter((b) => b.symbol === symbol.value && b.timeframe === timeframe.value)
+        const idx = arr.findIndex((b) => b.ts === bar.ts)
+        if (idx >= 0) {
+          arr[idx] = bar
+        } else {
+          arr.push(bar)
+        }
+        liveBars.value = arr
+      }
+    }),
+  )
+  unlisteners.push(
+    await onKlineClosed((payload) => {
+      if (payload.symbol === symbol.value && payload.timeframe === timeframe.value) {
+        if (symbol.value) {
+          void klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
+        }
+      }
+    }),
+  )
   await symbolsStore.load()
   await groupsStore.load()
   await loadGroupSymbols()
@@ -2224,6 +2267,13 @@ onMounted(async () => {
   // 这里仅做兜底：若因时序/空路由未加载到则补拉一次，避免显示无数据
   if (symbol.value && (!klinesStore.rows.length || klinesStore.rows[0]?.symbol !== symbol.value || klinesStore.rows[0]?.timeframe !== timeframe.value)) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
+    if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
+      liveBars.value = [klinesStore.partialBar]
+    }
+    const curLatest = snapshots.value[symbol.value]?.latest
+    if (curLatest != null) {
+      updateLiveBar(curLatest)
+    }
     await loadTrendLine()
     scansStore.refreshLatestSignals()
     loadRecentPatterns()

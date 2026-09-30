@@ -47,7 +47,7 @@ function manualLevelTitle(alert: ManualLevelAlert): string {
 
 export const useAppStore = defineStore('app', {
   state: () => ({
-    info: { name: 'ntrend', version: '3.0.0' } as AppInfo,
+    info: { name: 'ntrend', version: '3.0.1' } as AppInfo,
     listeners: [] as (() => void)[],
     initialized: false,
     /** 当前进程收到的关键区域最新动态，供品种列表和K线卡片同步展示。 */

@@ -6,6 +6,7 @@ export const useKlinesStore = defineStore('klines', {
   state: () => ({
     symbol: '' as string,
     rows: [] as KlineRow[],
+    partialBar: null as KlineRow | null,
     timeframe: '15m' as Timeframe,
     loading: false,
     loadingCount: 0,
@@ -26,6 +27,7 @@ export const useKlinesStore = defineStore('klines', {
       if (isSwitch) {
         // 切换品种或周期时，立即清空旧数据，防止旧品种数据残留被误用为新数据基准
         this.rows = []
+        this.partialBar = null
       }
       this.symbol = symbol
       this.timeframe = timeframe
@@ -36,6 +38,7 @@ export const useKlinesStore = defineStore('klines', {
         const response = await api.getChartKlines(symbol, timeframe, limit)
         if (seq !== this.loadSeq) return
         this.rows = response.rows
+        this.partialBar = response.partial_bar ?? null
         this.chartStatus = response.status
         this.chartMessage = response.message
       } catch (e) {
@@ -58,6 +61,7 @@ export const useKlinesStore = defineStore('klines', {
       this.loadSeq++
       this.symbol = ''
       this.rows = []
+      this.partialBar = null
       this.error = ''
       this.loading = false
       this.loadingCount = 0

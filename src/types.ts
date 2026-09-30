@@ -50,6 +50,7 @@ export interface ChartKlineResponse {
   rows: KlineRow[]
   status: 'tqsdk' | 'tq_unavailable' | 'sina_consistent' | 'sina_mismatch' | 'sina_unverified' | 'tqsdk_recovery_pending' | string
   message: string
+  partial_bar?: KlineRow | null
 }
 
 /** 当前周期 MA20 长期趋势线的一个数据点 */

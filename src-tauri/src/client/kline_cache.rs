@@ -57,6 +57,7 @@ impl KlineMemoryCache {
             has_more: Some(false),
             next_before: None,
             full_reload_required: Some(false),
+            partial_bar: series.partial_bar.clone(),
         })
     }
 
@@ -74,7 +75,7 @@ impl KlineMemoryCache {
             symbol: symbol.to_string(),
             timeframe: timeframe.to_string(),
             bars,
-            partial_bar: None,
+            partial_bar: resp.partial_bar.clone(),
             latest_closed_ts: resp.latest_closed_ts,
             series_revision: resp.series_revision,
             last_updated: Instant::now(),
