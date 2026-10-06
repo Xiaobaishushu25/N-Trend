@@ -8,6 +8,28 @@ interface CacheItem {
   date: string
 }
 
+function isTradingHour(date: Date): boolean {
+  const d = date.getDay()
+  if (d === 0) return false // 周日休市
+  const h = date.getHours()
+  const m = date.getMinutes()
+  const timeNum = h * 60 + m
+
+  // 周六仅 02:35 前可能为周五晚盘收尾
+  if (d === 6) {
+    return timeNum <= 2 * 60 + 35
+  }
+
+  // 夜盘 20:58 - 02:35
+  if (timeNum >= 20 * 60 + 58 || timeNum <= 2 * 60 + 35) return true
+
+  // 日盘 08:58 - 11:32, 13:28 - 15:02
+  if (timeNum >= 8 * 60 + 58 && timeNum <= 11 * 60 + 32) return true
+  if (timeNum >= 13 * 60 + 28 && timeNum <= 15 * 60 + 2) return true
+
+  return false
+}
+
 export const useIntradayStore = defineStore('intraday', {
   state: () => ({
     symbol: '' as string,
@@ -21,10 +43,14 @@ export const useIntradayStore = defineStore('intraday', {
   }),
 
   actions: {
-    async load(symbol: string) {
+    async load(symbol: string, force = false) {
       if (!symbol) {
         this.clear()
         return
+      }
+
+      if (force) {
+        this.cache.delete(symbol)
       }
 
       const seq = ++this.loadSeq
@@ -34,7 +60,7 @@ export const useIntradayStore = defineStore('intraday', {
       this.symbol = symbol
 
       // 1. 命中当天缓存：0ms 瞬开，立刻渲染旧走势
-      if (cached && cached.date === today) {
+      if (!force && cached && cached.date === today) {
         this.prevSettle = cached.prevSettle
         this.points = [...cached.points]
         this.loading = false
@@ -78,11 +104,23 @@ export const useIntradayStore = defineStore('intraday', {
       }
 
       const latestPrice = snapshot.latest
+      const last = this.points[this.points.length - 1]
       const now = new Date()
+
+      // 非交易时段（休市期间）：不追加新分钟点，仅同步确保末端报价与实时快照绝对一致
+      if (!isTradingHour(now)) {
+        if (last.price !== latestPrice) {
+          last.price = latestPrice
+          const cached = this.cache.get(this.symbol)
+          if (cached && cached.points.length > 0) {
+            cached.points[cached.points.length - 1].price = latestPrice
+          }
+        }
+        return
+      }
+
       const pad = (n: number) => String(n).padStart(2, '0')
       const currentMinTs = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:00`
-
-      const last = this.points[this.points.length - 1]
 
       // 简单提取分钟前缀 "YYYY-MM-DD HH:mm" 对比
       const lastMinPrefix = last.ts.substring(0, 16)

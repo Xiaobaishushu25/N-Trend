@@ -3629,7 +3629,10 @@ impl Services {
         let prev_settle = quotes.get(symbol).map(|q| q.prev_settle).unwrap_or(0.0);
 
         let period = if self.data_source.tq_is_available() { "1m" } else { "1" };
-        let klines = self.data_source.fetch_minute(symbol, period, 600).await?;
+        let klines = match self.data_source.fetch_minute_raw(symbol, period, 600).await {
+            Ok(raw) if !raw.klines.is_empty() => raw.klines,
+            _ => self.data_source.fetch_minute(symbol, period, 600).await?,
+        };
 
         if klines.is_empty() {
             return Ok(IntradayChartResponse {
@@ -3679,6 +3682,15 @@ impl Services {
                 avg_price,
                 volume: bar.volume,
             });
+        }
+
+        // 若实时行情最新价有效，确保最后一根分时点价格与实时报价完全一致
+        if let Some(q) = quotes.get(symbol) {
+            if q.latest > 0.0 {
+                if let Some(last_p) = points.last_mut() {
+                    last_p.price = q.latest;
+                }
+            }
         }
 
         Ok(IntradayChartResponse {

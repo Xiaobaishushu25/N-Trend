@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NSpin } from 'naive-ui'
 import {
-  AreaSeries,
   ColorType,
   CrosshairMode,
   HistogramSeries,
@@ -12,8 +11,15 @@ import {
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type ISeriesPrimitive,
+  type IPrimitivePaneView,
+  type IPrimitivePaneRenderer,
+  type PrimitivePaneViewZOrder,
+  type SeriesAttachedParameter,
+  type Time,
   type UTCTimestamp,
 } from 'lightweight-charts'
+import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
 import { useIntradayStore } from '../stores/intraday'
 import type { IntradayPoint } from '../types'
 
@@ -25,10 +31,11 @@ const store = useIntradayStore()
 const container = ref<HTMLDivElement | null>(null)
 
 let chart: IChartApi | null = null
-let priceSeries: ISeriesApi<'Area'> | null = null
+let priceSeries: ISeriesApi<'Line'> | null = null
 let avgSeries: ISeriesApi<'Line'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let prevSettleLine: IPriceLine | null = null
+let sessionPrimitive: SessionBandPrimitive | null = null
 
 // 悬停十字光标数据，未悬停时默认展示最新一条
 const activePoint = ref<IntradayPoint | null>(null)
@@ -59,6 +66,134 @@ const changeInfo = computed(() => {
 
 function parseTs(ts: string): UTCTimestamp {
   return Math.floor(new Date(ts.replace(' ', 'T') + 'Z').getTime() / 1000) as UTCTimestamp
+}
+
+function getSessionBoundaryTimes(points: IntradayPoint[]): { nightStartTime: Time | null; dayStartTime: Time | null } {
+  if (!points || points.length === 0) return { nightStartTime: null, dayStartTime: null }
+
+  let nightStart: Time | null = null
+  let dayStart: Time | null = null
+
+  for (const p of points) {
+    const hour = parseInt(p.ts.substring(11, 13), 10)
+    const isNight = hour >= 20 || hour < 8
+    const isDay = hour >= 8 && hour <= 16
+
+    if (isNight && nightStart === null) {
+      nightStart = parseTs(p.ts) as Time
+    }
+    if (isDay && dayStart === null) {
+      dayStart = parseTs(p.ts) as Time
+    }
+  }
+
+  return { nightStartTime: nightStart, dayStartTime: dayStart }
+}
+
+class SessionBandPaneRenderer implements IPrimitivePaneRenderer {
+  constructor(
+    private chart: IChartApi,
+    private getBoundary: () => { nightStartTime: Time | null; dayStartTime: Time | null },
+  ) {}
+
+  draw(target: CanvasRenderingTarget2D) {
+    const { nightStartTime, dayStartTime } = this.getBoundary()
+    // 若无夜盘数据（如纯日盘品种），不进行任何绘制，全屏保留纯白底色
+    if (!nightStartTime) return
+
+    target.useMediaCoordinateSpace((scope: MediaCoordinatesRenderingScope) => {
+      const { context, mediaSize } = scope
+      const timeScale = this.chart.timeScale()
+
+      if (dayStartTime) {
+        const dayStartX = timeScale.timeToCoordinate(dayStartTime)
+        if (dayStartX != null) {
+          let startX = 0
+          const nx = timeScale.timeToCoordinate(nightStartTime)
+          if (nx != null && nx > 0) {
+            startX = nx
+          }
+
+          const nightWidth = dayStartX - startX
+          if (nightWidth > 0) {
+            // 1. 夜盘浅灰底色（精致微调对比日盘区域）
+            context.fillStyle = 'rgba(0, 0, 0, 0.032)'
+            context.fillRect(startX, 0, nightWidth, mediaSize.height)
+
+            // 2. 垂直分界线（夜盘与日盘分割线）
+            context.strokeStyle = '#cbd5e1'
+            context.lineWidth = 1
+            context.beginPath()
+            context.moveTo(dayStartX, 0)
+            context.lineTo(dayStartX, mediaSize.height)
+            context.stroke()
+
+            // 3. 底部分时标签 [ 夜盘 | 日盘 ] 胶囊徽章
+            const badgeY = Math.round(mediaSize.height * 0.77)
+            const badgeW = 28
+            const badgeH = 16
+
+            // 夜盘标签（位于分界线左侧）
+            context.fillStyle = '#e2e8f0'
+            context.fillRect(dayStartX - badgeW - 2, badgeY, badgeW, badgeH)
+            context.fillStyle = '#64748b'
+            context.font = '10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif'
+            context.textAlign = 'center'
+            context.textBaseline = 'middle'
+            context.fillText('夜盘', dayStartX - badgeW / 2 - 2, badgeY + badgeH / 2)
+
+            // 日盘标签（位于分界线右侧）
+            context.fillStyle = '#f1f5f9'
+            context.fillRect(dayStartX + 2, badgeY, badgeW, badgeH)
+            context.fillStyle = '#64748b'
+            context.fillText('日盘', dayStartX + badgeW / 2 + 2, badgeY + badgeH / 2)
+          }
+        }
+      } else {
+        // 只有夜盘数据（当前处于夜盘交易时段）
+        context.fillStyle = 'rgba(0, 0, 0, 0.032)'
+        context.fillRect(0, 0, mediaSize.width, mediaSize.height)
+      }
+    })
+  }
+}
+
+class SessionBandPaneView implements IPrimitivePaneView {
+  private paneRenderer: SessionBandPaneRenderer
+  constructor(chart: IChartApi, getBoundary: () => { nightStartTime: Time | null; dayStartTime: Time | null }) {
+    this.paneRenderer = new SessionBandPaneRenderer(chart, getBoundary)
+  }
+  renderer(): IPrimitivePaneRenderer | null {
+    return this.paneRenderer
+  }
+  zOrder(): PrimitivePaneViewZOrder {
+    return 'bottom'
+  }
+}
+
+class SessionBandPrimitive implements ISeriesPrimitive<Time> {
+  private view: SessionBandPaneView
+  private _requestUpdate?: () => void
+
+  constructor(chart: IChartApi, getBoundary: () => { nightStartTime: Time | null; dayStartTime: Time | null }) {
+    this.view = new SessionBandPaneView(chart, getBoundary)
+  }
+
+  attached(param: SeriesAttachedParameter<Time>) {
+    this._requestUpdate = param.requestUpdate
+  }
+
+  detached() {
+    this._requestUpdate = undefined
+  }
+
+  paneViews(): readonly IPrimitivePaneView[] {
+    return [this.view]
+  }
+
+  update() {
+    this._requestUpdate?.()
+  }
 }
 
 function initChart() {
@@ -100,14 +235,17 @@ function initChart() {
     },
   })
 
-  // 1. 现价折线（黑色/深灰细线，契合亮色白底风格）
-  priceSeries = chart.addSeries(AreaSeries, {
-    lineColor: '#0f172a',
-    topColor: 'rgba(15, 23, 42, 0.04)',
-    bottomColor: 'rgba(15, 23, 42, 0.0)',
+  // 1. 现价折线（纯黑/深灰细线，无面积阴影，上下全为纯白）
+  priceSeries = chart.addSeries(LineSeries, {
+    color: '#0f172a',
     lineWidth: 1,
+    lineStyle: LineStyle.Solid,
     priceFormat: { type: 'price', precision: 1, minMove: 1 },
   })
+
+  // 挂载夜盘浅灰区域与日夜分界线 Primitive
+  sessionPrimitive = new SessionBandPrimitive(chart, () => getSessionBoundaryTimes(store.points))
+  priceSeries.attachPrimitive(sessionPrimitive)
 
   // 2. 均价线（明亮宝蓝色，光滑醒目）
   avgSeries = chart.addSeries(LineSeries, {
@@ -161,6 +299,7 @@ function updateChartData() {
       priceSeries.removePriceLine(prevSettleLine)
       prevSettleLine = null
     }
+    sessionPrimitive?.update()
     return
   }
 
@@ -218,6 +357,7 @@ function updateChartData() {
   }
 
   chart.timeScale().fitContent()
+  sessionPrimitive?.update()
 }
 
 // 监听窗口大小缩放
@@ -307,11 +447,11 @@ onBeforeUnmount(() => {
       </div>
       <div v-else-if="store.error" class="header-items text-red">
         <span>加载分时失败: {{ store.error }}</span>
-        <button class="retry-btn" @click="store.load(props.symbol)">重试</button>
+        <button class="retry-btn" @click="store.load(props.symbol, true)">重试</button>
       </div>
       <div v-else-if="!store.loading && store.points.length === 0" class="header-items text-muted">
         今日暂无分时数据
-        <button class="retry-btn" @click="store.load(props.symbol)">刷新</button>
+        <button class="retry-btn" @click="store.load(props.symbol, true)">刷新</button>
       </div>
       <div v-else class="header-items text-muted">
         正在载入分时走势...
