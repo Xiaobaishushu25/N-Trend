@@ -58,8 +58,7 @@ const changeInfo = computed(() => {
 })
 
 function parseTs(ts: string): UTCTimestamp {
-  const d = new Date(ts.replace(/-/g, '/'))
-  return Math.floor(d.getTime() / 1000) as UTCTimestamp
+  return Math.floor(new Date(ts.replace(' ', 'T') + 'Z').getTime() / 1000) as UTCTimestamp
 }
 
 function initChart() {
@@ -244,6 +243,9 @@ onMounted(() => {
   nextTick(() => {
     initChart()
     window.addEventListener('resize', handleResize)
+    if (props.symbol && store.points.length === 0) {
+      store.load(props.symbol)
+    }
   })
 })
 
@@ -292,6 +294,14 @@ onBeforeUnmount(() => {
           <span class="label">量:</span>
           <span class="val text-muted">{{ currentDisplay.volume }}</span>
         </span>
+      </div>
+      <div v-else-if="store.error" class="header-items text-red">
+        <span>加载分时失败: {{ store.error }}</span>
+        <button class="retry-btn" @click="store.load(props.symbol)">重试</button>
+      </div>
+      <div v-else-if="!store.loading && store.points.length === 0" class="header-items text-muted">
+        今日暂无分时数据
+        <button class="retry-btn" @click="store.load(props.symbol)">刷新</button>
       </div>
       <div v-else class="header-items text-muted">
         正在载入分时走势...
@@ -372,6 +382,20 @@ onBeforeUnmount(() => {
 
 .text-muted {
   color: #94a3b8 !important;
+}
+
+.retry-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  background: rgba(56, 189, 248, 0.2);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  cursor: pointer;
+}
+.retry-btn:hover {
+  background: rgba(56, 189, 248, 0.35);
 }
 
 .chart-canvas-box {
