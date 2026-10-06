@@ -66,42 +66,52 @@ function initChart() {
 
   chart = createChart(container.value, {
     layout: {
-      background: { type: ColorType.Solid, color: '#131722' },
-      textColor: '#94a3b8',
+      background: { type: ColorType.Solid, color: '#ffffff' },
+      textColor: '#475569',
     },
     grid: {
-      vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
-      horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
+      vertLines: { color: 'rgba(0, 0, 0, 0.05)' },
+      horzLines: { color: 'rgba(0, 0, 0, 0.05)' },
     },
     crosshair: {
       mode: CrosshairMode.Normal,
+      vertLine: {
+        color: 'rgba(0, 0, 0, 0.25)',
+        width: 1,
+        style: LineStyle.Dashed,
+      },
+      horzLine: {
+        color: 'rgba(0, 0, 0, 0.25)',
+        width: 1,
+        style: LineStyle.Dashed,
+      },
     },
     rightPriceScale: {
-      borderColor: 'rgba(255, 255, 255, 0.1)',
+      borderColor: 'rgba(0, 0, 0, 0.08)',
       scaleMargins: {
-        top: 0.1,
+        top: 0.08,
         bottom: 0.25, // 预留底部给成交量
       },
     },
     timeScale: {
-      borderColor: 'rgba(255, 255, 255, 0.1)',
+      borderColor: 'rgba(0, 0, 0, 0.08)',
       timeVisible: true,
       secondsVisible: false,
     },
   })
 
-  // 1. 现价折线（带平滑半透明面积阴影）
+  // 1. 现价折线（黑色/深灰细线，契合亮色白底风格）
   priceSeries = chart.addSeries(AreaSeries, {
-    lineColor: '#e2e8f0',
-    topColor: 'rgba(56, 189, 248, 0.2)',
-    bottomColor: 'rgba(56, 189, 248, 0.0)',
-    lineWidth: 2,
+    lineColor: '#0f172a',
+    topColor: 'rgba(15, 23, 42, 0.04)',
+    bottomColor: 'rgba(15, 23, 42, 0.0)',
+    lineWidth: 1,
     priceFormat: { type: 'price', precision: 1, minMove: 1 },
   })
 
-  // 2. 均价线（明亮蓝色，对比鲜明）
+  // 2. 均价线（明亮宝蓝色，光滑醒目）
   avgSeries = chart.addSeries(LineSeries, {
-    color: '#38bdf8',
+    color: '#2563eb',
     lineWidth: 1,
     lineStyle: LineStyle.Solid,
     priceFormat: { type: 'price', precision: 1, minMove: 1 },
@@ -325,7 +335,7 @@ onBeforeUnmount(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background: #131722;
+  background: #ffffff;
   overflow: hidden;
 }
 
@@ -335,8 +345,8 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   padding: 0 16px;
-  background: rgba(15, 23, 42, 0.7);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
   font-size: 13px;
   user-select: none;
   z-index: 10;
@@ -360,28 +370,29 @@ onBeforeUnmount(() => {
 }
 
 .val {
-  color: #f1f5f9;
+  color: #0f172a;
+  font-weight: 500;
 }
 
 .time-val {
-  color: #94a3b8;
+  color: #475569;
   font-family: monospace;
 }
 
 .text-red {
-  color: #ef4444 !important;
+  color: #dc2626 !important;
 }
 
 .text-green {
-  color: #22c55e !important;
+  color: #16a34a !important;
 }
 
 .text-blue {
-  color: #38bdf8 !important;
+  color: #2563eb !important;
 }
 
 .text-muted {
-  color: #94a3b8 !important;
+  color: #64748b !important;
 }
 
 .retry-btn {
@@ -389,19 +400,20 @@ onBeforeUnmount(() => {
   padding: 1px 8px;
   font-size: 11px;
   border-radius: 4px;
-  background: rgba(56, 189, 248, 0.2);
-  color: #38bdf8;
-  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: #eff6ff;
+  color: #2563eb;
+  border: 1px solid #bfdbfe;
   cursor: pointer;
 }
 .retry-btn:hover {
-  background: rgba(56, 189, 248, 0.35);
+  background: #dbeafe;
 }
 
 .chart-canvas-box {
   flex: 1;
   width: 100%;
   min-height: 0;
+  background: #ffffff;
 }
 
 .loading-overlay {
@@ -410,7 +422,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(19, 23, 34, 0.45);
+  background: rgba(255, 255, 255, 0.75);
   backdrop-filter: blur(2px);
   z-index: 20;
 }
