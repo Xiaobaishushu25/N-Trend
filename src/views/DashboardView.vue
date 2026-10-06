@@ -9,6 +9,7 @@ import {
   NIcon,
   NInput,
   NModal,
+  NPopover,
   NSpace,
   NSwitch,
   NTab,
@@ -706,6 +707,37 @@ function precloseOutcome(signal: PrecloseSignal | PrecloseCandidate) {
   return 'outcome' in signal && signal.outcome ? signal.outcome : '已观察'
 }
 
+function isCandidate(s: PrecloseSignal | PrecloseCandidate): s is PrecloseCandidate {
+  return 'warning_kind' in s
+}
+
+function precloseTypeTitle(s: PrecloseSignal | PrecloseCandidate) {
+  return isCandidate(s) ? '未收盘临时推演 (机制二)' : '正式候选预检测 (机制一)'
+}
+
+function precloseStateBadge(state: string) {
+  switch (state) {
+    case 'precheck':
+      return { text: '预检测中', color: '#b45309', bg: 'rgba(245, 158, 11, 0.15)' }
+    case 'provisional':
+      return { text: '临时预判', color: '#b45309', bg: 'rgba(245, 158, 11, 0.15)' }
+    case 'confirmed':
+      return { text: '已确认', color: '#1677ff', bg: 'rgba(22, 119, 255, 0.15)' }
+    case 'observed':
+      return { text: '已观察', color: '#0f9d58', bg: 'rgba(15, 157, 88, 0.15)' }
+    case 'invalidated':
+      return { text: '已失效', color: '#94a3b8', bg: 'rgba(148, 163, 184, 0.15)' }
+    case 'superseded':
+      return { text: '已提前触发', color: '#6366f1', bg: 'rgba(99, 102, 241, 0.15)' }
+    default:
+      return { text: state, color: '#64748b', bg: 'rgba(100, 116, 139, 0.12)' }
+  }
+}
+
+function goToChart(symbol: string) {
+  router.push({ name: 'chart', params: { symbol } })
+}
+
 /** 状态胶囊的短标签（与 K 线图左侧品种列表一致） */
 function stateLabel(state: string) {
   switch (state) {
@@ -1316,15 +1348,102 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
   <div class="page" :class="{ 'is-mobile-layout': isMobile }">
     <div v-if="visiblePrecloseSignals.length" class="preclose-strip">
       <span class="preclose-strip-title">收盘前预检测</span>
-      <span
-        v-for="signal in visiblePrecloseSignals.slice(0, 4)"
-        :key="signal.id"
-        class="preclose-chip"
-        :class="`is-${signal.state}`"
+      <n-popover
+        v-for="signal in visiblePrecloseSignals"
+        :key="isCandidate(signal) ? `candidate-${signal.id}` : `signal-${signal.id}`"
+        :trigger="isMobile ? 'click' : 'hover'"
+        placement="bottom"
+        :show-arrow="true"
+        style="max-width: 320px; padding: 10px 12px;"
       >
-        {{ signal.symbol }} {{ signal.direction === 'up' ? '多' : '空' }} ·
-        {{ signal.state === 'precheck' ? `距收盘 ${precloseCountdown(signal)} · 预检测` : signal.state === 'provisional' ? `距收盘 ${precloseCountdown(signal)} · 临时预判` : signal.state === 'confirmed' ? '已确认' : signal.state === 'observed' ? `开盘${precloseOutcome(signal)}` : signal.state }}
-      </span>
+        <template #trigger>
+          <span
+            class="preclose-chip"
+            :class="`is-${signal.state}`"
+            :title="`识别时间：${signal.emitted_at}`"
+          >
+            <span class="preclose-chip-time">{{ signal.emitted_at && signal.emitted_at.length >= 16 ? signal.emitted_at.slice(11, 16) : signal.emitted_at }}</span>
+            {{ signal.symbol }} {{ signal.direction === 'up' ? '多' : '空' }} ·
+            {{ signal.state === 'precheck' ? `距收盘 ${precloseCountdown(signal)} · 预检测` : signal.state === 'provisional' ? `距收盘 ${precloseCountdown(signal)} · 临时预判` : signal.state === 'confirmed' ? '已确认' : signal.state === 'observed' ? `开盘${precloseOutcome(signal)}` : signal.state }}
+          </span>
+        </template>
+        <div class="preclose-detail-card">
+          <div class="preclose-card-header">
+            <div class="preclose-card-title">
+              <span class="symbol-name">{{ signal.symbol }}</span>
+              <span class="dir-tag" :class="signal.direction">{{ signal.direction === 'up' ? '做多' : '做空' }}</span>
+              <span class="type-tag">{{ precloseTypeTitle(signal) }}</span>
+            </div>
+            <span
+              class="state-badge"
+              :style="{
+                color: precloseStateBadge(signal.state).color,
+                backgroundColor: precloseStateBadge(signal.state).bg,
+              }"
+            >
+              {{ precloseStateBadge(signal.state).text }}
+            </span>
+          </div>
+
+          <div class="preclose-card-rows">
+            <div class="preclose-row highlight-row">
+              <span class="row-label">识别时间</span>
+              <span class="row-val time-val">{{ signal.emitted_at }}</span>
+            </div>
+            <div class="preclose-row">
+              <span class="row-label">预计收盘</span>
+              <span class="row-val">{{ signal.session_close_ts }}</span>
+            </div>
+            <div class="preclose-row">
+              <span class="row-label">参考现价</span>
+              <span class="row-val price-val">{{ fmt(signal.reference_price, 1) }}</span>
+            </div>
+            <div class="preclose-row">
+              <span class="row-label">入场目标</span>
+              <span class="row-val">入场 {{ fmt(signal.entry, 1) }} · 止损 {{ fmt(signal.stop, 1) }}</span>
+            </div>
+
+            <template v-if="isCandidate(signal)">
+              <div class="preclose-row">
+                <span class="row-label">推演评分</span>
+                <span class="row-val">{{ signal.entry_score.toFixed(2) }} 分 ({{ signal.level }} / {{ signal.grade }})</span>
+              </div>
+              <div class="preclose-row">
+                <span class="row-label">K线基准</span>
+                <span class="row-val">{{ signal.warning_ts }}</span>
+              </div>
+            </template>
+
+            <template v-else>
+              <div class="preclose-row">
+                <span class="row-label">来源候选</span>
+                <span class="row-val">正式形态 #{{ signal.parent_event_id }}</span>
+              </div>
+              <div v-if="signal.next_open_price != null" class="preclose-row">
+                <span class="row-label">次时段开盘</span>
+                <span class="row-val">
+                  {{ fmt(signal.next_open_price, 1) }}
+                  <span v-if="signal.gap_pct != null" :style="{ color: trendColor(signal.gap_pct) }">
+                    ({{ signal.gap_pct >= 0 ? '+' : '' }}{{ signal.gap_pct.toFixed(2) }}%)
+                  </span>
+                </span>
+              </div>
+              <div v-if="signal.mfe_r != null || signal.mae_r != null" class="preclose-row">
+                <span class="row-label">开盘后波动</span>
+                <span class="row-val">
+                  有利 +{{ fmt(signal.mfe_r, 2) }}R / 不利 -{{ fmt(signal.mae_r, 2) }}R
+                </span>
+              </div>
+            </template>
+          </div>
+
+          <div class="preclose-card-actions">
+            <button class="view-chart-btn" @click="goToChart(signal.symbol)">
+              查看 {{ signal.symbol }} K线图
+            </button>
+          </div>
+        </div>
+      </n-popover>
     </div>
     <div class="group-bar">
       <n-tabs
@@ -1655,17 +1774,150 @@ const displayColumns = computed<DataTableColumns<WatchRow>>(() => {
   white-space: nowrap;
 }
 .preclose-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 3px 8px;
   border-radius: 999px;
   color: #475569;
   background: rgba(148, 163, 184, 0.12);
   font-size: 12px;
   white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+}
+.preclose-chip:hover {
+  filter: brightness(0.96);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
+}
+.preclose-chip:active {
+  transform: translateY(0);
+}
+.preclose-chip-time {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.06);
+  font-family: monospace;
 }
 .preclose-chip.is-precheck { color: #b45309; background: rgba(245, 158, 11, 0.13); }
 .preclose-chip.is-provisional { color: #b45309; background: rgba(245, 158, 11, 0.13); }
 .preclose-chip.is-confirmed { color: #1677ff; background: rgba(22, 119, 255, 0.12); }
 .preclose-chip.is-observed { color: #0f9d58; background: rgba(15, 157, 88, 0.12); }
+
+.preclose-detail-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+  color: #334155;
+  min-width: 240px;
+}
+.preclose-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.8);
+}
+.preclose-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.preclose-card-title .symbol-name {
+  font-weight: 700;
+  font-size: 13px;
+  color: #0f172a;
+}
+.preclose-card-title .dir-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.preclose-card-title .dir-tag.up {
+  color: #e03131;
+  background: rgba(224, 49, 49, 0.1);
+}
+.preclose-card-title .dir-tag.down {
+  color: #0f9d58;
+  background: rgba(15, 157, 88, 0.1);
+}
+.preclose-card-title .type-tag {
+  font-size: 10px;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.state-badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.preclose-card-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.preclose-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.preclose-row.highlight-row {
+  background: rgba(22, 119, 255, 0.05);
+  padding: 3px 6px;
+  border-radius: 4px;
+  margin: 1px -6px;
+}
+.row-label {
+  color: #64748b;
+  flex-shrink: 0;
+}
+.row-val {
+  color: #1e293b;
+  font-weight: 500;
+  text-align: right;
+  word-break: break-all;
+}
+.time-val {
+  color: #1677ff;
+  font-weight: 600;
+  font-family: monospace;
+}
+.price-val {
+  font-family: monospace;
+  font-weight: 600;
+}
+.preclose-card-actions {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(226, 232, 240, 0.8);
+}
+.view-chart-btn {
+  width: 100%;
+  padding: 5px 0;
+  background: #1677ff;
+  color: #ffffff;
+  border: none;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.view-chart-btn:hover {
+  background: #0958d9;
+}
 .page {
   display: flex;
   flex-direction: column;

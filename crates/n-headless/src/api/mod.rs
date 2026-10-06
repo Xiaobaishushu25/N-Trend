@@ -75,6 +75,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
             "/trend-series/:symbol/:timeframe",
             get(klines::get_trend_series),
         )
+        .route(
+            "/intraday/:symbol",
+            get(klines::get_intraday_chart),
+        )
         // 实时行情
         .route("/quotes", get(quotes::get_market_snapshot))
         // 信号与复盘

@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::fetch::{RequestPriority, SinaClient};
 
-/// 支持的分钟级别（5m 为持久化基级，15m/60m 供策略校验与手工抓取）。
-pub const PERIODS: [(&str, &str); 3] = [("5m", "5"), ("15m", "15"), ("60m", "60")];
+/// 支持的分钟级别（1m 供分时图，5m 为持久化基级，15m/60m 供策略校验与手工抓取）。
+pub const PERIODS: [(&str, &str); 4] = [("1m", "1"), ("5m", "5"), ("15m", "15"), ("60m", "60")];
 pub const DEFAULT_COUNT: usize = 300;
 /// 分钟K线时间戳过去后还需等待的确认时长，避免把接口刚生成的临时K线当最终值。
 pub const MINUTE_BAR_SETTLE_SECS: i64 = 30;

@@ -129,3 +129,17 @@ pub async fn get_klines(
     let res = get_chart_klines(State(ctx), device, path, query).await?;
     Ok(Json(res.0.rows))
 }
+
+pub async fn get_intraday_chart(
+    State(ctx): State<Arc<ServerContext>>,
+    _device: AuthDevice,
+    Path(symbol): Path<String>,
+) -> Result<Json<n_protocol::dto::IntradayChartResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+    match ctx.services.get_intraday_chart(&symbol).await {
+        Ok(res) => Ok(Json(res)),
+        Err(e) => {
+            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取分时数据失败: {e}"), "");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+        }
+    }
+}

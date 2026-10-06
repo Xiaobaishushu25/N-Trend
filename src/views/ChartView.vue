@@ -12,8 +12,10 @@ import {
 } from 'naive-ui'
 import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronsRight, Eye, EyeOff, GridDots, Heart, Help, InfoCircle, List, Maximize, Pencil, Plus, Settings, Star, X } from '@vicons/tabler'
 import KLineChart from '../components/KLineChart.vue'
+import IntradayChart from '../components/IntradayChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
 import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { useIntradayStore } from '../stores/intraday'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
 import { useGroupsStore } from '../stores/groups'
@@ -65,6 +67,8 @@ const chartSingleBars = computed(() => { const sb = scansStore.singleBars.get(sy
 const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
 const routeTimeframe = String(route.query.tf || '') as Timeframe
 const timeframe = ref<Timeframe>(allTimeframes.includes(routeTimeframe) ? routeTimeframe : '15m')
+const intradayStore = useIntradayStore()
+const isIntradayMode = ref(false)
 const settingsStore = useSettingsStore()
 /** 图表加载的历史K线根数：至少保留现有 1200 根窗口，展示根数调大时同步扩容 */
 const chartLoadLimit = computed(() => {
@@ -2219,8 +2223,11 @@ onMounted(async () => {
         if (s.latest != null && prev?.latest != null && s.latest !== prev.latest) {
           setRowFlash(s.code, s.latest > prev.latest ? 'up' : 'down')
         }
-        // 用当前品种的实时报价拼出正在形成的K线
-        if (s.latest != null && s.code === symbol.value) updateLiveBar(s.latest)
+        // 用当前品种的实时报价拼出正在形成的K线与分时增量
+        if (s.latest != null && s.code === symbol.value) {
+          updateLiveBar(s.latest)
+          intradayStore.onRealtimeTick(s)
+        }
         next[s.code] = s
       }
       snapshots.value = next
@@ -2354,14 +2361,24 @@ onBeforeUnmount(() => {
         <div class="topbar-timeframes">
           <div class="tf-group">
             <button
+              type="button"
+              class="tf-btn"
+              :class="{ active: isIntradayMode, 'is-disabled': reviewMode }"
+              :disabled="reviewMode"
+              title="分时走势图"
+              @click="isIntradayMode = true"
+            >
+              分时
+            </button>
+            <button
               v-for="t in visibleTimeframes"
               :key="t"
               type="button"
               class="tf-btn"
-              :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
+              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode }"
               :disabled="reviewMode"
               :title="reviewMode ? '复盘模式固定 15m' : t"
-              @click="timeframe = t"
+              @click="isIntradayMode = false; timeframe = t"
             >
               {{ t }}
             </button>
@@ -2458,14 +2475,24 @@ onBeforeUnmount(() => {
         <div class="m-topbar-center">
           <div class="tf-group m-tf-group">
             <button
+              type="button"
+              class="tf-btn m-tf-btn"
+              :class="{ active: isIntradayMode, 'is-disabled': reviewMode }"
+              :disabled="reviewMode"
+              title="分时走势图"
+              @click="isIntradayMode = true"
+            >
+              分时
+            </button>
+            <button
               v-for="t in visibleTimeframes"
               :key="t"
               type="button"
               class="tf-btn m-tf-btn"
-              :class="{ active: timeframe === t, 'is-disabled': reviewMode }"
+              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode }"
               :disabled="reviewMode"
               :title="reviewMode ? '复盘模式固定 15m' : t"
-              @click="timeframe = t"
+              @click="isIntradayMode = false; timeframe = t"
             >
               {{ t }}
             </button>
@@ -2794,12 +2821,20 @@ onBeforeUnmount(() => {
           <div class="mfs-header-right">
             <div class="mfs-header-tfs">
               <button
+                type="button"
+                class="mfs-htf-btn"
+                :class="{ active: isIntradayMode }"
+                @click="isIntradayMode = true"
+              >
+                分时
+              </button>
+              <button
                 v-for="t in visibleTimeframes"
                 :key="t"
                 type="button"
                 class="mfs-htf-btn"
-                :class="{ active: timeframe === t }"
-                @click="timeframe = t"
+                :class="{ active: !isIntradayMode && timeframe === t }"
+                @click="isIntradayMode = false; timeframe = t"
               >
                 {{ t === '1d' ? '日K' : t }}
               </button>
@@ -3133,8 +3168,12 @@ onBeforeUnmount(() => {
           {{ klinesStore.chartMessage || '当前图表使用临时数据源，数据不会写入本地库或参与策略。' }}
         </div>
         <div class="chart-canvas-wrapper" :class="{ 'is-fullscreen-canvas': isMobileFullscreen }">
+          <IntradayChart
+            v-if="isIntradayMode && symbol"
+            :symbol="symbol"
+          />
           <KLineChart
-            v-if="symbol && (displayRows.length || klinesStore.loading)"
+            v-else-if="symbol && (displayRows.length || klinesStore.loading)"
             ref="chartRef"
             :symbol="symbol"
             :timeframe="timeframe"

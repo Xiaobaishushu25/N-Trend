@@ -322,6 +322,11 @@ impl RemoteApiClient {
         self.execute(self.request(Method::GET, &path)).await
     }
 
+    pub async fn get_intraday_chart(&self, symbol: &str) -> Result<IntradayChartResponse, ApiErrorResponse> {
+        let path = format!("intraday/{symbol}");
+        self.execute(self.request(Method::GET, &path)).await
+    }
+
     pub async fn get_trend_series(&self, symbol: &str, timeframe: &str, limit: Option<usize>) -> Result<Vec<TrendPointDto>, ApiErrorResponse> {
         let mut path = format!("trend-series/{symbol}/{timeframe}?");
         if let Some(l) = limit {

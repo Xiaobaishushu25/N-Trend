@@ -1,6 +1,9 @@
 use crate::state::ServerContext;
 use chrono::Local;
-use n_core::notify::email::{event_email_payload_with_model, single_bar_email_payload, EventEmailKind};
+use n_core::notify::email::{
+    event_email_payload_with_model, preclose_candidate_email_payload, preclose_email_payload,
+    single_bar_email_payload, EventEmailKind,
+};
 use n_core::service::{RefreshStats, ScanResult};
 use n_protocol::NewNotificationHistoryItem;
 use std::sync::Arc;
@@ -240,7 +243,114 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
         }
     }
 
+    // 收盘后对账结算 (机制一与机制二)
+    let now_naive = Local::now().naive_local();
+    match ctx.services.reconcile_preclose_signals(now_naive).await {
+        Ok(updates) if !updates.is_empty() => {
+            let seq = ctx.next_event_seq();
+            ctx.realtime_hub
+                .broadcast(seq, "preclose-signal", serde_json::to_value(&updates).unwrap_or_default())
+                .await;
+        }
+        Err(error) => tracing::warn!("收盘前预检测结算失败: {error:#}"),
+        _ => {}
+    }
+    match ctx.services.reconcile_preclose_candidates(now_naive).await {
+        Ok(updates) if !updates.is_empty() => {
+            let seq = ctx.next_event_seq();
+            ctx.realtime_hub
+                .broadcast(seq, "preclose-candidate", serde_json::to_value(&updates).unwrap_or_default())
+                .await;
+        }
+        Err(error) => tracing::warn!("临时未收盘候选结算失败: {error:#}"),
+        _ => {}
+    }
+
     Ok(res)
+}
+
+fn spawn_preclose_emails(
+    ctx: Arc<ServerContext>,
+    updates: Vec<n_core::storage::entities::preclose_signals::Model>,
+) {
+    let signals = updates
+        .into_iter()
+        .filter(|signal| signal.state == "precheck")
+        .collect::<Vec<_>>();
+    if signals.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let cfg = ctx.services.config().await;
+        if !cfg.email.enabled || !cfg.email.sendable() {
+            return;
+        }
+        for signal in signals {
+            let parent = match n_core::storage::repo::pattern_event_by_id(
+                &ctx.db,
+                signal.parent_event_id,
+            )
+            .await
+            {
+                Ok(Some(parent)) => parent,
+                Ok(None) => {
+                    tracing::warn!(
+                        preclose_id = signal.id,
+                        parent_event_id = signal.parent_event_id,
+                        "预检测邮件对应的正式候选已不存在"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(preclose_id = signal.id, "读取预检测邮件候选失败: {error:#}");
+                    continue;
+                }
+            };
+            let (subject, body) = preclose_email_payload(&signal, &parent);
+            tracing::info!(
+                preclose_id = signal.id,
+                symbol = signal.symbol,
+                "准备发送收盘前预检测邮件"
+            );
+            let email_cfg = cfg.email.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+            });
+        }
+    });
+}
+
+fn spawn_preclose_candidate_emails(
+    ctx: Arc<ServerContext>,
+    updates: Vec<n_core::storage::entities::preclose_candidates::Model>,
+) {
+    let candidates = updates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.state == "provisional" && candidate.emitted_at == candidate.last_seen_at
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let cfg = ctx.services.config().await;
+        if !cfg.email.enabled || !cfg.email.sendable() {
+            return;
+        }
+        for candidate in candidates {
+            let (subject, body) = preclose_candidate_email_payload(&candidate);
+            tracing::info!(
+                candidate_id = candidate.id,
+                symbol = candidate.symbol,
+                "准备发送临时未收盘推演邮件"
+            );
+            let email_cfg = cfg.email.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+            });
+        }
+    });
 }
 
 fn spawn_quote_poller(ctx: Arc<ServerContext>) {
@@ -276,6 +386,32 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                             let seq = ctx.next_event_seq();
                             ctx.realtime_hub.broadcast(seq, "manual_level.triggered", serde_json::to_value(&alerts).unwrap_or_default()).await;
                         }
+                    }
+
+                    // 收盘前预检测 (机制一)
+                    match ctx.services.preclose_tick(&snapshots).await {
+                        Ok(updates) if !updates.is_empty() => {
+                            let seq = ctx.next_event_seq();
+                            ctx.realtime_hub
+                                .broadcast(seq, "preclose-signal", serde_json::to_value(&updates).unwrap_or_default())
+                                .await;
+                            spawn_preclose_emails(ctx.clone(), updates);
+                        }
+                        Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
+                        _ => {}
+                    }
+
+                    // 临时未收盘推演扫描 (机制二)
+                    match ctx.services.preclose_candidate_tick(&snapshots).await {
+                        Ok(updates) if !updates.is_empty() => {
+                            let seq = ctx.next_event_seq();
+                            ctx.realtime_hub
+                                .broadcast(seq, "preclose-candidate", serde_json::to_value(&updates).unwrap_or_default())
+                                .await;
+                            spawn_preclose_candidate_emails(ctx.clone(), updates);
+                        }
+                        Err(error) => tracing::warn!("临时未收盘推演轮询失败: {error:#}"),
+                        _ => {}
                     }
                 }
                 Err(e) => {

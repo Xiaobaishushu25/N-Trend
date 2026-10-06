@@ -83,6 +83,21 @@ pub struct MarketSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntradayPointDto {
+    pub ts: String,
+    pub price: f64,
+    pub avg_price: f64,
+    pub volume: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IntradayChartResponse {
+    pub symbol: String,
+    pub prev_settle: f64,
+    pub points: Vec<IntradayPointDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ManualLevelDto {
     pub id: i64,
     pub symbol: String,

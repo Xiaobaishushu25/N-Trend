@@ -331,6 +331,14 @@ pub async fn get_trend_series(
 }
 
 #[tauri::command]
+pub async fn get_intraday_chart(
+    state: State<'_, Arc<AppState>>,
+    symbol: String,
+) -> Result<IntradayChartResponse, String> {
+    state.api.get_intraday_chart(&symbol).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
 pub async fn get_market_snapshot(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<MarketSnapshot>, String> {

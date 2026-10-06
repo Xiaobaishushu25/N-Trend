@@ -328,6 +328,12 @@ impl RealtimeClient {
                             }
                             let _ = self.app.emit("server-status", &payload);
                         }
+                        "preclose.signal" | "preclose-signal" => {
+                            let _ = self.app.emit("preclose-signal", &payload);
+                        }
+                        "preclose.candidate" | "preclose-candidate" => {
+                            let _ = self.app.emit("preclose-candidate", &payload);
+                        }
                         _ => {
                             let _ = self.app.emit(&topic, &payload);
                         }

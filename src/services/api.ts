@@ -10,6 +10,7 @@ import type {
   Config,
   ContractSuggestion,
   ChartKlineResponse,
+  IntradayChartResponse,
   EntryTriggerHit,
   GroupRow,
   KlineRow,
@@ -97,6 +98,8 @@ export const api = {
     invoke<KlineRow[]>('get_klines', { symbol, timeframe, limit }),
   getChartKlines: (symbol: string, timeframe: string, limit?: number) =>
     invoke<ChartKlineResponse>('get_chart_klines', { symbol, timeframe, limit }),
+  getIntradayChart: (symbol: string) =>
+    invoke<IntradayChartResponse>('get_intraday_chart', { symbol }),
   getTrendSeries: (symbol: string, timeframe: string, limit?: number) =>
     invoke<TrendPointDto[]>('get_trend_series', { symbol, timeframe, limit }),
 

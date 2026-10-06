@@ -169,6 +169,7 @@ pub fn run() {
             commands::enrich_symbol_names,
             commands::get_klines,
             commands::get_chart_klines,
+            commands::get_intraday_chart,
             commands::get_trend_series,
             commands::get_market_snapshot,
             commands::list_manual_levels,

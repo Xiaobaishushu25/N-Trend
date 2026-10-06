@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
 use sea_orm::{DatabaseConnection, NotSet, Set};
 use serde::Serialize;
+use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -3619,6 +3620,71 @@ impl Services {
             status: entry.status,
             message,
             partial_bar: None,
+        })
+    }
+
+    /// 获取今日开盘以来的分时图数据（基于 1 分钟序列与实时均价聚合）
+    pub async fn get_intraday_chart(&self, symbol: &str) -> Result<IntradayChartResponse> {
+        let quotes = self.data_source.fetch_quotes(&[symbol.to_string()]).await.unwrap_or_default();
+        let prev_settle = quotes.get(symbol).map(|q| q.prev_settle).unwrap_or(0.0);
+
+        let period = if self.data_source.tq_is_available() { "1m" } else { "1" };
+        let klines = self.data_source.fetch_minute(symbol, period, 600).await?;
+
+        if klines.is_empty() {
+            return Ok(IntradayChartResponse {
+                symbol: symbol.to_string(),
+                prev_settle,
+                points: Vec::new(),
+            });
+        }
+
+        // 倒推寻找当前交易日的开盘起点（寻找相邻两根 bar 间隔超过 3 小时且发生于日盘收盘后的断档）
+        let mut start_idx = 0;
+        for i in (1..klines.len()).rev() {
+            let prev_dt = chrono::NaiveDateTime::parse_from_str(&klines[i - 1].datetime, "%Y-%m-%d %H:%M:%S").ok();
+            let curr_dt = chrono::NaiveDateTime::parse_from_str(&klines[i].datetime, "%Y-%m-%d %H:%M:%S").ok();
+            if let (Some(p), Some(c)) = (prev_dt, curr_dt) {
+                let diff_mins = (c - p).num_minutes();
+                if diff_mins > 180 {
+                    let p_hour = p.time().hour();
+                    if (15..=18).contains(&p_hour) {
+                        start_idx = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let today_bars = &klines[start_idx..];
+
+        let mut points = Vec::with_capacity(today_bars.len());
+        let mut cum_volume = 0.0;
+        let mut cum_turnover = 0.0;
+
+        for bar in today_bars {
+            cum_volume += bar.volume;
+            let bar_avg = (bar.open + bar.high + bar.low + bar.close) / 4.0;
+            cum_turnover += bar_avg * bar.volume;
+
+            let avg_price = if cum_volume > 0.0 {
+                cum_turnover / cum_volume
+            } else {
+                bar.close
+            };
+
+            points.push(IntradayPointDto {
+                ts: bar.datetime.clone(),
+                price: bar.close,
+                avg_price,
+                volume: bar.volume,
+            });
+        }
+
+        Ok(IntradayChartResponse {
+            symbol: symbol.to_string(),
+            prev_settle,
+            points,
         })
     }
 

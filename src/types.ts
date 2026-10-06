@@ -60,6 +60,19 @@ export interface TrendPointDto {
   direction: string
 }
 
+export interface IntradayPoint {
+  ts: string
+  price: number
+  avg_price: number
+  volume: number
+}
+
+export interface IntradayChartResponse {
+  symbol: string
+  prev_settle: number
+  points: IntradayPoint[]
+}
+
 export interface SwingDto {
   index: number
   price: number
