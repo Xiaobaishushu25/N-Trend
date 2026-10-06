@@ -1,6 +1,25 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
-import type { Config, SchedulerStatus } from '../types'
+import type { Config, SchedulerStatus, ClientLocalSettings } from '../types'
+
+export const defaultClientSettings = (): ClientLocalSettings => ({
+  serverUrl: 'http://127.0.0.1:8081',
+  deviceId: '',
+  deviceName: 'Desktop PC',
+  theme: 'dark',
+  chartDisplayBars: 200,
+  mobileChartFullscreenBars: 180,
+  chartRightGap: 15,
+  minBarSpacing: 6,
+  timeframes: ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
+  lastGroupId: null,
+  desktopNotificationEnabled: true,
+  inAppNotificationEnabled: true,
+  notificationMinScore: 0.0,
+  entryTriggerNotificationEnabled: true,
+  manualLevelEvents: ['approach', 'testing', 'breakout', 'rejection', 'retest'],
+  logLevel: 'info',
+})
 
 const defaultConfig = (): Config => ({
   app_config: {
@@ -75,12 +94,53 @@ const defaultConfig = (): Config => ({
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     settings: defaultConfig() as Config,
+    clientSettings: defaultClientSettings(),
     status: { running: false, last_refresh: null, last_scan: null, active_data_source: '天勤' } as SchedulerStatus,
   }),
   actions: {
     async load() {
       this.settings = await api.getConfig()
       this.status = await api.schedulerStatus()
+      try {
+        const client = await api.getClientSettings()
+        if (client) {
+          this.setClientSettings(client)
+        }
+      } catch {
+        // 静默降级
+      }
+    },
+    setClientSettings(client: Partial<ClientLocalSettings>) {
+      this.clientSettings = {
+        ...this.clientSettings,
+        ...client,
+        inAppNotificationEnabled:
+          client.inAppNotificationEnabled ??
+          (client as any).in_app_notification_enabled ??
+          this.clientSettings.inAppNotificationEnabled ??
+          true,
+        notificationMinScore: Number(
+          client.notificationMinScore ??
+          (client as any).notification_min_score ??
+          this.clientSettings.notificationMinScore ??
+          0,
+        ),
+        entryTriggerNotificationEnabled:
+          client.entryTriggerNotificationEnabled ??
+          (client as any).entry_trigger_notification_enabled ??
+          this.clientSettings.entryTriggerNotificationEnabled ??
+          true,
+        desktopNotificationEnabled:
+          client.desktopNotificationEnabled ??
+          (client as any).desktop_notification_enabled ??
+          this.clientSettings.desktopNotificationEnabled ??
+          true,
+        manualLevelEvents: Array.isArray(client.manualLevelEvents)
+          ? client.manualLevelEvents
+          : Array.isArray((client as any).manual_level_events)
+            ? (client as any).manual_level_events
+            : (this.clientSettings.manualLevelEvents || ['approach', 'testing', 'breakout', 'rejection', 'retest']),
+      }
     },
     async save(next: Config) {
       this.settings = await api.updateConfig(next)

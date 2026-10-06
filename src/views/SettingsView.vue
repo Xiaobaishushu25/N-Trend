@@ -286,12 +286,24 @@ const clientSettings = ref<ClientLocalSettings>({
   timeframes: ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
   lastGroupId: null,
   desktopNotificationEnabled: true,
+  inAppNotificationEnabled: true,
+  notificationMinScore: 0.0,
+  entryTriggerNotificationEnabled: true,
+  manualLevelEvents: ['approach', 'testing', 'breakout', 'rejection', 'retest'],
   logLevel: 'info',
 })
 const autoLaunch = ref(false)
 const autoLaunchBusy = ref(false)
 const savingClientSettings = ref(false)
 const openingLogDir = ref(false)
+
+const manualLevelEventOptions = [
+  { label: '接近关键区域 (approach)', value: 'approach' },
+  { label: '测试关键区域 (testing)', value: 'testing' },
+  { label: '向上/向下突破 (breakout)', value: 'breakout' },
+  { label: '支撑/压力拒绝反弹 (rejection)', value: 'rejection' },
+  { label: '突破后回踩确认 (retest)', value: 'retest' },
+]
 
 const clientLogLevelOptions = [
   { label: 'DEBUG (调试详细)', value: 'debug' },
@@ -337,6 +349,14 @@ async function loadClientSettings() {
       timeframes: Array.isArray(s.timeframes) && s.timeframes.length > 0 ? s.timeframes : ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
       lastGroupId: s.lastGroupId ?? (s as any).last_group_id ?? null,
       desktopNotificationEnabled: s.desktopNotificationEnabled ?? (s as any).desktop_notification_enabled ?? true,
+      inAppNotificationEnabled: s.inAppNotificationEnabled ?? (s as any).in_app_notification_enabled ?? true,
+      notificationMinScore: Number(s.notificationMinScore ?? (s as any).notification_min_score ?? 0),
+      entryTriggerNotificationEnabled: s.entryTriggerNotificationEnabled ?? (s as any).entry_trigger_notification_enabled ?? true,
+      manualLevelEvents: Array.isArray(s.manualLevelEvents)
+        ? s.manualLevelEvents
+        : Array.isArray((s as any).manual_level_events)
+          ? (s as any).manual_level_events
+          : ['approach', 'testing', 'breakout', 'rejection', 'retest'],
       logLevel: s.logLevel || 'info',
     }
   } catch (e) {
@@ -373,9 +393,14 @@ async function saveClientSettings() {
       timeframes: Array.isArray(raw.timeframes) && raw.timeframes.length > 0 ? raw.timeframes : ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
       lastGroupId: raw.lastGroupId ?? null,
       desktopNotificationEnabled: raw.desktopNotificationEnabled ?? true,
+      inAppNotificationEnabled: raw.inAppNotificationEnabled ?? true,
+      notificationMinScore: Number(raw.notificationMinScore ?? 0),
+      entryTriggerNotificationEnabled: raw.entryTriggerNotificationEnabled ?? true,
+      manualLevelEvents: Array.isArray(raw.manualLevelEvents) ? raw.manualLevelEvents : ['approach', 'testing', 'breakout', 'rejection', 'retest'],
       logLevel: raw.logLevel || 'info',
     }
     await api.updateClientSettings(payload)
+    settingsStore.setClientSettings(payload)
 
     // 即时更新 pinia store 中的 UI 设置，使图表视图立即生效
     if (settingsStore.settings?.ui) {
@@ -932,6 +957,64 @@ onMounted(async () => {
                 </div>
               </div>
 
+              <label class="section-title">信号提醒与通知（当前设备）</label>
+              <div class="setting-card">
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    局内卡片通知
+                    <Tip text="扫描发现新形态、单K反转或行情触碰时，在当前窗口右下角弹出通知卡片。关闭后仅静默记录到通知历史中。" />
+                  </div>
+                  <n-switch v-model:value="clientSettings.inAppNotificationEnabled" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    新形态通知评分阈值
+                    <Tip text="当前设备仅当即将触发形态评分达到该阈值时才弹卡片通知；设为 0 表示只要发现形态全部弹窗提示。" />
+                  </div>
+                  <n-input-number
+                    v-model:value="clientSettings.notificationMinScore"
+                    :min="0"
+                    :max="5"
+                    :step="0.1"
+                    :precision="1"
+                    :disabled="!clientSettings.inAppNotificationEnabled"
+                    class="setting-input-number"
+                    style="width: 180px"
+                  />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    入场价触碰提醒
+                    <Tip text="实时行情触及形态入场价时弹出持久通知卡片（突破或跌破入场点）。" />
+                  </div>
+                  <n-switch
+                    v-model:value="clientSettings.entryTriggerNotificationEnabled"
+                    :disabled="!clientSettings.inAppNotificationEnabled"
+                  />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    关键区域提醒事件
+                    <Tip text="选择当前设备接收弹窗通知的关键区域动态事件；未勾选的事件类型将不会在当前设备弹窗打扰。" />
+                  </div>
+                  <n-select
+                    v-model:value="clientSettings.manualLevelEvents"
+                    multiple
+                    :options="manualLevelEventOptions"
+                    placeholder="选择需要提醒的事件类型"
+                    class="setting-input-wide"
+                    :disabled="!clientSettings.inAppNotificationEnabled && !clientSettings.desktopNotificationEnabled"
+                  />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    系统桌面通知
+                    <Tip text="入场价触及或关键区域状态变化时，同时发送操作系统级通知（需操作系统通知权限）。" />
+                  </div>
+                  <n-switch v-model:value="clientSettings.desktopNotificationEnabled" />
+                </div>
+              </div>
+
               <label class="section-title">本地日志与存储</label>
               <div class="setting-card">
                 <div class="setting-card-row">
@@ -1092,6 +1175,56 @@ onMounted(async () => {
                 <div class="setting-card-row">
                   <div class="row-label">接收邮箱</div>
                   <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" class="setting-input-wide" />
+                </div>
+                <div class="setting-card-row" v-if="serverSettingsUpdate.notify">
+                  <div class="row-label">
+                    邮件报警形态评分阈值
+                    <Tip text="仅当发现的新形态或触发信号评分达到该阈值时才发送邮件；设为 0 表示不设门槛全部发送。" />
+                  </div>
+                  <n-input-number
+                    v-model:value="serverSettingsUpdate.notify.new_pattern_min_score"
+                    :min="0"
+                    :max="5"
+                    :step="0.1"
+                    :precision="1"
+                    class="setting-input-number"
+                    style="width: 180px"
+                  />
+                </div>
+              </div>
+
+              <label class="section-title">收盘前预检测与推演</label>
+              <div class="setting-card" v-if="serverSettingsUpdate.preclose">
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    启用收盘前预检测
+                    <Tip text="在日盘/夜盘各节收盘前对候选形态提前推演，仅供预警提示，不计入正式胜率。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.preclose.enabled" />
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    提前检测时间
+                    <Tip text="在收盘前多少秒执行推演计算与提示。" />
+                  </div>
+                  <n-radio-group v-model:value="serverSettingsUpdate.preclose.lead_secs" :size="isMobile ? 'small' : 'medium'">
+                    <n-radio-button :value="120">提前 2 分钟 (120s)</n-radio-button>
+                    <n-radio-button :value="180">提前 3 分钟 (180s)</n-radio-button>
+                  </n-radio-group>
+                </div>
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    开盘后观察窗口（分钟）
+                    <Tip text="下一交易节开盘后持续跟踪观察该推演信号表现的分钟数。" />
+                  </div>
+                  <n-input-number
+                    v-model:value="serverSettingsUpdate.preclose.horizon_minutes"
+                    :min="15"
+                    :max="240"
+                    :step="15"
+                    class="setting-input-number"
+                    style="width: 180px"
+                  />
                 </div>
               </div>
 

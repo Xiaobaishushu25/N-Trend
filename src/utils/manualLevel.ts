@@ -31,3 +31,15 @@ export function manualLevelPhaseLabel(phase: string): string {
 export function manualLevelAlertTitle(alert: ManualLevelAlert): string {
   return `${manualLevelEventLabel(alert.event_type)} · ${manualLevelRoleLabel(alert.role)}`
 }
+
+export function isManualLevelEventAllowed(eventType: string, allowedEvents?: string[] | null): boolean {
+  if (!allowedEvents || allowedEvents.length === 0) return false
+  if (allowedEvents.includes(eventType)) return true
+  if (allowedEvents.includes('breakout') && (eventType === 'breakout_up' || eventType === 'breakout_down' || eventType === 'reentry')) {
+    return true
+  }
+  if (allowedEvents.includes('retest') && (eventType === 'retest_support' || eventType === 'retest_resistance')) {
+    return true
+  }
+  return false
+}

@@ -211,12 +211,38 @@ pub struct ClientLocalSettings {
     pub last_group_id: Option<i64>,
     #[serde(alias = "desktop_notification_enabled")]
     pub desktop_notification_enabled: bool,
+    #[serde(default = "default_true", alias = "in_app_notification_enabled", alias = "inAppNotificationEnabled")]
+    pub in_app_notification_enabled: bool,
+    #[serde(default = "default_zero_f64", alias = "notification_min_score", alias = "notificationMinScore")]
+    pub notification_min_score: f64,
+    #[serde(default = "default_true", alias = "entry_trigger_notification_enabled", alias = "entryTriggerNotificationEnabled")]
+    pub entry_trigger_notification_enabled: bool,
+    #[serde(default = "default_manual_level_events", alias = "manual_level_events", alias = "manualLevelEvents")]
+    pub manual_level_events: Vec<String>,
     #[serde(alias = "backup_dir")]
     pub backup_dir: Option<String>,
     #[serde(alias = "last_backup_date")]
     pub last_backup_date: Option<String>,
     #[serde(default = "default_log_level", alias = "log_level")]
     pub log_level: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_zero_f64() -> f64 {
+    0.0
+}
+
+fn default_manual_level_events() -> Vec<String> {
+    vec![
+        "approach".to_string(),
+        "testing".to_string(),
+        "breakout".to_string(),
+        "rejection".to_string(),
+        "retest".to_string(),
+    ]
 }
 
 fn default_mobile_chart_fullscreen_bars() -> usize {
@@ -249,6 +275,10 @@ impl Default for ClientLocalSettings {
             ],
             last_group_id: None,
             desktop_notification_enabled: true,
+            in_app_notification_enabled: true,
+            notification_min_score: 0.0,
+            entry_trigger_notification_enabled: true,
+            manual_level_events: default_manual_level_events(),
             backup_dir: None,
             last_backup_date: None,
             log_level: "info".to_string(),

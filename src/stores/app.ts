@@ -11,11 +11,13 @@ import { useSymbolsStore } from './symbols'
 import { useGroupsStore } from './groups'
 import { useActionsStore } from './actions'
 import { isMainWindow, notify } from '../utils/notify'
-import { manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
+import { manualLevelPhaseLabel, manualLevelRoleLabel, isManualLevelEventAllowed } from '../utils/manualLevel'
 import type { AppInfo, ConnectionStatus, ManualLevelAlert, RecentOutcomeFilters } from '../types'
 
 /** 通过 Tauri 官方通知插件发送系统级通知（自动申请权限；非 Tauri 环境忽略） */
 async function sendSystemNotification(title: string, body: string) {
+  const client = useSettingsStore().clientSettings
+  if (client && client.desktopNotificationEnabled === false) return
   try {
     let granted = await isPermissionGranted()
     if (!granted) {
@@ -144,10 +146,15 @@ export const useAppStore = defineStore('app', {
         await onEntryTrigger((hits) => {
           // 只由主窗口处理，避免设置窗口重复弹出/重复发送系统通知
           if (!isMainWindow()) return
-          const cfg = useSettingsStore().settings.notify
+          const settingsStore = useSettingsStore()
+          const client = settingsStore.clientSettings
+          const inAppEnabled = client?.inAppNotificationEnabled ?? true
+          const entryEnabled = client?.entryTriggerNotificationEnabled ?? true
+          const desktopEnabled = client?.desktopNotificationEnabled ?? true
+
           for (const hit of hits) {
             const dirLabel = hit.direction === 'up' ? '做多' : '做空'
-            if (cfg.in_app_entry_trigger) {
+            if (inAppEnabled && entryEnabled) {
               notify.entryTrigger({
                 symbol: hit.symbol,
                 name: hit.name || hit.symbol,
@@ -156,7 +163,7 @@ export const useAppStore = defineStore('app', {
                 latest: hit.latest,
               })
             }
-            if (cfg.system_entry_trigger) {
+            if (desktopEnabled && entryEnabled) {
               sendSystemNotification(
                 `${hit.name || hit.symbol} ${dirLabel}`,
                 `入场价 ${fmtPrice(hit.entry)} · 最新 ${fmtPrice(hit.latest)}`,
@@ -173,14 +180,23 @@ export const useAppStore = defineStore('app', {
             if (!latestByLevel.has(alert.level_id)) latestByLevel.set(alert.level_id, alert)
           }
           this.manualLevelAlerts = [...latestByLevel.values()].slice(0, 80)
-          const cfg = useSettingsStore().settings.notify
+
+          const settingsStore = useSettingsStore()
+          const client = settingsStore.clientSettings
+          const inAppEnabled = client?.inAppNotificationEnabled ?? true
+          const desktopEnabled = client?.desktopNotificationEnabled ?? true
+          const allowedEvents = client?.manualLevelEvents ?? ['approach', 'testing', 'breakout', 'rejection', 'retest']
+
           for (const alert of alerts) {
-            if (cfg.in_app_new_pattern) notify.manualLevel(alert)
-            if (cfg.system_entry_trigger) {
-              sendSystemNotification(
-                `${alert.symbol} ${manualLevelTitle(alert)}`,
-                `#K${alert.level_id} · ${manualLevelRoleLabel(alert.role)} · ${manualLevelPhaseLabel(alert.phase)} · ${alert.timeframe} · ${alert.reason}`,
-              )
+            const allowed = isManualLevelEventAllowed(alert.event_type, allowedEvents)
+            if (allowed) {
+              if (inAppEnabled) notify.manualLevel(alert)
+              if (desktopEnabled) {
+                sendSystemNotification(
+                  `${alert.symbol} ${manualLevelTitle(alert)}`,
+                  `#K${alert.level_id} · ${manualLevelRoleLabel(alert.role)} · ${manualLevelPhaseLabel(alert.phase)} · ${alert.timeframe} · ${alert.reason}`,
+                )
+              }
             }
           }
         }),
@@ -207,4 +223,3 @@ export const useAppStore = defineStore('app', {
     },
   },
 })
-

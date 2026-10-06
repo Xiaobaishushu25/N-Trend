@@ -106,7 +106,12 @@ export const useScansStore = defineStore('scans', {
       return latestRefreshPromise
     },
     applyScanResult(result: ScanResult) {
-      const notifySettings = useSettingsStore().settings.notify
+      const settingsStore = useSettingsStore()
+      const client = settingsStore.clientSettings
+      const inAppEnabled = client?.inAppNotificationEnabled ?? true
+      const minScore = client?.notificationMinScore ?? 0.0
+      const entryTriggerEnabled = client?.entryTriggerNotificationEnabled ?? true
+
       const symbolsStore = useSymbolsStore()
       const nameOf = (code: string) => {
         const sym = symbolsStore.symbols.find((x) => x.code === code)
@@ -127,35 +132,39 @@ export const useScansStore = defineStore('scans', {
           }
         }
         this.upsertSingleBars(result.single_bars)
-        if (notifySettings.in_app_new_pattern) {
-          for(const sb of newBars){
-              notify.singleBar({
-                symbol: sb.symbol,
-                name: nameOf(sb.symbol),
-                label: sb.label,
-                kind: sb.kind,
-                time: sb.trigger_bar_ts.slice(11,16),
-                price: sb.price,
-              })
-            }
+        if (inAppEnabled) {
+          for (const sb of newBars) {
+            notify.singleBar({
+              symbol: sb.symbol,
+              name: nameOf(sb.symbol),
+              label: sb.label,
+              kind: sb.kind,
+              time: sb.trigger_bar_ts.slice(11, 16),
+              price: sb.price,
+            })
           }
         }
+      }
 
-      if (notifySettings.in_app_new_pattern) {
-        for (const e of result.new_warnings) {
-          const signal = toNotificationSignal(e, nameOf(e.symbol))
-          if (e.entry_score >= notifySettings.new_pattern_min_score) notify.signal(signal)
-          else notify.recordSignal(signal)
+      for (const e of result.new_warnings) {
+        const signal = toNotificationSignal(e, nameOf(e.symbol))
+        if (inAppEnabled && e.entry_score >= minScore) {
+          notify.signal(signal)
+        } else {
+          notify.recordSignal(signal)
         }
       }
-      for (const e of result.newly_triggered) {
-        notify.entryTrigger({
-          symbol: e.symbol,
-          name: nameOf(e.symbol),
-          direction: e.direction,
-          entry: e.entry,
-          latest: e.trigger_price ?? e.entry,
-        })
+
+      if (inAppEnabled && entryTriggerEnabled) {
+        for (const e of result.newly_triggered) {
+          notify.entryTrigger({
+            symbol: e.symbol,
+            name: nameOf(e.symbol),
+            direction: e.direction,
+            entry: e.entry,
+            latest: e.trigger_price ?? e.entry,
+          })
+        }
       }
     },
     ingest(result: ScanResult) {
@@ -178,10 +187,10 @@ export const useScansStore = defineStore('scans', {
       const sym = symbolsStore.symbols[0]
       if (!sym) return null
       const now = new Date()
-      const pad = (n:number)=>String(n).padStart(2,'0')
-      const ts = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:00`
-      const expD = new Date(now.getTime()+15*60*1000)
-      const expTs = `${expD.getFullYear()}-${pad(expD.getMonth()+1)}-${pad(expD.getDate())} ${pad(expD.getHours())}:${pad(expD.getMinutes())}:00`
+      const pad = (n: number) => String(n).padStart(2, '0')
+      const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:00`
+      const expD = new Date(now.getTime() + 15 * 60 * 1000)
+      const expTs = `${expD.getFullYear()}-${pad(expD.getMonth() + 1)}-${pad(expD.getDate())} ${pad(expD.getHours())}:${pad(expD.getMinutes())}:00`
       const mock: SingleBarEvent = {
         symbol: sym.code,
         timeframe: '15m',
@@ -197,7 +206,14 @@ export const useScansStore = defineStore('scans', {
       }
       ensureCleanup(this)
       this.singleBars.set(mock.symbol, mock)
-      notify.singleBar({ symbol: mock.symbol, name: mock.symbol, label: mock.label, kind: 'hammer', time: ts.slice(11,16), price: mock.price })
+      notify.singleBar({
+        symbol: mock.symbol,
+        name: mock.symbol,
+        label: mock.label,
+        kind: 'hammer',
+        time: ts.slice(11, 16),
+        price: mock.price,
+      })
       return mock
     },
     cleanupSingleBars() {
@@ -208,7 +224,3 @@ export const useScansStore = defineStore('scans', {
     },
   },
 })
-
-
-
-

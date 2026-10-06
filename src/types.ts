@@ -771,6 +771,14 @@ export interface ClientLocalSettings {
   timeframes: string[]
   lastGroupId: number | null
   desktopNotificationEnabled: boolean
+  inAppNotificationEnabled?: boolean
+  in_app_notification_enabled?: boolean
+  notificationMinScore?: number
+  notification_min_score?: number
+  entryTriggerNotificationEnabled?: boolean
+  entry_trigger_notification_enabled?: boolean
+  manualLevelEvents?: string[]
+  manual_level_events?: string[]
   backupDir?: string | null
   lastBackupDate?: string | null
   logLevel?: string
