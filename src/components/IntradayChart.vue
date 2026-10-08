@@ -18,6 +18,7 @@ import {
   type SeriesAttachedParameter,
   type Time,
   type UTCTimestamp,
+  type WhitespaceData,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
 import { useIntradayStore } from '../stores/intraday'
@@ -196,6 +197,163 @@ class SessionBandPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
+function getNightCloseTime(symbol: string): { hour: number; minute: number } | null {
+  const prefix = symbol.replace(/\d+$/, '').toUpperCase()
+  // 02:30 贵金属与原油
+  if (['AU', 'AG', 'SC'].includes(prefix)) {
+    return { hour: 2, minute: 30 }
+  }
+  // 01:00 有色金属与不锈钢
+  if (['CU', 'AL', 'ZN', 'PB', 'NI', 'SN', 'BC', 'SS'].includes(prefix)) {
+    return { hour: 1, minute: 0 }
+  }
+  // 23:30 纯碱与玻璃
+  if (['SA', 'FG'].includes(prefix)) {
+    return { hour: 23, minute: 30 }
+  }
+  // 无夜盘品种（农产品、部分能化、中金所股指国债）
+  if ([
+    'AP', 'CJ', 'JD', 'LH', 'PK', 'SI', 'LC', 'UR', 'WH', 'PM', 'RI', 'JR',
+    'LR', 'BB', 'FB', 'IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'
+  ].includes(prefix)) {
+    return null
+  }
+  // 其余黑色、化工、油脂等默认为 23:00
+  return { hour: 23, minute: 0 }
+}
+
+function generateFutureWhitespace(symbol: string, lastTs: string): WhitespaceData<UTCTimestamp>[] {
+  if (!lastTs || lastTs.length < 16) return []
+
+  const dateStr = lastTs.substring(0, 10)
+  const hour = parseInt(lastTs.substring(11, 13), 10)
+  const minute = parseInt(lastTs.substring(14, 16), 10)
+  const timeVal = hour * 60 + minute
+
+  const prefix = symbol.replace(/\d+$/, '').toUpperCase()
+  const isCffex = ['IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'].includes(prefix)
+  const isBond = ['TF', 'T', 'TS', 'TL'].includes(prefix)
+
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const toTsStr = (d: string, h: number, m: number) => `${d} ${pad(h)}:${pad(m)}:00`
+
+  const whitespaceList: WhitespaceData<UTCTimestamp>[] = []
+
+  // 情况 1: 当前处于日盘交易时段（08:50 ~ 15:15 之间）
+  // 补齐从当前时间直至当天收盘（普通商品 15:00，国债 15:15）的所有交易分钟
+  if (timeVal >= 8 * 60 && timeVal < 15 * 60 + 15) {
+    const dayDate = dateStr
+
+    if (isCffex) {
+      // 中金所时段: 09:30-11:30, 13:00-15:00 (国债至 15:15)
+      for (let m = 9 * 60 + 31; m <= 11 * 60 + 30; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+      const closeMin = isBond ? 15 * 60 + 15 : 15 * 60
+      for (let m = 13 * 60 + 1; m <= closeMin; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+    } else {
+      // 普通商品期货: 09:00-10:15, 10:30-11:30, 13:30-15:00
+      for (let m = 9 * 60 + 1; m <= 10 * 60 + 15; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+      for (let m = 10 * 60 + 31; m <= 11 * 60 + 30; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+      for (let m = 13 * 60 + 31; m <= 15 * 60; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+    }
+
+    return whitespaceList
+  }
+
+  // 情况 2: 当前处于夜盘交易时段（20:50 至 24:00，或者跨日 00:00 至 02:30）
+  // 补齐：剩余夜盘分钟 + 次日完整日盘时段直至 15:00
+  const nightClose = getNightCloseTime(symbol)
+  if (nightClose && (hour >= 20 || hour < 8)) {
+    let dayDate = dateStr
+    if (hour >= 20) {
+      const curDate = new Date(dateStr)
+      curDate.setDate(curDate.getDate() + 1)
+      dayDate = `${curDate.getFullYear()}-${pad(curDate.getMonth() + 1)}-${pad(curDate.getDate())}`
+    }
+
+    // (a) 剩余夜盘前半夜 (21:01 - 24:00)
+    if (hour >= 20) {
+      const nightCloseVal = nightClose.hour < 8 ? 24 * 60 : nightClose.hour * 60 + nightClose.minute
+      for (let m = 21 * 60 + 1; m <= nightCloseVal; m++) {
+        if (m > timeVal && m <= 24 * 60) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dateStr, h, min)) })
+        }
+      }
+      // 跨日到凌晨
+      if (nightClose.hour < 8) {
+        const morningCloseVal = nightClose.hour * 60 + nightClose.minute
+        for (let m = 1; m <= morningCloseVal; m++) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+    } else if (hour < 8) {
+      // (b) 已经进入凌晨
+      const morningCloseVal = nightClose.hour * 60 + nightClose.minute
+      for (let m = 1; m <= morningCloseVal; m++) {
+        if (m > timeVal) {
+          const h = Math.floor(m / 60)
+          const min = m % 60
+          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+        }
+      }
+    }
+
+    // (c) 次日日盘全天预留（09:00 - 15:00）
+    for (let m = 9 * 60 + 1; m <= 10 * 60 + 15; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+    }
+    for (let m = 10 * 60 + 31; m <= 11 * 60 + 30; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+    }
+    for (let m = 13 * 60 + 31; m <= 15 * 60; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
+    }
+
+    return whitespaceList
+  }
+
+  return []
+}
+
 function initChart() {
   if (!container.value) return
 
@@ -333,9 +491,12 @@ function updateChartData() {
     color: p.price >= store.prevSettle ? 'rgba(239, 68, 68, 0.55)' : 'rgba(34, 197, 94, 0.55)',
   }))
 
-  priceSeries.setData(priceData)
-  avgSeries.setData(avgData)
-  volumeSeries.setData(volData)
+  const lastPointTs = uniquePts[uniquePts.length - 1].ts
+  const futureWhitespace = generateFutureWhitespace(props.symbol, lastPointTs)
+
+  priceSeries.setData([...priceData, ...futureWhitespace])
+  avgSeries.setData([...avgData, ...futureWhitespace])
+  volumeSeries.setData([...volData, ...futureWhitespace])
 
   // 昨结算基准线 (0.00% 轴)
   if (store.prevSettle > 0) {
