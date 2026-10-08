@@ -502,9 +502,23 @@ function updateChartData() {
 
   // 排序与去重时间戳
   const sorted = [...pts].sort((a, b) => parseTs(a.ts) - parseTs(b.ts))
+
+  // 1. 过滤隔离跨交易日数据：
+  // 交易日以晚间 20:30+ 夜盘为开端，次日下午 15:00 收盘为终点。
+  // 若 points 内部包含旧交易日的日盘 (<=16:00) 与新交易日的夜盘 (>=20:00)，夜盘为新交易日起点，剥离旧日盘点。
+  let sessionStartIndex = 0
+  for (let i = 1; i < sorted.length; i++) {
+    const prevHour = parseInt(sorted[i - 1].ts.substring(11, 13), 10)
+    const currHour = parseInt(sorted[i].ts.substring(11, 13), 10)
+    if (prevHour <= 16 && currHour >= 20) {
+      sessionStartIndex = i
+    }
+  }
+  const currentSessionPts = sessionStartIndex > 0 ? sorted.slice(sessionStartIndex) : sorted
+
   const uniquePts: IntradayPoint[] = []
   let lastT = -1
-  for (const p of sorted) {
+  for (const p of currentSessionPts) {
     const t = parseTs(p.ts)
     if (t !== lastT) {
       uniquePts.push(p)
