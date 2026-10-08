@@ -69,7 +69,12 @@ function parseTs(ts: string): UTCTimestamp {
   return Math.floor(new Date(ts.replace(' ', 'T') + 'Z').getTime() / 1000) as UTCTimestamp
 }
 
-function getSessionBoundaryTimes(points: IntradayPoint[]): { nightStartTime: Time | null; dayStartTime: Time | null } {
+let currentFutureWhitespace: WhitespaceData<UTCTimestamp>[] = []
+
+function getSessionBoundaryTimes(
+  points: IntradayPoint[],
+  futureWhitespace: WhitespaceData<UTCTimestamp>[] = []
+): { nightStartTime: Time | null; dayStartTime: Time | null } {
   if (!points || points.length === 0) return { nightStartTime: null, dayStartTime: null }
 
   let nightStart: Time | null = null
@@ -85,6 +90,18 @@ function getSessionBoundaryTimes(points: IntradayPoint[]): { nightStartTime: Tim
     }
     if (isDay && dayStart === null) {
       dayStart = parseTs(p.ts) as Time
+    }
+  }
+
+  // 若处于夜盘且尚未进入日盘，从 futureWhitespace 中寻找次日日盘 09:01 的时间戳
+  if (nightStart !== null && dayStart === null && futureWhitespace.length > 0) {
+    for (const ws of futureWhitespace) {
+      const d = new Date((ws.time as number) * 1000)
+      const h = d.getUTCHours()
+      if (h >= 8 && h <= 16) {
+        dayStart = ws.time
+        break
+      }
     }
   }
 
@@ -295,8 +312,14 @@ function generateFutureWhitespace(symbol: string, lastTs: string): WhitespaceDat
   if (nightClose && (hour >= 20 || hour < 8)) {
     let dayDate = dateStr
     if (hour >= 20) {
-      const curDate = new Date(dateStr)
-      curDate.setDate(curDate.getDate() + 1)
+      const parts = dateStr.split('-').map(Number)
+      const curDate = new Date(parts[0], parts[1] - 1, parts[2])
+      if (curDate.getDay() === 5) {
+        // 周五夜盘归属下周一交易日
+        curDate.setDate(curDate.getDate() + 3)
+      } else {
+        curDate.setDate(curDate.getDate() + 1)
+      }
       dayDate = `${curDate.getFullYear()}-${pad(curDate.getMonth() + 1)}-${pad(curDate.getDate())}`
     }
 
@@ -390,6 +413,11 @@ function initChart() {
       borderColor: 'rgba(0, 0, 0, 0.08)',
       timeVisible: true,
       secondsVisible: false,
+      fixLeftEdge: true,
+      fixRightEdge: false,
+      lockVisibleTimeRangeOnResize: true,
+      minBarSpacing: 0.1,
+      shiftVisibleRangeOnNewBar: false,
     },
   })
 
@@ -402,7 +430,9 @@ function initChart() {
   })
 
   // 挂载夜盘浅灰区域与日夜分界线 Primitive
-  sessionPrimitive = new SessionBandPrimitive(chart, () => getSessionBoundaryTimes(store.points))
+  sessionPrimitive = new SessionBandPrimitive(chart, () =>
+    getSessionBoundaryTimes(store.points, currentFutureWhitespace),
+  )
   priceSeries.attachPrimitive(sessionPrimitive)
 
   // 2. 均价线（明亮宝蓝色，光滑醒目）
@@ -445,11 +475,20 @@ function initChart() {
   updateChartData()
 }
 
+function applyVisibleRange(totalBars: number) {
+  if (!chart || totalBars <= 0) return
+  chart.timeScale().setVisibleLogicalRange({
+    from: 0,
+    to: Math.max(1, totalBars - 1),
+  })
+}
+
 function updateChartData() {
   if (!chart || !priceSeries || !avgSeries || !volumeSeries) return
 
   const pts = store.points
   if (pts.length === 0) {
+    currentFutureWhitespace = []
     priceSeries.setData([])
     avgSeries.setData([])
     volumeSeries.setData([])
@@ -492,11 +531,11 @@ function updateChartData() {
   }))
 
   const lastPointTs = uniquePts[uniquePts.length - 1].ts
-  const futureWhitespace = generateFutureWhitespace(props.symbol, lastPointTs)
+  currentFutureWhitespace = generateFutureWhitespace(props.symbol, lastPointTs)
 
-  priceSeries.setData([...priceData, ...futureWhitespace])
-  avgSeries.setData([...avgData, ...futureWhitespace])
-  volumeSeries.setData([...volData, ...futureWhitespace])
+  priceSeries.setData([...priceData, ...currentFutureWhitespace])
+  avgSeries.setData([...avgData, ...currentFutureWhitespace])
+  volumeSeries.setData([...volData, ...currentFutureWhitespace])
 
   // 昨结算基准线 (0.00% 轴)
   if (store.prevSettle > 0) {
@@ -517,7 +556,9 @@ function updateChartData() {
     }
   }
 
-  chart.timeScale().fitContent()
+  const totalBars = uniquePts.length + currentFutureWhitespace.length
+  applyVisibleRange(totalBars)
+  requestAnimationFrame(() => applyVisibleRange(totalBars))
   sessionPrimitive?.update()
 }
 
@@ -525,6 +566,11 @@ function updateChartData() {
 function handleResize() {
   if (chart && container.value) {
     chart.resize(container.value.clientWidth, container.value.clientHeight)
+    const pts = store.points
+    if (pts.length > 0) {
+      const totalBars = pts.length + currentFutureWhitespace.length
+      applyVisibleRange(totalBars)
+    }
   }
 }
 
