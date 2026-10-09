@@ -213,8 +213,9 @@ mod tests {
         assert!(!judger.is_bar_final("CU0", &cu_close, &dt("2026-09-01 01:01:14")));
         assert!(judger.is_bar_final("CU0", &cu_close, &dt("2026-09-01 01:01:15")));
 
-        // 纯碱 SA0 在 23:30 收盘
-        assert_eq!(judger.required_settle_secs("SA0", 23, 30), 75);
+        // 纯碱 SA0 在 23:00 收盘
+        assert_eq!(judger.required_settle_secs("SA0", 23, 0), 75);
+        assert_eq!(judger.required_settle_secs("SA0", 23, 30), 30);
 
         // 贵金属 AU0 在 02:30 收盘
         assert_eq!(judger.required_settle_secs("AU0", 2, 30), 75);

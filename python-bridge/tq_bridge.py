@@ -554,8 +554,9 @@ class TqDataWorker:
 
             # Otherwise wait briefly for initial data download
             t0 = time.time()
-            while time.time() - t0 < 1.5:
-                self._pump_update(time.time() + 0.05)
+            max_wait = 0.05 if cache_hit else 0.15
+            while time.time() - t0 < max_wait:
+                self._pump_update(time.time() + 0.02)
                 if len(klines) > 0 and not pd.isna(klines.iloc[-1]["close"]):
                     break
             logger.info(
@@ -1174,6 +1175,32 @@ async def handle_kline(request: web.Request) -> web.Response:
     # Convert K-lines to standard format
     # Note: Align timestamp to Bar END TIME by adding duration_seconds to start time!
     rows = []
+
+    quote = worker.quotes.get(tq_symbol)
+    last_price = getattr(quote, "last_price", None) if quote is not None else None
+    if last_price is not None and not pd.isna(last_price):
+        try:
+            last_price = float(last_price)
+        except (ValueError, TypeError):
+            last_price = None
+    else:
+        last_price = None
+
+    # If the last bar has NaN close (e.g. unclosed bar before any trade in this bar),
+    # fill with last_price from quote so it is not dropped by dropna
+    if len(klines_df) > 0 and last_price is not None:
+        last_idx = klines_df.index[-1]
+        if pd.isna(klines_df.at[last_idx, "close"]):
+            if pd.isna(klines_df.at[last_idx, "open"]):
+                klines_df.at[last_idx, "open"] = last_price
+            if pd.isna(klines_df.at[last_idx, "high"]):
+                klines_df.at[last_idx, "high"] = max(klines_df.at[last_idx, "open"], last_price)
+            if pd.isna(klines_df.at[last_idx, "low"]):
+                klines_df.at[last_idx, "low"] = min(klines_df.at[last_idx, "open"], last_price)
+            klines_df.at[last_idx, "close"] = last_price
+            if pd.isna(klines_df.at[last_idx, "volume"]):
+                klines_df.at[last_idx, "volume"] = 0.0
+
     # Drop rows with NaN close
     valid_df = klines_df.dropna(subset=["close"]).tail(count)
 

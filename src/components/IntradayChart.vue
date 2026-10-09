@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { NSpin } from 'naive-ui'
 import {
   ColorType,
@@ -21,7 +21,7 @@ import {
   type WhitespaceData,
 } from 'lightweight-charts'
 import type { CanvasRenderingTarget2D, MediaCoordinatesRenderingScope } from 'fancy-canvas'
-import { useIntradayStore } from '../stores/intraday'
+import { useIntradayStore, getNightCloseTime } from '../stores/intraday'
 import type { IntradayPoint } from '../types'
 
 const props = defineProps<{
@@ -40,10 +40,12 @@ let sessionPrimitive: SessionBandPrimitive | null = null
 
 // 悬停十字光标数据，未悬停时默认展示最新一条
 const activePoint = ref<IntradayPoint | null>(null)
+// 当前交易日实际有效渲染的点序列
+const renderedPoints = shallowRef<IntradayPoint[]>([])
 
 const latestPoint = computed(() => {
-  if (store.points.length === 0) return null
-  return store.points[store.points.length - 1]
+  if (renderedPoints.value.length === 0) return null
+  return renderedPoints.value[renderedPoints.value.length - 1]
 })
 
 const currentDisplay = computed(() => {
@@ -72,10 +74,18 @@ function parseTs(ts: string): UTCTimestamp {
 let currentFutureWhitespace: WhitespaceData<UTCTimestamp>[] = []
 
 function getSessionBoundaryTimes(
+  symbol: string,
   points: IntradayPoint[],
   futureWhitespace: WhitespaceData<UTCTimestamp>[] = []
 ): { nightStartTime: Time | null; dayStartTime: Time | null } {
-  if (!points || points.length === 0) return { nightStartTime: null, dayStartTime: null }
+  const nightClose = getNightCloseTime(symbol)
+  if (!nightClose) {
+    return { nightStartTime: null, dayStartTime: null }
+  }
+
+  if (points.length === 0 && futureWhitespace.length === 0) {
+    return { nightStartTime: null, dayStartTime: null }
+  }
 
   let nightStart: Time | null = null
   let dayStart: Time | null = null
@@ -94,7 +104,7 @@ function getSessionBoundaryTimes(
   }
 
   // 若处于夜盘且尚未进入日盘，从 futureWhitespace 中寻找次日日盘 09:01 的时间戳
-  if (nightStart !== null && dayStart === null && futureWhitespace.length > 0) {
+  if (dayStart === null && futureWhitespace.length > 0) {
     for (const ws of futureWhitespace) {
       const d = new Date((ws.time as number) * 1000)
       const h = d.getUTCHours()
@@ -214,167 +224,127 @@ class SessionBandPrimitive implements ISeriesPrimitive<Time> {
   }
 }
 
-function getNightCloseTime(symbol: string): { hour: number; minute: number } | null {
+function getTradingSessionDates(lastTs: string): { nightDateStr: string; dayDateStr: string } {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const toYmd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+
+  const dateStr = lastTs.substring(0, 10)
+  const hour = parseInt(lastTs.substring(11, 13), 10)
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const dt = new Date(y, m - 1, d)
+
+  if (hour >= 20) {
+    // 晚上夜盘 (20:00+)，nightDate 为当天，dayDate 为次交易日
+    const nightDateStr = dateStr
+    const nextDt = new Date(dt)
+    if (dt.getDay() === 5) {
+      nextDt.setDate(dt.getDate() + 3) // 周五夜盘归属下周一
+    } else {
+      nextDt.setDate(dt.getDate() + 1)
+    }
+    return { nightDateStr, dayDateStr: toYmd(nextDt) }
+  } else if (hour < 8) {
+    // 凌晨时段 (00:00 - 08:00)，dayDate 为当天，nightDate 为前一晚
+    const dayDateStr = dateStr
+    const prevDt = new Date(dt)
+    if (dt.getDay() === 1) {
+      prevDt.setDate(dt.getDate() - 3) // 周一凌晨归属上周五
+    } else {
+      prevDt.setDate(dt.getDate() - 1)
+    }
+    return { nightDateStr: toYmd(prevDt), dayDateStr }
+  } else {
+    // 白天日盘及盘后 (08:00 - 20:00)，dayDate 为当天，nightDate 为前一晚
+    const dayDateStr = dateStr
+    const prevDt = new Date(dt)
+    if (dt.getDay() === 1) {
+      prevDt.setDate(dt.getDate() - 3) // 周一日盘前序夜盘为上周五
+    } else {
+      prevDt.setDate(dt.getDate() - 1)
+    }
+    return { nightDateStr: toYmd(prevDt), dayDateStr }
+  }
+}
+
+function getAllTradingMinutes(symbol: string, lastTs: string): UTCTimestamp[] {
+  const { nightDateStr, dayDateStr } = getTradingSessionDates(lastTs)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const toTsStr = (d: string, h: number, m: number) => `${d} ${pad(h)}:${pad(m)}:00`
+
   const prefix = symbol.replace(/\d+$/, '').toUpperCase()
-  // 02:30 贵金属与原油
-  if (['AU', 'AG', 'SC'].includes(prefix)) {
-    return { hour: 2, minute: 30 }
+  const isCffex = ['IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'].includes(prefix)
+  const isBond = ['TF', 'T', 'TS', 'TL'].includes(prefix)
+  const nightClose = getNightCloseTime(symbol)
+
+  const timestamps: UTCTimestamp[] = []
+
+  // 1. 夜盘时段（如果有夜盘）
+  if (nightClose) {
+    // (a) 前半夜: 21:01 - 24:00 (或到收盘)
+    const nightCloseMin = nightClose.hour < 8 ? 24 * 60 : nightClose.hour * 60 + nightClose.minute
+    for (let m = 21 * 60 + 1; m <= nightCloseMin; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(nightDateStr, h, min)))
+    }
+
+    // (b) 跨日凌晨: 00:01 到 nightClose (仅针对 AU/AG/CU 等凌晨收盘品种)
+    if (nightClose.hour < 8) {
+      const morningCloseMin = nightClose.hour * 60 + nightClose.minute
+      for (let m = 1; m <= morningCloseMin; m++) {
+        const h = Math.floor(m / 60)
+        const min = m % 60
+        timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+      }
+    }
   }
-  // 01:00 有色金属与不锈钢
-  if (['CU', 'AL', 'ZN', 'PB', 'NI', 'SN', 'BC', 'SS'].includes(prefix)) {
-    return { hour: 1, minute: 0 }
+
+  // 2. 日盘时段 (全在 dayDateStr)
+  if (isCffex) {
+    // 中金所 09:31 - 11:30
+    for (let m = 9 * 60 + 31; m <= 11 * 60 + 30; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+    }
+    // 中金所 13:01 - 15:00 (国债至 15:15)
+    const closeMin = isBond ? 15 * 60 + 15 : 15 * 60
+    for (let m = 13 * 60 + 1; m <= closeMin; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+    }
+  } else {
+    // 普通商品期货: 09:01-10:15, 10:31-11:30, 13:31-15:00
+    for (let m = 9 * 60 + 1; m <= 10 * 60 + 15; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+    }
+    for (let m = 10 * 60 + 31; m <= 11 * 60 + 30; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+    }
+    for (let m = 13 * 60 + 31; m <= 15 * 60; m++) {
+      const h = Math.floor(m / 60)
+      const min = m % 60
+      timestamps.push(parseTs(toTsStr(dayDateStr, h, min)))
+    }
   }
-  // 23:30 纯碱与玻璃
-  if (['SA', 'FG'].includes(prefix)) {
-    return { hour: 23, minute: 30 }
-  }
-  // 无夜盘品种（农产品、部分能化、中金所股指国债）
-  if ([
-    'AP', 'CJ', 'JD', 'LH', 'PK', 'SI', 'LC', 'UR', 'WH', 'PM', 'RI', 'JR',
-    'LR', 'BB', 'FB', 'IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'
-  ].includes(prefix)) {
-    return null
-  }
-  // 其余黑色、化工、油脂等默认为 23:00
-  return { hour: 23, minute: 0 }
+
+  return timestamps
 }
 
 function generateFutureWhitespace(symbol: string, lastTs: string): WhitespaceData<UTCTimestamp>[] {
   if (!lastTs || lastTs.length < 16) return []
 
-  const dateStr = lastTs.substring(0, 10)
-  const hour = parseInt(lastTs.substring(11, 13), 10)
-  const minute = parseInt(lastTs.substring(14, 16), 10)
-  const timeVal = hour * 60 + minute
+  const lastTime = parseTs(lastTs)
+  const allMinutes = getAllTradingMinutes(symbol, lastTs)
 
-  const prefix = symbol.replace(/\d+$/, '').toUpperCase()
-  const isCffex = ['IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'].includes(prefix)
-  const isBond = ['TF', 'T', 'TS', 'TL'].includes(prefix)
-
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const toTsStr = (d: string, h: number, m: number) => `${d} ${pad(h)}:${pad(m)}:00`
-
-  const whitespaceList: WhitespaceData<UTCTimestamp>[] = []
-
-  // 情况 1: 当前处于日盘交易时段（08:50 ~ 15:15 之间）
-  // 补齐从当前时间直至当天收盘（普通商品 15:00，国债 15:15）的所有交易分钟
-  if (timeVal >= 8 * 60 && timeVal < 15 * 60 + 15) {
-    const dayDate = dateStr
-
-    if (isCffex) {
-      // 中金所时段: 09:30-11:30, 13:00-15:00 (国债至 15:15)
-      for (let m = 9 * 60 + 31; m <= 11 * 60 + 30; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-      const closeMin = isBond ? 15 * 60 + 15 : 15 * 60
-      for (let m = 13 * 60 + 1; m <= closeMin; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-    } else {
-      // 普通商品期货: 09:00-10:15, 10:30-11:30, 13:30-15:00
-      for (let m = 9 * 60 + 1; m <= 10 * 60 + 15; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-      for (let m = 10 * 60 + 31; m <= 11 * 60 + 30; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-      for (let m = 13 * 60 + 31; m <= 15 * 60; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-    }
-
-    return whitespaceList
-  }
-
-  // 情况 2: 当前处于夜盘交易时段（20:50 至 24:00，或者跨日 00:00 至 02:30）
-  // 补齐：剩余夜盘分钟 + 次日完整日盘时段直至 15:00
-  const nightClose = getNightCloseTime(symbol)
-  if (nightClose && (hour >= 20 || hour < 8)) {
-    let dayDate = dateStr
-    if (hour >= 20) {
-      const parts = dateStr.split('-').map(Number)
-      const curDate = new Date(parts[0], parts[1] - 1, parts[2])
-      if (curDate.getDay() === 5) {
-        // 周五夜盘归属下周一交易日
-        curDate.setDate(curDate.getDate() + 3)
-      } else {
-        curDate.setDate(curDate.getDate() + 1)
-      }
-      dayDate = `${curDate.getFullYear()}-${pad(curDate.getMonth() + 1)}-${pad(curDate.getDate())}`
-    }
-
-    // (a) 剩余夜盘前半夜 (21:01 - 24:00)
-    if (hour >= 20) {
-      const nightCloseVal = nightClose.hour < 8 ? 24 * 60 : nightClose.hour * 60 + nightClose.minute
-      for (let m = 21 * 60 + 1; m <= nightCloseVal; m++) {
-        if (m > timeVal && m <= 24 * 60) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dateStr, h, min)) })
-        }
-      }
-      // 跨日到凌晨
-      if (nightClose.hour < 8) {
-        const morningCloseVal = nightClose.hour * 60 + nightClose.minute
-        for (let m = 1; m <= morningCloseVal; m++) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-    } else if (hour < 8) {
-      // (b) 已经进入凌晨
-      const morningCloseVal = nightClose.hour * 60 + nightClose.minute
-      for (let m = 1; m <= morningCloseVal; m++) {
-        if (m > timeVal) {
-          const h = Math.floor(m / 60)
-          const min = m % 60
-          whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-        }
-      }
-    }
-
-    // (c) 次日日盘全天预留（09:00 - 15:00）
-    for (let m = 9 * 60 + 1; m <= 10 * 60 + 15; m++) {
-      const h = Math.floor(m / 60)
-      const min = m % 60
-      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-    }
-    for (let m = 10 * 60 + 31; m <= 11 * 60 + 30; m++) {
-      const h = Math.floor(m / 60)
-      const min = m % 60
-      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-    }
-    for (let m = 13 * 60 + 31; m <= 15 * 60; m++) {
-      const h = Math.floor(m / 60)
-      const min = m % 60
-      whitespaceList.push({ time: parseTs(toTsStr(dayDate, h, min)) })
-    }
-
-    return whitespaceList
-  }
-
-  return []
+  return allMinutes
+    .filter((t) => t > lastTime)
+    .map((t) => ({ time: t }))
 }
 
 function initChart() {
@@ -431,7 +401,7 @@ function initChart() {
 
   // 挂载夜盘浅灰区域与日夜分界线 Primitive
   sessionPrimitive = new SessionBandPrimitive(chart, () =>
-    getSessionBoundaryTimes(store.points, currentFutureWhitespace),
+    getSessionBoundaryTimes(props.symbol, renderedPoints.value, currentFutureWhitespace),
   )
   priceSeries.attachPrimitive(sessionPrimitive)
 
@@ -458,13 +428,13 @@ function initChart() {
 
   // 十字光标订阅
   chart.subscribeCrosshairMove((param) => {
-    if (!param.time || !param.seriesData || store.points.length === 0) {
+    if (!param.time || !param.seriesData || renderedPoints.value.length === 0) {
       activePoint.value = null
       return
     }
 
     const t = param.time as number
-    const found = store.points.find((p) => parseTs(p.ts) === t)
+    const found = renderedPoints.value.find((p) => parseTs(p.ts) === t)
     if (found) {
       activePoint.value = found
     } else {
@@ -488,6 +458,7 @@ function updateChartData() {
 
   const pts = store.points
   if (pts.length === 0) {
+    renderedPoints.value = []
     currentFutureWhitespace = []
     priceSeries.setData([])
     avgSeries.setData([])
@@ -510,7 +481,13 @@ function updateChartData() {
   for (let i = 1; i < sorted.length; i++) {
     const prevHour = parseInt(sorted[i - 1].ts.substring(11, 13), 10)
     const currHour = parseInt(sorted[i].ts.substring(11, 13), 10)
+    const prevDate = sorted[i - 1].ts.substring(0, 10)
+    const currDate = sorted[i].ts.substring(0, 10)
+
     if (prevHour <= 16 && currHour >= 20) {
+      sessionStartIndex = i
+    } else if (prevHour <= 16 && prevDate !== currDate && currHour >= 8 && currHour <= 16) {
+      // 纯日盘品种跨日
       sessionStartIndex = i
     }
   }
@@ -527,6 +504,8 @@ function updateChartData() {
       uniquePts[uniquePts.length - 1] = p
     }
   }
+
+  renderedPoints.value = uniquePts
 
   const priceData = uniquePts.map((p) => ({
     time: parseTs(p.ts),
@@ -580,7 +559,7 @@ function updateChartData() {
 function handleResize() {
   if (chart && container.value) {
     chart.resize(container.value.clientWidth, container.value.clientHeight)
-    const pts = store.points
+    const pts = renderedPoints.value
     if (pts.length > 0) {
       const totalBars = pts.length + currentFutureWhitespace.length
       applyVisibleRange(totalBars)

@@ -31,13 +31,13 @@ pub enum Timeframe {
 impl Timeframe {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "5m" => Some(Self::M5),
-            "15m" => Some(Self::M15),
-            "30m" => Some(Self::M30),
-            "60m" => Some(Self::M60),
-            "120m" => Some(Self::M120),
-            "240m" => Some(Self::M240),
-            "1d" | "day" => Some(Self::Day),
+            "5" | "5m" => Some(Self::M5),
+            "15" | "15m" => Some(Self::M15),
+            "30" | "30m" => Some(Self::M30),
+            "60" | "60m" => Some(Self::M60),
+            "120" | "120m" => Some(Self::M120),
+            "240" | "240m" => Some(Self::M240),
+            "1d" | "d" | "day" => Some(Self::Day),
             _ => None,
         }
     }
@@ -196,6 +196,12 @@ fn bucket_ts(key: BucketKey, target: Timeframe) -> String {
             .format(TS_FORMAT)
             .to_string(),
     }
+}
+
+/// 计算指定时间点在目标周期下的桶末结束时间戳（格式：%Y-%m-%d %H:%M:%S）。
+pub fn current_bucket_end_ts(dt: NaiveDateTime, target: Timeframe) -> String {
+    let key = bucket_key(dt, target);
+    bucket_ts(key, target)
 }
 
 /// 交易日：20:00 之后的夜盘归入下一交易日。

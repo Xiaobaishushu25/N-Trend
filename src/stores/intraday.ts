@@ -8,24 +8,83 @@ interface CacheItem {
   date: string
 }
 
-function isTradingHour(date: Date): boolean {
+export function getNightCloseTime(symbol: string): { hour: number; minute: number } | null {
+  const prefix = symbol.replace(/\d+$/, '').toUpperCase()
+  // 02:30 贵金属与原油
+  if (['AU', 'AG', 'SC'].includes(prefix)) {
+    return { hour: 2, minute: 30 }
+  }
+  // 01:00 有色金属与不锈钢
+  if (['CU', 'AL', 'ZN', 'PB', 'NI', 'SN', 'BC', 'SS', 'AO'].includes(prefix)) {
+    return { hour: 1, minute: 0 }
+  }
+  // 无夜盘品种（农产品、部分能化、中金所股指国债）
+  if ([
+    'AP', 'CJ', 'JD', 'LH', 'PK', 'SI', 'LC', 'UR', 'WH', 'PM', 'RI', 'JR',
+    'LR', 'BB', 'FB', 'IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'
+  ].includes(prefix)) {
+    return null
+  }
+  // 其余黑色、化工、油脂、玻璃(FG)、纯碱(SA)等默认为 23:00
+  return { hour: 23, minute: 0 }
+}
+
+export function isTradingHour(symbol: string, date: Date = new Date()): boolean {
   const d = date.getDay()
   if (d === 0) return false // 周日休市
   const h = date.getHours()
   const m = date.getMinutes()
   const timeNum = h * 60 + m
 
-  // 周六仅 02:35 前可能为周五晚盘收尾
-  if (d === 6) {
-    return timeNum <= 2 * 60 + 35
+  const prefix = symbol.replace(/\d+$/, '').toUpperCase()
+  const isCffex = ['IF', 'IH', 'IC', 'IM', 'TF', 'T', 'TS', 'TL'].includes(prefix)
+  const isBond = ['TF', 'T', 'TS', 'TL'].includes(prefix)
+
+  // 日盘判断
+  if (isCffex) {
+    // 中金所 09:28 - 11:32, 12:58 - 15:02 (国债至 15:17)
+    const afternoonClose = isBond ? 15 * 60 + 17 : 15 * 60 + 2
+    if (timeNum >= 9 * 60 + 28 && timeNum <= 11 * 60 + 32) return true
+    if (timeNum >= 12 * 60 + 58 && timeNum <= afternoonClose) return true
+    return false // 中金所无夜盘
+  } else {
+    // 普通商品期货: 08:58 - 10:17, 10:28 - 11:32, 13:28 - 15:02
+    if (timeNum >= 8 * 60 + 58 && timeNum <= 10 * 60 + 17) return true
+    if (timeNum >= 10 * 60 + 28 && timeNum <= 11 * 60 + 32) return true
+    if (timeNum >= 13 * 60 + 28 && timeNum <= 15 * 60 + 2) return true
   }
 
-  // 夜盘 20:58 - 02:35
-  if (timeNum >= 20 * 60 + 58 || timeNum <= 2 * 60 + 35) return true
+  // 夜盘判断
+  const nightClose = getNightCloseTime(symbol)
+  if (!nightClose) {
+    return false // 无夜盘品种
+  }
 
-  // 日盘 08:58 - 11:32, 13:28 - 15:02
-  if (timeNum >= 8 * 60 + 58 && timeNum <= 11 * 60 + 32) return true
-  if (timeNum >= 13 * 60 + 28 && timeNum <= 15 * 60 + 2) return true
+  // 周六仅在跨日夜盘收盘前有效
+  if (d === 6) {
+    if (nightClose.hour < 8) {
+      const closeMin = nightClose.hour * 60 + nightClose.minute + 2
+      return timeNum <= closeMin
+    }
+    return false
+  }
+
+  // 周一到周五的夜盘：前半夜 20:58 开始
+  if (timeNum >= 20 * 60 + 58) {
+    if (nightClose.hour >= 20) {
+      const closeMin = nightClose.hour * 60 + nightClose.minute + 2
+      return timeNum <= closeMin
+    } else {
+      // 跨午夜品种（如 01:00 或 02:30），前半夜 21:00-24:00 均为有效交易时段
+      return true
+    }
+  }
+
+  // 跨日凌晨时段 (00:00 - 08:00)
+  if (nightClose.hour < 8 && timeNum < 8 * 60) {
+    const closeMin = nightClose.hour * 60 + nightClose.minute + 2
+    return timeNum <= closeMin
+  }
 
   return false
 }
@@ -112,13 +171,18 @@ export const useIntradayStore = defineStore('intraday', {
         const resp: IntradayChartResponse = await api.getIntradayChart(symbol)
         if (seq !== this.loadSeq) return
 
+        const now = new Date()
+        const pad = (n: number) => String(n).padStart(2, '0')
+        const nowLimitStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:59`
+        const validPoints = (resp.points || []).filter((p) => p.ts <= nowLimitStr)
+
         this.prevSettle = resp.prev_settle
-        this.points = resp.points || []
+        this.points = validPoints
 
         // 存入内存缓存（绑定交易日）
         this.cache.set(symbol, {
           prevSettle: resp.prev_settle,
-          points: [...(resp.points || [])],
+          points: [...validPoints],
           date: tradingDay,
         })
       } catch (e) {
@@ -161,7 +225,7 @@ export const useIntradayStore = defineStore('intraday', {
       }
 
       // 非交易时段（休市期间）：不追加新分钟点，仅同步确保末端报价与实时快照绝对一致
-      if (!isTradingHour(now)) {
+      if (!isTradingHour(this.symbol, now)) {
         if (last.price !== latestPrice) {
           last.price = latestPrice
           if (cached && cached.points.length > 0) {

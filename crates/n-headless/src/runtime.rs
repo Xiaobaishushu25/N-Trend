@@ -13,6 +13,7 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
     spawn_scheduler(ctx.clone());
     spawn_quote_poller(ctx.clone());
     spawn_tq_bar_event_consumer(ctx.clone());
+    spawn_tq_warmup(ctx.clone());
 }
 
 fn spawn_scheduler(ctx: Arc<ServerContext>) {
@@ -369,8 +370,24 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
 
             match ctx.services.realtime_quotes().await {
                 Ok(snapshots) => {
+                    // 同步更新服务端常驻维护的 5m 未决 K 线内存
+                    let updated_bars = ctx.services.update_live_bars_from_quotes(&snapshots).await;
+
                     let seq = ctx.next_event_seq();
                     ctx.realtime_hub.broadcast(seq, "quote.updated", serde_json::to_value(&snapshots).unwrap_or_default()).await;
+
+                    // 广播实时未决 K 线给已订阅客户端（图表可原地平滑更新）
+                    for bar in updated_bars {
+                        let bar_seq = ctx.next_event_seq();
+                        let sym = bar.symbol.clone();
+                        let tf = bar.timeframe.clone();
+                        let payload = serde_json::json!({
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "bar": bar,
+                        });
+                        ctx.realtime_hub.broadcast_kline(bar_seq, "kline.partial", &sym, &tf, payload).await;
+                    }
 
                     // 检测入场价命中
                     if let Ok(hits) = ctx.services.entry_trigger_hits(&snapshots).await {
@@ -457,14 +474,51 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                     }
                     tracing::info!("🔔 [FAST_PATH] 收到天勤闭合K线: {} {} {}", ev.symbol, ev.period, ev.bar_end);
                     let seq = ctx.next_event_seq();
+                    let closed_dto = n_protocol::dto::KlineDto {
+                        symbol: ev.symbol.clone(),
+                        timeframe: ev.period.clone(),
+                        ts: ev.bar_end.clone(),
+                        open: ev.kline.open,
+                        high: ev.kline.high,
+                        low: ev.kline.low,
+                        close: ev.kline.close,
+                        volume: ev.kline.volume,
+                        hold: ev.kline.hold,
+                        source: "tqsdk_closed".to_string(),
+                        rollover: false,
+                    };
+                    let payload = serde_json::json!({
+                        "symbol": ev.symbol,
+                        "timeframe": ev.period,
+                        "bar": closed_dto,
+                        "event": ev,
+                    });
                     ctx.realtime_hub.broadcast_kline(
                         seq,
                         "kline.closed",
                         &ev.symbol,
                         &ev.period,
-                        serde_json::to_value(&ev).unwrap_or_default(),
+                        payload,
                     ).await;
                 }
+            }
+        }
+    });
+}
+
+fn spawn_tq_warmup(ctx: Arc<ServerContext>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let cfg = ctx.services.config().await;
+        if cfg.data_source.primary_source != "tqsdk" || !ctx.services.data_source.tq_is_available() {
+            return;
+        }
+        let tq = ctx.services.data_source.tq_client().await;
+        if let Ok(symbols) = n_core::storage::repo::list_symbols(&ctx.db, true).await {
+            let codes: Vec<String> = symbols.into_iter().map(|s| s.code).collect();
+            if !codes.is_empty() {
+                tracing::info!("🔥 正在为 {} 个活跃品种预热天勤 5m K 线订阅...", codes.len());
+                let _ = tq.subscribe_klines(&codes, "5m", 300).await;
             }
         }
     });

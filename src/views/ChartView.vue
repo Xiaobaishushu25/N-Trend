@@ -2263,16 +2263,19 @@ onMounted(async () => {
   // 进入页面立即拉一次行情快照，避免左侧价格/涨幅要等下一次刷新或扫描事件才显示
   loadSnapshots()
   if (!scansStore.latest) {
-    try {
-      await scansStore.runScan()
+    void scansStore.runScan().then(() => {
       scansStore.refreshLatestSignals()
-    } catch {
+    }).catch(() => {
       // 无数据时扫描失败不影响看图
-    }
+    })
   }
   // 首屏K线已由 watch([symbol,timeframe], immediate:true) 加载，
-  // 这里仅做兜底：若因时序/空路由未加载到则补拉一次，避免显示无数据
-  if (symbol.value && (!klinesStore.rows.length || klinesStore.rows[0]?.symbol !== symbol.value || klinesStore.rows[0]?.timeframe !== timeframe.value)) {
+  // 这里仅做兜底：若因时序/空路由未加载到且当前未在加载中，则补拉一次，避免显示无数据或重复并发请求丢包
+  if (
+    symbol.value &&
+    !klinesStore.loading &&
+    (!klinesStore.rows.length || klinesStore.rows[0]?.symbol !== symbol.value || klinesStore.rows[0]?.timeframe !== timeframe.value)
+  ) {
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
     if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
       liveBars.value = [klinesStore.partialBar]

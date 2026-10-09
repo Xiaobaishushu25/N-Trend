@@ -201,11 +201,10 @@ pub fn classify_night_session(symbol_or_prefix: &str) -> NightSessionType {
         // 02:30 贵金属 & 原油
         "AU" | "AG" | "SC" => NightSessionType::Close0230,
 
-        // 01:00 有色金属、不锈钢
-        "CU" | "AL" | "ZN" | "PB" | "NI" | "SN" | "BC" | "SS" => NightSessionType::Close0100,
-
-        // 23:30 纯碱、玻璃
-        "SA" | "FG" => NightSessionType::Close2330,
+        // 01:00 有色金属、不锈钢、氧化铝
+        "CU" | "AL" | "ZN" | "PB" | "NI" | "SN" | "BC" | "SS" | "AO" => {
+            NightSessionType::Close0100
+        }
 
         // 无夜盘品种（农产品、部分化工、金融期货等）
         "AP" | "CJ" | "JD" | "LH" | "PK" | "SI" | "LC" | "UR" | "WH" | "PM" | "RI" | "JR"
@@ -213,7 +212,7 @@ pub fn classify_night_session(symbol_or_prefix: &str) -> NightSessionType {
             NightSessionType::None
         }
 
-        // 其余默认大多数 23:00（黑色系、能化等）
+        // 其余默认大多数 23:00（黑色系、能化、玻璃 FG、纯碱 SA 等）
         _ => NightSessionType::Close2300,
     }
 }
@@ -234,6 +233,8 @@ mod tests {
         assert_eq!(classify_night_session("SS0"), NightSessionType::Close0100);
         assert_eq!(classify_night_session("AU"), NightSessionType::Close0230);
         assert_eq!(classify_night_session("CJ"), NightSessionType::None);
+        assert_eq!(classify_night_session("FG0"), NightSessionType::Close2300);
+        assert_eq!(classify_night_session("SA0"), NightSessionType::Close2300);
     }
 
     #[test]
