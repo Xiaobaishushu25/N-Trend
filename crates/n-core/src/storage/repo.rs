@@ -875,25 +875,56 @@ pub async fn preclose_candidate_by_key(
         .context("查询临时未收盘候选失败")?)
 }
 
+pub const PRECLOSE_RETENTION_HOURS: i64 = 24;
+
+pub fn preclose_retention_cutoff_ts() -> String {
+    (chrono::Local::now().naive_local() - chrono::Duration::hours(PRECLOSE_RETENTION_HOURS))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+pub async fn prune_preclose_candidates(
+    db: &DatabaseConnection,
+    cutoff_ts: &str,
+) -> Result<u64> {
+    let res = preclose_candidates::Entity::delete_many()
+        .filter(preclose_candidates::Column::SessionCloseTs.lt(cutoff_ts))
+        .exec(db)
+        .await
+        .context("清理历史临时未收盘候选失败")?;
+    Ok(res.rows_affected)
+}
+
 pub async fn active_preclose_candidates(
     db: &DatabaseConnection,
 ) -> Result<Vec<preclose_candidates::Model>> {
+    let cutoff = preclose_retention_cutoff_ts();
     Ok(preclose_candidates::Entity::find()
         .filter(preclose_candidates::Column::State.eq("provisional"))
+        .filter(preclose_candidates::Column::SessionCloseTs.gte(cutoff))
         .order_by_desc(preclose_candidates::Column::EmittedAt)
         .all(db)
         .await
         .context("查询有效临时未收盘候选失败")?)
 }
 
-pub async fn all_preclose_candidates(
+pub async fn recent_preclose_candidates(
     db: &DatabaseConnection,
+    cutoff_ts: &str,
 ) -> Result<Vec<preclose_candidates::Model>> {
     Ok(preclose_candidates::Entity::find()
+        .filter(preclose_candidates::Column::SessionCloseTs.gte(cutoff_ts))
         .order_by_desc(preclose_candidates::Column::EmittedAt)
         .all(db)
         .await
         .context("查询临时未收盘候选失败")?)
+}
+
+pub async fn all_preclose_candidates(
+    db: &DatabaseConnection,
+) -> Result<Vec<preclose_candidates::Model>> {
+    let cutoff = preclose_retention_cutoff_ts();
+    recent_preclose_candidates(db, &cutoff).await
 }
 
 pub async fn update_preclose_candidate(
@@ -993,23 +1024,55 @@ pub async fn preclose_signal_by_key(
         .context("查询收盘前预检测事件失败")?)
 }
 
+pub async fn prune_preclose_signals(
+    db: &DatabaseConnection,
+    cutoff_ts: &str,
+) -> Result<u64> {
+    let res = preclose_signals::Entity::delete_many()
+        .filter(preclose_signals::Column::SessionCloseTs.lt(cutoff_ts))
+        .exec(db)
+        .await
+        .context("清理历史收盘前预检测事件失败")?;
+    Ok(res.rows_affected)
+}
+
+pub async fn prune_preclose_records(
+    db: &DatabaseConnection,
+    cutoff_ts: &str,
+) -> Result<(u64, u64)> {
+    let s = prune_preclose_signals(db, cutoff_ts).await?;
+    let c = prune_preclose_candidates(db, cutoff_ts).await?;
+    Ok((s, c))
+}
+
 pub async fn active_preclose_signals(
     db: &DatabaseConnection,
 ) -> Result<Vec<preclose_signals::Model>> {
+    let cutoff = preclose_retention_cutoff_ts();
     Ok(preclose_signals::Entity::find()
         .filter(preclose_signals::Column::State.is_in(["precheck", "confirmed"]))
+        .filter(preclose_signals::Column::SessionCloseTs.gte(cutoff))
         .order_by_desc(preclose_signals::Column::EmittedAt)
         .all(db)
         .await
         .context("查询有效收盘前预检测事件失败")?)
 }
 
-pub async fn all_preclose_signals(db: &DatabaseConnection) -> Result<Vec<preclose_signals::Model>> {
+pub async fn recent_preclose_signals(
+    db: &DatabaseConnection,
+    cutoff_ts: &str,
+) -> Result<Vec<preclose_signals::Model>> {
     Ok(preclose_signals::Entity::find()
+        .filter(preclose_signals::Column::SessionCloseTs.gte(cutoff_ts))
         .order_by_desc(preclose_signals::Column::EmittedAt)
         .all(db)
         .await
         .context("查询收盘前预检测事件失败")?)
+}
+
+pub async fn all_preclose_signals(db: &DatabaseConnection) -> Result<Vec<preclose_signals::Model>> {
+    let cutoff = preclose_retention_cutoff_ts();
+    recent_preclose_signals(db, &cutoff).await
 }
 
 pub async fn update_preclose_signal(
@@ -2286,6 +2349,155 @@ mod tests {
         assert_eq!(saved.next_open_price, Some(1205.0));
         assert_eq!(saved.outcome.as_deref(), Some("win"));
         assert_eq!(saved.outcome_ts.as_deref(), Some("2026-09-07 10:00:00"));
+    }
+
+    #[tokio::test]
+    async fn prune_and_query_preclose_records_retention() {
+        let db = test_db().await;
+        let old_signal = preclose_signals::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("SA0".to_string()),
+            direction: Set("up".to_string()),
+            session_close_ts: Set("2026-09-01 15:00:00".to_string()),
+            emitted_at: Set("2026-09-01 14:57:00".to_string()),
+            reference_price: Set(1200.0),
+            parent_event_id: Set(101),
+            entry: Set(1201.0),
+            stop: Set(1191.0),
+            target: Set(1221.0),
+            risk: Set(10.0),
+            state: Set("confirmed".to_string()),
+            confirmed_at: Set(Some("2026-09-01 15:01:20".to_string())),
+            invalid_reason: Set(None),
+            next_open_ts: Set(None),
+            next_open_price: Set(None),
+            gap_pct: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            outcome: Set(None),
+            outcome_ts: Set(None),
+            horizon_minutes: Set(60),
+            created_at: Set("2026-09-01 14:57:00".to_string()),
+            updated_at: Set("2026-09-01 15:01:20".to_string()),
+        };
+        let new_signal = preclose_signals::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("RB0".to_string()),
+            direction: Set("down".to_string()),
+            session_close_ts: Set("2026-09-05 15:00:00".to_string()),
+            emitted_at: Set("2026-09-05 14:57:00".to_string()),
+            reference_price: Set(3200.0),
+            parent_event_id: Set(102),
+            entry: Set(3190.0),
+            stop: Set(3210.0),
+            target: Set(3150.0),
+            risk: Set(20.0),
+            state: Set("precheck".to_string()),
+            confirmed_at: Set(None),
+            invalid_reason: Set(None),
+            next_open_ts: Set(None),
+            next_open_price: Set(None),
+            gap_pct: Set(None),
+            mfe_r: Set(None),
+            mae_r: Set(None),
+            outcome: Set(None),
+            outcome_ts: Set(None),
+            horizon_minutes: Set(60),
+            created_at: Set("2026-09-05 14:57:00".to_string()),
+            updated_at: Set("2026-09-05 14:57:00".to_string()),
+        };
+        insert_preclose_signal(&db, old_signal).await.unwrap();
+        insert_preclose_signal(&db, new_signal).await.unwrap();
+
+        let old_candidate = preclose_candidates::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("SA0".to_string()),
+            direction: Set("up".to_string()),
+            level: Set("15m".to_string()),
+            grade: Set("A级".to_string()),
+            warning_ts: Set("2026-09-01 15:00".to_string()),
+            session_close_ts: Set("2026-09-01 15:00:00".to_string()),
+            emitted_at: Set("2026-09-01 14:57:00".to_string()),
+            last_seen_at: Set("2026-09-01 14:59:00".to_string()),
+            reference_price: Set(1200.0),
+            entry_score: Set(3.5),
+            entry_score_dims: Set("{}".to_string()),
+            warning_kind: Set("strong".to_string()),
+            s0_ts: Set("2026-09-01 14:00".to_string()),
+            s0_price: Set(1190.0),
+            s1_ts: Set("2026-09-01 14:30".to_string()),
+            s1_price: Set(1210.0),
+            s2_ts: Set("2026-09-01 14:45".to_string()),
+            s2_price: Set(1195.0),
+            a_move: Set(20.0),
+            b_move: Set(15.0),
+            a_bars: Set(2),
+            b_bars: Set(1),
+            retracement: Set(0.75),
+            entry: Set(1205.0),
+            stop: Set(1195.0),
+            target: Set(1225.0),
+            risk: Set(10.0),
+            rr: Set(2.0),
+            provisional_fingerprint: Set("fp1".to_string()),
+            state: Set("confirmed".to_string()),
+            parent_event_id: Set(Some(101)),
+            invalid_reason: Set(None),
+            created_at: Set("2026-09-01 14:57:00".to_string()),
+            updated_at: Set("2026-09-01 15:01:20".to_string()),
+        };
+        let new_candidate = preclose_candidates::ActiveModel {
+            id: sea_orm::NotSet,
+            symbol: Set("RB0".to_string()),
+            direction: Set("down".to_string()),
+            level: Set("15m".to_string()),
+            grade: Set("A级".to_string()),
+            warning_ts: Set("2026-09-05 15:00".to_string()),
+            session_close_ts: Set("2026-09-05 15:00:00".to_string()),
+            emitted_at: Set("2026-09-05 14:57:00".to_string()),
+            last_seen_at: Set("2026-09-05 14:59:00".to_string()),
+            reference_price: Set(3200.0),
+            entry_score: Set(3.8),
+            entry_score_dims: Set("{}".to_string()),
+            warning_kind: Set("strong".to_string()),
+            s0_ts: Set("2026-09-05 14:00".to_string()),
+            s0_price: Set(3220.0),
+            s1_ts: Set("2026-09-05 14:30".to_string()),
+            s1_price: Set(3180.0),
+            s2_ts: Set("2026-09-05 14:45".to_string()),
+            s2_price: Set(3205.0),
+            a_move: Set(40.0),
+            b_move: Set(25.0),
+            a_bars: Set(2),
+            b_bars: Set(1),
+            retracement: Set(0.625),
+            entry: Set(3190.0),
+            stop: Set(3210.0),
+            target: Set(3150.0),
+            risk: Set(20.0),
+            rr: Set(2.0),
+            provisional_fingerprint: Set("fp2".to_string()),
+            state: Set("provisional".to_string()),
+            parent_event_id: Set(None),
+            invalid_reason: Set(None),
+            created_at: Set("2026-09-05 14:57:00".to_string()),
+            updated_at: Set("2026-09-05 14:57:00".to_string()),
+        };
+        insert_preclose_candidate(&db, old_candidate).await.unwrap();
+        insert_preclose_candidate(&db, new_candidate).await.unwrap();
+
+        let cutoff = "2026-09-04 15:00:00";
+        let (pruned_signals, pruned_candidates) = prune_preclose_records(&db, cutoff).await.unwrap();
+        assert_eq!(pruned_signals, 1);
+        assert_eq!(pruned_candidates, 1);
+
+        let remaining_signals = recent_preclose_signals(&db, cutoff).await.unwrap();
+        assert_eq!(remaining_signals.len(), 1);
+        assert_eq!(remaining_signals[0].symbol, "RB0");
+
+        let remaining_candidates = recent_preclose_candidates(&db, cutoff).await.unwrap();
+        assert_eq!(remaining_candidates.len(), 1);
+        assert_eq!(remaining_candidates[0].symbol, "RB0");
     }
 
     #[tokio::test]

@@ -2411,6 +2411,10 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_signals::Model>> {
+        let cutoff = (now - ChronoDuration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(err) = repo::prune_preclose_signals(&self.db, &cutoff).await {
+            tracing::warn!("自动清理过期收盘前预检测记录失败: {err:#}");
+        }
         let mut changed = Vec::new();
         for mut row in repo::active_preclose_signals(&self.db).await? {
             let Some(close) = parse_local_ts(&row.session_close_ts) else {
@@ -2467,6 +2471,10 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_candidates::Model>> {
+        let cutoff = (now - ChronoDuration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+        if let Err(err) = repo::prune_preclose_candidates(&self.db, &cutoff).await {
+            tracing::warn!("自动清理过期临时未收盘候选记录失败: {err:#}");
+        }
         let mut changed = Vec::new();
         for mut row in repo::active_preclose_candidates(&self.db).await? {
             if row.state != "provisional" {

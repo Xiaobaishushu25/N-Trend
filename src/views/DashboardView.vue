@@ -75,20 +75,39 @@ const rows = ref<WatchRow[]>([])
 const precloseSignals = ref<PrecloseSignal[]>([])
 const precloseCandidates = ref<PrecloseCandidate[]>([])
 const precloseClock = ref(Date.now())
-const visiblePrecloseSignals = computed<Array<PrecloseSignal | PrecloseCandidate>>(() => [
-  ...precloseSignals.value.filter((signal) => {
-    if (signal.state === 'confirmed') return true
-    if (signal.state !== 'precheck') return false
-    const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
-    return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
-  }),
-  ...precloseCandidates.value.filter((candidate) => {
-    if (candidate.state === 'confirmed') return true
-    if (candidate.state !== 'provisional') return false
-    const closeMs = new Date(candidate.session_close_ts.replace(' ', 'T')).getTime()
-    return Number.isFinite(closeMs) && precloseClock.value < closeMs + 80_000
-  }),
-])
+/** 收盘前预检测与推演最多保留1天（24小时），更早的数据无意义直接隐藏 */
+const PRECLOSE_RETENTION_MS = 24 * 60 * 60 * 1000
+
+function isPrecloseWithinRetention(
+  item: PrecloseSignal | PrecloseCandidate,
+  clockMs: number = Date.now(),
+): boolean {
+  const ts = item.session_close_ts || item.emitted_at
+  if (!ts) return false
+  const closeMs = new Date(ts.replace(' ', 'T')).getTime()
+  if (!Number.isFinite(closeMs)) return false
+  return clockMs - closeMs <= PRECLOSE_RETENTION_MS
+}
+
+const visiblePrecloseSignals = computed<Array<PrecloseSignal | PrecloseCandidate>>(() => {
+  const now = precloseClock.value
+  return [
+    ...precloseSignals.value.filter((signal) => {
+      if (!isPrecloseWithinRetention(signal, now)) return false
+      const closeMs = new Date(signal.session_close_ts.replace(' ', 'T')).getTime()
+      if (signal.state === 'precheck') return now < closeMs + 80_000
+      if (signal.state === 'confirmed' || signal.state === 'observed') return true
+      return false
+    }),
+    ...precloseCandidates.value.filter((candidate) => {
+      if (!isPrecloseWithinRetention(candidate, now)) return false
+      const closeMs = new Date(candidate.session_close_ts.replace(' ', 'T')).getTime()
+      if (candidate.state === 'provisional') return now < closeMs + 80_000
+      if (candidate.state === 'confirmed') return true
+      return false
+    }),
+  ]
+})
 let precloseTimer: ReturnType<typeof setInterval> | null = null
 const loading = ref(false)
 const groupModal = ref<'create' | 'manage' | null>(null)
@@ -178,8 +197,8 @@ async function loadAll() {
     if (activeSingleBars?.length) {
       scansStore.upsertSingleBars(activeSingleBars)
     }
-    precloseSignals.value = preclose
-    precloseCandidates.value = candidates
+    precloseSignals.value = preclose.filter((s) => isPrecloseWithinRetention(s))
+    precloseCandidates.value = candidates.filter((c) => isPrecloseWithinRetention(c))
     const bySymbol = new Map<string, PatternEvent[]>()
     for (const s of signals) {
       const arr = bySymbol.get(s.symbol) || []
@@ -973,7 +992,9 @@ onMounted(async () => {
         notify.info(`${update.symbol} 收盘前预检测：${update.direction === 'up' ? '做多' : '做空'}，来源正式候选 #${update.parent_event_id}`, { duration: 8000 })
       }
     }
-    precloseSignals.value = [...byId.values()].sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
+    precloseSignals.value = [...byId.values()]
+      .filter((s) => isPrecloseWithinRetention(s))
+      .sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
   }))
   unlisteners.push(await onPrecloseCandidate((updates) => {
     const byId = new Map(precloseCandidates.value.map((x) => [x.id, x]))
@@ -988,7 +1009,9 @@ onMounted(async () => {
         notify.info(`${update.symbol} 临时未收盘扫描：${update.direction === 'up' ? '预做多' : '预做空'}，评分 ${update.entry_score.toFixed(2)}，待收盘确认`, { duration: 8000 })
       }
     }
-    precloseCandidates.value = [...byId.values()].sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
+    precloseCandidates.value = [...byId.values()]
+      .filter((c) => isPrecloseWithinRetention(c))
+      .sort((a, b) => b.emitted_at.localeCompare(a.emitted_at))
   }))
   // 扫描完成时同步更新内存里的最新扫描结果，避免图表页「全部N形态」停留在旧扫描
   unlisteners.push(
