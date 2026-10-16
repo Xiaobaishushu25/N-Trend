@@ -183,6 +183,18 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         if pRspInfo and pRspInfo.ErrorID != 0:
             logger.error(f"[穿透认证] 认证失败: {pRspInfo.ErrorMsg}")
             self.is_authenticated = False
+            # 柜台前置可能未初始化或不活跃，延迟 10 秒后自动重试穿透认证
+            def retry_auth():
+                time.sleep(10)
+                if self.is_connected and not self.is_authenticated and not self._stop_requested:
+                    logger.info("[穿透认证] 正在自动重试穿透式认证...")
+                    req = tdapi.CThostFtdcReqAuthenticateField()
+                    req.BrokerID = self.config.get("BrokerID", "9999")
+                    req.UserID = self.config.get("UserID", "")
+                    req.AppID = self.config.get("AppID", "simnow_client_test")
+                    req.AuthCode = self.config.get("AuthCode", "0000000000000000")
+                    self.api.ReqAuthenticate(req, self.get_req_id())
+            threading.Thread(target=retry_auth, daemon=True).start()
             return
         logger.info("[穿透认证] 穿透式认证成功，开始用户登录...")
         self.is_authenticated = True
@@ -196,6 +208,17 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         if pRspInfo and pRspInfo.ErrorID != 0:
             logger.error(f"[用户登录] 登录失败: {pRspInfo.ErrorMsg}")
             self.is_logged_in = False
+            # 延迟 10 秒后自动重试登录
+            def retry_login():
+                time.sleep(10)
+                if self.is_connected and self.is_authenticated and not self.is_logged_in and not self._stop_requested:
+                    logger.info("[用户登录] 正在自动重试用户登录...")
+                    login_req = tdapi.CThostFtdcReqUserLoginField()
+                    login_req.BrokerID = self.config.get("BrokerID", "9999")
+                    login_req.UserID = self.config.get("UserID", "")
+                    login_req.Password = self.config.get("Password", "")
+                    self.api.ReqUserLogin(login_req, self.get_req_id())
+            threading.Thread(target=retry_login, daemon=True).start()
             return
         self.is_logged_in = True
         day = str(pRspUserLogin.TradingDay)
