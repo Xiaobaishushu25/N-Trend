@@ -749,7 +749,9 @@ const winRateDiff = computed(() => {
 .live-trader-page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
   background: #f8fafc;
   color: #1e293b;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -759,16 +761,17 @@ const winRateDiff = computed(() => {
 
 /* 顶部 Header */
 .trader-header {
-  padding: 14px 20px 12px 20px;
+  padding: 10px 18px 8px 18px;
   background: #ffffff;
   border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
 }
 
 .header-top-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .header-title-box {
@@ -880,30 +883,30 @@ const winRateDiff = computed(() => {
   display: flex;
   align-items: center;
   background: #ffffff;
-  padding: 12px 20px;
-  border-radius: 10px;
+  padding: 8px 16px;
+  border-radius: 8px;
   border: 1px solid #e2e8f0;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .acc-col {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   flex: 1;
 }
 
 .acc-label {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: #64748b;
 }
 
 .acc-val {
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 800;
-  line-height: 1.25;
+  line-height: 1.2;
   color: #0f172a;
   letter-spacing: -0.3px;
 }
@@ -930,9 +933,9 @@ const winRateDiff = computed(() => {
 
 .acc-divider {
   width: 1px;
-  height: 32px;
+  height: 28px;
   background: #e2e8f0;
-  margin: 0 14px;
+  margin: 0 12px;
 }
 
 /* KPI & 比对行 */
@@ -948,8 +951,8 @@ const winRateDiff = computed(() => {
   align-items: center;
   background: #ffffff;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  padding: 12px 18px;
+  border-radius: 8px;
+  padding: 8px 14px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
@@ -957,38 +960,38 @@ const winRateDiff = computed(() => {
   display: flex;
   flex-direction: column;
   flex: 1;
-  gap: 3px;
+  gap: 2px;
 }
 
 .kpi-name {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: #64748b;
 }
 
 .kpi-num {
-  font-size: 22px;
+  font-size: 19px;
   font-weight: 800;
   line-height: 1.2;
   color: #0f172a;
 }
 
 .kpi-num .unit {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
   color: #64748b;
 }
 
 .kpi-sub {
-  font-size: 12px;
+  font-size: 11px;
   color: #94a3b8;
 }
 
 .kpi-divider {
   width: 1px;
-  height: 36px;
+  height: 30px;
   background: #e2e8f0;
-  margin: 0 14px;
+  margin: 0 12px;
 }
 
 .comparison-card {
@@ -996,7 +999,7 @@ const winRateDiff = computed(() => {
   background: #f0fdf4;
   border: 1px solid #bbf7d0;
   border-radius: 8px;
-  padding: 8px 14px;
+  padding: 6px 12px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -1006,7 +1009,7 @@ const winRateDiff = computed(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   color: #15803d;
 }
@@ -1014,22 +1017,22 @@ const winRateDiff = computed(() => {
 .cmp-content {
   display: flex;
   justify-content: space-between;
-  margin: 4px 0;
+  margin: 2px 0;
 }
 
 .cmp-item {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .cmp-label {
-  font-size: 11px;
+  font-size: 10px;
   color: #64748b;
 }
 
 .cmp-val {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 700;
   color: #0f172a;
 }
@@ -1044,9 +1047,10 @@ const winRateDiff = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 10px 20px;
+  padding: 8px 18px;
   background: #ffffff;
   border-bottom: 1px solid #e2e8f0;
+  flex-shrink: 0;
 }
 
 .tabs-buttons {
@@ -1056,9 +1060,28 @@ const winRateDiff = computed(() => {
 
 /* 主内容区 */
 .trader-content-box {
-  flex: 1;
+  flex: 1 1 0%;
+  min-height: 0;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: 14px 20px 60px 20px;
+  box-sizing: border-box;
+}
+
+.trader-content-box::-webkit-scrollbar {
+  width: 6px;
+}
+
+.trader-content-box::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.trader-content-box::-webkit-scrollbar-thumb {
+  background-color: rgba(140, 150, 170, 0.35);
+  border-radius: 6px;
+}
+
+.trader-content-box::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(140, 150, 170, 0.65);
 }
 
 .empty-holder {
@@ -1075,6 +1098,7 @@ const winRateDiff = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  padding-bottom: 32px;
 }
 
 /* 持仓卡片（白色卡片，左侧红绿状态边框） */
@@ -1082,7 +1106,7 @@ const winRateDiff = computed(() => {
   background: #ffffff;
   border-radius: 8px;
   border: 1px solid #e2e8f0;
-  padding: 14px 18px;
+  padding: 12px 16px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
@@ -1140,10 +1164,10 @@ const winRateDiff = computed(() => {
   display: flex;
   align-items: center;
   background: #f8fafc;
-  padding: 10px 16px;
+  padding: 8px 14px;
   border-radius: 6px;
-  gap: 16px;
-  margin-bottom: 10px;
+  gap: 14px;
+  margin-bottom: 8px;
   border: 1px solid #f1f5f9;
 }
 
@@ -1287,6 +1311,7 @@ const winRateDiff = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  padding-bottom: 32px;
 }
 
 .history-card {
