@@ -1,19 +1,21 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
-    /// 仅模拟/记录，不向柜台发送任何真实委托
-    DryRun,
-    /// 半自动：触发时弹窗提示，人工确认后开仓；成交后平仓全自动
+    /// 仅监控/模拟：不向柜台发送任何真实开平仓委托
+    #[serde(alias = "dry_run", alias = "DryRun", alias = "MonitorOnly", alias = "monitor_only")]
+    MonitorOnly,
+    /// 半自动：触发突破时弹窗提示，待人工确认后才报单；成交后平仓全自动
+    #[serde(alias = "semi_auto", alias = "SemiAuto")]
     SemiAuto,
-    /// 全自动：触发后严格按交易规则无人值守开平仓
+    /// 全自动：触发后严格按交易规则无人值守全自动报单开平仓
+    #[serde(alias = "full_auto", alias = "FullAuto")]
     FullAuto,
 }
 
 impl Default for ExecutionMode {
     fn default() -> Self {
-        Self::DryRun
+        Self::SemiAuto
     }
 }
 

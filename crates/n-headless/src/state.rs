@@ -35,9 +35,32 @@ impl ServerContext {
     ) -> Arc<Self> {
         let realtime_hub = Arc::new(RealtimeHub::new());
         let trader_client = n_core::trader::CtpTraderClient::for_port(8766);
-        let execution_engine = Arc::new(n_core::trader::ExecutionEngine::new(
+        let config_path = data_dir.join("trader_config.json");
+        let initial_config = if config_path.exists() {
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => match serde_json::from_str::<n_core::trader::ExecutionConfig>(&content) {
+                    Ok(cfg) => {
+                        tracing::info!("💾 成功从磁盘加载交易执行配置: {}", config_path.display());
+                        cfg
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ 解析交易配置失败: {}, 将采用默认配置", e);
+                        n_core::trader::ExecutionConfig::default()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("⚠️ 读取交易配置失败: {}, 将采用默认配置", e);
+                    n_core::trader::ExecutionConfig::default()
+                }
+            }
+        } else {
+            n_core::trader::ExecutionConfig::default()
+        };
+
+        let execution_engine = Arc::new(n_core::trader::ExecutionEngine::with_config_path(
             trader_client,
-            n_core::trader::ExecutionConfig::default(),
+            initial_config,
+            Some(config_path),
         ));
         Arc::new(Self {
             db,

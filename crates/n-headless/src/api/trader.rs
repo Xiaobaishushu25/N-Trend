@@ -37,15 +37,7 @@ pub async fn get_trader_status(
     State(ctx): State<Arc<ServerContext>>,
 ) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
-    let health = match client.health().await {
-        Ok(h) => h,
-        Err(e) => {
-            return Json(ApiResponse::<serde_json::Value>::err(format!(
-                "CTP 桥接服务未响应或未启动: {}",
-                e
-            )));
-        }
-    };
+    let health = client.health().await.ok();
     let config = ctx.execution_engine.get_config().await;
     let res = serde_json::json!({
         "health": health,

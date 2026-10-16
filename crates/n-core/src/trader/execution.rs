@@ -138,7 +138,7 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            mode: ExecutionMode::DryRun,
+            mode: ExecutionMode::SemiAuto,
             max_risk_percent: 1.0,
             default_large_volume: 2,
             default_small_volume: 1,
@@ -150,6 +150,7 @@ impl Default for ExecutionConfig {
 pub struct ExecutionEngine {
     client: CtpTraderClient,
     config: RwLock<ExecutionConfig>,
+    config_path: Option<std::path::PathBuf>,
     // key: condition_order_id
     conditions: RwLock<HashMap<String, ConditionOrder>>,
     // key: position_id
@@ -162,9 +163,18 @@ pub struct ExecutionEngine {
 
 impl ExecutionEngine {
     pub fn new(client: CtpTraderClient, config: ExecutionConfig) -> Self {
+        Self::with_config_path(client, config, None)
+    }
+
+    pub fn with_config_path(
+        client: CtpTraderClient,
+        config: ExecutionConfig,
+        config_path: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             client,
             config: RwLock::new(config),
+            config_path,
             conditions: RwLock::new(HashMap::new()),
             positions: RwLock::new(HashMap::new()),
             trade_history: RwLock::new(Vec::new()),
@@ -177,7 +187,13 @@ impl ExecutionEngine {
     }
 
     pub async fn update_config(&self, cfg: ExecutionConfig) {
-        *self.config.write().await = cfg;
+        *self.config.write().await = cfg.clone();
+        if let Some(ref path) = self.config_path {
+            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                let _ = std::fs::write(path, json);
+                tracing::info!("💾 交易执行配置已成功持久化至磁盘: {}", path.display());
+            }
+        }
     }
 
     pub async fn list_conditions(&self) -> Vec<ConditionOrder> {
@@ -373,7 +389,7 @@ impl ExecutionEngine {
                 if touched {
                     let fill_price = ord.entry_price;
                     match mode {
-                        ExecutionMode::DryRun => {
+                        ExecutionMode::MonitorOnly => {
                             ord.state = ConditionState::Filled;
                             ord.note = format!("模拟撮合成交 @ {:.1}", fill_price);
                             to_fill.push((ord.clone(), fill_price));
@@ -774,7 +790,7 @@ mod tests {
     fn create_test_engine() -> ExecutionEngine {
         let client = CtpTraderClient::for_port(8766);
         let config = ExecutionConfig {
-            mode: ExecutionMode::DryRun,
+            mode: ExecutionMode::MonitorOnly,
             max_risk_percent: 1.0,
             default_large_volume: 2,
             default_small_volume: 1,
