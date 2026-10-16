@@ -102,6 +102,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         # updates event queue for incremental polling
         self.update_events: List[Dict[str, Any]] = []
         self.event_counter = 0
+        self._last_account_query_time = 0.0
+        self._last_position_query_time = 0.0
 
     def get_req_id(self) -> int:
         with self.lock:
@@ -195,37 +197,69 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self._start_periodic_query()
 
     def _start_periodic_query(self):
+        """
+        优雅的低频心跳校准循环：
+        CTP 是纯异步事件驱动架构，成交回报 OnRtnTrade 会自动推送并本地更新持仓。
+        因此平时绝不进行高频轮询（避免触发柜台 1Hz 流控甚至被期货公司封禁），
+        仅在就绪后执行一次初始同步，随后以 120 秒低频心跳进行被动数据校准。
+        """
         def loop():
-            time.sleep(0.5)
+            # 1. 服务就绪后先执行首次完整初始化同步
+            time.sleep(1.0)
+            if self.is_ready:
+                try:
+                    self.query_account(force=True)
+                    time.sleep(1.5)
+                    self.query_positions(force=True)
+                except Exception as e:
+                    logger.error(f"初始数据同步异常: {e}")
+
+            # 2. 正常运行期间改为长周期心跳校准（120秒一次），彻底杜绝流控封号风险
             while not self._stop_requested:
-                if self.is_ready:
+                for _ in range(120):
+                    if self._stop_requested:
+                        break
+                    time.sleep(1)
+                if self.is_ready and not self._stop_requested:
                     try:
                         self.query_account()
                         time.sleep(1.5)
                         self.query_positions()
                     except Exception as e:
-                        logger.error(f"定期查询异常: {e}")
-                time.sleep(3.5)
+                        logger.error(f"心跳校准查询异常: {e}")
         t = threading.Thread(target=loop, daemon=True)
         t.start()
 
-    def query_account(self):
+    def query_account(self, force: bool = False):
         if not self.is_logged_in:
             return
+        now = time.time()
+        # 严格遵守 CTP 规范：同一接口查询间隔不得低于 1.5 秒
+        if not force and (now - self._last_account_query_time < 1.5):
+            return
+        self._last_account_query_time = now
         qry_req = tdapi.CThostFtdcQryTradingAccountField()
         qry_req.BrokerID = self.config.get("BrokerID", "9999")
         qry_req.InvestorID = self.config.get("UserID", "")
         self.api.ReqQryTradingAccount(qry_req, self.get_req_id())
 
-    def query_positions(self):
+    def query_positions(self, force: bool = False):
         if not self.is_logged_in:
             return
+        now = time.time()
+        # 严格遵守 CTP 规范：同一接口查询间隔不得低于 1.5 秒
+        if not force and (now - self._last_position_query_time < 1.5):
+            return
+        self._last_position_query_time = now
         qry_req = tdapi.CThostFtdcQryInvestorPositionField()
         qry_req.BrokerID = self.config.get("BrokerID", "9999")
         qry_req.InvestorID = self.config.get("UserID", "")
         self.api.ReqQryInvestorPosition(qry_req, self.get_req_id())
 
     def OnRspQryTradingAccount(self, pAccount, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            logger.warning(f"[资金查询] 柜台反馈提示 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}")
+            return
         if pAccount:
             with self.lock:
                 balance = float(pAccount.Balance)
@@ -245,11 +279,14 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                     "updated_at": time.time(),
                 }
             logger.info(
-                f"[资金查询] 权益: {pAccount.Balance:.2f}, 可用: {pAccount.Available:.2f}, 保证金: {pAccount.CurrMargin:.2f}, 风险度: {risk_ratio*100:.2f}%"
+                f"[资金同步] 权益: {pAccount.Balance:.2f}, 可用: {pAccount.Available:.2f}, 保证金: {pAccount.CurrMargin:.2f}, 风险度: {risk_ratio*100:.2f}%"
             )
             self.emit_event("account", self.account_data)
 
     def OnRspQryInvestorPosition(self, pPosition, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            logger.warning(f"[持仓查询] 柜台反馈提示 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}")
+            return
         if pPosition:
             inst = str(pPosition.InstrumentID)
             posi_dir = "buy" if pPosition.PosiDirection == tdapi.THOST_FTDC_PD_Long else "sell"
@@ -270,7 +307,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 else:
                     self.positions.pop(pos_key, None)
         if bIsLast:
-            logger.info(f"[持仓查询完成] 当前持仓项数: {len(self.positions)}")
+            logger.info(f"[持仓同步] 完成，当前持仓项数: {len(self.positions)}")
             self.emit_event("positions", list(self.positions.values()))
 
     # ── 报单状态回报 ──
@@ -362,10 +399,10 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         threading.Thread(target=self._refresh_after_trade, daemon=True).start()
 
     def _refresh_after_trade(self):
-        time.sleep(1.0)
-        self.query_account()
-        time.sleep(0.5)
-        self.query_positions()
+        time.sleep(1.5)
+        self.query_account(force=True)
+        time.sleep(1.5)
+        self.query_positions(force=True)
 
     def OnRspOrderInsert(self, pInputOrder, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:
@@ -640,10 +677,10 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"success": True, "closed_orders": closed_orders})
 
         elif path == "/sync":
-            # 主动触发资金与持仓同步
-            g_trader_mgr.query_account()
-            time.sleep(0.3)
-            g_trader_mgr.query_positions()
+            # 主动触发资金与持仓同步（带 CTP 1.5s 流控保护）
+            g_trader_mgr.query_account(force=True)
+            time.sleep(1.5)
+            g_trader_mgr.query_positions(force=True)
             return self._send_json(200, {"success": True, "msg": "Sync requested"})
 
         else:
