@@ -23,6 +23,7 @@ pub struct ServerContext {
     pub last_refresh: RwLock<Option<chrono::NaiveDateTime>>,
     pub last_scan: RwLock<Option<chrono::NaiveDateTime>>,
     pub scheduler_running: AtomicBool,
+    pub execution_engine: Arc<n_core::trader::ExecutionEngine>,
 }
 
 impl ServerContext {
@@ -33,6 +34,11 @@ impl ServerContext {
         secrets: ServerSecrets,
     ) -> Arc<Self> {
         let realtime_hub = Arc::new(RealtimeHub::new());
+        let trader_client = n_core::trader::CtpTraderClient::for_port(8766);
+        let execution_engine = Arc::new(n_core::trader::ExecutionEngine::new(
+            trader_client,
+            n_core::trader::ExecutionConfig::default(),
+        ));
         Arc::new(Self {
             db,
             services,
@@ -46,6 +52,7 @@ impl ServerContext {
             last_refresh: RwLock::new(None),
             last_scan: RwLock::new(None),
             scheduler_running: AtomicBool::new(true),
+            execution_engine,
         })
     }
 

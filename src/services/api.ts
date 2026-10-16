@@ -51,6 +51,14 @@ import type {
   DeviceRegisterRequest,
   DeviceRegisterResponse,
   BackupStatus,
+  CtpHealth,
+  ExecutionConfig,
+  TraderAccount,
+  LiveBrokerPosition,
+  LiveConditionOrder,
+  LiveManagedPosition,
+  LiveTradeRecord,
+  LiveTradeStatistics,
 } from '../types'
 
 export const api = {
@@ -208,6 +216,20 @@ export const api = {
   getBackupStatus: () => invoke<BackupStatus>('get_backup_status'),
   triggerDatabaseBackup: () => invoke<string>('trigger_database_backup'),
   openBackupDirectory: () => invoke<void>('open_backup_directory'),
+
+  // ---- Live Trader ----
+  getTraderStatus: () => invoke<{ health: CtpHealth; config: ExecutionConfig }>('get_trader_status'),
+  getTraderAccount: () => invoke<TraderAccount>('get_trader_account'),
+  getTraderPositions: () =>
+    invoke<{ broker_positions: LiveBrokerPosition[]; managed_positions: LiveManagedPosition[] }>('get_trader_positions'),
+  getConditionOrders: () => invoke<LiveConditionOrder[]>('get_condition_orders'),
+  cancelConditionOrder: (id: string) => invoke<any>('cancel_condition_order', { id }),
+  confirmConditionOrder: (id: string) => invoke<any>('confirm_condition_order', { id }),
+  updateTraderConfig: (config: ExecutionConfig) => invoke<ExecutionConfig>('update_trader_config', { config }),
+  emergencyCancelAll: () => invoke<any>('emergency_cancel_all'),
+  emergencyCloseAll: () => invoke<any>('emergency_close_all'),
+  getTradeHistory: () => invoke<LiveTradeRecord[]>('get_trade_history'),
+  getTradeStatistics: () => invoke<LiveTradeStatistics>('get_trade_statistics'),
 }
 
 export function onConnectionStatusChanged(cb: (status: ConnectionStatus) => void) {

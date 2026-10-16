@@ -1,12 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use n_protocol::auth::*;
 use n_protocol::config::*;
 use n_protocol::dto::*;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::client::{AuthRecord, BackupStatus, ConnectionStateDto};
+use crate::client::{AuthRecord, BackupStatus, ConnectionStateDto, ConnectionStatus};
 use crate::state::AppState;
+
+static LOCAL_TRADER_CONFIG: Mutex<Option<Value>> = Mutex::new(None);
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AppInfo {
@@ -968,4 +970,204 @@ pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
         let _ = dir;
         Err("移动端不支持打开本地日志目录".to_string())
     }
+}
+
+// ── Trader Commands ──
+
+#[tauri::command]
+pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.get_trader_status().await {
+            return Ok(res);
+        }
+    }
+    // 当 n-headless 未启动时，直接直连本地运行的 CTP 桥接守护进程 (port 8766)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default();
+    match client.get("http://127.0.0.1:8766/health").send().await {
+        Ok(resp) => {
+            if let Ok(health) = resp.json::<Value>().await {
+                let current_cfg = LOCAL_TRADER_CONFIG
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "mode": "SemiAuto",
+                            "max_risk_percent": 1.0,
+                            "default_large_volume": 2,
+                            "default_small_volume": 1,
+                            "daily_loss_limit_r": 3.0
+                        })
+                    });
+                return Ok(serde_json::json!({
+                    "health": health,
+                    "config": current_cfg
+                }));
+            }
+        }
+        Err(e) => return Err(format!("CTP 桥接服务连接失败: {e}")),
+    }
+    Err("CTP 状态获取失败".to_string())
+}
+
+#[tauri::command]
+pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.get_trader_account().await {
+            return Ok(res);
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default();
+    match client.get("http://127.0.0.1:8766/account").send().await {
+        Ok(resp) => {
+            if let Ok(mut acc) = resp.json::<Value>().await {
+                if acc.get("margin").is_none() {
+                    if let Some(cm) = acc.get("curr_margin") {
+                        acc["margin"] = cm.clone();
+                    }
+                }
+                if acc.get("account_id").is_none() {
+                    acc["account_id"] = Value::String("278272".to_string());
+                }
+                if acc.get("risk_ratio").is_none() {
+                    let bal = acc.get("balance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let mgn = acc.get("margin").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let ratio = if bal > 0.0 { mgn / bal } else { 0.0 };
+                    acc["risk_ratio"] = serde_json::json!(ratio);
+                }
+                return Ok(acc);
+            }
+        }
+        Err(e) => return Err(format!("CTP 账户查询失败: {e}")),
+    }
+    Err("CTP 账户获取失败".to_string())
+}
+
+#[tauri::command]
+pub async fn get_trader_positions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.get_trader_positions().await {
+            return Ok(res);
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1500))
+        .build()
+        .unwrap_or_default();
+    match client.get("http://127.0.0.1:8766/positions").send().await {
+        Ok(resp) => {
+            if let Ok(broker_positions) = resp.json::<Value>().await {
+                return Ok(serde_json::json!({
+                    "broker_positions": broker_positions,
+                    "managed_positions": []
+                }));
+            }
+        }
+        Err(e) => return Err(format!("CTP 持仓查询失败: {e}")),
+    }
+    Err("CTP 持仓获取失败".to_string())
+}
+
+#[tauri::command]
+pub async fn get_condition_orders(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if let Ok(res) = state.api.get_condition_orders().await {
+        return Ok(res);
+    }
+    Ok(serde_json::json!([]))
+}
+
+#[tauri::command]
+pub async fn cancel_condition_order(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Value, String> {
+    state.api.cancel_condition_order(&id).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn confirm_condition_order(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Value, String> {
+    state.api.confirm_condition_order(&id).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn update_trader_config(
+    state: State<'_, Arc<AppState>>,
+    config: Value,
+) -> Result<Value, String> {
+    *LOCAL_TRADER_CONFIG.lock().unwrap() = Some(config.clone());
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.update_trader_config(&config).await {
+            return Ok(res);
+        }
+    }
+    // 当服务端离线时，本地直接确认模式更新
+    Ok(config)
+}
+
+#[tauri::command]
+pub async fn emergency_cancel_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.emergency_cancel_all().await {
+            return Ok(res);
+        }
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:8766/emergency/cancel_all")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    resp.json::<Value>().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn emergency_close_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
+        if let Ok(res) = state.api.emergency_close_all().await {
+            return Ok(res);
+        }
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("http://127.0.0.1:8766/emergency/close_all")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    resp.json::<Value>().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_trade_history(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if let Ok(res) = state.api.get_trade_history().await {
+        return Ok(res);
+    }
+    Ok(serde_json::json!([]))
+}
+
+#[tauri::command]
+pub async fn get_trade_statistics(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if let Ok(res) = state.api.get_trade_statistics().await {
+        return Ok(res);
+    }
+    Ok(serde_json::json!({
+        "total_trades": 0,
+        "win_trades": 0,
+        "loss_trades": 0,
+        "win_rate_pct": 0.0,
+        "total_r": 0.0,
+        "avg_r": 0.0,
+        "profit_factor": 0.0,
+        "large_trades_count": 0,
+        "small_trades_count": 0,
+        "exit_reason_breakdown": {}
+    }))
 }

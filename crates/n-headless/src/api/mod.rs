@@ -11,6 +11,7 @@ pub mod quotes;
 pub mod settings;
 pub mod signals;
 pub mod symbols;
+pub mod trader;
 pub mod ws_handler;
 
 use crate::state::ServerContext;
@@ -173,7 +174,19 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         )
         // 数据完整性
         .route("/integrity", get(integrity::check_integrity))
-        .route("/integrity/repair", post(integrity::repair_integrity));
+        .route("/integrity/repair", post(integrity::repair_integrity))
+        // SimNow 自动化交易与持仓风控
+        .route("/trader/status", get(trader::get_trader_status))
+        .route("/trader/account", get(trader::get_trader_account))
+        .route("/trader/positions", get(trader::get_trader_positions))
+        .route("/trader/conditions", get(trader::get_condition_orders))
+        .route("/trader/condition/cancel", post(trader::cancel_condition_order))
+        .route("/trader/condition/confirm", post(trader::confirm_condition_order))
+        .route("/trader/config", post(trader::update_trader_config))
+        .route("/trader/emergency/cancel-all", post(trader::emergency_cancel_all))
+        .route("/trader/emergency/close-all", post(trader::emergency_close_all))
+        .route("/trader/history", get(trader::get_trade_history))
+        .route("/trader/statistics", get(trader::get_trade_statistics));
 
     Router::new()
         .route("/healthz", get(meta::healthz))

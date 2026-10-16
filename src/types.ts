@@ -867,3 +867,126 @@ export interface BackupStatus {
 export interface V2ModelRow { model_id: string; name: string; schema_version: string; feature_whitelist: string; train_window: string; dataset_hash: string; coefficients: string; spline_knots: string | null; metrics: string; created_at: string; }
 export interface V2PredictionRow { id: number; event_id: number; model_id: string; p_win: number | null; logit: number | null; feature_hash: string; predicted_at: string; }
 export interface V2ReportBundle { "logistic_report.md"?: string; "gam_report.md"?: string; "acceptance.md"?: string; [k: string]: string | undefined; }
+
+// ---- Live Trader ----
+export interface CtpHealth {
+  healthy: boolean
+  ready: boolean
+  trading_day: string
+  account_id?: string
+  broker_id?: string
+  message?: string
+}
+
+export interface ExecutionConfig {
+  mode: 'MonitorOnly' | 'SemiAuto' | 'FullAuto'
+  max_risk_percent: number
+  default_large_volume: number
+  default_small_volume: number
+  daily_loss_limit_r: number
+}
+
+export interface TraderAccount {
+  account_id: string
+  pre_balance: number
+  balance: number
+  available: number
+  margin: number
+  close_profit: number
+  position_profit: number
+  commission: number
+  risk_ratio: number
+}
+
+export interface LiveBrokerPosition {
+  instrument_id: string
+  direction: string
+  position: number
+  today_position: number
+  yd_position: number
+  open_cost: number
+  position_cost: number
+  position_profit: number
+  margin: number
+}
+
+export interface LiveConditionOrder {
+  id: string
+  event_id?: number | null
+  symbol: string
+  instrument_id: string
+  direction: string
+  entry_price: number
+  stop_price: number
+  target_price: number
+  risk: number
+  score: number
+  tier: 'Large' | 'Small'
+  volume: number
+  state: 'Pending' | 'WaitingConfirm' | 'Triggered' | 'Filled' | 'Canceled' | 'Rejected'
+  created_at: number
+  note: string
+}
+
+export interface LiveManagedPosition {
+  id: string
+  condition_order_id: string
+  symbol: string
+  instrument_id: string
+  direction: string
+  tier: 'Large' | 'Small'
+  fill_price: number
+  initial_stop_price: number
+  target_price: number
+  risk: number
+  volume: number
+  open_ts: string
+  bars_held: number
+  max_mfe_r: number
+  max_mae_r: number
+  trailing_grade: number
+  current_stop_price: number
+  lot1_closed: boolean
+  exit_reason?: string | null
+  exit_price?: number | null
+  is_closed: boolean
+  realized_pnl_pts?: number | null
+  r_multiple?: number | null
+}
+
+export interface LiveTradeRecord {
+  id: string
+  condition_order_id: string
+  symbol: string
+  instrument_id: string
+  direction: string
+  tier: 'Large' | 'Small'
+  volume: number
+  fill_price: number
+  exit_price: number
+  risk: number
+  initial_stop_price: number
+  target_price: number
+  open_ts: string
+  exit_ts: string
+  exit_reason: string
+  realized_pnl_pts: number
+  r_multiple: number
+  max_mfe_r: number
+  max_mae_r: number
+  bars_held: number
+}
+
+export interface LiveTradeStatistics {
+  total_trades: number
+  win_trades: number
+  loss_trades: number
+  win_rate_pct: number
+  total_r: number
+  avg_r: number
+  profit_factor: number
+  large_trades_count: number
+  small_trades_count: number
+  exit_reason_breakdown: Record<string, number>
+}
+

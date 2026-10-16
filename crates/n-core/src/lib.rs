@@ -14,6 +14,7 @@ pub mod scheduler;
 pub mod service;
 pub mod session;
 pub mod storage;
+pub mod trader;
 
 pub mod v2;
 pub use sea_orm;

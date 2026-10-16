@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capabilities for main and standalone windows",
-  "windows": ["main", "settings", "review", "notifications"],
+  "windows": ["main", "settings", "review", "notifications", "trade-review", "live-trader"],
   "permissions": [
     "core:default",
     "core:webview:allow-create-webview-window",

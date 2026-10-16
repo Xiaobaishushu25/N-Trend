@@ -633,4 +633,52 @@ impl RemoteApiClient {
     pub async fn repair_symbol_integrity(&self, symbol: &str) -> Result<serde_json::Value, ApiErrorResponse> {
         self.execute(self.request(Method::POST, &format!("integrity/repair?symbol={symbol}"))).await
     }
+
+    // ── Trader ──
+
+    pub async fn get_trader_status(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/status")).await
+    }
+
+    pub async fn get_trader_account(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/account")).await
+    }
+
+    pub async fn get_trader_positions(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/positions")).await
+    }
+
+    pub async fn get_condition_orders(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/conditions")).await
+    }
+
+    pub async fn cancel_condition_order(&self, id: &str) -> Result<serde_json::Value, ApiErrorResponse> {
+        let req = serde_json::json!({ "id": id });
+        self.execute(self.request(Method::POST, "trader/condition/cancel").json(&req)).await
+    }
+
+    pub async fn confirm_condition_order(&self, id: &str) -> Result<serde_json::Value, ApiErrorResponse> {
+        let req = serde_json::json!({ "id": id });
+        self.execute(self.request(Method::POST, "trader/condition/confirm").json(&req)).await
+    }
+
+    pub async fn update_trader_config(&self, cfg: &serde_json::Value) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "trader/config").json(cfg)).await
+    }
+
+    pub async fn emergency_cancel_all(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "trader/emergency/cancel-all")).await
+    }
+
+    pub async fn emergency_close_all(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "trader/emergency/close-all")).await
+    }
+
+    pub async fn get_trade_history(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/history")).await
+    }
+
+    pub async fn get_trade_statistics(&self) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "trader/statistics")).await
+    }
 }

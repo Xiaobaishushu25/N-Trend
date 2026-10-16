@@ -227,6 +227,17 @@ pub fn run() {
             commands::get_finality_simulation,
             commands::get_finality_sentinel_eval,
             commands::open_log_directory,
+            commands::get_trader_status,
+            commands::get_trader_account,
+            commands::get_trader_positions,
+            commands::get_condition_orders,
+            commands::cancel_condition_order,
+            commands::confirm_condition_order,
+            commands::update_trader_config,
+            commands::emergency_cancel_all,
+            commands::emergency_close_all,
+            commands::get_trade_history,
+            commands::get_trade_statistics,
         ])
         .run(tauri::generate_context!())
         .expect("运行 N趋势 客户端失败");

@@ -1,8 +1,10 @@
-﻿import { createRouter, createWebHashHistory } from 'vue-router'
+import { createRouter, createWebHashHistory } from 'vue-router'
 import DashboardView from '../views/DashboardView.vue'
 import ChartView from '../views/ChartView.vue'
 import NotificationsView from '../views/NotificationsView.vue'
 import ReviewView from '../views/ReviewView.vue'
+import TradeReviewView from '../views/TradeReviewView.vue'
+import LiveTraderView from '../views/LiveTraderView.vue'
 import SettingsView from '../views/SettingsView.vue'
 
 export default createRouter({
@@ -25,6 +27,18 @@ export default createRouter({
       path: '/review',
       name: 'review',
       component: ReviewView,
+      meta: { bare: true },
+    },
+    {
+      path: '/trade-review',
+      name: 'trade-review',
+      component: TradeReviewView,
+      meta: { bare: true },
+    },
+    {
+      path: '/live-trader',
+      name: 'live-trader',
+      component: LiveTraderView,
       meta: { bare: true },
     },
     {

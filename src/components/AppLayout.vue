@@ -22,12 +22,14 @@ import { usePlatform } from '../utils/platform'
 import {
   ArrowLeft,
   BellX,
+  Bolt,
   Clock,
   Database,
   DotsVertical,
   History,
   Plus,
   Refresh,
+  ReportAnalytics,
   Scan,
   Search,
   Settings as SettingsIcon,
@@ -41,6 +43,8 @@ import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
 import { openNotificationsWindow } from '../utils/openNotificationsWindow'
 import { openReviewWindow } from '../utils/openReviewWindow'
+import { openTradeReviewWindow } from '../utils/openTradeReviewWindow'
+import { openLiveTraderWindow } from '../utils/openLiveTraderWindow'
 import { openSettingsWindow } from '../utils/openSettingsWindow'
 import { dismissAll, notify, notifyItems } from '../utils/notify'
 import TitleBar from './TitleBar.vue'
@@ -72,16 +76,25 @@ const dataSourceTagType = computed<'default' | 'info' | 'warning' | 'success'>((
 
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
 const isStandaloneWindow = computed(
-  () => route.name === 'settings' || route.name === 'review' || route.name === 'notifications',
+  () =>
+    route.name === 'settings' ||
+    route.name === 'review' ||
+    route.name === 'trade-review' ||
+    route.name === 'live-trader' ||
+    route.name === 'notifications',
 )
 const windowTitle = computed(() =>
   route.name === 'settings'
     ? '系统设置'
     : route.name === 'review'
       ? '复盘统计'
-      : route.name === 'notifications'
-        ? '历史通知'
-        : '',
+      : route.name === 'trade-review'
+        ? '量化复盘工作台'
+        : route.name === 'live-trader'
+          ? '实盘量化执行终端'
+          : route.name === 'notifications'
+            ? '历史通知'
+            : '',
 )
 const activeNotifyCount = computed(() => notifyItems.length)
 
@@ -249,6 +262,16 @@ const actionOptions = computed<DropdownOption[]>(() => [
 
 const mobileActionOptions = computed<DropdownOption[]>(() => [
   {
+    label: '实盘量化',
+    key: 'live-trader',
+    icon: () => h(NIcon, { component: Bolt, size: 16, color: '#f5c23f' }),
+  },
+  {
+    label: '量化复盘',
+    key: 'trade-review',
+    icon: () => h(NIcon, { component: ReportAnalytics, size: 16 }),
+  },
+  {
     label: '复盘统计',
     key: 'review',
     icon: () => h(NIcon, { component: History, size: 16 }),
@@ -268,7 +291,9 @@ const mobileActionOptions = computed<DropdownOption[]>(() => [
 ])
 
 function onMobileActionSelect(key: string) {
-  if (key === 'review') openReviewWindow()
+  if (key === 'live-trader') openLiveTraderWindow()
+  else if (key === 'trade-review') openTradeReviewWindow()
+  else if (key === 'review') openReviewWindow()
   else if (key === 'notifications') openNotificationsWindow()
   else if (key === 'settings') openSettingsWindow()
   else onActionSelect(key)
@@ -638,6 +663,30 @@ onBeforeUnmount(() => {
               </template>
             </n-button>
           </n-dropdown>
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="实盘量化执行终端 (SimNow)"
+            class="live-trader-button"
+            @click="openLiveTraderWindow"
+          >
+            <template #icon>
+              <n-icon :component="Bolt" size="18" color="#f5c23f" />
+            </template>
+          </n-button>
+          <n-button
+            quaternary
+            circle
+            size="small"
+            title="量化复盘工作台"
+            class="trade-review-button"
+            @click="openTradeReviewWindow"
+          >
+            <template #icon>
+              <n-icon :component="ReportAnalytics" size="18" />
+            </template>
+          </n-button>
           <n-button
             quaternary
             circle
