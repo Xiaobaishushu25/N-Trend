@@ -691,6 +691,7 @@ def main():
     trader_api.Init()
 
     # Start HTTP Server
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
     server_address = ("127.0.0.1", args.port)
     httpd = socketserver.ThreadingTCPServer(server_address, CtpHttpHandler)
     httpd.daemon_threads = True
