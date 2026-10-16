@@ -34,7 +34,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/devices/:id", delete(devices::revoke_device))
         .route("/devices/:id/role", put(devices::update_device_role))
         // 品种与分组
-        .route("/symbols", get(symbols::get_symbols).post(symbols::add_symbol))
+        .route(
+            "/symbols",
+            get(symbols::get_symbols).post(symbols::add_symbol),
+        )
         .route("/symbols/:code", delete(symbols::remove_symbol))
         .route("/symbols/:code/groups", get(symbols::get_symbol_groups))
         .route("/symbols/reorder", post(symbols::reorder_symbols))
@@ -44,7 +47,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/symbols/refresh", post(symbols::refresh_symbol_list))
         .route("/symbols/enrich", post(symbols::enrich_symbol_names))
         .route("/contracts/search", get(symbols::search_contracts))
-        .route("/groups", get(symbols::list_groups).post(symbols::create_group))
+        .route(
+            "/groups",
+            get(symbols::list_groups).post(symbols::create_group),
+        )
         .route(
             "/groups/:id",
             put(symbols::rename_group).delete(symbols::delete_group),
@@ -64,10 +70,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
             post(symbols::reorder_group_symbols),
         )
         // K 线与趋势线
-        .route(
-            "/klines/:symbol/:timeframe",
-            get(klines::get_klines),
-        )
+        .route("/klines/:symbol/:timeframe", get(klines::get_klines))
         .route(
             "/chart-klines/:symbol/:timeframe",
             get(klines::get_chart_klines),
@@ -76,10 +79,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
             "/trend-series/:symbol/:timeframe",
             get(klines::get_trend_series),
         )
-        .route(
-            "/intraday/:symbol",
-            get(klines::get_intraday_chart),
-        )
+        .route("/intraday/:symbol", get(klines::get_intraday_chart))
         // 实时行情
         .route("/quotes", get(quotes::get_market_snapshot))
         // 信号与复盘
@@ -96,10 +96,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/review/stats", get(signals::get_review_stats))
         .route("/review/outcomes", get(signals::get_recent_outcomes))
         .route("/review/signal/:id", get(signals::get_review_signal))
-        .route(
-            "/review/outcomes/refresh",
-            post(signals::refresh_outcomes),
-        )
+        .route("/review/outcomes/refresh", post(signals::refresh_outcomes))
         .route("/v2/models", get(signals::get_v2_models))
         .route("/v2/models/status", post(signals::set_v2_model_status))
         .route("/v2/predictions", get(signals::get_v2_predictions))
@@ -159,7 +156,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/admin/bridge/restart", post(admin::restart_bridge))
         .route("/admin/runtime/restart", post(admin::restart_runtime))
         .route("/admin/runtime/status", get(admin::get_scheduler_status))
-        .route("/admin/runtime/scheduler", post(admin::set_scheduler_running))
+        .route(
+            "/admin/runtime/scheduler",
+            post(admin::set_scheduler_running),
+        )
         .route(
             "/admin/database-backup",
             get(admin::download_database_backup),
@@ -168,23 +168,33 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/actions/refresh", post(actions::refresh_data_now))
         .route("/actions/scan", post(actions::run_scan_now))
         .route("/actions/scan-fast", post(actions::run_scan_fast_now))
-        .route(
-            "/actions/rebuild-events",
-            post(actions::rebuild_events_now),
-        )
+        .route("/actions/rebuild-events", post(actions::rebuild_events_now))
         // 数据完整性
         .route("/integrity", get(integrity::check_integrity))
         .route("/integrity/repair", post(integrity::repair_integrity))
         // SimNow 自动化交易与持仓风控
         .route("/trader/status", get(trader::get_trader_status))
+        .route("/trader/snapshot", get(trader::get_trader_snapshot))
         .route("/trader/account", get(trader::get_trader_account))
         .route("/trader/positions", get(trader::get_trader_positions))
         .route("/trader/conditions", get(trader::get_condition_orders))
-        .route("/trader/condition/cancel", post(trader::cancel_condition_order))
-        .route("/trader/condition/confirm", post(trader::confirm_condition_order))
+        .route(
+            "/trader/condition/cancel",
+            post(trader::cancel_condition_order),
+        )
+        .route(
+            "/trader/condition/confirm",
+            post(trader::confirm_condition_order),
+        )
         .route("/trader/config", post(trader::update_trader_config))
-        .route("/trader/emergency/cancel-all", post(trader::emergency_cancel_all))
-        .route("/trader/emergency/close-all", post(trader::emergency_close_all))
+        .route(
+            "/trader/emergency/cancel-all",
+            post(trader::emergency_cancel_all),
+        )
+        .route(
+            "/trader/emergency/close-all",
+            post(trader::emergency_close_all),
+        )
         .route("/trader/history", get(trader::get_trade_history))
         .route("/trader/statistics", get(trader::get_trade_statistics));
 
@@ -214,9 +224,21 @@ async fn log_http_request(
     // 过滤高频健康探测请求避免日志冗余
     if path != "/healthz" {
         if status >= 400 {
-            tracing::warn!("📥 [HTTP] {} {} -> {} ({}ms)", method, path, status, elapsed);
+            tracing::warn!(
+                "📥 [HTTP] {} {} -> {} ({}ms)",
+                method,
+                path,
+                status,
+                elapsed
+            );
         } else {
-            tracing::info!("📥 [HTTP] {} {} -> {} ({}ms)", method, path, status, elapsed);
+            tracing::info!(
+                "📥 [HTTP] {} {} -> {} ({}ms)",
+                method,
+                path,
+                status,
+                elapsed
+            );
         }
     }
 

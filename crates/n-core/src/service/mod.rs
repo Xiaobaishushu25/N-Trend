@@ -2,9 +2,9 @@
 
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
+use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
 use sea_orm::{DatabaseConnection, NotSet, Set};
 use serde::Serialize;
-use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1505,8 +1505,14 @@ impl Services {
                             match ds_for_spawn.fetch_trading_calendar(None, None).await {
                                 Ok(days) => {
                                     crate::session::SessionCalendar::update_trading_calendar(&days);
-                                    let _ = crate::session::SessionCalendar::save_trading_calendar_file(&cal_path_clone);
-                                    tracing::info!("📅 成功同步并持久化天勤法定交易日历 ({}天)", days.len());
+                                    let _ =
+                                        crate::session::SessionCalendar::save_trading_calendar_file(
+                                            &cal_path_clone,
+                                        );
+                                    tracing::info!(
+                                        "📅 成功同步并持久化天勤法定交易日历 ({}天)",
+                                        days.len()
+                                    );
                                 }
                                 Err(err) => {
                                     tracing::warn!("同步天勤法定交易日历失败: {err:#}");
@@ -2411,7 +2417,9 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_signals::Model>> {
-        let cutoff = (now - ChronoDuration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff = (now - ChronoDuration::days(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         if let Err(err) = repo::prune_preclose_signals(&self.db, &cutoff).await {
             tracing::warn!("自动清理过期收盘前预检测记录失败: {err:#}");
         }
@@ -2471,7 +2479,9 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_candidates::Model>> {
-        let cutoff = (now - ChronoDuration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff = (now - ChronoDuration::days(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         if let Err(err) = repo::prune_preclose_candidates(&self.db, &cutoff).await {
             tracing::warn!("自动清理过期临时未收盘候选记录失败: {err:#}");
         }
@@ -2856,7 +2866,10 @@ impl Services {
         repo::delete_symbol_klines(&self.db, code).await?;
         repo::delete_symbol_rollovers(&self.db, code).await?;
         self.live_5m_bars.write().await.remove(code);
-        self.live_derived_bars.write().await.retain(|(sym, _), _| sym != code);
+        self.live_derived_bars
+            .write()
+            .await
+            .retain(|(sym, _), _| sym != code);
         Ok(())
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
@@ -3653,10 +3666,18 @@ impl Services {
 
     /// 获取今日开盘以来的分时图数据（基于 1 分钟序列与实时均价聚合）
     pub async fn get_intraday_chart(&self, symbol: &str) -> Result<IntradayChartResponse> {
-        let quotes = self.data_source.fetch_quotes(&[symbol.to_string()]).await.unwrap_or_default();
+        let quotes = self
+            .data_source
+            .fetch_quotes(&[symbol.to_string()])
+            .await
+            .unwrap_or_default();
         let prev_settle = quotes.get(symbol).map(|q| q.prev_settle).unwrap_or(0.0);
 
-        let period = if self.data_source.tq_is_available() { "1m" } else { "1" };
+        let period = if self.data_source.tq_is_available() {
+            "1m"
+        } else {
+            "1"
+        };
         let klines = match self.data_source.fetch_minute_raw(symbol, period, 600).await {
             Ok(raw) if !raw.klines.is_empty() => raw.klines,
             _ => self.data_source.fetch_minute(symbol, period, 600).await?,
@@ -3667,7 +3688,9 @@ impl Services {
         let klines: Vec<_> = klines
             .into_iter()
             .filter(|k| {
-                if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&k.datetime, "%Y-%m-%d %H:%M:%S") {
+                if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&k.datetime, "%Y-%m-%d %H:%M:%S")
+                {
                     dt <= now_limit
                 } else {
                     true
@@ -3686,8 +3709,12 @@ impl Services {
         // 倒推寻找当前交易日的开盘起点（寻找相邻两根 bar 间隔超过 3 小时且发生于日盘收盘后的断档）
         let mut start_idx = 0;
         for i in (1..klines.len()).rev() {
-            let prev_dt = chrono::NaiveDateTime::parse_from_str(&klines[i - 1].datetime, "%Y-%m-%d %H:%M:%S").ok();
-            let curr_dt = chrono::NaiveDateTime::parse_from_str(&klines[i].datetime, "%Y-%m-%d %H:%M:%S").ok();
+            let prev_dt =
+                chrono::NaiveDateTime::parse_from_str(&klines[i - 1].datetime, "%Y-%m-%d %H:%M:%S")
+                    .ok();
+            let curr_dt =
+                chrono::NaiveDateTime::parse_from_str(&klines[i].datetime, "%Y-%m-%d %H:%M:%S")
+                    .ok();
             if let (Some(p), Some(c)) = (prev_dt, curr_dt) {
                 let diff_mins = (c - p).num_minutes();
                 if diff_mins > 180 {
@@ -3743,19 +3770,27 @@ impl Services {
 
     /// 根据实时行情快照更新常驻内存中的 5m 未决 K 线。
     /// 在当前 5m 桶内就地更新最新价、最高价、最低价；跨入新桶时开盘价继承前一桶收盘价，返回被更新的 K 线列表。
-    pub async fn update_live_bars_from_quotes(&self, snapshots: &[MarketSnapshot]) -> Vec<KlineDto> {
+    pub async fn update_live_bars_from_quotes(
+        &self,
+        snapshots: &[MarketSnapshot],
+    ) -> Vec<KlineDto> {
         let now = chrono::Local::now();
         if !crate::scheduler::is_trading_time(&now) {
             return Vec::new();
         }
         let now_dt = now.naive_local();
-        let bucket_5m_end = crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
+        let bucket_5m_end =
+            crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
 
         let mut updated = Vec::new();
         let mut map = self.live_5m_bars.write().await;
         for s in snapshots {
-            let Some(latest) = s.latest else { continue; };
-            if latest <= 0.0 { continue; }
+            let Some(latest) = s.latest else {
+                continue;
+            };
+            if latest <= 0.0 {
+                continue;
+            }
             let symbol = &s.code;
 
             match map.get_mut(symbol) {
@@ -3771,7 +3806,9 @@ impl Services {
                 }
                 Some(bar) => {
                     // 判断是否紧邻上一桶（时间差 <= 10 分钟且处于同一天），若跨日或跨休市则开盘价取当前最新价
-                    let is_consecutive = if let Ok(prev_dt) = chrono::NaiveDateTime::parse_from_str(&bar.ts, "%Y-%m-%d %H:%M:%S") {
+                    let is_consecutive = if let Ok(prev_dt) =
+                        chrono::NaiveDateTime::parse_from_str(&bar.ts, "%Y-%m-%d %H:%M:%S")
+                    {
                         let diff_min = (now_dt - prev_dt).num_minutes();
                         diff_min >= 0 && diff_min <= 10 && prev_dt.date() == now_dt.date()
                     } else {
@@ -3824,13 +3861,16 @@ impl Services {
             return None;
         }
         let now_dt = now.naive_local();
-        let bucket_5m_end = crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
+        let bucket_5m_end =
+            crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
 
         // 1. 如果天勤可用，设置 80ms 极短超时快速探测一次天勤内存中是否有真实未决 5m 柱
         if self.data_source.tq_is_available() {
             let tq = self.data_source.tq_client().await;
             let query = tq.fetch_minute_raw(symbol, "5m", 1);
-            if let Ok(Ok(raw)) = tokio::time::timeout(std::time::Duration::from_millis(80), query).await {
+            if let Ok(Ok(raw)) =
+                tokio::time::timeout(std::time::Duration::from_millis(80), query).await
+            {
                 if let Some(last) = raw.klines.into_iter().last() {
                     let dto = KlineDto {
                         symbol: symbol.to_string(),
@@ -3845,7 +3885,10 @@ impl Services {
                         source: "tqsdk_partial".to_string(),
                         rollover: false,
                     };
-                    self.live_5m_bars.write().await.insert(symbol.to_string(), dto.clone());
+                    self.live_5m_bars
+                        .write()
+                        .await
+                        .insert(symbol.to_string(), dto.clone());
                     return Some(dto);
                 }
             }
@@ -3878,7 +3921,10 @@ impl Services {
                         source: "live_quote".to_string(),
                         rollover: false,
                     };
-                    self.live_5m_bars.write().await.insert(symbol.to_string(), dto.clone());
+                    self.live_5m_bars
+                        .write()
+                        .await
+                        .insert(symbol.to_string(), dto.clone());
                     return Some(dto);
                 }
             }
@@ -3912,7 +3958,9 @@ impl Services {
             _ => 90,
         };
 
-        let closed_models = repo::klines(&self.db, symbol, "5m", Some(needed), None).await.ok()?;
+        let closed_models = repo::klines(&self.db, symbol, "5m", Some(needed), None)
+            .await
+            .ok()?;
         let mut bars: Vec<Kline> = closed_models.iter().map(model_to_fetch).collect();
 
         let live_bar = Kline {
@@ -3952,10 +4000,10 @@ impl Services {
                 source: "derived_partial".to_string(),
                 rollover: false,
             };
-            self.live_derived_bars
-                .write()
-                .await
-                .insert((symbol.to_string(), target_tf.as_str().to_string()), dto.clone());
+            self.live_derived_bars.write().await.insert(
+                (symbol.to_string(), target_tf.as_str().to_string()),
+                dto.clone(),
+            );
             Some(dto)
         } else {
             None
@@ -4085,23 +4133,42 @@ impl Services {
     /// 实时现价快照：拉取启用品种的实时价（优先天勤，回退新浪）。
     /// 缺失/解析失败的品种返回 `latest: None`，由前端回退到库内旧数据。
     pub async fn realtime_quotes(&self) -> Result<Vec<MarketSnapshot>> {
+        Ok(self.realtime_quotes_with_contracts(&[]).await?.0)
+    }
+
+    /// Fetch held contracts in the same market-data batch, but keep them separate
+    /// from the enabled symbols used by chart aggregation and strategy scanning.
+    pub async fn realtime_quotes_with_contracts(
+        &self,
+        contracts: &[String],
+    ) -> Result<(Vec<MarketSnapshot>, Vec<MarketSnapshot>)> {
         let symbols = repo::list_symbols(&self.db, true).await?;
-        let codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+        let mut codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+        for code in contracts {
+            if !codes.iter().any(|c| c.eq_ignore_ascii_case(code)) {
+                codes.push(code.clone());
+            }
+        }
         if codes.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let quotes = self.data_source.fetch_quotes(&codes).await?;
-        Ok(symbols
-            .into_iter()
-            .map(|s| {
-                let q = quotes.get(&s.code);
-                MarketSnapshot {
-                    code: s.code,
-                    latest: q.map(|q| q.latest),
-                    change_pct: q.and_then(|q| q.change_pct),
-                }
-            })
-            .collect())
+        let snapshot = |code: String| {
+            let q = quotes.get(&code).or_else(|| {
+                quotes
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&code))
+                    .map(|(_, quote)| quote)
+            });
+            MarketSnapshot {
+                code,
+                latest: q.map(|q| q.latest),
+                change_pct: q.and_then(|q| q.change_pct),
+            }
+        };
+        let enabled = symbols.into_iter().map(|s| snapshot(s.code)).collect();
+        let held = contracts.iter().cloned().map(snapshot).collect();
+        Ok((enabled, held))
     }
 
     /// 订阅数据源降级/恢复事件通知。
@@ -4420,7 +4487,9 @@ impl Services {
     }
 
     /// 获取当前仍处于活跃有效期的单K（上影锤/下影锤）形态列表
-    pub async fn get_active_single_bars(&self) -> Result<Vec<crate::analyze::model::SingleBarAlert>> {
+    pub async fn get_active_single_bars(
+        &self,
+    ) -> Result<Vec<crate::analyze::model::SingleBarAlert>> {
         let now_str = crate::analyze::time::now_display();
         {
             let mut cache = self.active_single_bars.write().await;
@@ -4440,8 +4509,12 @@ impl Services {
                         let expire = crate::analyze::indicators::bare_expire_ts(&sig.bar_ts);
                         if expire > now_str {
                             let (kind_s, label) = match sig.kind {
-                                crate::analyze::indicators::BareKind::Hammer => ("hammer", "下影锤"),
-                                crate::analyze::indicators::BareKind::Needle => ("needle", "上影锤"),
+                                crate::analyze::indicators::BareKind::Hammer => {
+                                    ("hammer", "下影锤")
+                                }
+                                crate::analyze::indicators::BareKind::Needle => {
+                                    ("needle", "上影锤")
+                                }
                             };
                             results.push(crate::analyze::model::SingleBarAlert {
                                 symbol: sym.code,

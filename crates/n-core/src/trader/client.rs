@@ -1,6 +1,6 @@
-use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use std::time::Duration;
 
 use super::model::*;
 
@@ -8,6 +8,67 @@ use super::model::*;
 pub struct CtpTraderClient {
     base_url: String,
     http: Client,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[tokio::test]
+    async fn stream_handles_fragmented_unicode_multiple_frames_and_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).unwrap();
+            let body = "data: {\"revision\":1,\"message\":\"持仓\"}\n\ndata: {\"revision\":2}\n\n";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            // Include UTF-8 splits and several events on one connection.
+            for fragment in body.as_bytes().chunks(2) {
+                socket.write_all(fragment).unwrap();
+            }
+        });
+        let client = CtpTraderClient::new(format!("http://{address}"));
+        let mut stream = client.event_stream().await.unwrap();
+        assert_eq!(stream.next_snapshot().await.unwrap()["message"], "持仓");
+        assert_eq!(stream.next_snapshot().await.unwrap()["revision"], 2);
+        assert!(stream.next_snapshot().await.is_err());
+        worker.join().unwrap();
+    }
+}
+
+pub struct TraderSnapshotStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+}
+
+impl TraderSnapshotStream {
+    pub async fn next_snapshot(&mut self) -> Result<serde_json::Value> {
+        loop {
+            if let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                if let Some(data) = line.strip_prefix(b"data: ") {
+                    return serde_json::from_slice(data).context("CTP 快照格式错误");
+                }
+                continue;
+            }
+            let chunk =
+                tokio::time::timeout(Duration::from_secs(40), self.response.chunk()).await??;
+            let Some(chunk) = chunk else {
+                anyhow::bail!("CTP 快照推送连接关闭")
+            };
+            self.buffer.extend_from_slice(&chunk);
+            if self.buffer.len() > 4 * 1024 * 1024 {
+                anyhow::bail!("CTP 推送帧过大");
+            }
+        }
+    }
 }
 
 impl CtpTraderClient {
@@ -21,6 +82,23 @@ impl CtpTraderClient {
 
     pub fn for_port(port: u16) -> Self {
         Self::new(format!("http://127.0.0.1:{port}"))
+    }
+
+    /// A separate client has no total-body timeout for the persistent SSE stream.
+    /// The consumer applies an idle timeout to each received chunk instead.
+    pub async fn event_stream(&self) -> Result<TraderSnapshotStream> {
+        let response = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()?
+            .get(format!("{}/events", self.base_url))
+            .send()
+            .await?
+            .error_for_status()
+            .context("CTP 快照推送连接失败")?;
+        Ok(TraderSnapshotStream {
+            response,
+            buffer: Vec::new(),
+        })
     }
 
     pub async fn health(&self) -> Result<TraderHealth> {
@@ -135,20 +213,29 @@ impl CtpTraderClient {
         let url = format!("{}/emergency/cancel_all", self.base_url);
         let resp = self.http.post(&url).send().await?;
         let val = resp.json::<serde_json::Value>().await?;
-        Ok(val.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
+        Ok(val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     pub async fn emergency_close_all(&self) -> Result<bool> {
         let url = format!("{}/emergency/close_all", self.base_url);
         let resp = self.http.post(&url).send().await?;
         let val = resp.json::<serde_json::Value>().await?;
-        Ok(val.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
+        Ok(val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     pub async fn sync(&self) -> Result<bool> {
         let url = format!("{}/sync", self.base_url);
         let resp = self.http.post(&url).send().await?;
         let val = resp.json::<serde_json::Value>().await?;
-        Ok(val.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
+        Ok(val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 }

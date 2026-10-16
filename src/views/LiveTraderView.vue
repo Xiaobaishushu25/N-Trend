@@ -128,15 +128,15 @@ function getInstrumentName(inst: string): string {
 }
 
 onMounted(async () => {
+  await trader.startRealtime()
   await trader.loadAll()
-  trader.startPolling(2500)
   if (!review.rawOutcomes.length) {
     void review.load()
   }
 })
 
 onBeforeUnmount(() => {
-  trader.stopPolling()
+  trader.stopRealtime()
 })
 
 function fmtPrice(v: number | null | undefined): string {
@@ -146,6 +146,18 @@ function fmtPrice(v: number | null | undefined): string {
 
 function dirLabel(direction: string): string {
   return direction === 'up' || direction === 'buy' ? '做多' : '做空'
+}
+
+function conditionLabel(state: string): string {
+  return ({ Pending: '等待突破', WaitingConfirm: '等待确认开仓', Triggered: '已触发，尚未提交',
+    Unknown: '提交结果待核实', Working: '委托中，尚未成交', PartFilled: '部分成交',
+    Closing: '自动平仓处理中', Filled: '已成交', Rejected: '提交失败，等待重试',
+    Canceled: '已取消后续开仓', Closed: '已平仓', Expired: '已过期', Invalidated: '已失效' } as Record<string, string>)[state] || state
+}
+
+function orderLabel(phase: string): string {
+  return ({ Unknown: '等待柜台确认', Working: '柜台委托中', CancelPending: '等待撤单确认',
+    Terminal: '委托已结束', Rejected: '提交失败' } as Record<string, string>)[phase] || phase
 }
 
 function exitReasonBadge(reason: string) {
@@ -193,11 +205,12 @@ const winRateDiff = computed(() => {
               round
               class="status-tag"
             >
-              {{ trader.isReady ? 'SimNow 柜台在线 (READY)' : 'CTP 柜台离线' }}
+              {{ trader.isReady ? 'CTP 柜台就绪' : trader.health?.sync_pending ? 'CTP 数据同步中' : 'CTP 未就绪' }}
             </n-tag>
           </div>
           <span class="header-subtitle">
-            SimNow 真实撮合持仓 · 突破条件单托管 · 动态移动保本 · 实盘与理论复盘比对
+            {{ trader.bridgeOnline ? '交易数据已连接' : '交易数据连接中断' }} · 柜台资金更新：{{ trader.account?.updated_at ? new Date(trader.account.updated_at * 1000).toLocaleTimeString('zh-CN') : '等待同步' }}
+            <span v-if="trader.errorMsg"> · {{ trader.errorMsg }}</span>
           </span>
         </div>
 
@@ -280,14 +293,14 @@ const winRateDiff = computed(() => {
         </div>
         <div class="acc-divider" />
         <div class="acc-col">
-          <span class="acc-label">动态权益 (元)</span>
+          <span class="acc-label">柜台权益 (元)</span>
           <span class="acc-val font-num is-bold">
             {{ trader.account?.balance != null ? Number(trader.account.balance).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—' }}
           </span>
         </div>
         <div class="acc-divider" />
         <div class="acc-col">
-          <span class="acc-label">可用资金 (元)</span>
+          <span class="acc-label">柜台可用资金 (元)</span>
           <span class="acc-val font-num is-available">
             {{ trader.account?.available != null ? Number(trader.account.available).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—' }}
           </span>
@@ -301,7 +314,7 @@ const winRateDiff = computed(() => {
         </div>
         <div class="acc-divider" />
         <div class="acc-col">
-          <span class="acc-label">浮动盈亏</span>
+          <span class="acc-label">柜台浮动盈亏</span>
           <span
             class="acc-val font-num"
             :class="(trader.account?.position_profit ?? 0) >= 0 ? 'is-up' : 'is-down'"
@@ -489,8 +502,8 @@ const winRateDiff = computed(() => {
                 <n-tag size="small" type="info">
                   在手 {{ pos.position }} 手 (今仓 {{ pos.today_position }} / 昨仓 {{ pos.yd_position }})
                 </n-tag>
-                <n-tag v-if="pos.managed" size="small" :type="pos.managed.tier === 'Large' ? 'warning' : 'default'">
-                  {{ pos.managed.tier === 'Large' ? '策略托管: 大仓分批' : '策略托管: 小仓1:1' }}
+                <n-tag v-if="pos.managed" size="small" :type="pos.managed.tier === 'large' ? 'warning' : 'default'">
+                  {{ pos.managed.tier === 'large' ? '策略托管: 大仓分批' : '策略托管: 小仓1:1' }}
                 </n-tag>
                 <n-tag v-else size="small" type="default">
                   SimNow 柜台直持仓
@@ -524,7 +537,7 @@ const winRateDiff = computed(() => {
                     class="cell-val font-num"
                     :class="pos.position_profit >= 0 ? 'is-up' : 'is-down'"
                   >
-                    {{ pos.position_profit >= 0 ? '+' : '' }}{{ pos.position_profit.toFixed(2) }}
+                    {{ pos.position_profit >= 0 ? '+' : '' }}{{ pos.position_profit.toFixed(2) }}{{ pos.profit_is_estimated ? '（估算）' : '（柜台）' }}
                   </span>
                   <span v-if="pos.managed" class="stop-nature-tag" :class="pos.managed.lot1_closed ? 'is-breakeven' : ''">
                     {{ pos.managed.lot1_closed ? (pos.managed.trailing_grade > 1 ? `阶梯锁盈档位 ${pos.managed.trailing_grade}` : '开仓成本线保本') : '初始硬止损' }}
@@ -543,7 +556,7 @@ const winRateDiff = computed(() => {
                 <div class="stat-bubble">
                   <span class="lbl">持仓浮动盈亏</span>
                   <span class="val font-num" :class="(pos.position_profit ?? 0) >= 0 ? 'is-up' : 'is-down'">
-                    {{ (pos.position_profit ?? 0) >= 0 ? '+' : '' }}{{ pos.position_profit != null ? Number(pos.position_profit).toFixed(2) : '0.00' }} 元
+                    {{ (pos.position_profit ?? 0) >= 0 ? '+' : '' }}{{ pos.position_profit != null ? Number(pos.position_profit).toFixed(2) : '0.00' }} 元{{ pos.profit_is_estimated ? '（估算）' : '（柜台）' }}
                   </span>
                 </div>
                 <div class="stat-bubble">
@@ -588,8 +601,8 @@ const winRateDiff = computed(() => {
                 >
                   {{ dirLabel(cond.direction) }}
                 </n-tag>
-                <n-tag size="small" :type="cond.tier === 'Large' ? 'warning' : 'default'">
-                  {{ cond.tier === 'Large' ? '大仓 (2手)' : '小仓 (1手)' }}
+                <n-tag size="small" :type="cond.tier === 'large' ? 'warning' : 'default'">
+                  {{ cond.tier === 'large' ? '大仓' : '小仓' }}（计划 {{ cond.volume }} 手）
                 </n-tag>
                 <span class="score-badge">评分 {{ cond.score.toFixed(2) }}</span>
               </div>
@@ -599,7 +612,7 @@ const winRateDiff = computed(() => {
                   size="small"
                   :type="cond.state === 'WaitingConfirm' ? 'warning' : cond.state === 'Triggered' ? 'info' : 'default'"
                 >
-                  {{ cond.state === 'WaitingConfirm' ? '⚠️ 等待人工确认开仓' : cond.state === 'Triggered' ? '突破已报单柜台' : '监听盘中突破' }}
+                  {{ conditionLabel(cond.state) }}
                 </n-tag>
               </div>
             </div>
@@ -643,11 +656,24 @@ const winRateDiff = computed(() => {
                 size="small"
                 secondary
                 type="error"
+                :disabled="cond.state === 'Closing'"
                 @click="trader.cancelCondition(cond.id)"
               >
                 <template #icon><n-icon :component="CircleX" /></template>
-                撤销条件单
+                取消剩余开仓
               </n-button>
+            </div>
+          </div>
+        </div>
+        <div v-if="trader.executionOrders.length" class="history-list" style="margin-top: 20px">
+          <div v-for="order in trader.executionOrders.slice(-20)" :key="order.request.order_ref" class="cond-card">
+            <div class="cond-head">
+              <span>{{ order.request.instrument_id }} · {{ order.request.direction === 'buy' ? '买入' : '卖出' }}</span>
+              <n-tag size="small">{{ orderLabel(order.phase) }}</n-tag>
+            </div>
+            <div class="cond-body">
+              委托 {{ order.request.volume }} 手 @ {{ fmtPrice(order.request.price) }} · 柜台成交 {{ order.filled }} 手
+              <div class="cond-note">{{ order.note }}</div>
             </div>
           </div>
         </div>

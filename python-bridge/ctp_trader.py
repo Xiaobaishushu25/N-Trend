@@ -102,8 +102,30 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         # updates event queue for incremental polling
         self.update_events: List[Dict[str, Any]] = []
         self.event_counter = 0
-        self._last_account_query_time = 0.0
-        self._last_position_query_time = 0.0
+        self._condition = threading.Condition(self.lock)
+        self._query_thread = None
+        self._settlement_confirmed = False
+        self._pending_queries = {}
+        self._inflight = None
+        self._last_query_sent = 0.0
+        self._query_interval = max(1.5, float(config.get("QueryIntervalSeconds", 1.5)))
+        self._reconcile_interval = max(10.0, float(config.get("ReconcileSeconds", 30)))
+        self._query_timeout = max(5.0, float(config.get("QueryTimeoutSeconds", 15)))
+        self._synced = set()
+        self._data_revision = 0
+        self.positions_updated_at = 0.0
+        self.sync_error = None
+        self._seen_trades = set()
+        self._order_versions = {}
+        self._order_requests = {}
+        self.last_trade_at = 0.0
+        self.orders_updated_at = 0.0
+        self.trades_updated_at = 0.0
+        self._journal_path = config.get("OrderJournalPath")
+        self._submitted_requests = {}
+        if self._journal_path and os.path.exists(self._journal_path):
+            with open(self._journal_path, "r", encoding="utf-8") as journal:
+                self._submitted_requests = json.load(journal)
 
     def get_req_id(self) -> int:
         with self.lock:
@@ -128,6 +150,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             # keep max 500 events
             if len(self.update_events) > 500:
                 self.update_events.pop(0)
+            self._data_revision += 1
+            self._condition.notify_all()
 
     # ── CTP SPI Callbacks ──
 
@@ -146,7 +170,13 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self.is_connected = False
         self.is_authenticated = False
         self.is_logged_in = False
-        self.is_ready = False
+        with self._condition:
+            self.is_ready = False
+            self._settlement_confirmed = False
+            self._synced.clear()
+            self._inflight = None
+            self._pending_queries.clear()
+            self._condition.notify_all()
         self.emit_event("disconnected", {"reason": nReason})
 
     def OnRspAuthenticate(self, pRspAuthenticateField, pRspInfo, nRequestID, bIsLast):
@@ -168,7 +198,16 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             self.is_logged_in = False
             return
         self.is_logged_in = True
-        self.trading_day = str(pRspUserLogin.TradingDay)
+        day = str(pRspUserLogin.TradingDay)
+        if self.trading_day and self.trading_day != day:
+            with self.lock:
+                self.orders.clear()
+                self.trades.clear()
+                self._seen_trades.clear()
+                self._order_versions.clear()
+                self._synced.clear()
+                self.is_ready = False
+        self.trading_day = day
         self.front_id = int(pRspUserLogin.FrontID)
         self.session_id = int(pRspUserLogin.SessionID)
         # Initialize order_ref offset based on MaxOrderRef to prevent conflict
@@ -190,128 +229,243 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self.api.ReqSettlementInfoConfirm(settle_req, self.get_req_id())
 
     def OnRspSettlementInfoConfirm(self, pConfirm, pRspInfo, nRequestID, bIsLast):
-        logger.info("[结算确认] 投资者结算结果已确认！交易服务就绪 (READY)")
-        self.is_ready = True
-        self.emit_event("ready", {"trading_day": self.trading_day})
-        # 启动后台常驻资金与持仓定期查询轮询
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            self.sync_error = f"结算确认失败: {pRspInfo.ErrorMsg}"
+            self.emit_event("sync_error", self.sync_error)
+            return
+        if not bIsLast:
+            return
+        self._settlement_confirmed = True
+        logger.info("[结算确认] 开始初始化资金与持仓快照")
         self._start_periodic_query()
+        self.request_sync()
 
-    def _start_periodic_query(self):
-        """
-        优雅的低频心跳校准循环：
-        CTP 是纯异步事件驱动架构，成交回报 OnRtnTrade 会自动推送并本地更新持仓。
-        因此平时绝不进行高频轮询（避免触发柜台 1Hz 流控甚至被期货公司封禁），
-        仅在就绪后执行一次初始同步，随后以 120 秒低频心跳进行被动数据校准。
-        """
-        def loop():
-            # 1. 服务就绪后先执行首次完整初始化同步
-            time.sleep(1.0)
-            if self.is_ready:
-                try:
-                    self.query_account(force=True)
-                    time.sleep(1.5)
-                    self.query_positions(force=True)
-                except Exception as e:
-                    logger.error(f"初始数据同步异常: {e}")
-
-            # 2. 正常运行期间改为长周期心跳校准（120秒一次），彻底杜绝流控封号风险
-            while not self._stop_requested:
-                for _ in range(120):
-                    if self._stop_requested:
-                        break
-                    time.sleep(1)
-                if self.is_ready and not self._stop_requested:
-                    try:
-                        self.query_account()
-                        time.sleep(1.5)
-                        self.query_positions()
-                    except Exception as e:
-                        logger.error(f"心跳校准查询异常: {e}")
-        t = threading.Thread(target=loop, daemon=True)
-        t.start()
+    def request_sync(self, delay: float = 0.0):
+        # Merge bursts without postponing the first pending refresh indefinitely.
+        with self._condition:
+            due = time.monotonic() + delay
+            for kind in ("positions", "account", "orders", "trades"):
+                self._pending_queries[kind] = min(self._pending_queries.get(kind, due), due)
+            self._condition.notify_all()
 
     def query_account(self, force: bool = False):
-        if not self.is_logged_in:
-            return
-        now = time.time()
-        # 严格遵守 CTP 规范：同一接口查询间隔不得低于 1.5 秒
-        if not force and (now - self._last_account_query_time < 1.5):
-            return
-        self._last_account_query_time = now
-        qry_req = tdapi.CThostFtdcQryTradingAccountField()
-        qry_req.BrokerID = self.config.get("BrokerID", "9999")
-        qry_req.InvestorID = self.config.get("UserID", "")
-        self.api.ReqQryTradingAccount(qry_req, self.get_req_id())
+        # Compatibility: force requests a refresh but never bypasses flow control.
+        self._enqueue_query("account")
 
     def query_positions(self, force: bool = False):
-        if not self.is_logged_in:
+        self._enqueue_query("positions")
+
+    def _enqueue_query(self, kind):
+        with self._condition:
+            self._pending_queries.setdefault(kind, time.monotonic())
+            self._condition.notify_all()
+
+    def _start_periodic_query(self):
+        with self._condition:
+            if self._query_thread and self._query_thread.is_alive():
+                return
+            self._query_thread = threading.Thread(target=self._query_loop, daemon=True)
+            self._query_thread.start()
+
+    def _query_loop(self):
+        next_reconcile = time.monotonic() + self._reconcile_interval
+        while not self._stop_requested:
+            with self._condition:
+                now = time.monotonic()
+                if now >= next_reconcile:
+                    if self._settlement_confirmed:
+                        self.request_sync()
+                    next_reconcile = now + self._reconcile_interval
+                if self._inflight:
+                    if now - self._inflight["started"] >= self._query_timeout and not self._inflight.get("timed_out"):
+                        # A timeout does not prove the CTP query has finished. Keep
+                        # the slot occupied until its final response or reconnect.
+                        self._inflight["timed_out"] = True
+                        self.sync_error = "柜台查询响应超时，等待结束回报或重连"
+                        self.is_ready = False
+                        self.emit_event("sync_error", self.sync_error)
+                    self._condition.wait(0.5)
+                    continue
+                if not self.is_logged_in or not self._settlement_confirmed or not self._pending_queries:
+                    self._condition.wait(0.5)
+                    continue
+                kind = min(self._pending_queries, key=self._pending_queries.get)
+                due = max(self._pending_queries[kind], self._last_query_sent + self._query_interval)
+                if now < due:
+                    self._condition.wait(min(due - now, 0.5))
+                    continue
+                del self._pending_queries[kind]
+                req_id = self.get_req_id()
+                self._inflight = {"id": req_id, "kind": kind, "started": now, "rows": {}, "error": None,
+                                  "revision": self._data_revision}
+                self._last_query_sent = now
+                try:
+                    if kind == "account":
+                        req = tdapi.CThostFtdcQryTradingAccountField()
+                        send = self.api.ReqQryTradingAccount
+                    elif kind == "positions":
+                        req = tdapi.CThostFtdcQryInvestorPositionField()
+                        send = self.api.ReqQryInvestorPosition
+                    elif kind == "orders":
+                        req = tdapi.CThostFtdcQryOrderField()
+                        send = self.api.ReqQryOrder
+                    else:
+                        req = tdapi.CThostFtdcQryTradeField()
+                        send = self.api.ReqQryTrade
+                    req.BrokerID = self.config.get("BrokerID", "9999")
+                    req.InvestorID = self.config.get("UserID", "")
+                    ret = send(req, req_id)
+                    if ret != 0:
+                        self._finish_query(req_id, f"{kind} 查询发送失败: {ret}")
+                except Exception as exc:
+                    self._finish_query(req_id, str(exc))
+
+    def _finish_query(self, req_id, error=None):
+        # Caller holds the shared RLock; stale responses cannot modify snapshots.
+        query = self._inflight
+        if not query or query["id"] != req_id:
             return
-        now = time.time()
-        # 严格遵守 CTP 规范：同一接口查询间隔不得低于 1.5 秒
-        if not force and (now - self._last_position_query_time < 1.5):
-            return
-        self._last_position_query_time = now
-        qry_req = tdapi.CThostFtdcQryInvestorPositionField()
-        qry_req.BrokerID = self.config.get("BrokerID", "9999")
-        qry_req.InvestorID = self.config.get("UserID", "")
-        self.api.ReqQryInvestorPosition(qry_req, self.get_req_id())
+        kind = query["kind"]
+        error = error or query["error"]
+        self._inflight = None
+        if error:
+            self.sync_error = error
+            self.is_ready = False
+            self._pending_queries[kind] = time.monotonic() + max(3.0, self._query_interval)
+            logger.warning("[同步失败] %s", error)
+            self.emit_event("sync_error", error)
+        else:
+            if kind == "positions":
+                self.positions = query["rows"]
+                self.positions_updated_at = time.time()
+                self.emit_event("positions", list(self.positions.values()))
+            elif kind == "orders":
+                for ref, record in query["rows"].items():
+                    if self._order_versions.get(ref, 0) <= query["revision"]:
+                        self.orders[ref] = record
+                self.orders_updated_at = time.time()
+                self.emit_event("orders", list(self.orders.values()))
+            elif kind == "trades":
+                for record in query["rows"].values():
+                    self._merge_trade(record)
+                self.trades_updated_at = time.time()
+                self.emit_event("trades", self.trades)
+            elif query["rows"]:
+                self.account_data = query["rows"]
+                self.emit_event("account", self.account_data)
+            else:
+                self._pending_queries[kind] = time.monotonic() + 3.0
+                self.sync_error = "资金查询返回空结果"
+                self.is_ready = False
+                self.emit_event("sync_error", self.sync_error)
+                self._condition.notify_all()
+                return
+            self._synced.add(kind)
+            if self._synced == {"account", "positions", "orders", "trades"} and not self._pending_queries:
+                self.sync_error = None
+                self.is_ready = True
+                self.emit_event("ready", {"trading_day": self.trading_day})
+        self._condition.notify_all()
+
+    def OnRspError(self, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID:
+            with self._condition:
+                query = self._inflight
+                if query and query["id"] == nRequestID:
+                    query["error"] = f"柜台查询错误 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
+                    if bIsLast:
+                        self._finish_query(nRequestID)
+                elif nRequestID in self._order_requests:
+                    self._record_order_error(self._order_requests[nRequestID], f"柜台拒单 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}")
 
     def OnRspQryTradingAccount(self, pAccount, pRspInfo, nRequestID, bIsLast):
-        if pRspInfo and pRspInfo.ErrorID != 0:
-            logger.warning(f"[资金查询] 柜台反馈提示 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}")
-            return
-        if pAccount:
-            with self.lock:
+        with self._condition:
+            query = self._inflight
+            if not query or query["id"] != nRequestID or query["kind"] != "account":
+                return
+            if pRspInfo and pRspInfo.ErrorID:
+                query["error"] = f"资金查询错误 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
+            elif pAccount and str(getattr(pAccount, "CurrencyID", "CNY")) in ("", "CNY"):
                 balance = float(pAccount.Balance)
                 margin = float(pAccount.CurrMargin)
-                risk_ratio = (margin / balance) if balance > 0 else 0.0
-                self.account_data = {
-                    "account_id": self.config.get("UserID", "278272"),
+                query["rows"] = {
+                    "account_id": self.config.get("UserID", ""),
                     "pre_balance": float(pAccount.PreBalance),
-                    "balance": balance,
-                    "available": float(pAccount.Available),
-                    "curr_margin": margin,
-                    "margin": margin,
+                    "balance": balance, "available": float(pAccount.Available),
+                    "curr_margin": margin, "margin": margin,
                     "close_profit": float(pAccount.CloseProfit),
                     "position_profit": float(pAccount.PositionProfit),
                     "commission": float(pAccount.Commission),
-                    "risk_ratio": risk_ratio,
+                    "risk_ratio": margin / balance if balance > 0 else 0.0,
                     "updated_at": time.time(),
                 }
-            logger.info(
-                f"[资金同步] 权益: {pAccount.Balance:.2f}, 可用: {pAccount.Available:.2f}, 保证金: {pAccount.CurrMargin:.2f}, 风险度: {risk_ratio*100:.2f}%"
-            )
-            self.emit_event("account", self.account_data)
+            if bIsLast:
+                self._finish_query(nRequestID)
 
     def OnRspQryInvestorPosition(self, pPosition, pRspInfo, nRequestID, bIsLast):
-        if pRspInfo and pRspInfo.ErrorID != 0:
-            logger.warning(f"[持仓查询] 柜台反馈提示 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}")
-            return
-        if pPosition:
-            inst = str(pPosition.InstrumentID)
-            posi_dir = "buy" if pPosition.PosiDirection == tdapi.THOST_FTDC_PD_Long else "sell"
-            pos_key = f"{inst}_{posi_dir}"
-            pos_info = {
-                "instrument_id": inst,
-                "direction": posi_dir,
-                "position": int(pPosition.Position),
-                "yd_position": int(pPosition.YdPosition),
-                "today_position": int(pPosition.TodayPosition),
-                "open_cost": float(pPosition.OpenCost),
-                "position_profit": float(pPosition.PositionProfit),
-                "margin": float(pPosition.UseMargin),
+        with self._condition:
+            query = self._inflight
+            if not query or query["id"] != nRequestID or query["kind"] != "positions":
+                return
+            if pRspInfo and pRspInfo.ErrorID:
+                query["error"] = f"持仓查询错误 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
+            elif pPosition and pPosition.Position > 0:
+                inst = str(pPosition.InstrumentID)
+                direction = "buy" if pPosition.PosiDirection == tdapi.THOST_FTDC_PD_Long else "sell"
+                key = f"{inst}_{direction}"
+                row = query["rows"].setdefault(key, {
+                    "instrument_id": inst, "direction": direction,
+                    "position": 0, "yd_position": 0, "today_position": 0,
+                    "open_cost": 0.0, "position_cost": 0.0,
+                    "position_profit": 0.0, "margin": 0.0,
+                })
+                volume = int(pPosition.Position)
+                today = min(volume, max(0, int(pPosition.TodayPosition)))
+                row["position"] += volume
+                row["today_position"] += today
+                # YdPosition is a historical field; use the current remaining lots.
+                row["yd_position"] += volume - today
+                row["open_cost"] += float(pPosition.OpenCost)
+                row["position_cost"] += float(pPosition.PositionCost)
+                row["position_profit"] += float(pPosition.PositionProfit)
+                row["margin"] += float(pPosition.UseMargin)
+            if bIsLast:
+                self._finish_query(nRequestID)
+
+    def health_snapshot(self):
+        with self.lock:
+            return {
+                "service": SERVICE_NAME, "healthy": self.is_ready,
+                "pid": os.getpid(), "uptime": time.time() - SERVER_STARTED_AT,
+                "connected": self.is_connected, "authenticated": self.is_authenticated,
+                "logged_in": self.is_logged_in, "ready": self.is_ready,
+                "settlement_confirmed": self._settlement_confirmed,
+                "trading_day": self.trading_day,
+                "broker_id": self.config.get("BrokerID"), "user_id": self.config.get("UserID"),
+                "account_id": self.config.get("UserID"),
+                "account_updated_at": self.account_data.get("updated_at", 0),
+                "positions_updated_at": self.positions_updated_at,
+                "orders_updated_at": self.orders_updated_at,
+                "trades_updated_at": self.trades_updated_at,
+                "sync_pending": bool(self._pending_queries or self._inflight),
+                "sync_error": self.sync_error,
             }
-            with self.lock:
-                if pPosition.Position > 0:
-                    self.positions[pos_key] = pos_info
-                else:
-                    self.positions.pop(pos_key, None)
-        if bIsLast:
-            logger.info(f"[持仓同步] 完成，当前持仓项数: {len(self.positions)}")
-            self.emit_event("positions", list(self.positions.values()))
+
+    def stream_snapshot(self):
+        with self.lock:
+            return {"health": self.health_snapshot(), "account": dict(self.account_data),
+                    "broker_positions": list(self.positions.values()), "revision": self._data_revision,
+                    "orders": list(self.orders.values()), "trades": list(self.trades), "last_trade_at": self.last_trade_at}
+
+    def stop(self):
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+        if self._query_thread:
+            self._query_thread.join(timeout=2.0)
 
     # ── 报单状态回报 ──
-    def OnRtnOrder(self, pOrder):
+    def _order_record(self, pOrder):
         if not pOrder:
             return
         ref = str(pOrder.OrderRef)
@@ -327,6 +481,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             tdapi.THOST_FTDC_OST_Unknown: "unknown",
         }
         status_code = status_map.get(pOrder.OrderStatus, "unknown")
+        if getattr(pOrder, "OrderSubmitStatus", None) == getattr(tdapi, "THOST_FTDC_OSS_InsertRejected", "4"):
+            status_code = "rejected"
         dir_str = "buy" if pOrder.Direction == tdapi.THOST_FTDC_D_Buy else "sell"
         offset_map = {
             tdapi.THOST_FTDC_OF_Open: "open",
@@ -334,7 +490,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             tdapi.THOST_FTDC_OF_CloseToday: "close_today",
             tdapi.THOST_FTDC_OF_CloseYesterday: "close_yesterday",
         }
-        offset_str = offset_map.get(pOrder.CombOffsetFlag, "unknown")
+        offset_str = offset_map.get(str(pOrder.CombOffsetFlag)[:1], "unknown")
 
         order_record = {
             "order_ref": ref,
@@ -354,16 +510,33 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             "insert_time": str(pOrder.InsertTime),
             "update_time": str(pOrder.UpdateTime),
         }
-        with self.lock:
-            self.orders[ref] = order_record
+        return order_record
 
-        logger.info(
-            f"[报单状态] 合约: {inst} | 引用: {ref} | 状态: {status_code} ({pOrder.StatusMsg}) | 成交: {pOrder.VolumeTraded}/{pOrder.VolumeTotalOriginal}"
-        )
-        self.emit_event("order_update", order_record)
+    def OnRtnOrder(self, pOrder):
+        if not pOrder:
+            return
+        record = self._order_record(pOrder)
+        with self.lock:
+            self.orders[record["order_ref"]] = record
+            self._order_versions[record["order_ref"]] = self._data_revision + 1
+        self.request_sync(delay=0.5)
+        self.emit_event("order_update", record)
+
+    def OnRspQryOrder(self, pOrder, pRspInfo, nRequestID, bIsLast):
+        with self._condition:
+            query = self._inflight
+            if not query or query["id"] != nRequestID or query["kind"] != "orders":
+                return
+            if pRspInfo and pRspInfo.ErrorID:
+                query["error"] = f"委托查询失败: {pRspInfo.ErrorMsg}"
+            elif pOrder:
+                record = self._order_record(pOrder)
+                query["rows"][record["order_ref"]] = record
+            if bIsLast:
+                self._finish_query(nRequestID)
 
     # ── 成交回报 ──
-    def OnRtnTrade(self, pTrade):
+    def _trade_record(self, pTrade):
         if not pTrade:
             return
         inst = str(pTrade.InstrumentID)
@@ -387,39 +560,106 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             "volume": int(pTrade.Volume),
             "trade_time": str(pTrade.TradeTime),
             "trade_date": str(pTrade.TradeDate),
+            "trading_day": str(getattr(pTrade, "TradingDay", "") or pTrade.TradeDate),
         }
+        return trade_record
+
+    def _merge_trade(self, record):
+        key = (record.get("trading_day") or record["trade_date"], record["exchange_id"], record["trade_id"], record["instrument_id"], record["direction"])
+        if key in self._seen_trades:
+            return False
+        self._seen_trades.add(key)
+        self.trades.append(record)
+        return True
+
+    def OnRtnTrade(self, pTrade):
+        if not pTrade:
+            return
+        record = self._trade_record(pTrade)
         with self.lock:
-            self.trades.append(trade_record)
+            if not self._merge_trade(record):
+                return
+            self.last_trade_at = time.time()
+        self.request_sync(delay=0.5)
+        self.emit_event("trade", record)
 
-        logger.info(
-            f"[🎉 撮合成交] 合约: {inst} | 方向: {offset_str} {dir_str} | 成交价: {pTrade.Price:.1f} | 成交量: {pTrade.Volume} | 时间: {pTrade.TradeTime}"
-        )
-        self.emit_event("trade", trade_record)
-        # 撮合成交后，异步刷新一次资金与持仓
-        threading.Thread(target=self._refresh_after_trade, daemon=True).start()
+    def OnRspQryTrade(self, pTrade, pRspInfo, nRequestID, bIsLast):
+        with self._condition:
+            query = self._inflight
+            if not query or query["id"] != nRequestID or query["kind"] != "trades":
+                return
+            if pRspInfo and pRspInfo.ErrorID:
+                query["error"] = f"成交查询失败: {pRspInfo.ErrorMsg}"
+            elif pTrade:
+                record = self._trade_record(pTrade)
+                key = (record.get("trading_day") or record["trade_date"], record["exchange_id"], record["trade_id"], record["instrument_id"], record["direction"])
+                query["rows"][key] = record
+            if bIsLast:
+                self._finish_query(nRequestID)
 
-    def _refresh_after_trade(self):
-        time.sleep(1.5)
-        self.query_account(force=True)
-        time.sleep(1.5)
-        self.query_positions(force=True)
+    def _record_order_error(self, pInputOrder, msg):
+        if not pInputOrder:
+            return
+        ref = str(pInputOrder.OrderRef)
+        with self.lock:
+            record = dict(self.orders.get(ref, {}))
+            record.update(order_ref=ref, instrument_id=str(pInputOrder.InstrumentID),
+                          status="rejected", status_msg=msg, volume_traded=record.get("volume_traded", 0))
+            self.orders[ref] = record
+            self._order_versions[ref] = self._data_revision + 1
+        self.emit_event("order_error", record)
 
     def OnRspOrderInsert(self, pInputOrder, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:
             msg = f"柜台拒绝报单 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
             logger.error(f"[错误] {msg}")
             ref = str(pInputOrder.OrderRef) if pInputOrder else ""
-            self.emit_event("order_error", {"order_ref": ref, "error": msg})
+            self._record_order_error(pInputOrder, msg)
 
     def OnErrRtnOrderInsert(self, pInputOrder, pRspInfo):
         if pRspInfo and pRspInfo.ErrorID != 0:
             msg = f"交易所拒绝报单 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
             logger.error(f"[错误] {msg}")
             ref = str(pInputOrder.OrderRef) if pInputOrder else ""
-            self.emit_event("order_error", {"order_ref": ref, "error": msg})
+            self._record_order_error(pInputOrder, msg)
 
     # ── 下单方法 ──
-    def send_order(
+    def _save_journal(self):
+        if not self._journal_path:
+            return
+        temp = self._journal_path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as file:
+            json.dump(self._submitted_requests, file, ensure_ascii=False)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, self._journal_path)
+
+    def send_order(self, instrument_id, direction, offset, price, volume, exchange_id=None, custom_ref=None):
+        with self.lock:
+            fingerprint = json.dumps([instrument_id, direction, offset, price, volume, exchange_id])
+            if custom_ref and custom_ref in self._submitted_requests:
+                old = self._submitted_requests[custom_ref]
+                if old["fingerprint"] != fingerprint:
+                    return {"success": False, "msg": "委托标识已用于不同报单参数"}
+                return old["result"]
+            if custom_ref:
+                self._submitted_requests[custom_ref] = {"fingerprint": fingerprint, "result": {
+                    "success": True, "order_ref": custom_ref, "msg": "提交结果待查询确认，不能重复提交"}}
+                try:
+                    self._save_journal()  # Before any call which could reach the counter.
+                except OSError as exc:
+                    self._submitted_requests.pop(custom_ref, None)
+                    return {"success": False, "order_ref": custom_ref, "msg": f"委托日志保存失败，未提交: {exc}"}
+            result = self._send_order(instrument_id, direction, offset, price, volume, exchange_id, custom_ref)
+            if custom_ref:
+                self._submitted_requests[custom_ref]["result"] = result
+                try:
+                    self._save_journal()
+                except OSError:
+                    logger.exception("报单结果保存失败；初始提交意图仍保留，禁止盲目重报")
+            return result
+
+    def _send_order(
         self,
         instrument_id: str,
         direction: str,  # "buy" or "sell"
@@ -435,6 +675,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         inst = instrument_id.strip()
         exch = exchange_id or guess_exchange_id(inst)
         order_ref = custom_ref or self.get_order_ref()
+        if custom_ref:
+            self.order_ref_counter = max(self.order_ref_counter, int(custom_ref))
 
         # 处理开平方向
         c_dir = tdapi.THOST_FTDC_D_Buy if direction.lower() == "buy" else tdapi.THOST_FTDC_D_Sell
@@ -448,6 +690,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         elif offset.lower() == "close":
             c_offset = tdapi.THOST_FTDC_OF_Close
         elif offset.lower() == "auto":
+            if self.positions_updated_at <= self.last_trade_at:
+                return {"success": False, "order_ref": order_ref, "msg": "等待成交后的柜台持仓同步，未提交平仓"}
             # 上期所 (SHFE) 与 能源中心 (INE) 区分平今仓与平昨仓
             if exch in ("SHFE", "INE"):
                 # 查询该合约持仓：如果持有今仓，优先平今仓
@@ -455,6 +699,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 pos = self.positions.get(pos_key)
                 if pos and pos.get("today_position", 0) > 0:
                     c_offset = tdapi.THOST_FTDC_OF_CloseToday
+                    volume = min(volume, int(pos["today_position"]))
                 else:
                     c_offset = tdapi.THOST_FTDC_OF_Close
             else:
@@ -485,7 +730,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         req.IsAutoSuspend = 0
         req.UserForceClose = 0
 
-        res = self.api.ReqOrderInsert(req, self.get_req_id())
+        req_id = self.get_req_id()
+        self._order_requests[req_id] = req
+        res = self.api.ReqOrderInsert(req, req_id)
         offset_label = "开仓" if c_offset == tdapi.THOST_FTDC_OF_Open else "平仓"
         dir_label = "买" if c_dir == tdapi.THOST_FTDC_D_Buy else "卖"
         logger.info(
@@ -504,8 +751,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         front_id: Optional[int] = None,
         session_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        if not self.is_ready:
-            return {"success": False, "msg": "CTP未就绪"}
+        # A stale/failed snapshot must not prevent cancelling a live order.
+        if not self.is_logged_in or not self._settlement_confirmed:
+            return {"success": False, "msg": "CTP交易连接未就绪"}
         req = tdapi.CThostFtdcInputOrderActionField()
         req.BrokerID = self.config.get("BrokerID", "9999")
         req.InvestorID = self.config.get("UserID", "")
@@ -513,8 +761,11 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         req.OrderRef = order_ref
         req.InstrumentID = instrument_id
         req.ExchangeID = exchange_id or guess_exchange_id(instrument_id)
-        req.FrontID = front_id if front_id is not None else self.front_id
-        req.SessionID = session_id if session_id is not None else self.session_id
+        known = self.orders.get(order_ref, {})
+        req.FrontID = front_id if front_id is not None else known.get("front_id", self.front_id)
+        req.SessionID = session_id if session_id is not None else known.get("session_id", self.session_id)
+        if known.get("order_sys_id"):
+            req.OrderSysID = known["order_sys_id"]
         req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
         res = self.api.ReqOrderAction(req, self.get_req_id())
         logger.info(f"[撤单请求] 撤销 OrderRef: {order_ref} ({instrument_id})，返回值: {res}")
@@ -552,20 +803,33 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(500, {"error": "Trader manager not initialized"})
 
         path = self.path.split("?")[0]
-        if path == "/health":
-            return self._send_json(200, {
-                "service": SERVICE_NAME,
-                "healthy": g_trader_mgr.is_ready,
-                "pid": os.getpid(),
-                "uptime": time.time() - SERVER_STARTED_AT,
-                "connected": g_trader_mgr.is_connected,
-                "authenticated": g_trader_mgr.is_authenticated,
-                "logged_in": g_trader_mgr.is_logged_in,
-                "ready": g_trader_mgr.is_ready,
-                "trading_day": g_trader_mgr.trading_day,
-                "broker_id": g_trader_mgr.config.get("BrokerID"),
-                "user_id": g_trader_mgr.config.get("UserID"),
-            })
+        if path == "/events":
+            # SSE stays on loopback. Each message is a full snapshot, so reconnects
+            # and slow consumers recover without replaying a truncated event log.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            revision = -1
+            try:
+                self.connection.settimeout(20)
+                while not g_trader_mgr._stop_requested:
+                    with g_trader_mgr._condition:
+                        if revision == g_trader_mgr._data_revision:
+                            g_trader_mgr._condition.wait(15)
+                        snapshot = g_trader_mgr.stream_snapshot()
+                        revision = snapshot["revision"]
+                    data = json.dumps(snapshot, ensure_ascii=False)
+                    self.wfile.write(("data: " + data + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            return
+        elif path == "/snapshot":
+            return self._send_json(200, g_trader_mgr.stream_snapshot())
+        elif path == "/health":
+            return self._send_json(200, g_trader_mgr.health_snapshot())
         elif path == "/account":
             return self._send_json(200, g_trader_mgr.account_data)
         elif path == "/positions":
@@ -677,10 +941,7 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(200, {"success": True, "closed_orders": closed_orders})
 
         elif path == "/sync":
-            # 主动触发资金与持仓同步（带 CTP 1.5s 流控保护）
-            g_trader_mgr.query_account(force=True)
-            time.sleep(1.5)
-            g_trader_mgr.query_positions(force=True)
+            g_trader_mgr.request_sync()
             return self._send_json(200, {"success": True, "msg": "Sync requested"})
 
         else:
@@ -719,12 +980,13 @@ def main():
     os.makedirs(flow_dir, exist_ok=True)
 
     trader_api = tdapi.CThostFtdcTraderApi.CreateFtdcTraderApi(flow_dir + os.sep)
+    config.setdefault("OrderJournalPath", os.path.join(flow_dir, "order_requests.json"))
     g_trader_mgr = CtpTraderManager(config)
     g_trader_mgr.api = trader_api
     trader_api.RegisterSpi(g_trader_mgr)
     trader_api.RegisterFront(config["TdFront"])
     trader_api.SubscribePublicTopic(tdapi.THOST_TERT_QUICK)
-    trader_api.SubscribePrivateTopic(tdapi.THOST_TERT_QUICK)
+    trader_api.SubscribePrivateTopic(tdapi.THOST_TERT_RESUME)
     trader_api.Init()
 
     # Start HTTP Server
@@ -739,6 +1001,8 @@ def main():
     except KeyboardInterrupt:
         logger.info("Stopping CTP Bridge...")
     finally:
+        if g_trader_mgr:
+            g_trader_mgr.stop()
         if trader_api:
             trader_api.Release()
         httpd.server_close()

@@ -253,6 +253,10 @@ class TqDataWorker:
         self.last_market_event_at = 0.0
         self.quote_symbols = set()
         self.subscription_specs = {}
+        self.execution_symbols = {}
+        self.execution_events = deque(maxlen=4096)
+        self.execution_seq = 0
+        self.execution_latest = {}
         self.events = deque(maxlen=2048)
         self.events_lock = threading.Lock()
         self.next_event_id = itertools.count(1)
@@ -508,9 +512,22 @@ class TqDataWorker:
         if updated:
             self.last_market_event_at = time.time()
             self._detect_closed_bars()
+            for code, tq_symbol in list(self.execution_symbols.items()):
+                quote = self.quotes.get(tq_symbol)
+                if quote is None:
+                    continue
+                data = execution_quote(quote, tq_symbol)
+                with self.events_lock:
+                    if self.execution_latest.get(code) != data:
+                        self.execution_latest[code] = data
+                        self.execution_seq += 1
+                        self.execution_events.append({"id": self.execution_seq, "code": code, "quote": data})
         return updated
 
     def _handle_cmd(self, cmd: str, args: dict):
+        if cmd == "subscribe_execution":
+            self.execution_symbols.update(args["mapping"])
+            return self._handle_cmd("subscribe_quotes", {"tq_symbols": list(args["mapping"].values())})
         if cmd == "subscribe_quotes":
             tq_symbols = args["tq_symbols"]
             self.quote_symbols.update(tq_symbols)
@@ -1061,6 +1078,47 @@ async def handle_events(request: web.Request) -> web.Response:
         await asyncio.sleep(0.05)
 
 
+def execution_quote(q, tq_symbol):
+    def number(name):
+        value = getattr(q, name, 0.0)
+        return float(value) if value is not None and not pd.isna(value) and abs(float(value)) < 1e100 else 0.0
+    return {"instrument_id": tq_symbol.split(".")[-1],
+            "exchange_id": str(getattr(q, "exchange_id", "") or ""),
+            "underlying_symbol": str(getattr(q, "underlying_symbol", "") or ""),
+            "latest": number("last_price"), "bid": number("bid_price1"), "ask": number("ask_price1"),
+            "price_tick": number("price_tick"), "lower_limit": number("lower_limit"), "upper_limit": number("upper_limit"),
+            "datetime": str(getattr(q, "datetime", "") or "")}
+
+
+async def handle_execution_events(request):
+    if not worker or not worker.connected:
+        return web.json_response({"error": "行情连接未就绪"}, status=503)
+    data = await request.json()
+    codes = [str(code).upper() for code in data.get("symbols", [])]
+    mapping = {code: SymbolMapper.parse_code(code)[2] for code in codes}
+    try:
+        await asyncio.to_thread(worker.exec_cmd, "subscribe_execution", {"mapping": mapping}, 5.0)
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=503)
+    after = int(data.get("after_id", 0))
+    reset = data.get("stream_id") != STREAM_ID
+    deadline = time.monotonic() + min(25.0, float(data.get("wait_seconds", 20)))
+    while True:
+        with worker.events_lock:
+            oldest = worker.execution_events[0]["id"] if worker.execution_events else 0
+            gap = not reset and after > 0 and oldest > after + 1
+            events = [event.copy() for event in worker.execution_events if event["id"] > after and event["code"] in mapping]
+            if reset:
+                events = [{"id": worker.execution_seq, "code": code, "quote": dict(quote)}
+                          for code, quote in worker.execution_latest.items() if code in mapping]
+            latest = worker.execution_seq
+        if events or reset or gap or time.monotonic() >= deadline:
+            return web.json_response({"stream_id": STREAM_ID, "latest_event_id": latest, "gap": gap, "events": events})
+        if not worker.connected:
+            return web.json_response({"error": "行情连接中断"}, status=503)
+        await asyncio.sleep(0.02)
+
+
 async def handle_quotes(request: web.Request) -> web.Response:
     global worker
     if not worker or not worker.connected:
@@ -1125,6 +1183,14 @@ async def handle_quotes(request: web.Request) -> web.Response:
             "low": float(q.lowest) if not pd.isna(q.lowest) else float(q.last_price),
             "open": float(q.open) if not pd.isna(q.open) else float(q.last_price),
             "datetime": str(q.datetime) if hasattr(q, "datetime") else "",
+            "instrument_id": tq_sym.split(".")[-1],
+            "exchange_id": str(getattr(q, "exchange_id", "") or ""),
+            "underlying_symbol": str(getattr(q, "underlying_symbol", "") or ""),
+            "bid": float(q.bid_price1) if not pd.isna(q.bid_price1) else 0.0,
+            "ask": float(q.ask_price1) if not pd.isna(q.ask_price1) else 0.0,
+            "price_tick": float(q.price_tick) if not pd.isna(q.price_tick) else 0.0,
+            "lower_limit": float(q.lower_limit) if not pd.isna(q.lower_limit) else 0.0,
+            "upper_limit": float(q.upper_limit) if not pd.isna(q.upper_limit) else 0.0,
         }
 
     return web.json_response({"quotes": out})
@@ -1297,6 +1363,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/subscribe-klines", handle_subscribe_klines)
     app.router.add_get("/api/events", handle_events)
     app.router.add_post("/api/quotes", handle_quotes)
+    app.router.add_post("/api/execution-events", handle_execution_events)
     app.router.add_get("/api/quotes", handle_quotes)
     app.router.add_get("/api/kline", handle_kline)
     app.router.add_get("/api/search", handle_search)

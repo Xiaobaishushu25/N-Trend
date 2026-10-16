@@ -36,9 +36,8 @@ fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
         return tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
     }
-    let base = format!(
-        "{level},reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn"
-    );
+    let base =
+        format!("{level},reqwest=warn,rustls=warn,h2=warn,tungstenite=warn,tao=warn,wry=warn");
     tracing_subscriber::EnvFilter::try_new(&base)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
@@ -78,7 +77,9 @@ pub fn run() {
             let settings_path = data_dir.join("client_settings.json");
             let mut log_level = "info".to_string();
             if let Ok(content) = std::fs::read_to_string(&settings_path) {
-                if let Ok(saved) = serde_json::from_str::<n_protocol::config::ClientLocalSettings>(&content) {
+                if let Ok(saved) =
+                    serde_json::from_str::<n_protocol::config::ClientLocalSettings>(&content)
+                {
                     if !saved.log_level.trim().is_empty() {
                         log_level = saved.log_level;
                     }
@@ -97,8 +98,13 @@ pub fn run() {
             let credentials = Arc::new(CredentialStore::new(&data_dir));
             let api = Arc::new(RemoteApiClient::new(credentials.clone()));
             let kline_cache = Arc::new(KlineMemoryCache::new());
-            let realtime = RealtimeClient::new(app.handle().clone(), credentials.clone(), kline_cache.clone());
-            let backup_scheduler = BackupScheduler::new(app.handle().clone(), api.clone(), &data_dir);
+            let realtime = RealtimeClient::new(
+                app.handle().clone(),
+                credentials.clone(),
+                kline_cache.clone(),
+            );
+            let backup_scheduler =
+                BackupScheduler::new(app.handle().clone(), api.clone(), &data_dir);
 
             // 2. 初始化全局客户端状态
             let state = Arc::new(AppState::new(
@@ -228,6 +234,7 @@ pub fn run() {
             commands::get_finality_sentinel_eval,
             commands::open_log_directory,
             commands::get_trader_status,
+            commands::get_trader_snapshot,
             commands::get_trader_account,
             commands::get_trader_positions,
             commands::get_condition_orders,

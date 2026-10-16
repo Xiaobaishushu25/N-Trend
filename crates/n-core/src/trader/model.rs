@@ -1,9 +1,89 @@
 use serde::{Deserialize, Serialize};
 
+pub fn is_actual_futures_contract(code: &str) -> bool {
+    let prefix = code.bytes().take_while(u8::is_ascii_alphabetic).count();
+    prefix > 0
+        && matches!(code.len() - prefix, 3 | 4)
+        && code.as_bytes()[prefix..].iter().all(u8::is_ascii_digit)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionQuote {
+    pub instrument_id: String,
+    pub exchange_id: String,
+    pub underlying_symbol: String,
+    pub last: f64,
+    pub bid: f64,
+    pub ask: f64,
+    pub tick: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub timestamp: i64,
+}
+
+impl ExecutionQuote {
+    pub fn valid(&self) -> bool {
+        let age = chrono::Utc::now().timestamp() - self.timestamp;
+        (0..=15).contains(&age)
+            && self.last.is_finite()
+            && self.last > 0.0
+            && self.tick.is_finite()
+            && self.tick > 0.0
+            && self.lower.is_finite()
+            && self.upper.is_finite()
+            && self.lower > 0.0
+            && self.upper >= self.lower
+            && self.upper < 1e100
+            && self.last >= self.lower
+            && self.last <= self.upper
+            && is_actual_futures_contract(&self.instrument_id)
+            && !self.exchange_id.is_empty()
+    }
+
+    pub fn order_price(
+        &self,
+        buy: bool,
+        reference: f64,
+        ticks: u32,
+        max_ticks: u32,
+    ) -> Option<f64> {
+        if !self.valid() {
+            return None;
+        }
+        let opposite = if buy { self.ask } else { self.bid };
+        let base = if opposite.is_finite() && opposite >= self.lower && opposite <= self.upper {
+            opposite
+        } else if buy {
+            self.upper
+        } else {
+            self.lower
+        };
+        let price = base
+            + if buy {
+                ticks as f64 * self.tick
+            } else {
+                -(ticks as f64) * self.tick
+            };
+        let price = if max_ticks == 0 {
+            price
+        } else if buy {
+            price.min(reference + max_ticks as f64 * self.tick)
+        } else {
+            price.max(reference - max_ticks as f64 * self.tick)
+        };
+        Some(((price / self.tick).round() * self.tick).clamp(self.lower, self.upper))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
     /// 仅监控/模拟：不向柜台发送任何真实开平仓委托
-    #[serde(alias = "dry_run", alias = "DryRun", alias = "MonitorOnly", alias = "monitor_only")]
+    #[serde(
+        alias = "dry_run",
+        alias = "DryRun",
+        alias = "MonitorOnly",
+        alias = "monitor_only"
+    )]
     MonitorOnly,
     /// 半自动：触发突破时弹窗提示，待人工确认后才报单；成交后平仓全自动
     #[serde(alias = "semi_auto", alias = "SemiAuto")]
@@ -125,6 +205,8 @@ pub struct TraderTradeRecord {
     pub volume: i32,
     pub trade_time: String,
     pub trade_date: String,
+    #[serde(default)]
+    pub trading_day: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

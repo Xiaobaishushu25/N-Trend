@@ -876,6 +876,10 @@ export interface CtpHealth {
   account_id?: string
   broker_id?: string
   message?: string
+  sync_pending?: boolean
+  sync_error?: string | null
+  account_updated_at?: number
+  positions_updated_at?: number
 }
 
 export interface ExecutionConfig {
@@ -884,6 +888,10 @@ export interface ExecutionConfig {
   default_large_volume: number
   default_small_volume: number
   daily_loss_limit_r: number
+  order_wait_seconds?: number
+  slippage_ticks?: number
+  max_slippage_ticks?: number
+  max_exit_slippage_ticks?: number
 }
 
 export interface TraderAccount {
@@ -896,6 +904,7 @@ export interface TraderAccount {
   position_profit: number
   commission: number
   risk_ratio: number
+  updated_at?: number
 }
 
 export interface LiveBrokerPosition {
@@ -910,6 +919,27 @@ export interface LiveBrokerPosition {
   margin: number
 }
 
+export interface LiveTraderSnapshot {
+  source?: 'server' | 'local'
+  health: CtpHealth | null
+  account?: TraderAccount | null
+  broker_positions: LiveBrokerPosition[]
+  bridge_online?: boolean
+  config?: ExecutionConfig
+  managed_positions?: LiveManagedPosition[]
+  conditions?: LiveConditionOrder[]
+  history?: LiveTradeRecord[]
+  statistics?: LiveTradeStatistics | null
+  execution_error?: string | null
+  execution_orders?: Array<{
+    condition_id: string
+    request: { instrument_id: string; direction: string; volume: number; price: number; order_ref: string }
+    phase: 'Unknown' | 'Working' | 'CancelPending' | 'Terminal' | 'Rejected'
+    filled: number
+    note: string
+  }>
+}
+
 export interface LiveConditionOrder {
   id: string
   event_id?: number | null
@@ -921,9 +951,9 @@ export interface LiveConditionOrder {
   target_price: number
   risk: number
   score: number
-  tier: 'Large' | 'Small'
+  tier: 'large' | 'small'
   volume: number
-  state: 'Pending' | 'WaitingConfirm' | 'Triggered' | 'Filled' | 'Canceled' | 'Rejected'
+  state: 'Pending' | 'WaitingConfirm' | 'Triggered' | 'Filled' | 'Canceled' | 'Rejected' | 'Unknown' | 'Working' | 'PartFilled' | 'Closing' | 'Closed' | 'Expired' | 'Invalidated'
   created_at: number
   note: string
 }
@@ -934,7 +964,7 @@ export interface LiveManagedPosition {
   symbol: string
   instrument_id: string
   direction: string
-  tier: 'Large' | 'Small'
+  tier: 'large' | 'small'
   fill_price: number
   initial_stop_price: number
   target_price: number
@@ -960,7 +990,7 @@ export interface LiveTradeRecord {
   symbol: string
   instrument_id: string
   direction: string
-  tier: 'Large' | 'Small'
+  tier: 'large' | 'small'
   volume: number
   fill_price: number
   exit_price: number

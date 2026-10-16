@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use axum::extract::{Json, State};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use n_core::trader::{CtpTraderClient, ExecutionConfig};
 use crate::state::ServerContext;
+use n_core::trader::{CtpTraderClient, ExecutionConfig};
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
@@ -33,9 +33,7 @@ impl<T> ApiResponse<T> {
     }
 }
 
-pub async fn get_trader_status(
-    State(ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_trader_status(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     let health = client.health().await.ok();
     let config = ctx.execution_engine.get_config().await;
@@ -46,9 +44,16 @@ pub async fn get_trader_status(
     Json(ApiResponse::ok(res))
 }
 
-pub async fn get_trader_account(
-    State(_ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_trader_snapshot(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
+    let snapshot = ctx.trader_snapshot.read().await.clone();
+    if snapshot.is_null() {
+        Json(ApiResponse::err("交易快照正在初始化".to_string()))
+    } else {
+        Json(ApiResponse::ok(snapshot))
+    }
+}
+
+pub async fn get_trader_account(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     match client.account().await {
         Ok(acc) => Json(ApiResponse::ok(acc)),
@@ -56,9 +61,7 @@ pub async fn get_trader_account(
     }
 }
 
-pub async fn get_trader_positions(
-    State(ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_trader_positions(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     let broker_positions = client.positions().await.unwrap_or_default();
     let managed_positions = ctx.execution_engine.list_positions().await;
@@ -69,9 +72,7 @@ pub async fn get_trader_positions(
     Json(ApiResponse::ok(res))
 }
 
-pub async fn get_condition_orders(
-    State(ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_condition_orders(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let conditions = ctx.execution_engine.list_conditions().await;
     Json(ApiResponse::ok(conditions))
 }
@@ -112,13 +113,13 @@ pub async fn update_trader_config(
     State(ctx): State<Arc<ServerContext>>,
     Json(cfg): Json<ExecutionConfig>,
 ) -> impl IntoResponse {
-    ctx.execution_engine.update_config(cfg.clone()).await;
-    Json(ApiResponse::ok(cfg))
+    match ctx.execution_engine.update_config(cfg.clone()).await {
+        Ok(()) => Json(ApiResponse::ok(cfg)),
+        Err(e) => Json(ApiResponse::err(format!("保存执行配置失败: {e}"))),
+    }
 }
 
-pub async fn emergency_cancel_all(
-    State(_ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn emergency_cancel_all(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     match client.emergency_cancel_all().await {
         Ok(res) => Json(ApiResponse::ok(res)),
@@ -126,9 +127,7 @@ pub async fn emergency_cancel_all(
     }
 }
 
-pub async fn emergency_close_all(
-    State(_ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn emergency_close_all(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     match client.emergency_close_all().await {
         Ok(res) => Json(ApiResponse::ok(res)),
@@ -136,16 +135,12 @@ pub async fn emergency_close_all(
     }
 }
 
-pub async fn get_trade_history(
-    State(ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_trade_history(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let history = ctx.execution_engine.get_trade_history().await;
     Json(ApiResponse::ok(history))
 }
 
-pub async fn get_trade_statistics(
-    State(ctx): State<Arc<ServerContext>>,
-) -> impl IntoResponse {
+pub async fn get_trade_statistics(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let stats = ctx.execution_engine.get_trade_statistics().await;
     Json(ApiResponse::ok(stats))
 }

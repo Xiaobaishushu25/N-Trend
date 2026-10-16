@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
-import { api } from '../services/api'
+import { api, onQuotesUpdated } from '../services/api'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import type {
   CtpHealth,
+  LiveTraderSnapshot,
   ExecutionConfig,
   TraderAccount,
   LiveBrokerPosition,
@@ -23,13 +26,23 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     managedPositions: [] as LiveManagedPosition[],
     conditions: [] as LiveConditionOrder[],
     history: [] as LiveTradeRecord[],
+    executionOrders: [] as NonNullable<LiveTraderSnapshot['execution_orders']>,
     statistics: null as LiveTradeStatistics | null,
     loading: false,
     refreshing: false,
     activeTab: 'positions' as LiveTraderTab,
     filterReason: '' as string,
     errorMsg: null as string | null,
-    pollTimer: null as any | null,
+    pollTimer: null as ReturnType<typeof setInterval> | null,
+    realtimeListeners: [] as UnlistenFn[],
+    realtimeGeneration: 0,
+    pushRevision: 0,
+    lastPushAt: 0,
+    bridgeOnline: false,
+    snapshotSource: '' as string,
+    lastRecoveryAt: 0,
+    now: Date.now(),
+    quotes: {} as Record<string, { price: number; receivedAt: number }>,
   }),
 
   getters: {
@@ -48,6 +61,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       open_cost: number
       avg_price: number
       position_profit: number
+      profit_is_estimated: boolean
       margin: number
       is_broker: boolean
       managed?: LiveManagedPosition
@@ -61,6 +75,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         open_cost: number
         avg_price: number
         position_profit: number
+        profit_is_estimated: boolean
         margin: number
         is_broker: boolean
         managed?: LiveManagedPosition
@@ -69,12 +84,19 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       for (const bp of this.brokerPositions) {
         if (bp.position <= 0) continue
         const managed = this.managedPositions.find(
-          (m) => m.instrument_id.toLowerCase() === bp.instrument_id.toLowerCase() && !m.is_closed,
+          (m) => m.instrument_id.toLowerCase() === bp.instrument_id.toLowerCase() && !m.is_closed
+            && (m.direction === 'up' ? 'buy' : 'sell') === bp.direction,
         )
-        // 合约乘数估算开仓均价（若铅pb为5，大部分为10）
         const inst = bp.instrument_id.toLowerCase()
-        const mult = inst.startsWith('pb') || inst.startsWith('cu') || inst.startsWith('al') || inst.startsWith('zn') ? 5 : 10
-        const avgPrice = bp.position > 0 && bp.open_cost > 0 ? bp.open_cost / (bp.position * mult) : 0
+        const mult = DEFAULT_MULTIPLIERS[getSymbolPrefix(inst)]
+        const avgPrice = mult && bp.position > 0 && bp.open_cost > 0 ? bp.open_cost / (bp.position * mult) : 0
+        // Never substitute a continuous/main contract for the actual held contract.
+        const quote = this.quotes[inst]
+        const canEstimate = Boolean(this.isReady && !this.health?.sync_pending && mult && quote
+          && this.now - quote.receivedAt < 15000 && bp.position_cost > 0)
+        const estimatedProfit = canEstimate
+          ? (bp.direction === 'buy' ? 1 : -1) * (quote.price * mult * bp.position - bp.position_cost)
+          : bp.position_profit
         list.push({
           instrument_id: bp.instrument_id,
           direction: bp.direction,
@@ -83,7 +105,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           yd_position: bp.yd_position,
           open_cost: bp.open_cost,
           avg_price: avgPrice,
-          position_profit: bp.position_profit,
+          position_profit: estimatedProfit,
+          profit_is_estimated: canEstimate,
           margin: bp.margin,
           is_broker: true,
           managed,
@@ -105,6 +128,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
             open_cost: mp.fill_price * mp.volume,
             avg_price: mp.fill_price,
             position_profit: 0,
+            profit_is_estimated: false,
             margin: 0,
             is_broker: false,
             managed: mp,
@@ -116,7 +140,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     },
     activeConditions(): LiveConditionOrder[] {
       return this.conditions.filter(
-        (c) => c.state === 'Pending' || c.state === 'WaitingConfirm' || c.state === 'Triggered',
+        (c) => ['Pending', 'WaitingConfirm', 'Triggered', 'Unknown', 'Working', 'PartFilled', 'Closing', 'Rejected'].includes(c.state),
       )
     },
     waitingConfirmConditions(): LiveConditionOrder[] {
@@ -150,98 +174,104 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.loading = false
     },
 
+    applySnapshot(snapshot: LiveTraderSnapshot) {
+      if (snapshot.source && snapshot.source !== this.snapshotSource) this.quotes = {}
+      if (snapshot.source) this.snapshotSource = snapshot.source
+      this.health = snapshot.health
+      this.bridgeOnline = snapshot.bridge_online !== false
+      if (snapshot.account !== undefined) this.account = snapshot.account
+      this.brokerPositions = snapshot.broker_positions || []
+      if (snapshot.config) this.config = snapshot.config
+      if (snapshot.managed_positions) this.managedPositions = snapshot.managed_positions
+      if (snapshot.conditions) this.conditions = snapshot.conditions
+      if (snapshot.history) this.history = snapshot.history
+      if (snapshot.statistics !== undefined) this.statistics = snapshot.statistics
+      if (snapshot.execution_orders) this.executionOrders = snapshot.execution_orders
+      this.errorMsg = snapshot.execution_error || snapshot.health?.sync_error || null
+    },
+
     async refresh() {
+      if (this.refreshing) return
+      this.refreshing = true
+      const revision = this.pushRevision
       try {
-        this.refreshing = true
-        // 1. 获取 CTP 状态与运行配置
-        try {
-          const res: any = await api.getTraderStatus()
-          const payload = res?.data !== undefined ? res.data : res
-          if (payload) {
-            this.health = payload.health || null
-            if (payload.config) {
-              this.config = payload.config
-            }
-          }
-        } catch (e: any) {
-          this.errorMsg = typeof e === 'string' ? e : e?.message || '获取交易服务状态失败'
-        }
-
-        // 2. 获取资金账户
-        try {
-          const res: any = await api.getTraderAccount()
-          const payload = res?.data !== undefined ? res.data : res
-          if (payload) {
-            if (payload.margin === undefined && payload.curr_margin !== undefined) {
-              payload.margin = payload.curr_margin
-            }
-            if (payload.risk_ratio === undefined && (payload.balance || 0) > 0) {
-              payload.risk_ratio = (payload.margin || 0) / payload.balance
-            }
-            this.account = payload
-          }
-        } catch {}
-
-        // 3. 获取持仓（柜台持仓 + 策略托管持仓）
-        try {
-          const res: any = await api.getTraderPositions()
-          const payload = res?.data !== undefined ? res.data : res
-          if (payload) {
-            if (Array.isArray(payload)) {
-              this.brokerPositions = payload
-              this.managedPositions = []
-            } else {
-              this.brokerPositions = payload.broker_positions || []
-              this.managedPositions = payload.managed_positions || []
-            }
-          }
-        } catch {}
-
-        // 4. 获取合成条件单列表
-        try {
-          const res: any = await api.getConditionOrders()
-          const payload = res?.data !== undefined ? res.data : res
-          if (Array.isArray(payload)) {
-            this.conditions = payload
-          }
-        } catch {}
-
-        // 5. 获取平仓历史明细与多维统计
-        try {
-          const resHist: any = await api.getTradeHistory()
-          const payloadHist = resHist?.data !== undefined ? resHist.data : resHist
-          if (Array.isArray(payloadHist)) {
-            this.history = payloadHist
-          }
-          const resStats: any = await api.getTradeStatistics()
-          const payloadStats = resStats?.data !== undefined ? resStats.data : resStats
-          if (payloadStats) {
-            this.statistics = payloadStats
-          }
-        } catch {}
+        const res: any = await api.getTraderSnapshot()
+        if (revision !== this.pushRevision) return // A newer push supersedes this HTTP response.
+        if (res?.success === false) throw new Error(res.error || '交易快照尚未就绪')
+        const snapshot = res?.data !== undefined ? res.data : res
+        if (snapshot) this.applySnapshot(snapshot)
+      } catch (e: any) {
+        if (revision !== this.pushRevision) return
+        this.errorMsg = typeof e === 'string' ? e : e?.message || '获取交易快照失败'
+        this.bridgeOnline = false
+        if (this.health) this.health = { ...this.health, ready: false, healthy: false }
       } finally {
         this.refreshing = false
       }
     },
 
-    startPolling(intervalMs = 3000) {
-      if (this.pollTimer) clearInterval(this.pollTimer)
+    async startRealtime() {
+      this.stopRealtime()
+      const generation = this.realtimeGeneration
+      const add = async (listener: Promise<UnlistenFn>) => {
+        const unlisten = await listener
+        if (generation !== this.realtimeGeneration) unlisten()
+        else this.realtimeListeners.push(unlisten)
+      }
+      try {
+        await add(listen<LiveTraderSnapshot>('trader-updated', ({ payload }) => {
+          this.pushRevision++
+          this.lastPushAt = Date.now()
+          this.applySnapshot(payload)
+        }))
+        await add(listen('trader-heartbeat', () => { this.lastPushAt = Date.now() }))
+        await add(listen('trader-resync-needed', () => { void this.refresh() }))
+        await add(listen<string>('connection-status-changed', ({ payload }) => {
+          if (payload !== 'connected' && this.snapshotSource !== 'local') {
+            this.lastPushAt = 0
+            this.bridgeOnline = false
+            if (this.health) this.health = { ...this.health, ready: false, healthy: false }
+          }
+        }))
+        // Trader messages are complete snapshots. Global sequence gaps also occur
+        // for intentionally filtered chart events and do not require a trader read.
+        await add(listen('trader-stream-disconnected', () => {
+          this.lastPushAt = 0
+          this.bridgeOnline = false
+          if (this.health) this.health = { ...this.health, ready: false, healthy: false }
+        }))
+        await add(onQuotesUpdated((quotes) => {
+          for (const quote of quotes) {
+            if (quote.latest != null && Number.isFinite(quote.latest) && quote.latest > 0) {
+              this.quotes[quote.code.toLowerCase()] = { price: quote.latest, receivedAt: Date.now() }
+            }
+          }
+        }))
+      } catch {
+        // Browser preview or unavailable native events: use cache-only recovery reads.
+      }
+      if (generation !== this.realtimeGeneration) return
       this.pollTimer = setInterval(() => {
-        void this.refresh()
-      }, intervalMs)
+        this.now = Date.now()
+        // Healthy streams send a heartbeat every 15 s. Only recover via HTTP when stale.
+        if (this.now - this.lastPushAt > 45000 && this.now - this.lastRecoveryAt > 15000) {
+          this.lastRecoveryAt = this.now
+          void this.refresh()
+        }
+      }, 1000)
     },
 
-    stopPolling() {
-      if (this.pollTimer) {
-        clearInterval(this.pollTimer)
-        this.pollTimer = null
-      }
+    stopRealtime() {
+      this.realtimeGeneration++
+      if (this.pollTimer) clearInterval(this.pollTimer)
+      this.pollTimer = null
+      this.realtimeListeners.splice(0).forEach((unlisten) => unlisten())
     },
 
     async confirmCondition(id: string) {
       try {
         await api.confirmConditionOrder(id)
-        notify.success('开仓确认成功，委托已送达柜台')
+        notify.success('开仓任务已确认，等待柜台委托和成交回报')
         await this.refresh()
       } catch (e: any) {
         notify.error(`开仓确认失败: ${e}`)

@@ -41,6 +41,7 @@ pub async fn run_scan_now(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.run_scan().await {
         Ok(res) => {
+            crate::runtime::register_execution_signals(&ctx, &res.new_warnings).await;
             *ctx.last_scan.write().await = Some(chrono::Local::now().naive_local());
             let val = serde_json::to_value(&res).unwrap_or_default();
             let seq = ctx.next_event_seq();
@@ -62,6 +63,7 @@ pub async fn run_scan_fast_now(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.run_scan_fast().await {
         Ok(res) => {
+            crate::runtime::register_execution_signals(&ctx, &res.new_warnings).await;
             *ctx.last_scan.write().await = Some(chrono::Local::now().naive_local());
             let val = serde_json::to_value(&res).unwrap_or_default();
             let seq = ctx.next_event_seq();

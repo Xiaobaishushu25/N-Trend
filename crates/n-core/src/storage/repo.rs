@@ -883,10 +883,7 @@ pub fn preclose_retention_cutoff_ts() -> String {
         .to_string()
 }
 
-pub async fn prune_preclose_candidates(
-    db: &DatabaseConnection,
-    cutoff_ts: &str,
-) -> Result<u64> {
+pub async fn prune_preclose_candidates(db: &DatabaseConnection, cutoff_ts: &str) -> Result<u64> {
     let res = preclose_candidates::Entity::delete_many()
         .filter(preclose_candidates::Column::SessionCloseTs.lt(cutoff_ts))
         .exec(db)
@@ -1024,10 +1021,7 @@ pub async fn preclose_signal_by_key(
         .context("查询收盘前预检测事件失败")?)
 }
 
-pub async fn prune_preclose_signals(
-    db: &DatabaseConnection,
-    cutoff_ts: &str,
-) -> Result<u64> {
+pub async fn prune_preclose_signals(db: &DatabaseConnection, cutoff_ts: &str) -> Result<u64> {
     let res = preclose_signals::Entity::delete_many()
         .filter(preclose_signals::Column::SessionCloseTs.lt(cutoff_ts))
         .exec(db)
@@ -1106,6 +1100,17 @@ pub async fn update_preclose_signal(
     model.updated_at = Set(updated_at);
     model.update(db).await.context("更新收盘前预检测事件失败")?;
     Ok(())
+}
+
+/// 待触发的交易预警，独立于通知开关。
+pub async fn pending_execution_signals(
+    db: &DatabaseConnection,
+) -> Result<Vec<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::State.eq("pending"))
+        .order_by_asc(pattern_events::Column::Id)
+        .all(db)
+        .await?)
 }
 
 /// 全部信号事件（复盘统计用）。
@@ -1926,7 +1931,9 @@ pub async fn create_device(
         last_seen_at: Set(Some(now)),
         revoked_at: Set(None),
     };
-    let res = devices::Entity::insert(model).exec_with_returning(db).await?;
+    let res = devices::Entity::insert(model)
+        .exec_with_returning(db)
+        .await?;
     bump_revision(db, "devices").await.ok();
     Ok(res)
 }
@@ -2095,10 +2102,7 @@ pub async fn list_notification_history(
     Ok(out)
 }
 
-pub async fn mark_notifications_read(
-    db: &DatabaseConnection,
-    up_to_id: Option<u64>,
-) -> Result<()> {
+pub async fn mark_notifications_read(db: &DatabaseConnection, up_to_id: Option<u64>) -> Result<()> {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if let Some(id) = up_to_id {
         db.execute(Statement::from_sql_and_values(
@@ -2487,7 +2491,8 @@ mod tests {
         insert_preclose_candidate(&db, new_candidate).await.unwrap();
 
         let cutoff = "2026-09-04 15:00:00";
-        let (pruned_signals, pruned_candidates) = prune_preclose_records(&db, cutoff).await.unwrap();
+        let (pruned_signals, pruned_candidates) =
+            prune_preclose_records(&db, cutoff).await.unwrap();
         assert_eq!(pruned_signals, 1);
         assert_eq!(pruned_candidates, 1);
 

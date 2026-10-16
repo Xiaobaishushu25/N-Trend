@@ -1,11 +1,11 @@
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use n_protocol::dto::*;
 use n_protocol::ws::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::connect_async;
@@ -69,8 +69,64 @@ impl RealtimeClient {
         tauri::async_runtime::spawn(async move {
             worker_client.run_loop().await;
         });
+        let local_client = client.clone();
+        tauri::async_runtime::spawn(async move {
+            local_client.run_local_trader_stream().await;
+        });
 
         client
+    }
+
+    async fn run_local_trader_stream(&self) {
+        let Ok(client) = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+        else {
+            return;
+        };
+        loop {
+            if *self.status.read().await == ConnectionStatus::Connected {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            let result: anyhow::Result<()> = async {
+                let mut response = client
+                    .get("http://127.0.0.1:8766/events")
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let mut buffer = Vec::new();
+                loop {
+                    let chunk =
+                        tokio::time::timeout(Duration::from_secs(40), response.chunk()).await??;
+                    let Some(chunk) = chunk else {
+                        anyhow::bail!("本地交易推送连接关闭")
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(end) = buffer.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buffer.drain(..=end).collect();
+                        if let Some(data) = line.strip_prefix(b"data: ") {
+                            let mut snapshot: serde_json::Value = serde_json::from_slice(data)?;
+                            if *self.status.read().await == ConnectionStatus::Connected {
+                                return Ok(());
+                            }
+                            crate::commands::prepare_local_trader_snapshot(&mut snapshot);
+                            let _ = self.app.emit("trader-updated", snapshot);
+                        }
+                    }
+                    if buffer.len() > 4 * 1024 * 1024 {
+                        anyhow::bail!("本地交易推送帧过大");
+                    }
+                }
+            }
+            .await;
+            if result.is_err() {
+                if *self.status.read().await != ConnectionStatus::Connected {
+                    let _ = self.app.emit("trader-stream-disconnected", ());
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
     }
 
     pub async fn get_state(&self) -> ConnectionStateDto {
@@ -79,7 +135,11 @@ impl RealtimeClient {
             server_url: self.credentials.get_server_url(),
             quote_delay_ms: {
                 let delay = self.quote_delay_ms.load(Ordering::Relaxed);
-                if delay > 0 { Some(delay) } else { None }
+                if delay > 0 {
+                    Some(delay)
+                } else {
+                    None
+                }
             },
             last_event_seq: self.last_event_seq.load(Ordering::Relaxed),
         }
@@ -97,7 +157,10 @@ impl RealtimeClient {
             }
         }
 
-        let msg = WsClientMessage::Subscribe { symbols, timeframes };
+        let msg = WsClientMessage::Subscribe {
+            symbols,
+            timeframes,
+        };
         if let Some(tx) = self.tx_sub.read().await.as_ref() {
             let _ = tx.send(msg);
         }
@@ -115,7 +178,10 @@ impl RealtimeClient {
             }
         }
 
-        let msg = WsClientMessage::Unsubscribe { symbols, timeframes };
+        let msg = WsClientMessage::Unsubscribe {
+            symbols,
+            timeframes,
+        };
         if let Some(tx) = self.tx_sub.read().await.as_ref() {
             let _ = tx.send(msg);
         }
@@ -167,6 +233,7 @@ impl RealtimeClient {
                 Ok((ws_stream, _resp)) => {
                     tracing::info!("✅ 实时 WebSocket 连接已建立");
                     self.set_status(ConnectionStatus::Connected).await;
+                    let _ = self.app.emit("trader-resync-needed", ());
                     backoff_idx = 0;
 
                     let (mut write, mut read) = ws_stream.split();
@@ -174,8 +241,20 @@ impl RealtimeClient {
                     *self.tx_sub.write().await = Some(tx);
 
                     // Resend current subscriptions
-                    let current_syms: Vec<String> = self.subscribed_symbols.read().await.iter().cloned().collect();
-                    let current_tfs: Vec<String> = self.subscribed_timeframes.read().await.iter().cloned().collect();
+                    let current_syms: Vec<String> = self
+                        .subscribed_symbols
+                        .read()
+                        .await
+                        .iter()
+                        .cloned()
+                        .collect();
+                    let current_tfs: Vec<String> = self
+                        .subscribed_timeframes
+                        .read()
+                        .await
+                        .iter()
+                        .cloned()
+                        .collect();
                     if !current_syms.is_empty() || !current_tfs.is_empty() {
                         let sub_msg = WsClientMessage::Subscribe {
                             symbols: current_syms,
@@ -247,13 +326,19 @@ impl RealtimeClient {
     async fn handle_incoming_text(&self, text: &str) {
         if let Ok(msg) = serde_json::from_str::<WsServerMessage>(text) {
             match msg {
-                WsServerMessage::Pong { client_time, server_time } => {
+                WsServerMessage::Pong {
+                    client_time,
+                    server_time,
+                } => {
                     let now = chrono::Utc::now().timestamp_millis();
                     let rtt = (now - client_time).max(0) as u64;
                     self.quote_delay_ms.store(rtt, Ordering::Relaxed);
                     let _ = self.app.emit("server-pong", server_time);
                 }
-                WsServerMessage::Subscribed { symbols, timeframes } => {
+                WsServerMessage::Subscribed {
+                    symbols,
+                    timeframes,
+                } => {
                     tracing::info!("已订阅品种: {:?}, 周期: {:?}", symbols, timeframes);
                 }
                 WsServerMessage::Error { code, message } => {
@@ -262,7 +347,11 @@ impl RealtimeClient {
                         self.set_status(ConnectionStatus::Unauthorized).await;
                     }
                 }
-                WsServerMessage::Event { event_seq, topic, payload } => {
+                WsServerMessage::Event {
+                    event_seq,
+                    topic,
+                    payload,
+                } => {
                     let prev_seq = self.last_event_seq.swap(event_seq, Ordering::Relaxed);
                     if prev_seq > 0 && event_seq > prev_seq + 1 {
                         tracing::warn!(
@@ -275,6 +364,12 @@ impl RealtimeClient {
 
                     // Forward based on topic
                     match topic.as_str() {
+                        "trader.updated" => {
+                            let _ = self.app.emit("trader-updated", &payload);
+                        }
+                        "trader.heartbeat" => {
+                            let _ = self.app.emit("trader-heartbeat", ());
+                        }
                         "quote.updated" => {
                             let _ = self.app.emit("quote-updated", &payload);
                         }
@@ -284,7 +379,9 @@ impl RealtimeClient {
                                 payload.get("timeframe").and_then(|v| v.as_str()),
                             ) {
                                 if let Some(bar_val) = payload.get("bar") {
-                                    if let Ok(bar) = serde_json::from_value::<KlineDto>(bar_val.clone()) {
+                                    if let Ok(bar) =
+                                        serde_json::from_value::<KlineDto>(bar_val.clone())
+                                    {
                                         self.kline_cache.update_partial_bar(sym, tf, bar);
                                     }
                                 }
@@ -297,7 +394,9 @@ impl RealtimeClient {
                                 payload.get("timeframe").and_then(|v| v.as_str()),
                             ) {
                                 if let Some(bar_val) = payload.get("bar") {
-                                    if let Ok(bar) = serde_json::from_value::<KlineDto>(bar_val.clone()) {
+                                    if let Ok(bar) =
+                                        serde_json::from_value::<KlineDto>(bar_val.clone())
+                                    {
                                         self.kline_cache.merge_closed_bar(sym, tf, bar);
                                     }
                                 }
@@ -323,7 +422,9 @@ impl RealtimeClient {
                             let _ = self.app.emit("state-changed", &payload);
                         }
                         "server.status" => {
-                            if let Some(delay) = payload.get("quoteDelayMs").and_then(|v| v.as_u64()) {
+                            if let Some(delay) =
+                                payload.get("quoteDelayMs").and_then(|v| v.as_u64())
+                            {
                                 self.quote_delay_ms.store(delay, Ordering::Relaxed);
                             }
                             let _ = self.app.emit("server-status", &payload);

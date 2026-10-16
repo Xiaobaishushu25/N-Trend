@@ -1,7 +1,7 @@
 use crate::realtime::RealtimeHub;
 use crate::secrets::ServerSecrets;
-use n_core::service::Services;
 use n_core::sea_orm::DatabaseConnection;
+use n_core::service::Services;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +24,7 @@ pub struct ServerContext {
     pub last_scan: RwLock<Option<chrono::NaiveDateTime>>,
     pub scheduler_running: AtomicBool,
     pub execution_engine: Arc<n_core::trader::ExecutionEngine>,
+    pub trader_snapshot: RwLock<serde_json::Value>,
 }
 
 impl ServerContext {
@@ -38,16 +39,21 @@ impl ServerContext {
         let config_path = data_dir.join("trader_config.json");
         let initial_config = if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
-                Ok(content) => match serde_json::from_str::<n_core::trader::ExecutionConfig>(&content) {
-                    Ok(cfg) => {
-                        tracing::info!("💾 成功从磁盘加载交易执行配置: {}", config_path.display());
-                        cfg
+                Ok(content) => {
+                    match serde_json::from_str::<n_core::trader::ExecutionConfig>(&content) {
+                        Ok(cfg) => {
+                            tracing::info!(
+                                "💾 成功从磁盘加载交易执行配置: {}",
+                                config_path.display()
+                            );
+                            cfg
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ 解析交易配置失败: {}, 将采用默认配置", e);
+                            n_core::trader::ExecutionConfig::default()
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("⚠️ 解析交易配置失败: {}, 将采用默认配置", e);
-                        n_core::trader::ExecutionConfig::default()
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!("⚠️ 读取交易配置失败: {}, 将采用默认配置", e);
                     n_core::trader::ExecutionConfig::default()
@@ -76,6 +82,7 @@ impl ServerContext {
             last_scan: RwLock::new(None),
             scheduler_running: AtomicBool::new(true),
             execution_engine,
+            trader_snapshot: RwLock::new(serde_json::Value::Null),
         })
     }
 

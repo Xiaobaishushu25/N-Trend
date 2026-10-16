@@ -131,6 +131,86 @@ pub struct TqBridgeClient {
 }
 
 impl TqBridgeClient {
+    pub fn decode_execution_quote(
+        code: &str,
+        q: &serde_json::Value,
+    ) -> crate::trader::model::ExecutionQuote {
+        use chrono::TimeZone;
+        let date = chrono::NaiveDateTime::parse_from_str(
+            q["datetime"].as_str().unwrap_or(""),
+            "%Y-%m-%d %H:%M:%S%.f",
+        );
+        let timestamp = date
+            .ok()
+            .and_then(|d| {
+                chrono::FixedOffset::east_opt(8 * 3600)?
+                    .from_local_datetime(&d)
+                    .single()
+            })
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
+        let number = |key: &str| q[key].as_f64().unwrap_or(0.0);
+        crate::trader::model::ExecutionQuote {
+            instrument_id: q["instrument_id"].as_str().unwrap_or(code).into(),
+            exchange_id: q["exchange_id"].as_str().unwrap_or("").into(),
+            underlying_symbol: q["underlying_symbol"].as_str().unwrap_or("").into(),
+            last: number("latest"),
+            bid: number("bid"),
+            ask: number("ask"),
+            tick: number("price_tick"),
+            lower: number("lower_limit"),
+            upper: number("upper_limit"),
+            timestamp,
+        }
+    }
+
+    pub async fn execution_events(
+        &self,
+        symbols: &[String],
+        after: u64,
+        stream_id: &str,
+    ) -> Result<serde_json::Value> {
+        Ok(self
+            .http
+            .post(format!("{}/api/execution-events", self.base_url))
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({
+                "symbols": symbols, "after_id": after, "stream_id": stream_id, "wait_seconds": 20
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Rich actual-contract quotes for execution. Do not use the Sina fallback,
+    /// which does not provide the contract tick and daily price limits here.
+    pub async fn execution_quotes(
+        &self,
+        codes: &[String],
+    ) -> Result<HashMap<String, crate::trader::model::ExecutionQuote>> {
+        if codes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let body: serde_json::Value = self
+            .http
+            .post(format!("{}/api/quotes", self.base_url))
+            .timeout(Duration::from_secs(5))
+            .json(&QuotesRequest { symbols: codes })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(body["quotes"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(code, q)| (code.to_uppercase(), Self::decode_execution_quote(code, q)))
+            .collect())
+    }
+
     pub fn new(base_url: &str) -> Self {
         let http = Client::builder()
             .timeout(Duration::from_secs(40))
