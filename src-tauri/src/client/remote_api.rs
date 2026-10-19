@@ -102,7 +102,7 @@ impl RemoteApiClient {
         let status = resp.status();
         let url = resp.url().clone();
         if let Some(trace_id) = trace_id {
-            tracing::info!(trace_id, attempt, status = %status, headers_ms = attempt_started.elapsed().as_millis(), content_length = ?resp.content_length(), "K线HTTP响应头到达");
+            tracing::info!(trace_id, attempt, status = %status, headers_ms = attempt_started.elapsed().as_millis(), server_timing = ?resp.headers().get("Server-Timing"), content_encoding = ?resp.headers().get("Content-Encoding"), content_length = ?resp.content_length(), "K线HTTP响应头到达");
         }
         if status.is_success() {
             let body_started = std::time::Instant::now();

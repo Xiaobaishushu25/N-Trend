@@ -20,6 +20,7 @@ use axum::routing::{delete, get, post, put};
 use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tower_http::compression::CompressionLayer;
 
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     let api_v1 = Router::new()
@@ -73,7 +74,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/klines/:symbol/:timeframe", get(klines::get_klines))
         .route(
             "/chart-klines/:symbol/:timeframe",
-            get(klines::get_chart_klines),
+            get(klines::get_chart_klines).layer(CompressionLayer::new()),
         )
         .route(
             "/trend-series/:symbol/:timeframe",

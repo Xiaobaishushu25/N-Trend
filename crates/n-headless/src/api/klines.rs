@@ -1,7 +1,7 @@
 use crate::auth::AuthDevice;
 use crate::state::ServerContext;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
 use n_protocol::dto::{ChartKlineResponse, KlineDto, TrendPointDto};
 use n_protocol::error::ApiErrorResponse;
@@ -21,7 +21,7 @@ pub async fn get_chart_klines(
     Path((symbol, timeframe)): Path<(String, String)>,
     Query(q): Query<KlineQuery>,
     headers: HeaderMap,
-) -> Result<Json<ChartKlineResponse>, (StatusCode, Json<ApiErrorResponse>)> {
+) -> Result<(HeaderMap, Json<ChartKlineResponse>), (StatusCode, Json<ApiErrorResponse>)> {
     let limit = q.limit.unwrap_or(1200).min(5000);
     let started = std::time::Instant::now();
     let trace_id = headers.get("X-Ntrend-Trace-Id").and_then(|v| v.to_str().ok())
@@ -86,8 +86,13 @@ pub async fn get_chart_klines(
                 rollover: p.rollover,
             });
 
-            tracing::info!(trace_id, rows = rows.len(), total_ms = started.elapsed().as_millis(), "K线服务端响应组装完成");
-            Ok(Json(ChartKlineResponse {
+            let server_elapsed_ms = started.elapsed().as_millis();
+            tracing::info!(trace_id, rows = rows.len(), total_ms = server_elapsed_ms, "K线服务端响应组装完成");
+            let mut response_headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(&format!("app;dur={server_elapsed_ms}")) {
+                response_headers.insert("Server-Timing", value);
+            }
+            Ok((response_headers, Json(ChartKlineResponse {
                 rows,
                 status: res.status,
                 message: res.message,
@@ -98,7 +103,7 @@ pub async fn get_chart_klines(
                 next_before,
                 full_reload_required: Some(false),
                 partial_bar,
-            }))
+            })))
         }
         Err(e) => {
             tracing::error!(trace_id, elapsed_ms = started.elapsed().as_millis(), error = %e, "K线服务端请求失败");
@@ -140,7 +145,7 @@ pub async fn get_klines(
     path: Path<(String, String)>,
     query: Query<KlineQuery>,
 ) -> Result<Json<Vec<KlineDto>>, (StatusCode, Json<ApiErrorResponse>)> {
-    let res = get_chart_klines(State(ctx), device, path, query, HeaderMap::new()).await?;
+    let (_, res) = get_chart_klines(State(ctx), device, path, query, HeaderMap::new()).await?;
     Ok(Json(res.0.rows))
 }
 
