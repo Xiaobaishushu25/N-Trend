@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { reportPerformance } from '../utils/performanceLog'
 import {
   NAutoComplete,
   NBadge,
@@ -362,6 +363,8 @@ function kickBreathe() {
 const unlisteners: (() => void)[] = []
 
 onMounted(async () => {
+  const mountedAt = performance.now()
+  reportPerformance('layout_mounted', mountedAt)
   // 复盘窗口点击明细行时：主窗口接收事件并打开对应K线图（复盘点位重绘见 ChartView）
   try {
     if (getCurrentWindow().label === 'main') {
@@ -411,14 +414,19 @@ onMounted(async () => {
   } catch {
     // 浏览器预览等环境无 Tauri 事件 API，忽略
   }
+  reportPerformance('layout_events_ready', performance.now() - mountedAt)
   try {
     await settingsStore.load()
+    reportPerformance('settings_loaded', performance.now() - mountedAt)
   } catch {
+    reportPerformance('settings_load_failed', performance.now() - mountedAt)
     // 浏览器预览环境下无后端命令，忽略
   }
   try {
     await symbolsStore.load()
+    reportPerformance('symbols_loaded', performance.now() - mountedAt, { rows: symbolsStore.symbols.length })
   } catch {
+    reportPerformance('symbols_load_failed', performance.now() - mountedAt)
     // 浏览器预览环境下无后端命令，忽略
   }
   // 定时任务每次成功后，顶部时间信息实时跟随刷新

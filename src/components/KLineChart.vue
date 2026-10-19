@@ -32,6 +32,7 @@ import type { KlineRow, ManualLevelDto, ManualLevelInput, PatternDto, ReviewExit
 import { SINGLE_BAR_COLORS } from '../utils/singleBar'
 import { computePriceGaps, gapBoundaryCoordinate, type PriceGapSegment } from '../utils/priceGaps'
 import { useSettingsStore } from '../stores/settings'
+import { reportPerformance } from '../utils/performanceLog'
 
 const props = defineProps<{
   symbol: string
@@ -2106,6 +2107,7 @@ function renderData() {
     // )
     return
   }
+  const renderStarted = performance.now()
   const isSwitch = prevSymbol !== props.symbol || prevTimeframe !== props.timeframe
   prevSymbol = props.symbol
   prevTimeframe = props.timeframe
@@ -2265,6 +2267,13 @@ function renderData() {
   else if (pendingFocusTs) {
     // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
     scheduleFocusRetry()
+  }
+  const renderMs = performance.now() - renderStarted
+  if (isSwitch || renderMs >= 100) {
+    const symbol = props.symbol
+    const timeframe = props.timeframe
+    const rows = props.rows.length
+    requestAnimationFrame(() => reportPerformance('chart_render_finished', performance.now() - renderStarted, { symbol, timeframe, rows }))
   }
 }
 
@@ -2736,6 +2745,7 @@ function toggleManualLevelDraw() {
 }
 
 onMounted(() => {
+  const mountStarted = performance.now()
   if (!container.value) return
   window.addEventListener('keydown', handleManualLevelKeydown)
   // 每次进入图表页先回到默认视图（最新 displayKNum 根）；页内切换品种/级别沿用缩放
@@ -2918,6 +2928,7 @@ onMounted(() => {
     }
   })
   resizeObserver.observe(container.value)
+  reportPerformance('chart_created', performance.now() - mountStarted, { symbol: props.symbol, timeframe: props.timeframe })
   renderData()
   renderOverlays()
   // 兜底：确保图表拿到容器实际尺寸

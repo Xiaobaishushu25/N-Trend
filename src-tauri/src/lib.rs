@@ -69,6 +69,15 @@ pub fn run() {
         );
 
     builder
+        .on_page_load(|webview, payload| {
+            tracing::info!(
+                window = webview.label(),
+                event = ?payload.event(),
+                scheme = payload.url().scheme(),
+                host = payload.url().host_str().unwrap_or(""),
+                "客户端页面加载阶段"
+            );
+        })
         .setup(|app| {
             let setup_t0 = Instant::now();
             let data_dir = app_data_dir(app)?;
@@ -93,6 +102,7 @@ pub fn run() {
                 env!("CARGO_PKG_VERSION"),
                 data_dir.display()
             );
+            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端日志初始化完成");
 
             // 1. 初始化客户端模块
             let credentials = Arc::new(CredentialStore::new(&data_dir));
@@ -105,6 +115,7 @@ pub fn run() {
             );
             let backup_scheduler =
                 BackupScheduler::new(app.handle().clone(), api.clone(), &data_dir);
+            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端网络、缓存和后台调度器初始化完成");
 
             // 2. 初始化全局客户端状态
             let state = Arc::new(AppState::new(
@@ -116,10 +127,12 @@ pub fn run() {
                 backup_scheduler,
             ));
             app.manage(state);
+            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端全局状态初始化完成");
 
             // 3. 桌面端设置系统托盘
             #[cfg(desktop)]
             setup_tray(app)?;
+            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端托盘初始化完成");
 
             tracing::info!("✅ 主窗口就绪 总耗时 {}ms", setup_t0.elapsed().as_millis());
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -145,6 +158,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
+            commands::report_frontend_stage,
+            commands::report_frontend_perf,
+            commands::report_frontend_error,
             commands::set_window_size,
             commands::get_connection_status,
             commands::get_auth_record,

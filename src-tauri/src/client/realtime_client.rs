@@ -353,7 +353,11 @@ impl RealtimeClient {
                     payload,
                 } => {
                     let prev_seq = self.last_event_seq.swap(event_seq, Ordering::Relaxed);
-                    if prev_seq > 0 && event_seq > prev_seq + 1 {
+                    // 服务端先分配全局序号，再按订阅过滤 K 线事件。
+                    // 已订阅客户端看到的跳号是正常现象，不能当作丢包。
+                    let filtered = !self.subscribed_symbols.read().await.is_empty()
+                        || !self.subscribed_timeframes.read().await.is_empty();
+                    if !filtered && prev_seq > 0 && event_seq > prev_seq + 1 {
                         tracing::warn!(
                             "⚠️ WebSocket 跳号检测: 预期序号 {}, 收到序号 {}",
                             prev_seq + 1,

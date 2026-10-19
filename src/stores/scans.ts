@@ -14,7 +14,6 @@ function activeSignals(rows: PatternEvent[]): PatternEvent[] {
 
 let cleanupInterval: ReturnType<typeof setInterval> | null = null
 let latestRefreshPromise: Promise<void> | null = null
-let initialScanScheduled = false
 
 function ensureCleanup(store: { cleanupSingleBars: () => void }) {
   if (cleanupInterval != null || typeof window === 'undefined') return
@@ -88,16 +87,8 @@ export const useScansStore = defineStore('scans', {
             this.upsertSingleBars(activeSingleBars)
           }
         } catch {
-          // 缓存读取失败时仍允许下面安排一次后台扫描恢复数据。
+          // 读取失败时保持空状态；显式扫描与服务端定时扫描负责更新。
           this.latestSignals = []
-        }
-
-        // Dashboard/Chart 等多个视图会在启动时同时调用本方法。整个前端会话只安排
-        // 一次后台扫描，避免把相同请求连续塞进 Rust 的扫描锁队列。
-        if (!initialScanScheduled) {
-          initialScanScheduled = true
-          const delay = this.latestSignals.length ? 1200 : 0
-          setTimeout(() => this.runScanFast().catch(() => {}), delay)
         }
       })().finally(() => {
         latestRefreshPromise = null

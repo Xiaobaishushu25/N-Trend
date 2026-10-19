@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
+import { reportPerformance } from '../utils/performanceLog'
 import type { ChartKlineResponse, KlineRow, Timeframe } from '../types'
 
 export const useKlinesStore = defineStore('klines', {
@@ -28,6 +29,8 @@ export const useKlinesStore = defineStore('klines', {
       return true
     },
     async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
+      const started = performance.now()
+      if (!silent) reportPerformance('chart_load_started', started, { symbol, timeframe })
       // silent：后台静默刷新（如定时入库后），不弹加载遮罩
       if (!silent) {
         this.loadingCount++
@@ -47,14 +50,19 @@ export const useKlinesStore = defineStore('klines', {
       const seq = ++this.loadSeq
       try {
         const response = await api.getChartKlines(symbol, timeframe, limit)
-        if (seq !== this.loadSeq) return
+        if (seq !== this.loadSeq) {
+          if (!silent) reportPerformance('chart_load_superseded', performance.now() - started, { symbol, timeframe })
+          return
+        }
         this.rows = response.rows
         this.partialBar = response.partial_bar ?? null
         this.chartStatus = response.status
         this.chartMessage = response.message
+        if (!silent) reportPerformance('chart_load_finished', performance.now() - started, { symbol, timeframe, rows: response.rows.length })
       } catch (e: any) {
         if (seq !== this.loadSeq) return
         this.error = e?.message || String(e)
+        if (!silent) reportPerformance('chart_load_failed', performance.now() - started, { symbol, timeframe })
         if (!silent) {
           notify.error(`获取 [${symbol}] ${timeframe} K线失败: ${this.error}`)
         }

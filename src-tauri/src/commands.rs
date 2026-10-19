@@ -2,6 +2,7 @@ use n_protocol::auth::*;
 use n_protocol::config::*;
 use n_protocol::dto::*;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -9,6 +10,7 @@ use crate::client::{AuthRecord, BackupStatus, ConnectionStateDto, ConnectionStat
 use crate::state::AppState;
 
 static LOCAL_TRADER_CONFIG: Mutex<Option<Value>> = Mutex::new(None);
+static CHART_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn local_trader_config() -> Value {
     LOCAL_TRADER_CONFIG
@@ -31,6 +33,49 @@ pub(crate) fn prepare_local_trader_snapshot(snapshot: &mut Value) {
         snapshot[key] = serde_json::json!([]);
     }
     snapshot["statistics"] = Value::Null;
+}
+
+#[tauri::command]
+pub fn report_frontend_stage(window: tauri::Window, stage: String, elapsed_ms: f64) {
+    if matches!(stage.as_str(), "entry_evaluated" | "app_mounted" | "route_ready")
+        && elapsed_ms.is_finite()
+    {
+        tracing::info!(window = window.label(), stage, elapsed_ms, "前端启动阶段");
+    }
+}
+
+#[tauri::command]
+pub fn report_frontend_perf(
+    window: tauri::Window,
+    stage: String,
+    elapsed_ms: f64,
+    symbol: Option<String>,
+    timeframe: Option<String>,
+    rows: Option<usize>,
+) {
+    if !matches!(stage.as_str(),
+        "layout_mounted" | "layout_events_ready" | "settings_loaded" | "settings_load_failed" | "symbols_loaded" | "symbols_load_failed" |
+        "route_navigation_started" | "route_navigation_finished" | "route_navigation_failed" |
+        "dashboard_mounted" | "dashboard_settings_ready" | "dashboard_events_ready" | "dashboard_load_started" | "dashboard_symbols_loaded" | "dashboard_data_loaded" | "dashboard_load_finished" | "dashboard_load_failed" |
+        "chart_load_started" | "chart_load_finished" | "chart_load_failed" | "chart_load_superseded" |
+        "chart_created" | "chart_render_finished") || !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+        return;
+    }
+    let symbol = symbol.as_deref().unwrap_or("");
+    let timeframe = timeframe.as_deref().unwrap_or("");
+    if symbol.len() > 32 || timeframe.len() > 16 || !symbol.is_ascii() || !timeframe.is_ascii() {
+        return;
+    }
+    tracing::info!(window = window.label(), stage, elapsed_ms, symbol, timeframe, rows, "前端关键阶段");
+}
+
+#[tauri::command]
+pub fn report_frontend_error(window: tauri::Window, stage: String, message: String) {
+    if !matches!(stage.as_str(), "javascript_error" | "unhandled_rejection" | "router_error" | "vue_error") {
+        return;
+    }
+    let message: String = message.chars().filter(|c| !c.is_control()).take(500).collect();
+    tracing::error!(window = window.label(), stage, message, "前端执行异常");
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -385,42 +430,50 @@ pub async fn get_chart_klines(
     limit: Option<usize>,
 ) -> Result<ChartKlineResponse, String> {
     let started = std::time::Instant::now();
+    let trace_id = format!("{}-{}", chrono::Utc::now().timestamp_millis(), CHART_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed));
+    tracing::info!(%trace_id, %symbol, %timeframe, ?limit, "K线客户端请求开始");
     // Automatically subscribe active symbol and timeframe in realtime client
     state
         .realtime
         .subscribe(vec![symbol.clone()], vec![timeframe.clone()])
         .await;
+    tracing::info!(%trace_id, elapsed_ms = started.elapsed().as_millis(), "K线实时订阅完成");
 
     // 1. 如果有极新鲜的内存缓存（3秒内，如快速来回切换周期/品种），直接命中返回，实现 0ms 秒出图
     if let Some(fresh) = state
         .kline_cache
         .get_fresh(&symbol, &timeframe, std::time::Duration::from_secs(3))
     {
-        tracing::debug!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "K线命中3秒内存缓存");
+        tracing::info!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = fresh.rows.len(), "K线命中3秒内存缓存");
         return Ok(fresh);
     }
 
     let cached = state.kline_cache.get(&symbol, &timeframe);
+    tracing::info!(%trace_id, cached = cached.is_some(), elapsed_ms = started.elapsed().as_millis(), "K线缓存检查完成");
 
     // 2. 正常请求服务端最新K线；若存在历史缓存，则设置 1500ms 快速超时回退，绝不让用户干等十秒
-    let fetch_fut = state.api.get_chart_klines(&symbol, &timeframe, limit, None);
+    let fetch_fut = state.api.get_chart_klines(&symbol, &timeframe, limit, None, &trace_id);
     let resp_res = if cached.is_some() {
         match tokio::time::timeout(std::time::Duration::from_millis(1500), fetch_fut).await {
             Ok(res) => res.map_err(|e| e.message),
             Err(_) => {
-                tracing::warn!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "网络或服务端响应慢，先显示内存缓存");
+                tracing::warn!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "网络或服务端响应慢，先显示内存缓存");
                 let bg_state = state.inner().clone();
                 let bg_app = app.clone();
                 let sym = symbol.clone();
                 let tf = timeframe.clone();
+                let bg_trace_id = format!("{trace_id}-refresh");
                 tokio::spawn(async move {
-                    if let Ok(resp) = bg_state.api.get_chart_klines(&sym, &tf, limit, None).await {
+                    if let Ok(resp) = bg_state.api.get_chart_klines(&sym, &tf, limit, None, &bg_trace_id).await {
+                        tracing::info!(trace_id = %bg_trace_id, rows = resp.rows.len(), "K线后台刷新完成");
                         bg_state.kline_cache.put(&sym, &tf, &resp);
                         let _ = bg_app.emit("chart-klines-refreshed", serde_json::json!({
                             "symbol": sym,
                             "timeframe": tf,
                             "response": resp,
                         }));
+                    } else {
+                        tracing::warn!(trace_id = %bg_trace_id, "K线后台刷新失败");
                     }
                 });
                 return Ok(cached.unwrap());
@@ -429,11 +482,11 @@ pub async fn get_chart_klines(
     } else {
         match tokio::time::timeout(std::time::Duration::from_secs(30), fetch_fut).await {
             Ok(res) => res.map_err(|e| {
-                tracing::warn!("获取K线失败 [{}/{}]: {:?}", symbol, timeframe, e);
+                tracing::warn!(%trace_id, "获取K线失败 [{}/{}]: {:?}", symbol, timeframe, e);
                 e.message
             }),
             Err(_) => {
-                tracing::warn!("获取K线超时(30s) [{}/{}]，可能因远端派生计算较慢或网络延迟", symbol, timeframe);
+                tracing::warn!(%trace_id, elapsed_ms = started.elapsed().as_millis(), "获取K线超时(30s) [{}/{}]", symbol, timeframe);
                 Err("获取K线超时，请检查网络或服务端状态".to_string())
             }
         }
@@ -441,13 +494,15 @@ pub async fn get_chart_klines(
 
     match resp_res {
         Ok(resp) => {
+            tracing::info!(%trace_id, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), status = %resp.status, "K线客户端请求完成");
             if started.elapsed() >= std::time::Duration::from_millis(500) {
-                tracing::warn!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), "K线客户端请求较慢");
+                tracing::warn!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), "K线客户端请求较慢");
             }
             state.kline_cache.put(&symbol, &timeframe, &resp);
             Ok(resp)
         }
         Err(e) => {
+            tracing::warn!(%trace_id, elapsed_ms = started.elapsed().as_millis(), error = %e, "K线客户端请求结束于错误");
             if let Some(c) = cached {
                 tracing::warn!("网络异常，展示内存缓存K线数据: {e}");
                 Ok(c)

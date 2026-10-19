@@ -43,6 +43,7 @@ import { useActionsStore } from '../stores/actions'
 import { useAppStore } from '../stores/app'
 import { confirmAction } from '../utils/confirm'
 import { notify } from '../utils/notify'
+import { reportPerformance } from '../utils/performanceLog'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
 import { usePlatform } from '../utils/platform'
 import ReorderToggle from '../components/ReorderToggle.vue'
@@ -179,9 +180,12 @@ function bestSignal(signals: PatternEvent[]): PatternEvent | null {
 }
 
 async function loadAll() {
+  const started = performance.now()
+  reportPerformance('dashboard_load_started', started)
   loading.value = true
   try {
     await symbolsStore.load()
+    reportPerformance('dashboard_symbols_loaded', performance.now() - started, { rows: symbolsStore.symbols.length })
     let symbols = symbolsStore.symbols
     if (groupsStore.selectedId != null) {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
@@ -194,6 +198,7 @@ async function loadAll() {
       api.getActivePrecloseCandidates().catch(() => [] as PrecloseCandidate[]),
       api.getActiveSingleBars().catch(() => [] as SingleBarEvent[]),
     ])
+    reportPerformance('dashboard_data_loaded', performance.now() - started, { rows: snapshots.length })
     if (activeSingleBars?.length) {
       scansStore.upsertSingleBars(activeSingleBars)
     }
@@ -223,8 +228,12 @@ async function loadAll() {
       }
     })
     rows.value = list
+  } catch (error) {
+    reportPerformance('dashboard_load_failed', performance.now() - started)
+    throw error
   } finally {
     loading.value = false
+    reportPerformance('dashboard_load_finished', performance.now() - started, { rows: rows.value.length })
   }
 }
 
@@ -963,11 +972,14 @@ const columns: DataTableColumns<WatchRow> = [
 ]
 
 onMounted(async () => {
+  const mountedAt = performance.now()
+  reportPerformance('dashboard_mounted', mountedAt)
   precloseTimer = setInterval(() => { precloseClock.value = Date.now() }, 1000)
   // 设置与分组并行加载，不串行阻塞首绘
   const settingsP = settingsStore.load().catch(() => {})
   const groupsP = groupsStore.load().catch(() => {})
   await Promise.all([settingsP, groupsP])
+  reportPerformance('dashboard_settings_ready', performance.now() - mountedAt)
   // 恢复上次打开的分组表格；分组已不存在时回退到“全部品种”
   const last = settingsStore.settings.ui.last_group_id
   groupsStore.selectedId =
@@ -1020,6 +1032,7 @@ onMounted(async () => {
       if (!listDragging.value) loadAll()
     }),
   )
+  reportPerformance('dashboard_events_ready', performance.now() - mountedAt)
   await loadAll()
   await nextTick()
   setupTableSortable()

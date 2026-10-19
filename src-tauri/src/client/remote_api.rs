@@ -65,21 +65,30 @@ impl RemoteApiClient {
         &self,
         rb: RequestBuilder,
     ) -> Result<T, ApiErrorResponse> {
-        self.execute_with_retry(rb, true).await
+        self.execute_with_retry(rb, true, None).await
     }
 
     async fn execute_with_retry<T: DeserializeOwned>(
         &self,
         rb: RequestBuilder,
         can_retry: bool,
+        trace_id: Option<&str>,
     ) -> Result<T, ApiErrorResponse> {
+        let attempt_started = std::time::Instant::now();
+        let attempt = if can_retry { 1 } else { 2 };
+        if let Some(trace_id) = trace_id {
+            tracing::info!(trace_id, attempt, "K线HTTP请求发送");
+        }
         let retry_clone = if can_retry { rb.try_clone() } else { None };
         let resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
+                if let Some(trace_id) = trace_id {
+                    tracing::warn!(trace_id, attempt, elapsed_ms = attempt_started.elapsed().as_millis(), error = %e, "K线HTTP连接/响应头失败");
+                }
                 if let Some(retry_rb) = retry_clone {
                     tracing::warn!("⚠️ [RemoteAPI] 网络请求中断，正在自动重试一次: {e}");
-                    return Box::pin(self.execute_with_retry(retry_rb, false)).await;
+                    return Box::pin(self.execute_with_retry(retry_rb, false, trace_id)).await;
                 }
                 tracing::error!("❌ [RemoteAPI] 网络请求失败: {e}");
                 return Err(ApiErrorResponse::new(
@@ -92,13 +101,20 @@ impl RemoteApiClient {
 
         let status = resp.status();
         let url = resp.url().clone();
+        if let Some(trace_id) = trace_id {
+            tracing::info!(trace_id, attempt, status = %status, headers_ms = attempt_started.elapsed().as_millis(), content_length = ?resp.content_length(), "K线HTTP响应头到达");
+        }
         if status.is_success() {
+            let body_started = std::time::Instant::now();
             let bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
+                    if let Some(trace_id) = trace_id {
+                        tracing::warn!(trace_id, attempt, elapsed_ms = attempt_started.elapsed().as_millis(), error = %e, "K线HTTP响应体读取失败");
+                    }
                     if let Some(retry_rb) = retry_clone {
                         tracing::warn!("⚠️ [RemoteAPI] 读取数据流中断，正在自动重试一次 ({}): {e}", url);
-                        return Box::pin(self.execute_with_retry(retry_rb, false)).await;
+                        return Box::pin(self.execute_with_retry(retry_rb, false, trace_id)).await;
                     }
                     tracing::error!("❌ [RemoteAPI] 读取响应流失败 ({}): {e}", url);
                     return Err(ApiErrorResponse::new(
@@ -108,12 +124,16 @@ impl RemoteApiClient {
                     ));
                 }
             };
+            if let Some(trace_id) = trace_id {
+                tracing::info!(trace_id, attempt, body_read_ms = body_started.elapsed().as_millis(), total_ms = attempt_started.elapsed().as_millis(), bytes = bytes.len(), "K线HTTP响应体读取完成");
+            }
+            let parse_started = std::time::Instant::now();
             let data = match serde_json::from_slice::<T>(&bytes) {
                 Ok(d) => d,
                 Err(e) => {
                     let text = String::from_utf8_lossy(&bytes);
                     let preview = if text.len() > 300 {
-                        format!("{}... (len: {})", &text[..300], text.len())
+                        format!("{}... (len: {})", text.chars().take(300).collect::<String>(), text.len())
                     } else {
                         text.to_string()
                     };
@@ -125,9 +145,15 @@ impl RemoteApiClient {
                     ));
                 }
             };
+            if let Some(trace_id) = trace_id {
+                tracing::info!(trace_id, attempt, parse_ms = parse_started.elapsed().as_millis(), total_ms = attempt_started.elapsed().as_millis(), "K线HTTP JSON解析完成");
+            }
             Ok(data)
         } else {
             let text = resp.text().await.unwrap_or_default();
+            if let Some(trace_id) = trace_id {
+                tracing::warn!(trace_id, attempt, status = %status, total_ms = attempt_started.elapsed().as_millis(), "K线HTTP服务端返回错误");
+            }
             tracing::error!("❌ [RemoteAPI] 请求失败 [{status}] {url} -> {text}");
             if status == StatusCode::UNAUTHORIZED {
                 Err(ApiErrorResponse::new(
@@ -503,6 +529,7 @@ impl RemoteApiClient {
         timeframe: &str,
         limit: Option<usize>,
         before: Option<i64>,
+        trace_id: &str,
     ) -> Result<ChartKlineResponse, ApiErrorResponse> {
         let mut path = format!("chart-klines/{symbol}/{timeframe}?");
         if let Some(l) = limit {
@@ -511,7 +538,17 @@ impl RemoteApiClient {
         if let Some(b) = before {
             path.push_str(&format!("before={b}&"));
         }
-        self.execute(self.request(Method::GET, &path)).await
+        // Chart responses are small when healthy. A stalled body used to consume the
+        // full 30s command deadline, cancelling execute_with_retry just as it began
+        // its second attempt. Bound each attempt so the built-in retry can finish.
+        self.execute_with_retry(
+            self.request(Method::GET, &path)
+                .timeout(Duration::from_secs(8))
+                .header("X-Ntrend-Trace-Id", trace_id),
+            true,
+            Some(trace_id),
+        )
+        .await
     }
 
     pub async fn get_intraday_chart(

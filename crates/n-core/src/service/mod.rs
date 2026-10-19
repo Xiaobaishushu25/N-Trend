@@ -3487,12 +3487,17 @@ impl Services {
         symbol: &str,
         timeframe: &str,
         limit: Option<usize>,
+        trace_id: &str,
     ) -> Result<ChartKlineResponse> {
+        let started = Instant::now();
         let config = self.config().await;
+        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), primary = %config.data_source.primary_source, "K线服务配置读取完成");
         let primary_is_tq = config.data_source.primary_source == "tqsdk";
         if !primary_is_tq {
+            let rows = self.get_klines(symbol, timeframe, limit).await?;
+            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线本地数据库查询完成");
             return Ok(ChartKlineResponse {
-                rows: self.get_klines(symbol, timeframe, limit).await?,
+                rows,
                 status: "tqsdk".to_string(),
                 message: String::new(),
                 partial_bar: None,
@@ -3501,15 +3506,18 @@ impl Services {
 
         // 健康检查有自己的冷却与连续成功策略，避免短暂抖动时反复切换。
         let tq_ready = self.data_source.tq_available_or_probe().await;
+        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), tq_ready, "K线天勤健康检查完成");
 
         if tq_ready {
             let had_fallback = self.chart_fallback_cache.lock().await.contains_key(symbol);
             let mut recovery_pending = false;
             let mut recovery_message = String::new();
             if had_fallback {
+                tracing::info!(trace_id, "K线历史回退缺口恢复开始");
                 match self.recover_chart_gap(symbol).await {
                     Ok(()) => {
                         self.chart_fallback_cache.lock().await.remove(symbol);
+                        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), "K线历史回退缺口恢复完成");
                     }
                     Err(error) => {
                         recovery_pending = true;
@@ -3520,6 +3528,7 @@ impl Services {
             }
 
             let rows = self.get_klines(symbol, timeframe, limit).await?;
+            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线本地数据库查询完成");
             let mut partial_bar = None;
             let now = chrono::Local::now();
             if crate::scheduler::is_symbol_trading_time(symbol, &now) {
@@ -3530,6 +3539,7 @@ impl Services {
                     }
                 }
             }
+            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), has_partial = partial_bar.is_some(), "K线未完成柱检查完成");
 
             return Ok(ChartKlineResponse {
                 rows,
@@ -3545,6 +3555,7 @@ impl Services {
 
         if !config.data_source.fallback_enabled {
             let rows = self.get_klines(symbol, timeframe, limit).await?;
+            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线数据源不可用，读取本地历史完成");
             let mut partial_bar = None;
             let now = chrono::Local::now();
             if crate::scheduler::is_symbol_trading_time(symbol, &now) {
@@ -3565,19 +3576,23 @@ impl Services {
         }
 
         // 新浪桥接变慢时先展示正式库中的历史K线，避免图表被外部请求卡住。
+        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), "K线新浪临时回退开始");
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             self.get_chart_klines_from_sina(symbol, timeframe, limit),
         )
         .await
         {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = response.rows.len(), "K线新浪临时回退完成");
+                Ok(response)
+            },
             Ok(Err(error)) => {
-                tracing::warn!(symbol, timeframe, "新浪临时图表获取失败，回退本地历史K线: {error:#}");
+                tracing::warn!(trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "新浪临时图表获取失败，回退本地历史K线: {error:#}");
                 self.local_chart_fallback(symbol, timeframe, limit).await
             }
             Err(_) => {
-                tracing::warn!(symbol, timeframe, "新浪临时图表超过2秒，回退本地历史K线");
+                tracing::warn!(trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "新浪临时图表超过2秒，回退本地历史K线");
                 self.local_chart_fallback(symbol, timeframe, limit).await
             }
         }

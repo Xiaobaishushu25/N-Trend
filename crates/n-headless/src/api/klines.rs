@@ -1,7 +1,7 @@
 use crate::auth::AuthDevice;
 use crate::state::ServerContext;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use n_protocol::dto::{ChartKlineResponse, KlineDto, TrendPointDto};
 use n_protocol::error::ApiErrorResponse;
@@ -20,12 +20,18 @@ pub async fn get_chart_klines(
     _device: AuthDevice,
     Path((symbol, timeframe)): Path<(String, String)>,
     Query(q): Query<KlineQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<ChartKlineResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     let limit = q.limit.unwrap_or(1200).min(5000);
     let started = std::time::Instant::now();
-    let result = ctx.services.get_chart_klines(&symbol, &timeframe, Some(limit)).await;
+    let trace_id = headers.get("X-Ntrend-Trace-Id").and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() <= 80 && v.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+        .unwrap_or("untraced");
+    tracing::info!(trace_id, %symbol, %timeframe, limit, "K线服务端请求开始");
+    let result = ctx.services.get_chart_klines(&symbol, &timeframe, Some(limit), trace_id).await;
+    tracing::info!(trace_id, %symbol, %timeframe, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "K线服务端取数完成");
     if started.elapsed() >= std::time::Duration::from_millis(500) {
-        tracing::warn!(symbol, timeframe, limit, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "图表服务端取数较慢");
+        tracing::warn!(trace_id, symbol, timeframe, limit, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "图表服务端取数较慢");
     }
     match result {
         Ok(res) => {
@@ -64,6 +70,7 @@ pub async fn get_chart_klines(
             let rev = n_core::storage::repo::get_revision(&ctx.db, &format!("kline:{symbol}:{timeframe}"))
                 .await
                 .unwrap_or(1);
+            tracing::info!(trace_id, rows = rows.len(), elapsed_ms = started.elapsed().as_millis(), "K线服务端修订号查询完成");
 
             let partial_bar = res.partial_bar.map(|p| KlineDto {
                 symbol: p.symbol,
@@ -79,6 +86,7 @@ pub async fn get_chart_klines(
                 rollover: p.rollover,
             });
 
+            tracing::info!(trace_id, rows = rows.len(), total_ms = started.elapsed().as_millis(), "K线服务端响应组装完成");
             Ok(Json(ChartKlineResponse {
                 rows,
                 status: res.status,
@@ -93,6 +101,7 @@ pub async fn get_chart_klines(
             }))
         }
         Err(e) => {
+            tracing::error!(trace_id, elapsed_ms = started.elapsed().as_millis(), error = %e, "K线服务端请求失败");
             let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取K线失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
@@ -131,7 +140,7 @@ pub async fn get_klines(
     path: Path<(String, String)>,
     query: Query<KlineQuery>,
 ) -> Result<Json<Vec<KlineDto>>, (StatusCode, Json<ApiErrorResponse>)> {
-    let res = get_chart_klines(State(ctx), device, path, query).await?;
+    let res = get_chart_klines(State(ctx), device, path, query, HeaderMap::new()).await?;
     Ok(Json(res.0.rows))
 }
 
