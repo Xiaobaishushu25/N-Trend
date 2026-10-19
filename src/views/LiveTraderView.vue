@@ -1,17 +1,22 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
+import { emit } from '@tauri-apps/api/event'
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import {
   NBadge,
   NButton,
   NDivider,
   NEmpty,
   NIcon,
+  NModal,
   NPopconfirm,
   NRadioGroup,
   NRadioButton,
   NSelect,
+  NSpin,
   NTag,
   NTooltip,
 } from 'naive-ui'
@@ -24,7 +29,10 @@ import {
   CircleCheck,
   CircleX,
   Clock,
+  ExternalLink,
+  Eye,
   Flame,
+  InfoCircle,
   LayersSubtract,
   Refresh,
   ShieldCheck,
@@ -33,7 +41,17 @@ import {
 } from '@vicons/tabler'
 import { useLiveTraderStore } from '../stores/liveTrader'
 import { useTradeReviewStore } from '../stores/tradeReview'
-import { formatPnlPoints, formatRMultiple } from '../utils/multipliers'
+import { api } from '../services/api'
+import { notify } from '../utils/notify'
+import {
+  calcSlippage,
+  calcTradeRecordPnlAmount,
+  formatPnlAmount,
+  formatPnlPoints,
+  formatRMultiple,
+  getSymbolMultiplier,
+} from '../utils/multipliers'
+import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from '../types'
 
 const trader = useLiveTraderStore()
 const review = useTradeReviewStore()
@@ -127,12 +145,23 @@ function getInstrumentName(inst: string): string {
   return inst.toUpperCase()
 }
 
+const theoreticalWinRate = ref<number | null>(null)
+
+async function loadTheoreticalWinRate() {
+  try {
+    const stats = await api.getReviewStats('overall', 'all')
+    if (stats?.overall?.win_rate != null) {
+      theoreticalWinRate.value = stats.overall.win_rate * 100
+    }
+  } catch (e) {
+    console.warn('获取理论复盘胜率失败:', e)
+  }
+}
+
 onMounted(async () => {
   await trader.startRealtime()
   await trader.loadAll()
-  if (!review.rawOutcomes.length) {
-    void review.load()
-  }
+  void loadTheoreticalWinRate()
 })
 
 onBeforeUnmount(() => {
@@ -142,6 +171,13 @@ onBeforeUnmount(() => {
 function fmtPrice(v: number | null | undefined): string {
   if (v == null || Number.isNaN(v)) return '—'
   return Number.isInteger(v) ? v.toFixed(0) : v.toFixed(1)
+}
+
+function formatAccountUpdateTime(sec?: number | null): string {
+  if (!sec) return '等待同步'
+  const d = new Date(sec * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
 function dirLabel(direction: string): string {
@@ -185,9 +221,101 @@ function exitReasonBadge(reason: string) {
 const winRateDiff = computed(() => {
   if (!trader.statistics || trader.statistics.total_trades === 0) return null
   const liveRate = trader.statistics.win_rate_pct
-  const reviewRate = review.metrics.winRate * 100
+  const reviewRate = theoreticalWinRate.value ?? (review.rawOutcomes.length ? review.metrics.winRate * 100 : null)
+  if (reviewRate == null) return null
   return liveRate - reviewRate
 })
+
+function getTradeRecordPnl(rec: LiveTradeRecord): number {
+  if (rec.realized_pnl_amount != null && !Number.isNaN(rec.realized_pnl_amount) && rec.realized_pnl_amount !== 0) {
+    return rec.realized_pnl_amount
+  }
+  return calcTradeRecordPnlAmount(rec.instrument_id || rec.symbol, rec.realized_pnl_pts, rec.volume)
+}
+
+const router = useRouter()
+
+/**
+ * 活跃信号（当前在手持仓 / 活跃条件单）：
+ * 在主窗口（main）中打开对应合约的实时 K 线图，呈现当前真实活跃盘口、K线与运行中的形态，不走历史复盘逻辑
+ */
+async function openActiveChart(symbol?: string | null) {
+  const sym = symbol || 'FG0'
+  if (!isTauri()) {
+    void router.push({
+      name: 'chart',
+      params: { symbol: sym },
+      query: { tf: '15m' },
+    })
+    return
+  }
+  try {
+    await emit('open-active-chart', { symbol: sym, timeframe: '15m' })
+    const main = await WebviewWindow.getByLabel('main')
+    if (main != null) {
+      await main.show()
+      await main.unminimize()
+      await main.setFocus()
+    }
+    notify.success(`已在主窗口打开 [${sym}] 实时活跃行情图表`)
+  } catch (e: any) {
+    notify.error(`打开主窗口图表失败: ${e?.message || e}`)
+  }
+}
+
+/**
+ * 历史平仓流水信号：
+ * 在专门的独立历史复盘图表窗口（history-chart 单例）中打开，不污染主窗口，也不会每次重复新建
+ */
+async function openHistoryChart(symbol?: string | null, eventId?: number | null) {
+  if (!eventId) return
+  const sym = symbol || 'FG0'
+  if (!isTauri()) {
+    void router.push({
+      name: 'chart',
+      params: { symbol: sym },
+      query: { review: String(eventId) },
+    })
+    return
+  }
+  try {
+    const existing = await WebviewWindow.getByLabel('history-chart')
+    if (existing != null) {
+      await existing.show()
+      await existing.unminimize()
+      await existing.setFocus()
+      await emit('open-history-chart', { symbol: sym, eventId })
+      notify.success(`已在历史复盘窗口定位 [${sym}] Event #${eventId}`)
+      return
+    }
+
+    const webview = new WebviewWindow('history-chart', {
+      url: `/#/chart/${encodeURIComponent(sym)}?review=${encodeURIComponent(eventId)}`,
+      title: `历史复盘图表 · ${sym}`,
+      width: 1280,
+      height: 820,
+      minWidth: 960,
+      minHeight: 640,
+      resizable: true,
+      decorations: false,
+      dragDropEnabled: false,
+      visible: false,
+    })
+    await webview.once('tauri://created', async () => {
+      await webview.show()
+      await webview.setFocus()
+    })
+    notify.success(`已新建历史复盘窗口定位 [${sym}] Event #${eventId}`)
+  } catch (e: any) {
+    console.warn('打开历史复盘独立窗口失败:', e)
+    notify.error(`打开历史复盘窗口失败: ${e?.message || e}`)
+  }
+}
+
+function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direction: string = 'up', instrumentId: string = '') {
+  if (plannedPrice == null || plannedPrice <= 0 || fillPrice <= 0) return null
+  return calcSlippage(fillPrice, plannedPrice, direction, instrumentId)
+}
 </script>
 
 <template>
@@ -199,18 +327,40 @@ const winRateDiff = computed(() => {
           <div class="title-with-badge">
             <n-icon :component="Bolt" size="22" color="#eab308" />
             <h1 class="header-title">实盘量化执行终端</h1>
-            <n-tag
-              :type="trader.isReady ? 'success' : 'error'"
-              size="small"
-              round
-              class="status-tag"
-            >
-              {{ trader.isReady ? 'CTP 柜台就绪' : trader.health?.sync_pending ? 'CTP 数据同步中' : 'CTP 未就绪' }}
-            </n-tag>
+            <n-tooltip trigger="hover">
+              <template #trigger>
+                <n-tag
+                  :type="trader.isReady ? 'success' : trader.health?.sync_pending ? 'warning' : 'error'"
+                  size="small"
+                  round
+                  class="status-tag"
+                >
+                  {{ trader.isReady ? 'CTP 柜台就绪' : trader.health?.sync_pending ? 'CTP 数据同步中' : 'CTP 未就绪' }}
+                </n-tag>
+              </template>
+              <span>
+                {{
+                  trader.isReady
+                    ? 'CTP 柜台已就绪，行情与报单通道正常'
+                    : trader.health?.sync_pending
+                      ? '正在从柜台同步最新资金、持仓与委托流...'
+                      : !trader.health?.connected
+                        ? 'CTP 柜台未连接（当前处于非交易时段或周末休市，期货柜台服务关闭；当前呈现的数据为最后一次成功同步的历史镜像）'
+                        : !trader.health?.logged_in
+                          ? 'CTP 柜台网络已连通，等待认证登录'
+                          : 'CTP 柜台未就绪'
+                }}
+              </span>
+            </n-tooltip>
           </div>
           <span class="header-subtitle">
-            {{ trader.bridgeOnline ? '交易数据已连接' : '交易数据连接中断' }} · 柜台资金更新：{{ trader.account?.updated_at ? new Date(trader.account.updated_at * 1000).toLocaleTimeString('zh-CN') : '等待同步' }}
-            <span v-if="trader.errorMsg"> · {{ trader.errorMsg }}</span>
+            {{ trader.bridgeOnline ? '交易数据已连接' : '交易数据连接中断' }} · 柜台资金更新：{{ formatAccountUpdateTime(trader.account?.updated_at) }}
+            <span v-if="trader.errorMsg" class="error-inline">
+              · <span class="error-msg-text">{{ trader.errorMsg }}</span>
+              <n-button text size="tiny" type="error" class="retry-btn" :loading="trader.refreshing" @click="trader.refresh">
+                重试
+              </n-button>
+            </span>
           </span>
         </div>
 
@@ -359,6 +509,19 @@ const winRateDiff = computed(() => {
           </div>
           <div class="kpi-divider" />
           <div class="kpi-box">
+            <span class="kpi-name">实盘平仓盈亏</span>
+            <span
+              class="kpi-num font-num"
+              :class="trader.totalRealizedPnlAmount >= 0 ? 'is-up' : 'is-down'"
+            >
+              {{ formatPnlAmount(trader.totalRealizedPnlAmount, { decimals: 2 }) }}
+            </span>
+            <span class="kpi-sub">
+              累计 {{ formatPnlPoints(trader.totalRealizedPnlPoints) }}
+            </span>
+          </div>
+          <div class="kpi-divider" />
+          <div class="kpi-box">
             <span class="kpi-name">实盘累计 R 倍数</span>
             <span
               class="kpi-num font-num"
@@ -387,7 +550,9 @@ const winRateDiff = computed(() => {
           <div class="cmp-content">
             <div class="cmp-item">
               <span class="cmp-label">理论胜率 (复盘):</span>
-              <span class="cmp-val font-num">{{ (review.metrics.winRate * 100).toFixed(1) }}%</span>
+              <span class="cmp-val font-num">
+                {{ theoreticalWinRate !== null ? theoreticalWinRate.toFixed(1) + '%' : (review.metrics.winRate ? (review.metrics.winRate * 100).toFixed(1) + '%' : '—') }}
+              </span>
             </div>
             <div class="cmp-item">
               <span class="cmp-label">实盘真实胜率:</span>
@@ -508,9 +673,32 @@ const winRateDiff = computed(() => {
                 <n-tag v-else size="small" type="default">
                   SimNow 柜台直持仓
                 </n-tag>
+
+                <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->
+                <n-tag
+                  v-if="trader.resolveEventId(pos.managed)"
+                  size="small"
+                  type="info"
+                  round
+                  class="signal-badge-btn"
+                  @click="openActiveChart(pos.managed?.symbol || pos.instrument_id)"
+                >
+                  <template #icon><n-icon :component="Bolt" /></template>
+                  Event #{{ trader.resolveEventId(pos.managed) }}
+                  <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
+                </n-tag>
+                <span v-if="trader.resolveScore(pos.managed)" class="score-badge">
+                  评分 {{ trader.resolveScore(pos.managed)?.toFixed(2) }}
+                </span>
               </div>
 
               <div class="head-right">
+                <span
+                  class="pos-profit-pill font-num"
+                  :class="(pos.position_profit ?? 0) >= 0 ? 'is-up' : 'is-down'"
+                >
+                  浮盈 {{ (pos.position_profit ?? 0) >= 0 ? '+' : '' }}{{ pos.position_profit != null ? Number(pos.position_profit).toFixed(2) : '0.00' }} 元{{ pos.profit_is_estimated ? '（估）' : '' }}
+                </span>
                 <span v-if="pos.managed?.lot1_closed" class="lot1-tag">
                   <n-icon :component="Check" size="14" /> 第一手已在 +1.0R 平仓锁定保本
                 </span>
@@ -519,7 +707,65 @@ const winRateDiff = computed(() => {
             </div>
 
             <div class="pos-card-body">
+              <!-- 信号拟定 vs 实际开仓成交对比栏 (包含预警时间、触价时间、报单时间、成交时间) -->
+              <div v-if="pos.managed" class="exec-plan-bar">
+                <div class="plan-item">
+                  <span class="plan-lbl">预警 K 线时间</span>
+                  <span class="plan-val font-num">{{ trader.resolveWarningBarTs(pos.managed) || '—' }}</span>
+                </div>
+                <div class="plan-divider" />
+                <div class="plan-item">
+                  <span class="plan-lbl">行情触价触发</span>
+                  <span class="plan-val font-num">{{ trader.resolveTriggerTs(pos.managed) || '已触发' }}</span>
+                </div>
+                <div v-if="trader.resolveOrderInsertTs(pos.managed)" class="plan-divider" />
+                <div v-if="trader.resolveOrderInsertTs(pos.managed)" class="plan-item">
+                  <span class="plan-lbl">报单委托时间</span>
+                  <span class="plan-val font-num">{{ trader.resolveOrderInsertTs(pos.managed) }}</span>
+                </div>
+                <div class="plan-divider" />
+                <div class="plan-item">
+                  <span class="plan-lbl">柜台成交时间</span>
+                  <span class="plan-val font-num highlight-fill">{{ pos.managed.open_ts }}</span>
+                </div>
+                <div class="plan-divider" />
+                <div class="plan-item">
+                  <span class="plan-lbl">拟定突破入场</span>
+                  <span class="plan-val font-num highlight-planned">{{ fmtPrice(trader.resolvePlannedEntryPrice(pos.managed)) }}</span>
+                </div>
+                <div class="plan-arrow">➔</div>
+                <div class="plan-item">
+                  <span class="plan-lbl">实际成交均价</span>
+                  <span class="plan-val font-num highlight-fill">{{ fmtPrice(pos.managed.fill_price) }}</span>
+                </div>
+                <div class="plan-divider" />
+                <div class="plan-item">
+                  <span class="plan-lbl">入场执行滑点</span>
+                  <span
+                    v-if="getSlippageInfo(pos.managed.fill_price, trader.resolvePlannedEntryPrice(pos.managed), pos.managed.direction, pos.instrument_id)"
+                    class="plan-val font-num"
+                    :class="getSlippageInfo(pos.managed.fill_price, trader.resolvePlannedEntryPrice(pos.managed), pos.managed.direction, pos.instrument_id)?.isAdverse ? 'slip-adverse' : 'slip-favorable'"
+                  >
+                    {{ getSlippageInfo(pos.managed.fill_price, trader.resolvePlannedEntryPrice(pos.managed), pos.managed.direction, pos.instrument_id)?.label }}
+                  </span>
+                  <span v-else class="plan-val font-num text-muted">零滑点</span>
+                </div>
+                <div class="plan-divider" />
+                <div class="plan-item">
+                  <span class="plan-lbl">单笔 1.0R 风险</span>
+                  <span class="plan-val font-num">{{ pos.managed.risk.toFixed(1) }} 点 (初损: {{ fmtPrice(pos.managed.initial_stop_price) }})</span>
+                </div>
+              </div>
+
+              <!-- 价格流转轴 -->
               <div class="price-flow-row">
+                <div v-if="pos.managed && trader.resolvePlannedEntryPrice(pos.managed)" class="flow-cell">
+                  <span class="cell-label">拟定突破价</span>
+                  <span class="cell-val font-num highlight-planned">
+                    {{ fmtPrice(trader.resolvePlannedEntryPrice(pos.managed)) }}
+                  </span>
+                </div>
+                <div v-if="pos.managed && trader.resolvePlannedEntryPrice(pos.managed)" class="flow-arrow">➔</div>
                 <div class="flow-cell">
                   <span class="cell-label">真实开仓均价</span>
                   <span class="cell-val font-num">
@@ -568,6 +814,10 @@ const winRateDiff = computed(() => {
                   <span class="val is-up">+{{ pos.managed.max_mfe_r.toFixed(2) }}R</span>
                 </div>
                 <div v-if="pos.managed" class="stat-bubble">
+                  <span class="lbl">最大不利回撤 (MAE)</span>
+                  <span class="val is-down">{{ pos.managed.max_mae_r.toFixed(2) }}R</span>
+                </div>
+                <div v-if="pos.managed" class="stat-bubble">
                   <span class="lbl">单笔风险 (1.0R)</span>
                   <span class="val">{{ pos.managed.risk.toFixed(1) }} 点</span>
                 </div>
@@ -604,10 +854,32 @@ const winRateDiff = computed(() => {
                 <n-tag size="small" :type="cond.tier === 'large' ? 'warning' : 'default'">
                   {{ cond.tier === 'large' ? '大仓' : '小仓' }}（计划 {{ cond.volume }} 手）
                 </n-tag>
+                <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->
+                <n-tag
+                  v-if="cond.event_id"
+                  size="small"
+                  type="info"
+                  round
+                  class="signal-badge-btn"
+                  @click="openActiveChart(cond.symbol)"
+                >
+                  <template #icon><n-icon :component="Bolt" /></template>
+                  Event #{{ cond.event_id }}
+                  <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
+                </n-tag>
                 <span class="score-badge">评分 {{ cond.score.toFixed(2) }}</span>
+                <span v-if="cond.warning_bar_ts" class="warning-ts-tag font-num">
+                  预警: {{ cond.warning_bar_ts }}
+                </span>
+                <span v-if="cond.trigger_ts" class="trigger-ts-tag font-num">
+                  触发: {{ cond.trigger_ts }}
+                </span>
               </div>
 
               <div class="head-right">
+                <span class="wait-progress font-num">
+                  已等待 {{ cond.bars_waited ?? 0 }} / {{ cond.max_wait_bars ?? 12 }} 根K线
+                </span>
                 <n-tag
                   size="small"
                   :type="cond.state === 'WaitingConfirm' ? 'warning' : cond.state === 'Triggered' ? 'info' : 'default'"
@@ -629,7 +901,7 @@ const winRateDiff = computed(() => {
                 </div>
                 <div class="cond-price-item">
                   <span class="lbl">目标止盈 (Target)</span>
-                  <span class="val font-num">{{ fmtPrice(cond.target_price) }}</span>
+                  <span class="val font-num text-success">{{ fmtPrice(cond.target_price) }}</span>
                 </div>
                 <div class="cond-price-item">
                   <span class="lbl">计划风险 (1.0R)</span>
@@ -705,9 +977,28 @@ const winRateDiff = computed(() => {
                 >
                   {{ exitReasonBadge(rec.exit_reason).text }}
                 </n-tag>
+                <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->
+                <n-tag
+                  v-if="trader.resolveEventId(rec)"
+                  size="small"
+                  type="info"
+                  round
+                  class="signal-badge-btn"
+                  @click="openHistoryChart(rec.symbol, trader.resolveEventId(rec))"
+                >
+                  <template #icon><n-icon :component="Bolt" /></template>
+                  Event #{{ trader.resolveEventId(rec) }}
+                  <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
+                </n-tag>
+                <span v-if="trader.resolveScore(rec)" class="score-badge">
+                  评分 {{ trader.resolveScore(rec)?.toFixed(2) }}
+                </span>
               </div>
 
               <div class="head-right font-num">
+                <span class="pnl-amount" :class="getTradeRecordPnl(rec) >= 0 ? 'is-up' : 'is-down'">
+                  {{ formatPnlAmount(getTradeRecordPnl(rec), { decimals: 2 }) }}
+                </span>
                 <span class="pnl-pts" :class="rec.realized_pnl_pts >= 0 ? 'is-up' : 'is-down'">
                   {{ formatPnlPoints(rec.realized_pnl_pts) }}
                 </span>
@@ -718,23 +1009,113 @@ const winRateDiff = computed(() => {
             </div>
 
             <div class="hist-card-body">
-              <div class="hist-timeline">
-                <div class="hist-step">
-                  <span class="step-lbl">开仓</span>
-                  <span class="step-val font-num">{{ fmtPrice(rec.fill_price) }}</span>
-                  <span class="step-ts font-num">{{ rec.open_ts }}</span>
+              <!-- 全流程执行时间线 (预警拟定 -> 突破开仓 -> 动态平仓) -->
+              <div class="hist-full-timeline">
+                <!-- 阶段1: 预警拟定 -->
+                <div class="timeline-node node-warning">
+                  <div class="node-title">
+                    <span class="node-badge">1. 预警拟定</span>
+                    <span class="node-ts font-num">{{ trader.resolveWarningBarTs(rec) || '—' }}</span>
+                  </div>
+                  <div class="node-content">
+                    <div class="node-field">
+                      <span class="field-lbl">触价触发时间</span>
+                      <span class="field-val font-num">{{ trader.resolveTriggerTs(rec) || '已触发' }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">计划突破入场</span>
+                      <span class="field-val font-num highlight-planned">{{ fmtPrice(trader.resolvePlannedEntryPrice(rec) ?? rec.fill_price) }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">初始硬止损</span>
+                      <span class="field-val font-num text-danger">{{ fmtPrice(trader.resolveInitialStopPrice(rec) ?? rec.initial_stop_price) }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">理论形态目标</span>
+                      <span class="field-val font-num text-success">{{ fmtPrice(trader.resolveTargetPrice(rec) ?? rec.target_price) }}</span>
+                    </div>
+                  </div>
                 </div>
-                <div class="hist-arrow">➔</div>
-                <div class="hist-step">
-                  <span class="step-lbl">平仓</span>
-                  <span class="step-val font-num">{{ fmtPrice(rec.exit_price) }}</span>
-                  <span class="step-ts font-num">{{ rec.exit_ts }}</span>
+
+                <div class="timeline-connector">➔</div>
+
+                <!-- 阶段2: 突破开仓 -->
+                <div class="timeline-node node-open">
+                  <div class="node-title">
+                    <span class="node-badge">2. 突破开仓</span>
+                    <span class="node-ts font-num">{{ rec.open_ts }}</span>
+                  </div>
+                  <div class="node-content">
+                    <div v-if="trader.resolveOrderInsertTs(rec)" class="node-field">
+                      <span class="field-lbl">报单委托时间</span>
+                      <span class="field-val font-num">{{ trader.resolveOrderInsertTs(rec) }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">实际成交时间</span>
+                      <span class="field-val font-num">{{ rec.open_ts }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">实际成交均价</span>
+                      <span class="field-val font-num highlight-fill">{{ fmtPrice(rec.fill_price) }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">入场执行滑点</span>
+                      <span
+                        v-if="getSlippageInfo(rec.fill_price, trader.resolvePlannedEntryPrice(rec), rec.direction, rec.instrument_id)"
+                        class="field-val font-num"
+                        :class="getSlippageInfo(rec.fill_price, trader.resolvePlannedEntryPrice(rec), rec.direction, rec.instrument_id)?.isAdverse ? 'slip-adverse' : 'slip-favorable'"
+                      >
+                        {{ getSlippageInfo(rec.fill_price, trader.resolvePlannedEntryPrice(rec), rec.direction, rec.instrument_id)?.label }}
+                      </span>
+                      <span v-else class="field-val font-num text-muted">零滑点</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">实际 1R 风险</span>
+                      <span class="field-val font-num">{{ rec.risk.toFixed(1) }} 点</span>
+                    </div>
+                  </div>
                 </div>
-                <div class="hist-meta">
-                  <span>持仓 {{ rec.bars_held }} 根K线</span>
-                  <span>MFE +{{ rec.max_mfe_r.toFixed(2) }}R</span>
-                  <span>MAE {{ rec.max_mae_r.toFixed(2) }}R</span>
+
+                <div class="timeline-connector">➔</div>
+
+                <!-- 阶段3: 动态平仓 -->
+                <div class="timeline-node node-exit">
+                  <div class="node-title">
+                    <span class="node-badge">3. 动态平仓</span>
+                    <span class="node-ts font-num">{{ rec.exit_ts }}</span>
+                  </div>
+                  <div class="node-content">
+                    <div class="node-field">
+                      <span class="field-lbl">实际平仓价格</span>
+                      <span class="field-val font-num font-bold">{{ fmtPrice(rec.exit_price) }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">平仓触发原因</span>
+                      <span class="field-val exit-reason-text">{{ exitReasonBadge(rec.exit_reason).text }}</span>
+                    </div>
+                    <div class="node-field">
+                      <span class="field-lbl">净收益实现</span>
+                      <span class="field-val font-num font-bold" :class="rec.realized_pnl_pts >= 0 ? 'is-up' : 'is-down'">
+                        {{ formatPnlPoints(rec.realized_pnl_pts) }} ({{ formatRMultiple(rec.r_multiple) }})
+                      </span>
+                    </div>
+                  </div>
                 </div>
+              </div>
+
+              <!-- 底部博弈关键指标 -->
+              <div class="hist-meta">
+                <span>合约乘数 {{ getSymbolMultiplier(rec.instrument_id) }} 元/点</span>
+                <span>持仓 {{ rec.bars_held }} 根K线</span>
+                <span class="mfe-tag">最大有利 MFE +{{ rec.max_mfe_r.toFixed(2) }}R</span>
+                <span class="mae-tag">最大不利 MAE {{ rec.max_mae_r.toFixed(2) }}R</span>
+                <button
+                  v-if="trader.resolveEventId(rec)"
+                  class="chart-jump-link"
+                  @click="openHistoryChart(rec.symbol, trader.resolveEventId(rec))"
+                >
+                  <n-icon :component="Eye" size="13" /> 在行情图表中复盘
+                </button>
               </div>
             </div>
           </div>
@@ -1160,6 +1541,24 @@ const winRateDiff = computed(() => {
   color: #64748b;
 }
 
+.pos-profit-pill {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: #f1f5f9;
+}
+
+.pos-profit-pill.is-up {
+  color: #dc2626 !important;
+  background: #fef2f2;
+}
+
+.pos-profit-pill.is-down {
+  color: #16a34a !important;
+  background: #f0fdf4;
+}
+
 .price-flow-row {
   display: flex;
   align-items: center;
@@ -1360,14 +1759,21 @@ const winRateDiff = computed(() => {
   border-radius: 3px;
 }
 
+.pnl-amount {
+  font-size: 16px;
+  font-weight: 800;
+  margin-right: 12px;
+}
+
 .pnl-pts {
-  font-size: 15px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 600;
   margin-right: 10px;
+  opacity: 0.9;
 }
 
 .pnl-r {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 800;
 }
 
@@ -1424,5 +1830,362 @@ const winRateDiff = computed(() => {
 
 .is-down {
   color: #16a34a !important;
+}
+
+.error-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.error-msg-text {
+  color: #ef4444;
+}
+
+.retry-btn {
+  margin-left: 2px;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* 预警信号与执行透明度增强样式 */
+.signal-badge-btn {
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.signal-badge-btn:hover {
+  filter: brightness(0.92);
+  transform: translateY(-1px);
+}
+
+.warning-ts-tag {
+  font-size: 11px;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.wait-progress {
+  font-size: 12px;
+  color: #64748b;
+  margin-right: 8px;
+}
+
+/* 计划与实际执行比对栏 (持仓卡片) */
+.exec-plan-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 14px;
+  margin-bottom: 10px;
+}
+
+.plan-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.plan-lbl {
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 500;
+}
+
+.plan-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.plan-divider {
+  width: 1px;
+  height: 22px;
+  background: #e2e8f0;
+}
+
+.plan-arrow {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.highlight-planned {
+  color: #2563eb;
+  font-weight: 700;
+}
+
+.highlight-fill {
+  color: #0f172a;
+  font-weight: 800;
+}
+
+.slip-adverse {
+  color: #d97706;
+  font-weight: 700;
+}
+
+.slip-favorable {
+  color: #16a34a;
+  font-weight: 700;
+}
+
+.text-muted {
+  color: #94a3b8;
+}
+
+.text-danger {
+  color: #dc2626;
+}
+
+.text-success {
+  color: #16a34a;
+}
+
+.font-bold {
+  font-weight: 700;
+}
+
+/* 真实平仓历史三段全生命周期时间线 */
+.hist-full-timeline {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  background: #f8fafc;
+  border: 1px solid #f1f5f9;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-top: 6px;
+  margin-bottom: 8px;
+}
+
+.timeline-node {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #ffffff;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+  padding: 8px 10px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+
+.timeline-node.node-warning {
+  border-top: 3px solid #6366f1;
+}
+
+.timeline-node.node-open {
+  border-top: 3px solid #0284c7;
+}
+
+.timeline-node.node-exit {
+  border-top: 3px solid #10b981;
+}
+
+.timeline-connector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #94a3b8;
+  font-size: 13px;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.node-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid #f1f5f9;
+  padding-bottom: 4px;
+}
+
+.node-badge {
+  font-size: 11px;
+  font-weight: 700;
+  color: #334155;
+}
+
+.node-ts {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.node-content {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.node-field {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+
+.field-lbl {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.field-val {
+  font-size: 12px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.exit-reason-text {
+  font-weight: 600;
+  color: #475569;
+}
+
+.mfe-tag {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.mae-tag {
+  color: #16a34a;
+  font-weight: 600;
+}
+
+.chart-jump-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #eff6ff;
+  color: #2563eb;
+  border: 1px solid #bfdbfe;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-left: auto;
+}
+
+.chart-jump-link:hover {
+  background: #dbeafe;
+  color: #1d4ed8;
+  border-color: #93c5fd;
+}
+
+/* 预警信号全景复盘弹窗 */
+.modal-loading-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 0;
+}
+
+.signal-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.modal-signal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #f8fafc;
+  padding: 10px 14px;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+}
+
+.msh-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.msh-symbol {
+  font-size: 16px;
+  font-weight: 800;
+  color: #0f172a;
+}
+
+.msh-grade {
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.msh-right {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.score-pill {
+  font-size: 12px;
+  font-weight: 700;
+  color: #b45309;
+  background: #fef3c7;
+  padding: 2px 8px;
+  border-radius: 12px;
+  border: 1px solid #fde68a;
+}
+
+.modal-grid-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.modal-section-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 12px 14px;
+}
+
+.msc-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e293b;
+  margin-bottom: 10px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.msc-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px 16px;
+}
+
+.msc-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+}
+
+.msc-item .lbl {
+  color: #64748b;
+}
+
+.msc-item .val {
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.modal-action-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
 }
 </style>

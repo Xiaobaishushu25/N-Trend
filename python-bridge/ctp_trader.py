@@ -646,6 +646,32 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             ref = str(pInputOrder.OrderRef) if pInputOrder else ""
             self._record_order_error(pInputOrder, msg)
 
+    def OnRspOrderAction(self, pInputOrderAction, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            msg = f"柜台拒绝撤单 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
+            logger.error(f"[撤单错误] {msg}")
+            ref = str(getattr(pInputOrderAction, "OrderRef", "") or "").strip() if pInputOrderAction else ""
+            if ref:
+                with self.lock:
+                    if ref in self.orders:
+                        self.orders[ref]["status_msg"] = msg
+                        self._order_versions[ref] = self._data_revision + 1
+                        self.emit_event("order_error", self.orders[ref])
+            self.request_sync(delay=0.1)
+
+    def OnErrRtnOrderAction(self, pOrderAction, pRspInfo):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            msg = f"交易所拒绝撤单 [{pRspInfo.ErrorID}]: {pRspInfo.ErrorMsg}"
+            logger.error(f"[撤单错误] {msg}")
+            ref = str(getattr(pOrderAction, "OrderRef", "") or "").strip() if pOrderAction else ""
+            if ref:
+                with self.lock:
+                    if ref in self.orders:
+                        self.orders[ref]["status_msg"] = msg
+                        self._order_versions[ref] = self._data_revision + 1
+                        self.emit_event("order_error", self.orders[ref])
+            self.request_sync(delay=0.1)
+
     # ── 下单方法 ──
     def _save_journal(self):
         if not self._journal_path:
@@ -787,8 +813,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         known = self.orders.get(order_ref, {})
         req.FrontID = front_id if front_id is not None else known.get("front_id", self.front_id)
         req.SessionID = session_id if session_id is not None else known.get("session_id", self.session_id)
-        if known.get("order_sys_id"):
-            req.OrderSysID = known["order_sys_id"]
+        # CTP 撤单规范：使用 (OrderRef, FrontID, SessionID) 定位当前会话订单时，OrderSysID 必须为空字符串。
+        # 严禁传入 order_sys_id，否则在大商所(DCE)和郑商所(CZCE)会触发字段冲突被柜台直接拒绝。
+        req.OrderSysID = ""
         req.ActionFlag = tdapi.THOST_FTDC_AF_Delete
         res = self.api.ReqOrderAction(req, self.get_req_id())
         logger.info(f"[撤单请求] 撤销 OrderRef: {order_ref} ({instrument_id})，返回值: {res}")

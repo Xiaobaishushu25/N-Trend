@@ -15,7 +15,9 @@ pub struct CachedSeries {
     pub partial_bar: Option<KlineDto>,
     pub latest_closed_ts: Option<i64>,
     pub series_revision: Option<i64>,
-    pub last_updated: Instant,
+    pub status: String,
+    pub message: String,
+    pub fetched_at: Instant,
 }
 
 pub struct KlineMemoryCache {
@@ -27,6 +29,41 @@ impl KlineMemoryCache {
         Self {
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(MAX_SERIES).unwrap())),
         }
+    }
+
+    pub fn get_fresh(&self, symbol: &str, timeframe: &str, max_age: std::time::Duration) -> Option<ChartKlineResponse> {
+        let mut lock = self.cache.lock().unwrap();
+        let key = (symbol.to_string(), timeframe.to_string());
+        let series = lock.get(&key)?;
+        if series.fetched_at.elapsed() > max_age {
+            return None;
+        }
+
+        let mut rows = series.bars.clone();
+        if let Some(partial) = &series.partial_bar {
+            if let Some(last) = rows.last_mut() {
+                if last.ts == partial.ts {
+                    *last = partial.clone();
+                } else {
+                    rows.push(partial.clone());
+                }
+            } else {
+                rows.push(partial.clone());
+            }
+        }
+
+        Some(ChartKlineResponse {
+            rows,
+            status: series.status.clone(),
+            message: format!("从内存缓存加载（{} 根）。{}", series.bars.len(), series.message),
+            latest_closed_ts: series.latest_closed_ts,
+            series_revision: series.series_revision,
+            server_time: Some(chrono::Utc::now().timestamp_millis()),
+            has_more: Some(false),
+            next_before: None,
+            full_reload_required: Some(false),
+            partial_bar: series.partial_bar.clone(),
+        })
     }
 
     pub fn get(&self, symbol: &str, timeframe: &str) -> Option<ChartKlineResponse> {
@@ -49,8 +86,8 @@ impl KlineMemoryCache {
 
         Some(ChartKlineResponse {
             rows,
-            status: "cached".to_string(),
-            message: format!("Loaded from memory cache ({} bars)", series.bars.len()),
+            status: series.status.clone(),
+            message: format!("从内存缓存加载（{} 根）。{}", series.bars.len(), series.message),
             latest_closed_ts: series.latest_closed_ts,
             series_revision: series.series_revision,
             server_time: Some(chrono::Utc::now().timestamp_millis()),
@@ -78,7 +115,9 @@ impl KlineMemoryCache {
             partial_bar: resp.partial_bar.clone(),
             latest_closed_ts: resp.latest_closed_ts,
             series_revision: resp.series_revision,
-            last_updated: Instant::now(),
+            status: resp.status.clone(),
+            message: resp.message.clone(),
+            fetched_at: Instant::now(),
         };
 
         lock.put(key, series);
@@ -97,7 +136,6 @@ impl KlineMemoryCache {
                 }
             }
             series.partial_bar = None;
-            series.last_updated = Instant::now();
         }
     }
 
@@ -106,7 +144,6 @@ impl KlineMemoryCache {
         let key = (symbol.to_string(), timeframe.to_string());
         if let Some(series) = lock.get_mut(&key) {
             series.partial_bar = Some(bar);
-            series.last_updated = Instant::now();
         }
     }
 
@@ -119,5 +156,59 @@ impl KlineMemoryCache {
     pub fn clear(&self) {
         let mut lock = self.cache.lock().unwrap();
         lock.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn bar() -> KlineDto {
+        KlineDto {
+            symbol: "EG0".into(),
+            timeframe: "15m".into(),
+            ts: "2026-10-19 21:15:00".into(),
+            open: 4976.0,
+            high: 4976.0,
+            low: 4920.0,
+            close: 4934.0,
+            volume: 1.0,
+            hold: 1.0,
+            source: "derived_partial".into(),
+            rollover: false,
+        }
+    }
+
+    #[test]
+    fn partial_tick_does_not_refresh_history_or_hide_source_warning() {
+        let cache = KlineMemoryCache::new();
+        cache.put(
+            "EG0",
+            "15m",
+            &ChartKlineResponse {
+                rows: vec![],
+                status: "tq_unavailable".into(),
+                message: "仅显示本地历史数据".into(),
+                latest_closed_ts: None,
+                series_revision: None,
+                server_time: None,
+                has_more: None,
+                next_before: None,
+                full_reload_required: None,
+                partial_bar: None,
+            },
+        );
+        {
+            let mut lock = cache.cache.lock().unwrap();
+            lock.get_mut(&(String::from("EG0"), String::from("15m")))
+                .unwrap()
+                .fetched_at = Instant::now() - Duration::from_secs(10);
+        }
+        cache.update_partial_bar("EG0", "15m", bar());
+        assert!(cache.get_fresh("EG0", "15m", Duration::from_secs(3)).is_none());
+        let response = cache.get("EG0", "15m").unwrap();
+        assert_eq!(response.status, "tq_unavailable");
+        assert!(response.message.contains("仅显示本地历史数据"));
     }
 }

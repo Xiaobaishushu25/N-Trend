@@ -97,7 +97,7 @@ export const useScansStore = defineStore('scans', {
         if (!initialScanScheduled) {
           initialScanScheduled = true
           const delay = this.latestSignals.length ? 1200 : 0
-          setTimeout(() => this.runScan().catch(() => {}), delay)
+          setTimeout(() => this.runScanFast().catch(() => {}), delay)
         }
       })().finally(() => {
         latestRefreshPromise = null

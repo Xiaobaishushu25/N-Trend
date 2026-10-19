@@ -22,7 +22,12 @@ pub async fn get_chart_klines(
     Query(q): Query<KlineQuery>,
 ) -> Result<Json<ChartKlineResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     let limit = q.limit.unwrap_or(1200).min(5000);
-    match ctx.services.get_chart_klines(&symbol, &timeframe, Some(limit)).await {
+    let started = std::time::Instant::now();
+    let result = ctx.services.get_chart_klines(&symbol, &timeframe, Some(limit)).await;
+    if started.elapsed() >= std::time::Duration::from_millis(500) {
+        tracing::warn!(symbol, timeframe, limit, elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "图表服务端取数较慢");
+    }
+    match result {
         Ok(res) => {
             let rows: Vec<KlineDto> = res
                 .rows

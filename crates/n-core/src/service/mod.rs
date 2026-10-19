@@ -3463,9 +3463,8 @@ impl Services {
             return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
-            let rows = repo::klines(&self.db, symbol, tf.as_str(), None, None).await?;
+            let rows = repo::klines(&self.db, symbol, tf.as_str(), limit, None).await?;
             if !rows.is_empty() {
-                let rows = apply_limit(rows, limit);
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
         }
@@ -3565,8 +3564,39 @@ impl Services {
             });
         }
 
-        self.get_chart_klines_from_sina(symbol, timeframe, limit)
-            .await
+        // 新浪桥接变慢时先展示正式库中的历史K线，避免图表被外部请求卡住。
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.get_chart_klines_from_sina(symbol, timeframe, limit),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                tracing::warn!(symbol, timeframe, "新浪临时图表获取失败，回退本地历史K线: {error:#}");
+                self.local_chart_fallback(symbol, timeframe, limit).await
+            }
+            Err(_) => {
+                tracing::warn!(symbol, timeframe, "新浪临时图表超过2秒，回退本地历史K线");
+                self.local_chart_fallback(symbol, timeframe, limit).await
+            }
+        }
+    }
+
+    async fn local_chart_fallback(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+    ) -> Result<ChartKlineResponse> {
+        let rows = self.get_klines(symbol, timeframe, limit).await?;
+        let latest = rows.last().map(|row| row.ts.as_str()).unwrap_or("无本地数据");
+        Ok(ChartKlineResponse {
+            message: format!("实时数据源响应缓慢，当前显示本地已入库历史K线（截至 {latest}）；请勿作为实时行情使用。"),
+            rows,
+            status: "tq_unavailable".to_string(),
+            partial_bar: None,
+        })
     }
 
     async fn get_chart_klines_from_sina(
@@ -3981,6 +4011,44 @@ impl Services {
             }
         } else {
             bars.push(live_bar);
+        }
+
+        // A 15m bar at the start of a session must include each 5m slice seen so far.
+        // Otherwise a delayed database refresh can turn the whole night opening move
+        // into a tiny candle starting at the latest quote.
+        if target_tf == crate::derive::Timeframe::M15 {
+            let end = NaiveDateTime::parse_from_str(&target_bucket_end, "%Y-%m-%d %H:%M:%S").ok()?;
+            let live_end = NaiveDateTime::parse_from_str(&live_5m.ts, "%Y-%m-%d %H:%M:%S").ok()?;
+            let first = end - ChronoDuration::minutes(10);
+            let missing_slice = |rows: &[Kline]| {
+                (0..3).any(|i| {
+                    let ts = first + ChronoDuration::minutes(i * 5);
+                    ts <= live_end
+                        && !rows.iter().any(|row| row.datetime == ts.format("%Y-%m-%d %H:%M:%S").to_string())
+                })
+            };
+            if missing_slice(&bars) && self.data_source.tq_is_available() {
+                let tq = self.data_source.tq_client().await;
+                if let Ok(Ok(raw)) = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    tq.fetch_minute_raw(symbol, "5m", 4),
+                )
+                .await
+                {
+                    let mut by_ts: std::collections::BTreeMap<String, Kline> =
+                        bars.into_iter().map(|bar| (bar.datetime.clone(), bar)).collect();
+                    for bar in raw.klines {
+                        if bar.datetime <= live_5m.ts {
+                            by_ts.insert(bar.datetime.clone(), bar);
+                        }
+                    }
+                    bars = by_ts.into_values().collect();
+                }
+            }
+            if missing_slice(&bars) {
+                tracing::warn!(symbol, target_bucket_end, "15m 临时K线缺少同桶5m数据，暂不绘制不完整K线");
+                return None;
+            }
         }
 
         let aggregated = crate::derive::aggregate(&bars, target_tf);
@@ -5175,13 +5243,6 @@ fn format_scan_signal(index: usize, e: &pattern_events::Model, min_score: f64) -
         rr = e.rr,
         threshold_flag = threshold_flag,
     )
-}
-
-fn apply_limit(rows: Vec<klines::Model>, limit: Option<usize>) -> Vec<klines::Model> {
-    match limit {
-        Some(limit) if rows.len() > limit => rows[rows.len() - limit..].to_vec(),
-        _ => rows,
-    }
 }
 
 fn apply_limit_dto<T>(rows: Vec<T>, limit: Option<usize>) -> Vec<T> {

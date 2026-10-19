@@ -880,6 +880,9 @@ export interface CtpHealth {
   sync_error?: string | null
   account_updated_at?: number
   positions_updated_at?: number
+  connected?: boolean
+  logged_in?: boolean
+  authenticated?: boolean
 }
 
 export interface ExecutionConfig {
@@ -953,6 +956,10 @@ export interface LiveConditionOrder {
   score: number
   tier: 'large' | 'small'
   volume: number
+  warning_bar_ts?: string
+  trigger_ts?: string | null
+  bars_waited?: number
+  max_wait_bars?: number
   state: 'Pending' | 'WaitingConfirm' | 'Triggered' | 'Filled' | 'Canceled' | 'Rejected' | 'Unknown' | 'Working' | 'PartFilled' | 'Closing' | 'Closed' | 'Expired' | 'Invalidated'
   created_at: number
   note: string
@@ -982,6 +989,12 @@ export interface LiveManagedPosition {
   is_closed: boolean
   realized_pnl_pts?: number | null
   r_multiple?: number | null
+  event_id?: number | null
+  planned_entry_price?: number | null
+  score?: number | null
+  warning_bar_ts?: string | null
+  trigger_ts?: string | null
+  order_insert_ts?: string | null
 }
 
 export interface LiveTradeRecord {
@@ -1001,10 +1014,17 @@ export interface LiveTradeRecord {
   exit_ts: string
   exit_reason: string
   realized_pnl_pts: number
+  realized_pnl_amount?: number
   r_multiple: number
   max_mfe_r: number
   max_mae_r: number
   bars_held: number
+  event_id?: number | null
+  planned_entry_price?: number | null
+  score?: number | null
+  warning_bar_ts?: string | null
+  trigger_ts?: string | null
+  order_insert_ts?: string | null
 }
 
 export interface LiveTradeStatistics {
@@ -1018,5 +1038,6 @@ export interface LiveTradeStatistics {
   large_trades_count: number
   small_trades_count: number
   exit_reason_breakdown: Record<string, number>
+  total_pnl?: number
 }
 

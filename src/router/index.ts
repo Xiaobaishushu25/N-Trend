@@ -1,11 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import DashboardView from '../views/DashboardView.vue'
-import ChartView from '../views/ChartView.vue'
-import NotificationsView from '../views/NotificationsView.vue'
-import ReviewView from '../views/ReviewView.vue'
-import TradeReviewView from '../views/TradeReviewView.vue'
-import LiveTraderView from '../views/LiveTraderView.vue'
-import SettingsView from '../views/SettingsView.vue'
 
 export default createRouter({
   history: createWebHashHistory(),
@@ -14,37 +8,37 @@ export default createRouter({
     {
       path: '/chart/:symbol',
       name: 'chart',
-      component: ChartView,
+      component: () => import('../views/ChartView.vue'),
       meta: { bare: true },
     },
     {
       path: '/settings',
       name: 'settings',
-      component: SettingsView,
+      component: () => import('../views/SettingsView.vue'),
       meta: { bare: true },
     },
     {
       path: '/review',
       name: 'review',
-      component: ReviewView,
+      component: () => import('../views/ReviewView.vue'),
       meta: { bare: true },
     },
     {
       path: '/trade-review',
       name: 'trade-review',
-      component: TradeReviewView,
+      component: () => import('../views/TradeReviewView.vue'),
       meta: { bare: true },
     },
     {
       path: '/live-trader',
       name: 'live-trader',
-      component: LiveTraderView,
+      component: () => import('../views/LiveTraderView.vue'),
       meta: { bare: true },
     },
     {
       path: '/notifications',
       name: 'notifications',
-      component: NotificationsView,
+      component: () => import('../views/NotificationsView.vue'),
       meta: { bare: true },
     },
   ],

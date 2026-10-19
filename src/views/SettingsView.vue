@@ -1080,6 +1080,20 @@ onMounted(async () => {
                     <n-radio-button value="2">2.0 严格N字+箱体</n-radio-button>
                   </n-radio-group>
                 </div>
+                <div class="setting-card-row" v-if="serverSettingsUpdate.quote">
+                  <div class="row-label">
+                    实时行情刷新间隔（秒）
+                    <Tip text="交易时段内服务端向数据源轮询最新现价的间隔（推荐 3 秒；修改后下一轮即生效）。" />
+                  </div>
+                  <n-input-number
+                    :value="(serverSettingsUpdate.quote.poll_interval_ms || 3000) / 1000"
+                    :min="1"
+                    :max="60"
+                    :step="1"
+                    class="setting-input-number"
+                    @update:value="(val) => { if (serverSettingsUpdate.quote) serverSettingsUpdate.quote.poll_interval_ms = Math.round((val || 3) * 1000) }"
+                  />
+                </div>
                 <div class="setting-card-row">
                   <div class="row-label">数据刷新间隔（秒）</div>
                   <n-input-number v-model:value="serverSettingsUpdate.scheduler!.refresh_interval_secs" :min="10" :max="600" class="setting-input-number" />

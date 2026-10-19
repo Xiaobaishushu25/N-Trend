@@ -147,8 +147,92 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       return this.conditions.filter((c) => c.state === 'WaitingConfirm')
     },
     filteredHistory(): LiveTradeRecord[] {
-      if (!this.filterReason) return this.history
-      return this.history.filter((h) => h.exit_reason === this.filterReason)
+      const list = this.filterReason
+        ? this.history.filter((h) => h.exit_reason === this.filterReason)
+        : [...this.history]
+      return list.sort((a, b) => {
+        const timeDiff = (b.exit_ts || '').localeCompare(a.exit_ts || '')
+        if (timeDiff !== 0) return timeDiff
+        return (b.id || '').localeCompare(a.id || '')
+      })
+    },
+    totalRealizedPnlAmount(): number {
+      if (this.statistics?.total_pnl != null && this.statistics.total_pnl !== 0) {
+        return this.statistics.total_pnl
+      }
+      return this.history.reduce((sum, h) => {
+        if (h.realized_pnl_amount != null && !Number.isNaN(h.realized_pnl_amount) && h.realized_pnl_amount !== 0) {
+          return sum + h.realized_pnl_amount
+        }
+        const mult = DEFAULT_MULTIPLIERS[getSymbolPrefix(h.instrument_id || h.symbol)] ?? 10
+        return sum + (h.realized_pnl_pts || 0) * mult * (h.volume || 1)
+      }, 0)
+    },
+    totalRealizedPnlPoints(): number {
+      return this.history.reduce((sum, h) => sum + (h.realized_pnl_pts || 0), 0)
+    },
+    conditionMap(): Record<string, LiveConditionOrder> {
+      const map: Record<string, LiveConditionOrder> = {}
+      for (const c of this.conditions) {
+        map[c.id] = c
+      }
+      return map
+    },
+    resolveEventId(): (item?: { event_id?: number | null; condition_order_id?: string } | null) => number | null {
+      return (item) => {
+        if (!item) return null
+        if (item.event_id != null) return item.event_id
+        return this.conditionMap[item.condition_order_id || '']?.event_id ?? null
+      }
+    },
+    resolvePlannedEntryPrice(): (item?: { planned_entry_price?: number | null; condition_order_id?: string } | null) => number | null {
+      return (item) => {
+        if (!item) return null
+        if (item.planned_entry_price != null) return item.planned_entry_price
+        return this.conditionMap[item.condition_order_id || '']?.entry_price ?? null
+      }
+    },
+    resolveScore(): (item?: { score?: number | null; condition_order_id?: string } | null) => number | null {
+      return (item) => {
+        if (!item) return null
+        if (item.score != null) return item.score
+        return this.conditionMap[item.condition_order_id || '']?.score ?? null
+      }
+    },
+    resolveWarningBarTs(): (item?: { warning_bar_ts?: string | null; condition_order_id?: string } | null) => string | null {
+      return (item) => {
+        if (!item) return null
+        if (item.warning_bar_ts) return item.warning_bar_ts
+        return this.conditionMap[item.condition_order_id || '']?.warning_bar_ts ?? null
+      }
+    },
+    resolveTargetPrice(): (item?: { target_price?: number | null; condition_order_id?: string } | null) => number | null {
+      return (item) => {
+        if (!item) return null
+        if (item.target_price != null) return item.target_price
+        return this.conditionMap[item.condition_order_id || '']?.target_price ?? null
+      }
+    },
+    resolveInitialStopPrice(): (item?: { initial_stop_price?: number | null; condition_order_id?: string } | null) => number | null {
+      return (item) => {
+        if (!item) return null
+        if (item.initial_stop_price != null) return item.initial_stop_price
+        return this.conditionMap[item.condition_order_id || '']?.stop_price ?? null
+      }
+    },
+    resolveTriggerTs(): (item?: { trigger_ts?: string | null; condition_order_id?: string } | null) => string | null {
+      return (item) => {
+        if (!item) return null
+        if (item.trigger_ts) return item.trigger_ts
+        return this.conditionMap[item.condition_order_id || '']?.trigger_ts ?? null
+      }
+    },
+    resolveOrderInsertTs(): (item?: { order_insert_ts?: string | null; condition_order_id?: string } | null) => string | null {
+      return (item) => {
+        if (!item) return null
+        if (item.order_insert_ts) return item.order_insert_ts
+        return null
+      }
     },
   },
 
@@ -224,7 +308,12 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           this.lastPushAt = Date.now()
           this.applySnapshot(payload)
         }))
-        await add(listen('trader-heartbeat', () => { this.lastPushAt = Date.now() }))
+        await add(listen('trader-heartbeat', () => {
+          this.lastPushAt = Date.now()
+          if (!this.bridgeOnline || this.errorMsg || !this.account) {
+            void this.refresh()
+          }
+        }))
         await add(listen('trader-resync-needed', () => { void this.refresh() }))
         await add(listen<string>('connection-status-changed', ({ payload }) => {
           if (payload !== 'connected' && this.snapshotSource !== 'local') {
@@ -254,7 +343,11 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.pollTimer = setInterval(() => {
         this.now = Date.now()
         // Healthy streams send a heartbeat every 15 s. Only recover via HTTP when stale.
-        if (this.now - this.lastPushAt > 45000 && this.now - this.lastRecoveryAt > 15000) {
+        // When there is an error or the trader data is not yet synchronized, retry more actively (5s).
+        const hasError = Boolean(this.errorMsg) || !this.bridgeOnline || !this.account
+        const staleTimeout = hasError ? 5000 : 45000
+        const minInterval = hasError ? 5000 : 15000
+        if (this.now - this.lastPushAt > staleTimeout && this.now - this.lastRecoveryAt > minInterval) {
           this.lastRecoveryAt = this.now
           void this.refresh()
         }

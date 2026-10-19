@@ -6,6 +6,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::client::CtpTraderClient;
 use super::model::*;
+use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
 use crate::analyze::model::Dir;
 use crate::analyze::outcome::{
     NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS, TRAIL_START_R, TRAIL_STEP_R,
@@ -62,6 +63,8 @@ pub struct ConditionOrder {
     pub score: f64,
     pub volume: i32,
     pub warning_bar_ts: String,
+    #[serde(default)]
+    pub trigger_ts: Option<String>,
     pub bars_waited: usize,
     pub max_wait_bars: usize,
     pub state: ConditionState,
@@ -94,6 +97,18 @@ pub struct ManagedPosition {
     pub is_closed: bool,
     pub realized_pnl_pts: Option<f64>,
     pub r_multiple: Option<f64>,
+    #[serde(default)]
+    pub event_id: Option<i64>,
+    #[serde(default)]
+    pub planned_entry_price: Option<f64>,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub warning_bar_ts: Option<String>,
+    #[serde(default)]
+    pub trigger_ts: Option<String>,
+    #[serde(default)]
+    pub order_insert_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -114,10 +129,24 @@ pub struct TradeRecord {
     pub exit_ts: String,
     pub exit_reason: String, // "stop", "trailing", "target_1r", "no_follow", "target_s1", "time_exit", "manual"
     pub realized_pnl_pts: f64,
+    #[serde(default)]
+    pub realized_pnl_amount: f64,
     pub r_multiple: f64,
     pub max_mfe_r: f64,
     pub max_mae_r: f64,
     pub bars_held: usize,
+    #[serde(default)]
+    pub event_id: Option<i64>,
+    #[serde(default)]
+    pub planned_entry_price: Option<f64>,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub warning_bar_ts: Option<String>,
+    #[serde(default)]
+    pub trigger_ts: Option<String>,
+    #[serde(default)]
+    pub order_insert_ts: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -132,6 +161,8 @@ pub struct TradeStatistics {
     pub large_trades_count: usize,
     pub small_trades_count: usize,
     pub exit_reason_breakdown: HashMap<String, usize>,
+    #[serde(default)]
+    pub total_pnl: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -197,6 +228,8 @@ pub struct ExecutionOrder {
     pub action_at: i64,
     pub trading_day: String,
     pub note: String,
+    #[serde(default)]
+    pub cancel_attempts: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -225,6 +258,10 @@ struct ExecutionState {
     account: Option<String>,
     trading_day: String,
     loss_r: f64,
+    #[serde(default)]
+    overnight_snapshots: HashMap<String, OvernightSnapshot>,
+    #[serde(default)]
+    recorded_checkpoints: HashSet<String>,
     #[serde(skip)]
     broker_ready: bool,
     #[serde(skip)]
@@ -398,6 +435,88 @@ impl ExecutionEngine {
             .or_else(|| s.market_error.clone())
     }
 
+    pub fn overnight_tracking_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .map(|p| p.with_file_name("overnight_tracking.jsonl"))
+    }
+
+    pub fn overnight_attribution_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .as_ref()
+            .map(|p| p.with_file_name("overnight_attribution.jsonl"))
+    }
+
+    pub async fn get_overnight_snapshots(&self) -> Vec<OvernightSnapshot> {
+        self.state.lock().await.overnight_snapshots.values().cloned().collect()
+    }
+
+    fn check_overnight_checkpoints(&self, s: &mut ExecutionState) {
+        let now = chrono::Local::now();
+        let tracking_path = self.overnight_tracking_path();
+        let open_positions: Vec<ManagedPosition> = s
+            .positions
+            .values()
+            .filter(|p| !p.is_closed)
+            .cloned()
+            .collect();
+
+        for pos in open_positions {
+            if let Some(checkpoint_type) = check_pre_close_checkpoint(&pos.symbol, &now, 2) {
+                let checkpoint_key = format!("{}:{}:{:?}", pos.id, s.trading_day, checkpoint_type);
+                if !s.recorded_checkpoints.contains(&checkpoint_key) {
+                    if let Some(quote) = s.quotes.get(&pos.instrument_id.to_uppercase()).filter(|q| q.valid()) {
+                        let snap = OvernightSnapshot::create(&pos, quote, checkpoint_type, &s.trading_day);
+                        tracing::info!(
+                            "🌙 [影子跟踪] 记录收盘前2分钟快照: 合约={} 方向={} 最新={:.2} 假设平仓价={:.2} 盈亏={:+.2}点({:+.2}R)",
+                            snap.instrument_id,
+                            snap.direction,
+                            snap.checkpoint_last,
+                            snap.hypo_exit_price,
+                            snap.hypo_pnl_pts,
+                            snap.hypo_pnl_r,
+                        );
+                        if let Some(ref path) = tracking_path {
+                            if let Err(e) = append_snapshot_jsonl(path, &snap) {
+                                tracing::warn!("写入隔夜快照失败: {e}");
+                            }
+                        }
+                        s.recorded_checkpoints.insert(checkpoint_key);
+                        s.overnight_snapshots.insert(pos.id.clone(), snap);
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_overnight_next_open(&self, s: &mut ExecutionState) {
+        let now = chrono::Local::now();
+        let now_ts = now.timestamp();
+        let tracking_path = self.overnight_tracking_path();
+
+        for (pos_id, snap) in s.overnight_snapshots.iter_mut() {
+            if snap.next_open_price.is_none() && now_ts - snap.created_at >= 180 {
+                if let Some(_pos) = s.positions.get(pos_id).filter(|p| !p.is_closed) {
+                    if let Some(quote) = s.quotes.get(&snap.instrument_id.to_uppercase()).filter(|q| q.valid()) {
+                        let open_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
+                        snap.update_next_open(quote.last, &open_ts);
+                        tracing::info!(
+                            "🌅 [影子跟踪] 记录次时段开盘跳空: 合约={} 开盘价={:.2} 跳空点数={:+.2} 跳空R={:+.2}R 击穿止损={:?}",
+                            snap.instrument_id,
+                            snap.next_open_price.unwrap_or_default(),
+                            snap.gap_pts.unwrap_or_default(),
+                            snap.gap_r.unwrap_or_default(),
+                            snap.gap_penetrated_stop.unwrap_or_default(),
+                        );
+                        if let Some(ref path) = tracking_path {
+                            let _ = append_snapshot_jsonl(path, snap);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub async fn get_trade_statistics(&self) -> TradeStatistics {
         let s = self.state.lock().await;
         let mut stats = TradeStatistics::default();
@@ -405,6 +524,7 @@ impl ExecutionEngine {
         for t in &s.history {
             stats.total_trades += 1;
             stats.total_r += t.r_multiple;
+            stats.total_pnl += t.realized_pnl_amount;
             if t.r_multiple > 0.0 {
                 stats.win_trades += 1;
                 wins += t.r_multiple;
@@ -451,12 +571,14 @@ impl ExecutionEngine {
                 && entry > 0.0
                 && stop > 0.0
                 && (if long {
-                    stop < entry && target > entry
+                    stop < entry
                 } else {
-                    stop > entry && target < entry
+                    stop > entry
                 }),
-            "入场/止损/目标价格不合法"
+            "入场/止损价格不合法"
         );
+        let risk = (entry - stop).abs();
+        anyhow::ensure!(risk > 0.0, "止损空间必须大于0");
         anyhow::ensure!(score.is_finite() && score >= 2.5, "评分低于执行门槛");
         anyhow::ensure!(
             is_actual_futures_contract(instrument_id),
@@ -482,6 +604,15 @@ impl ExecutionEngine {
         } else {
             PositionTier::Small
         };
+        let target_space = if long { target - entry } else { entry - target };
+        // 目标空间过小判定：若目标空间小于等于止损空间（即 RR <= 1.0，含 S1 倒挂或触碰 entry 的情形）
+        // 此时不以原形态 S1 目标点位作为止盈，而是将止盈预设在 1:1 盈亏比（1.0R）上
+        let (effective_target, is_preset_1r) = if target_space <= risk {
+            let one_r_target = if long { entry + risk } else { entry - risk };
+            (one_r_target, true)
+        } else {
+            (target, false)
+        };
         let id = uuid::Uuid::new_v4().to_string();
         s.conditions.insert(
             id.clone(),
@@ -494,8 +625,8 @@ impl ExecutionEngine {
                 tier,
                 entry_price: entry,
                 stop_price: stop,
-                target_price: target,
-                risk: (entry - stop).abs(),
+                target_price: effective_target,
+                risk,
                 score,
                 volume: if tier == PositionTier::Large {
                     cfg.default_large_volume.max(1)
@@ -503,11 +634,16 @@ impl ExecutionEngine {
                     cfg.default_small_volume.max(1)
                 },
                 warning_bar_ts: warning_ts.into(),
+                trigger_ts: None,
                 bars_waited: 0,
                 max_wait_bars: PENDING_BARS,
                 state: ConditionState::Pending,
                 created_at: chrono::Utc::now().timestamp(),
-                note: "等待实际合约触价".into(),
+                note: if is_preset_1r {
+                    format!("目标空间<1R(S1:{:.1})，止盈预设1:1", target)
+                } else {
+                    "等待实际合约触价".into()
+                },
             },
         );
         self.save(&mut s)?;
@@ -546,6 +682,9 @@ impl ExecutionEngine {
         s.authorized_entries.insert(id.into());
         let o = s.conditions.get_mut(id).unwrap();
         o.state = ConditionState::Triggered;
+        if o.trigger_ts.is_none() {
+            o.trigger_ts = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        }
         o.note = "已确认，等待有效盘口提交委托；尚未成交".into();
         self.save(&mut s)?;
         Ok(true)
@@ -699,6 +838,13 @@ impl ExecutionEngine {
             }
             let cond = s.conditions[&order.condition_id].clone();
             if order.reason.is_none() {
+                let order_insert_ts = s.orders.get(&trade.order_ref).map(|o| {
+                    chrono::DateTime::from_timestamp(o.action_at, 0)
+                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| {
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+                        })
+                });
                 let pos = s
                     .positions
                     .entry(cond.id.clone())
@@ -726,7 +872,19 @@ impl ExecutionEngine {
                         is_closed: false,
                         realized_pnl_pts: None,
                         r_multiple: None,
+                        event_id: cond.event_id,
+                        planned_entry_price: Some(cond.entry_price),
+                        score: Some(cond.score),
+                        warning_bar_ts: Some(cond.warning_bar_ts.clone()),
+                        trigger_ts: cond.trigger_ts.clone(),
+                        order_insert_ts: order_insert_ts.clone(),
                     });
+                if pos.order_insert_ts.is_none() {
+                    pos.order_insert_ts = order_insert_ts;
+                }
+                if pos.trigger_ts.is_none() {
+                    pos.trigger_ts = cond.trigger_ts.clone();
+                }
                 let qty = pos.volume + trade.volume;
                 pos.fill_price = (pos.fill_price * pos.volume as f64
                     + trade.price * trade.volume as f64)
@@ -734,6 +892,11 @@ impl ExecutionEngine {
                 pos.volume = qty;
                 pos.risk = (pos.fill_price - cond.stop_price).abs().max(1e-9);
                 pos.is_closed = false;
+                let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
+                let target_space = (cond.target_price - cond.entry_price) * sign;
+                if target_space <= cond.risk + 1e-6 {
+                    pos.target_price = pos.fill_price + sign * pos.risk;
+                }
                 // Stop exits include fills racing an entry cancellation. A partial
                 // profit-taking task still closes only its requested first lot.
                 if let Some(task) = s.closes.get_mut(&cond.id) {
@@ -757,6 +920,8 @@ impl ExecutionEngine {
                 pos.exit_price = Some(trade.price);
                 pos.exit_reason = order.reason.clone();
                 let r = points / pos.risk.max(1e-9);
+                let mult = crate::precision::effective_multiplier(&pos.instrument_id, "");
+                let pnl_amount = points * mult * trade.volume as f64;
                 let rec = TradeRecord {
                     id: key,
                     condition_order_id: cond.id.clone(),
@@ -774,16 +939,47 @@ impl ExecutionEngine {
                     exit_ts: format!("{} {}", trade.trade_date, trade.trade_time),
                     exit_reason: order.reason.clone().unwrap(),
                     realized_pnl_pts: points,
+                    realized_pnl_amount: pnl_amount,
                     r_multiple: r,
                     max_mfe_r: pos.max_mfe_r,
                     max_mae_r: pos.max_mae_r,
                     bars_held: pos.bars_held,
+                    event_id: cond.event_id.or(pos.event_id),
+                    planned_entry_price: Some(cond.entry_price).or(pos.planned_entry_price),
+                    score: Some(cond.score).or(pos.score),
+                    warning_bar_ts: Some(cond.warning_bar_ts.clone()).or_else(|| pos.warning_bar_ts.clone()),
+                    trigger_ts: cond.trigger_ts.clone().or_else(|| pos.trigger_ts.clone()),
+                    order_insert_ts: pos.order_insert_ts.clone(),
                 };
                 if r < 0.0 && *fill_day == s.trading_day {
                     s.loss_r -= r * trade.volume as f64;
                 }
                 if let Some(task) = s.closes.get_mut(&cond.id) {
                     task.filled += trade.volume;
+                }
+                if let Some(snap) = s.overnight_snapshots.get_mut(&cond.id) {
+                    snap.finalize_actual_exit(
+                        rec.exit_price,
+                        &rec.exit_ts,
+                        &rec.exit_reason,
+                        rec.realized_pnl_pts,
+                        rec.r_multiple,
+                    );
+                    tracing::info!(
+                        "📊 [影子跟踪] 隔夜持仓归因完成: 合约={} 真实出场={:.2}({:+.2}R) 假设平仓={:.2}({:+.2}R) => 隔夜超额收益={:+.2}点 ({:+.2}R)",
+                        snap.instrument_id,
+                        snap.actual_exit_price.unwrap_or_default(),
+                        snap.actual_realized_pnl_r.unwrap_or_default(),
+                        snap.hypo_exit_price,
+                        snap.hypo_pnl_r,
+                        snap.overnight_delta_pts.unwrap_or_default(),
+                        snap.overnight_delta_r.unwrap_or_default(),
+                    );
+                    if let Some(path) = self.overnight_attribution_path() {
+                        if let Err(e) = append_snapshot_jsonl(&path, snap) {
+                            tracing::warn!("写入隔夜归因记录失败: {e}");
+                        }
+                    }
                 }
                 s.history.push(rec);
             }
@@ -1021,6 +1217,9 @@ impl ExecutionEngine {
                 };
                 if hit {
                     let o = s.conditions.get_mut(&cond.id).unwrap();
+                    if o.trigger_ts.is_none() {
+                        o.trigger_ts = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                    }
                     o.state = if mode == ExecutionMode::SemiAuto {
                         ConditionState::WaitingConfirm
                     } else {
@@ -1097,10 +1296,12 @@ impl ExecutionEngine {
                             pos.current_stop_price,
                             true,
                         );
+                    } else if (q.last - pos.target_price) * sign >= 0.0 {
+                        let target_r = (pos.target_price - pos.fill_price) * sign / pos.risk.max(1e-9);
+                        if target_r > 1.0 {
+                            Self::latch_exit(&mut s, &cond.id, "target_s1", q.last, true);
+                        }
                     }
-                }
-                if (q.last - pos.target_price) * sign >= 0.0 {
-                    Self::latch_exit(&mut s, &cond.id, "target_s1", q.last, true);
                 }
             } else if s.closes[&cond.id].reason == "target_1r"
                 && pos.tier == PositionTier::Large
@@ -1147,12 +1348,33 @@ impl ExecutionEngine {
         let cfg = self.get_config().await;
         let now = chrono::Utc::now().timestamp();
         let mut s = self.state.lock().await;
+        self.check_overnight_checkpoints(&mut s);
+        self.update_overnight_next_open(&mut s);
         if cfg.mode == ExecutionMode::MonitorOnly {
             return Ok(());
         }
         if !s.broker_connected || s.persistence_error.is_some() || now - s.last_action_at < 2 {
             return Ok(());
         }
+        // 解除长时间处于 CancelPending 且已重试多次的死锁报单，防止阻塞驱动循环与其它品种交易
+        let mut unblocked_any = false;
+        for (r, o) in s.orders.iter_mut() {
+            if o.phase == OrderPhase::CancelPending && o.cancel_attempts >= 3 && now - o.action_at >= 15 {
+                tracing::warn!(
+                    "⚠️ 报单 {} ({}) 处于 CancelPending 且已重试 {} 次超时未获柜台终态回报，将其标记为 Rejected 避免阻塞其它品种交易",
+                    r,
+                    o.request.instrument_id,
+                    o.cancel_attempts
+                );
+                o.phase = OrderPhase::Rejected;
+                o.note = "撤单多次未获回报，标记终止".to_string();
+                unblocked_any = true;
+            }
+        }
+        if unblocked_any {
+            self.save(&mut s)?;
+        }
+
         let wait = cfg.order_wait_seconds.max(2) as i64;
         // Cancel a timed-out live order before replacing it. Terminal != all fills received.
         let cancel = s
@@ -1181,7 +1403,9 @@ impl ExecutionEngine {
                     });
                 (o.phase == OrderPhase::Working
                     && (abort || (now - o.action_at >= wait && reprice)))
-                    || (o.phase == OrderPhase::CancelPending && now - o.action_at >= wait)
+                    || (o.phase == OrderPhase::CancelPending
+                        && o.cancel_attempts < 3
+                        && now - o.action_at >= wait * (o.cancel_attempts as i64 + 1))
             })
             .min_by_key(|(_, o)| {
                 (
@@ -1191,8 +1415,10 @@ impl ExecutionEngine {
             })
             .map(|(r, o)| (r.clone(), o.clone()));
         if let Some((r, order)) = cancel {
-            s.orders.get_mut(&r).unwrap().phase = OrderPhase::CancelPending;
-            s.orders.get_mut(&r).unwrap().action_at = now;
+            let o_mut = s.orders.get_mut(&r).unwrap();
+            o_mut.phase = OrderPhase::CancelPending;
+            o_mut.cancel_attempts += 1;
+            o_mut.action_at = now;
             s.last_action_at = now;
             self.save(&mut s)?;
             drop(s);
@@ -1251,7 +1477,8 @@ impl ExecutionEngine {
                     || !s.entry_symbols_ready.contains(&cond.symbol)
                     || !s.authorized_entries.contains(&cond.id)
                     || s.aborted_entries.contains(&cond.id)
-                    || s.loss_r >= cfg.daily_loss_limit_r
+                    // 暂时停用日内亏损熔断限制（后续如需重新启用，解开下方注释即可）：
+                    // || (cfg.daily_loss_limit_r > 0.0 && s.loss_r >= cfg.daily_loss_limit_r)
                 {
                     continue;
                 }
@@ -1268,7 +1495,32 @@ impl ExecutionEngine {
             let max_ticks = if reason.is_some() {
                 cfg.max_exit_slippage_ticks
             } else {
-                cfg.max_slippage_ticks.max(1)
+                // 入场最大允许滑点：max(止损空间 * 0.2, 2 * tick)
+                let max_entry_slippage = (cond.risk * 0.2).max(2.0 * q.tick);
+                let market_price = if buy { q.ask } else { q.bid };
+                let market_price = if market_price.is_finite() && market_price > 0.0 {
+                    market_price
+                } else {
+                    q.last
+                };
+                let overshot = if buy {
+                    market_price > cond.entry_price + max_entry_slippage + 1e-6
+                } else {
+                    market_price < cond.entry_price - max_entry_slippage - 1e-6
+                };
+                if overshot {
+                    let limit_desc = if buy { "上限" } else { "下限" };
+                    let max_p = if buy {
+                        cond.entry_price + max_entry_slippage
+                    } else {
+                        cond.entry_price - max_entry_slippage
+                    };
+                    if let Some(o) = s.conditions.get_mut(&cond.id) {
+                        o.note = format!("盘口{:.1}超入场滑点限制({}{:.1})，暂缓报单", market_price, limit_desc, max_p);
+                    }
+                    continue;
+                }
+                (max_entry_slippage / q.tick).round() as u32
             };
             let ticks = cfg.slippage_ticks.saturating_add(attempts).min(20);
             let Some(price) = q.order_price(buy, reference, ticks, max_ticks) else {
@@ -1304,6 +1556,7 @@ impl ExecutionEngine {
                 action_at: now,
                 trading_day: day,
                 note: "已持久化提交意图，等待柜台回报".into(),
+                cancel_attempts: 0,
             },
         );
         if let Some(task) = s.closes.get_mut(&id) {

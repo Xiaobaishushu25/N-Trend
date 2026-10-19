@@ -253,6 +253,10 @@ export function onKlineClosed(cb: (payload: { symbol: string; timeframe: string;
   return listen<{ symbol: string; timeframe: string; bar: any }>('kline-closed', (e) => cb(e.payload))
 }
 
+export function onChartKlinesRefreshed(cb: (payload: { symbol: string; timeframe: string; response: ChartKlineResponse }) => void) {
+  return listen<{ symbol: string; timeframe: string; response: ChartKlineResponse }>('chart-klines-refreshed', (e) => cb(e.payload))
+}
+
 export function onStateChanged(cb: (payload: { scope: string; revision: number }) => void) {
   return listen<{ scope: string; revision: number }>('state-changed', (e) => cb(e.payload))
 }

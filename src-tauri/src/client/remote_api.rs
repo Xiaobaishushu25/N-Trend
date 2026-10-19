@@ -21,7 +21,10 @@ pub struct RemoteApiClient {
 impl RemoteApiClient {
     pub fn new(credentials: Arc<CredentialStore>) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(45))
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
             .build()
             .unwrap_or_default();
         Self {
@@ -62,9 +65,22 @@ impl RemoteApiClient {
         &self,
         rb: RequestBuilder,
     ) -> Result<T, ApiErrorResponse> {
+        self.execute_with_retry(rb, true).await
+    }
+
+    async fn execute_with_retry<T: DeserializeOwned>(
+        &self,
+        rb: RequestBuilder,
+        can_retry: bool,
+    ) -> Result<T, ApiErrorResponse> {
+        let retry_clone = if can_retry { rb.try_clone() } else { None };
         let resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
+                if let Some(retry_rb) = retry_clone {
+                    tracing::warn!("⚠️ [RemoteAPI] 网络请求中断，正在自动重试一次: {e}");
+                    return Box::pin(self.execute_with_retry(retry_rb, false)).await;
+                }
                 tracing::error!("❌ [RemoteAPI] 网络请求失败: {e}");
                 return Err(ApiErrorResponse::new(
                     "NETWORK_ERROR",
@@ -77,10 +93,38 @@ impl RemoteApiClient {
         let status = resp.status();
         let url = resp.url().clone();
         if status.is_success() {
-            let data = resp.json::<T>().await.map_err(|e| {
-                tracing::error!("❌ [RemoteAPI] 解析响应 JSON 失败 ({}): {e}", url);
-                ApiErrorResponse::new("PARSE_ERROR", format!("解析服务端响应失败: {e}"), "")
-            })?;
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    if let Some(retry_rb) = retry_clone {
+                        tracing::warn!("⚠️ [RemoteAPI] 读取数据流中断，正在自动重试一次 ({}): {e}", url);
+                        return Box::pin(self.execute_with_retry(retry_rb, false)).await;
+                    }
+                    tracing::error!("❌ [RemoteAPI] 读取响应流失败 ({}): {e}", url);
+                    return Err(ApiErrorResponse::new(
+                        "READ_ERROR",
+                        format!("读取服务端响应流失败: {e}"),
+                        "",
+                    ));
+                }
+            };
+            let data = match serde_json::from_slice::<T>(&bytes) {
+                Ok(d) => d,
+                Err(e) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let preview = if text.len() > 300 {
+                        format!("{}... (len: {})", &text[..300], text.len())
+                    } else {
+                        text.to_string()
+                    };
+                    tracing::error!("❌ [RemoteAPI] 解析响应 JSON 失败 ({}): {e} | 内容: {preview}", url);
+                    return Err(ApiErrorResponse::new(
+                        "PARSE_ERROR",
+                        format!("解析服务端响应失败: {e}"),
+                        "",
+                    ));
+                }
+            };
             Ok(data)
         } else {
             let text = resp.text().await.unwrap_or_default();
@@ -113,15 +157,31 @@ impl RemoteApiClient {
     }
 
     async fn execute_empty(&self, rb: RequestBuilder) -> Result<(), ApiErrorResponse> {
+        let retry_clone = rb.try_clone();
         let resp = match rb.send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("❌ [RemoteAPI] 网络请求失败: {e}");
-                return Err(ApiErrorResponse::new(
-                    "NETWORK_ERROR",
-                    format!("网络请求失败: {e}"),
-                    "",
-                ));
+                if let Some(retry_rb) = retry_clone {
+                    tracing::warn!("⚠️ [RemoteAPI] 网络请求中断，正在自动重试一次: {e}");
+                    match retry_rb.send().await {
+                        Ok(r) => r,
+                        Err(e2) => {
+                            tracing::error!("❌ [RemoteAPI] 重试后网络请求仍失败: {e2}");
+                            return Err(ApiErrorResponse::new(
+                                "NETWORK_ERROR",
+                                format!("网络请求失败: {e2}"),
+                                "",
+                            ));
+                        }
+                    }
+                } else {
+                    tracing::error!("❌ [RemoteAPI] 网络请求失败: {e}");
+                    return Err(ApiErrorResponse::new(
+                        "NETWORK_ERROR",
+                        format!("网络请求失败: {e}"),
+                        "",
+                    ));
+                }
             }
         };
 

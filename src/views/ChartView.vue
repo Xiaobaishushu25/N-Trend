@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { isTauri } from '@tauri-apps/api/core'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import draggable from 'vuedraggable'
 import {
   NButton,
@@ -14,7 +16,7 @@ import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Chevron
 import KLineChart from '../components/KLineChart.vue'
 import IntradayChart from '../components/IntradayChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onChartKlinesRefreshed, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useIntradayStore } from '../stores/intraday'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
@@ -332,10 +334,19 @@ async function loadReviewList(force = false) {
   const seq = ++reviewListSeq
   reviewLoading.value = true
   try {
-    let rows = await api.getRecentOutcomes(2000, filters ?? undefined)
-    // 目标信号不在筛选结果里时退化为全量明细，保证滚轮列表能覆盖当前信号
+    // 优先带上当前品种以走单品种极速路径（~100ms），避免无筛选时全量扫描50+品种SQLite（~8秒）
+    const effectiveFilters = filters ?? (symbol.value ? { symbol: symbol.value } : undefined)
+    let rows = await api.getRecentOutcomes(150, effectiveFilters)
+    // 目标信号不在筛选结果里时，单查当前信号并补入列表头部，保证滚轮能覆盖当前信号而无需重拉全量
     if (!rows.some((r) => r.event_id === id)) {
-      rows = await api.getRecentOutcomes(2000)
+      try {
+        const detail = await api.getReviewSignal(id)
+        if (detail) {
+          rows = [detail as any, ...rows]
+        }
+      } catch {
+        // 忽略补拉失败
+      }
     }
     if (seq !== reviewListSeq || reviewSignalId.value == null) return
     reviewRows.value = rows
@@ -389,6 +400,39 @@ function switchReviewSignal(dir: number) {
   const base = cur >= 0 ? cur : dir > 0 ? -1 : 0
   const next = rows[(base + dir + rows.length) % rows.length]
   selectReviewSignal(next)
+}
+
+/** 返回导航：如果是独立历史复盘图表窗口，则关闭独立窗口；若是主窗口则返回仪表盘 */
+async function handleBack() {
+  if (isTauri()) {
+    try {
+      const win = getCurrentWindow()
+      if (win.label === 'history-chart') {
+        await win.close()
+        return
+      }
+    } catch {}
+  }
+  void router.push({ name: 'dashboard' })
+}
+
+/** 手动或重试重新拉取K线数据 */
+async function retryLoadKlines() {
+  if (!symbol.value) return
+  await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, false)
+  if (klinesStore.rows.length > 0) {
+    notify.success(`已成功加载 [${symbol.value}] ${timeframe.value} K线数据 (${klinesStore.rows.length} 根)`)
+  }
+}
+
+/** 切换周期或点击当前周期刷新 */
+function handleTimeframeClick(t: Timeframe) {
+  isIntradayMode.value = false
+  if (timeframe.value === t) {
+    void klinesStore.load(symbol.value, t, chartLoadLimit.value, false)
+    return
+  }
+  timeframe.value = t
 }
 
 /** 退出复盘模式：移除 review 参数，回到当前品种的普通图表 */
@@ -1082,6 +1126,14 @@ function updateLiveBar(latest: number) {
     // 严格检查 prev 是否确实属于当前品种且价格在合理范围内，彻底阻断跨品种价格污染！
     const currentRows = displayRows.value
     const prev = currentRows.length ? currentRows[currentRows.length - 1] : null
+    // 跨休市段时，前一根收盘价不能代替新时段的开盘价。
+    // 等服务端给出包含完整 5m 切片的 partialBar，再画第一根 15m K线。
+    const prevTime = prev ? new Date(prev.ts.replace(' ', 'T')).getTime() : NaN
+    const currentTime = new Date(label.replace(' ', 'T')).getTime()
+    if (!prev || !Number.isFinite(prevTime) || currentTime - prevTime > (TIMEFRAME_MINUTES[curTf] ?? 0) * 60_000) {
+      liveBars.value = []
+      return
+    }
     const isPrevValid =
       prev != null &&
       prev.symbol === curSymbol &&
@@ -1123,6 +1175,9 @@ const displayRows = computed<KlineRow[]>(() => {
     klinesStore.rows[0].timeframe === tf
 
   const rows = isStoreMatch ? klinesStore.rows : []
+  // 基础历史K线尚未就绪时，决不能仅凭实时临时桶拼成单根伪K线展示，避免图表空白与错误
+  if (!rows.length) return []
+
   // 实时K线也必须严格过滤出当前品种与周期
   const live = liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf)
   if (!live.length) return rows
@@ -1149,12 +1204,13 @@ const displayRows = computed<KlineRow[]>(() => {
     }
   }
   for (const bar of live) {
-    if (!rowByTs.has(bar.ts) && (!out.length || bar.ts > out[out.length - 1].ts)) {
+    if (!rowByTs.has(bar.ts) && out.length > 0 && bar.ts > out[out.length - 1].ts) {
       out.push(bar)
     }
   }
   return out
 })
+
 
 /** 顶栏/信息卡回退用的最新收盘价，优先取实时拼出的正在形成的K线 */
 const latestClose = computed(() =>
@@ -2089,9 +2145,9 @@ watch(() => settingsStore.settings.ui.chart_show_first_signal, () => {
 })
 
 // 复盘模式：query.review 变化（或切换品种）时重新加载复盘点位
-watch([symbol, reviewSignalId], () => {
+watch([symbol, reviewSignalId], async () => {
   reviewHidden.value = new Set()
-  void loadReviewOverlay()
+  await loadReviewOverlay()
 }, { immediate: true })
 
 // 复盘模式：首次进入或筛选上下文变化时拉取一次明细列表，后续切换信号直接复用
@@ -2121,7 +2177,6 @@ watch([symbol, timeframe], async () => {
   liveBars.value = []
   shownRecentNumbers.value = new Set()
   trendPoints.value = []
-  loadRecentPatterns()
   if (symbol.value) {
     void manualLevelsStore.load(symbol.value, timeframe.value)
     await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
@@ -2132,14 +2187,15 @@ watch([symbol, timeframe], async () => {
     if (curLatest != null) {
       updateLiveBar(curLatest)
     }
-    await loadTrendLine()
-    scansStore.refreshLatestSignals()
+    void loadTrendLine()
+    void scansStore.refreshLatestSignals()
   }
 }, { immediate: true })
 
-// 完整性检测只针对当前品种的 Raw 5m 数据；切换品种进入图表后异步检测，
+// 完整性检测与最近形态只针对当前品种；切换品种进入图表后异步进行，
 // 不阻塞K线加载，也不在每次切换派生周期时重复发起同一检测。
 watch(symbol, () => {
+  loadRecentPatterns()
   void handleCheckIntegrity(false)
 }, { immediate: true })
 
@@ -2177,6 +2233,16 @@ onMounted(async () => {
       // the prediction rows; historical backfill is a separate maintenance
       // operation and must not delay the live card.
       void refreshV2Predictions()
+    }),
+  )
+  unlisteners.push(
+    await onChartKlinesRefreshed(({ symbol: refreshedSymbol, timeframe: refreshedTimeframe, response }) => {
+      if (refreshedSymbol !== symbol.value || refreshedTimeframe !== timeframe.value) return
+      if (!klinesStore.acceptRefreshed(refreshedSymbol, timeframe.value, response)) return
+      liveBars.value = response.partial_bar ? [response.partial_bar] : []
+      const latest = snapshots.value[refreshedSymbol]?.latest
+      if (latest != null) updateLiveBar(latest)
+      void loadTrendLine()
     }),
   )
   unlisteners.push(
@@ -2262,32 +2328,9 @@ onMounted(async () => {
   await loadGroupSymbols()
   // 进入页面立即拉一次行情快照，避免左侧价格/涨幅要等下一次刷新或扫描事件才显示
   loadSnapshots()
-  if (!scansStore.latest) {
-    void scansStore.runScan().then(() => {
-      scansStore.refreshLatestSignals()
-    }).catch(() => {
-      // 无数据时扫描失败不影响看图
-    })
-  }
-  // 首屏K线已由 watch([symbol,timeframe], immediate:true) 加载，
-  // 这里仅做兜底：若因时序/空路由未加载到且当前未在加载中，则补拉一次，避免显示无数据或重复并发请求丢包
-  if (
-    symbol.value &&
-    !klinesStore.loading &&
-    (!klinesStore.rows.length || klinesStore.rows[0]?.symbol !== symbol.value || klinesStore.rows[0]?.timeframe !== timeframe.value)
-  ) {
-    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
-    if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
-      liveBars.value = [klinesStore.partialBar]
-    }
-    const curLatest = snapshots.value[symbol.value]?.latest
-    if (curLatest != null) {
-      updateLiveBar(curLatest)
-    }
-    await loadTrendLine()
-    scansStore.refreshLatestSignals()
-    loadRecentPatterns()
-  }
+  // 进入页面立即刷新活跃信号（读 DB 活跃缓存仅需 ~100ms），绝不阻塞看图，绝不触发全市场26秒重扫描
+  void scansStore.refreshLatestSignals()
+  // 首屏K线只由上面的 immediate watcher 发起；失败时保留错误卡片供手动重试。
 })
 
 onBeforeUnmount(() => {
@@ -2311,7 +2354,7 @@ onBeforeUnmount(() => {
       <!-- 桌面端顶部导航栏：保持原有完整布局与全部按钮不变 -->
       <template v-if="!isMobile">
         <div class="topbar-left">
-          <n-button quaternary size="small" class="nav-btn" @click="router.push({ name: 'dashboard' })">
+          <n-button quaternary size="small" class="nav-btn" @click="handleBack">
             <template #icon>
               <n-icon :component="ArrowLeft" />
             </template>
@@ -2378,10 +2421,10 @@ onBeforeUnmount(() => {
               :key="t"
               type="button"
               class="tf-btn"
-              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode }"
-              :disabled="reviewMode"
-              :title="reviewMode ? '复盘模式固定 15m' : t"
-              @click="isIntradayMode = false; timeframe = t"
+              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode && t !== '15m' }"
+              :disabled="reviewMode && t !== '15m'"
+              :title="reviewMode ? (t === '15m' ? '复盘模式固定 15m（点击刷新K线）' : '复盘模式固定 15m') : t"
+              @click="handleTimeframeClick(t)"
             >
               {{ t }}
             </button>
@@ -2456,7 +2499,7 @@ onBeforeUnmount(() => {
       <!-- 移动端精简顶部工具栏：左侧导航、中间周期、右侧工具弹窗与形态抽屉 -->
       <template v-else>
         <div class="m-topbar-left">
-          <button type="button" class="m-tb-btn m-back-btn" @click="router.push({ name: 'dashboard' })" title="返回仪表盘">
+          <button type="button" class="m-tb-btn m-back-btn" @click="handleBack" title="返回仪表盘">
             <n-icon :component="ArrowLeft" :size="16" />
           </button>
           <button type="button" class="m-tb-btn" :class="{ active: showList }" @click="showList = !showList" title="切换品种列表">
@@ -2492,10 +2535,10 @@ onBeforeUnmount(() => {
               :key="t"
               type="button"
               class="tf-btn m-tf-btn"
-              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode }"
-              :disabled="reviewMode"
-              :title="reviewMode ? '复盘模式固定 15m' : t"
-              @click="isIntradayMode = false; timeframe = t"
+              :class="{ active: !isIntradayMode && timeframe === t, 'is-disabled': reviewMode && t !== '15m' }"
+              :disabled="reviewMode && t !== '15m'"
+              :title="reviewMode ? (t === '15m' ? '复盘模式固定 15m（点击刷新K线）' : '复盘模式固定 15m') : t"
+              @click="handleTimeframeClick(t)"
             >
               {{ t }}
             </button>
@@ -3198,11 +3241,32 @@ onBeforeUnmount(() => {
             @crosshair-candle="handleCrosshairCandle"
             :loading="klinesStore.loading"
           />
+          <div
+            v-else-if="klinesStore.error"
+            class="chart-empty chart-error-card"
+          >
+            <n-empty
+              :description="`获取 [${symbol}] ${timeframe} K线失败: ${klinesStore.error}`"
+            >
+              <template #extra>
+                <n-button type="primary" size="small" :loading="klinesStore.loading" @click="retryLoadKlines">
+                  重新加载K线数据
+                </n-button>
+              </template>
+            </n-empty>
+          </div>
           <n-empty
             v-else-if="!klinesStore.loading"
             class="chart-empty"
             description="暂无K线数据，请先在列表页刷新数据"
-          />
+          >
+            <template #extra>
+              <n-button type="default" size="small" :loading="klinesStore.loading" @click="retryLoadKlines">
+                重新加载K线
+              </n-button>
+            </template>
+          </n-empty>
+
         </div>
 
         <!-- 移动端专属多维决策看板（利用缩减K线空白腾出的约五分之一高度，整合形态决策、盘口行情与关键支撑压力；支持左右滑动切换品种） -->

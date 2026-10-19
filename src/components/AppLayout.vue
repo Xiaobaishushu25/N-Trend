@@ -77,14 +77,18 @@ const dataSourceTagType = computed<'default' | 'info' | 'warning' | 'success'>((
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
 const isStandaloneWindow = computed(
   () =>
+    (isTauri() && getCurrentWindow().label === 'history-chart') ||
     route.name === 'settings' ||
     route.name === 'review' ||
     route.name === 'trade-review' ||
     route.name === 'live-trader' ||
     route.name === 'notifications',
 )
-const windowTitle = computed(() =>
-  route.name === 'settings'
+const windowTitle = computed(() => {
+  if (isTauri() && getCurrentWindow().label === 'history-chart') {
+    return `历史复盘图表 · ${route.params.symbol || ''}`
+  }
+  return route.name === 'settings'
     ? '系统设置'
     : route.name === 'review'
       ? '复盘统计'
@@ -94,8 +98,8 @@ const windowTitle = computed(() =>
           ? '实盘量化执行终端'
           : route.name === 'notifications'
             ? '历史通知'
-            : '',
-)
+            : ''
+})
 const activeNotifyCount = computed(() => notifyItems.length)
 
 /** bare 路由（K线图/设置）：内容区不额外加内边距，由页面自行布局 */
@@ -366,6 +370,35 @@ onMounted(async () => {
           const { symbol: sym, eventId, filters } = e.payload
           if (sym) {
             appStore.reviewJumpFilters = filters ?? null
+            void router.push({
+              name: 'chart',
+              params: { symbol: sym },
+              query: { review: String(eventId) },
+            })
+          }
+        }),
+      )
+      // 主窗口接收活跃行情图表跳转（非历史复盘模式，直接进入实时分析）
+      unlisteners.push(
+        await listen<{ symbol: string; timeframe?: string }>('open-active-chart', (e) => {
+          const { symbol: sym, timeframe } = e.payload
+          if (sym) {
+            void router.push({
+              name: 'chart',
+              params: { symbol: sym },
+              query: timeframe ? { tf: timeframe } : {},
+            })
+          }
+        }),
+      )
+    }
+
+    // 独立历史复盘图表窗口（单例）：接收切换复盘合约与事件通知
+    if (getCurrentWindow().label === 'history-chart') {
+      unlisteners.push(
+        await listen<{ symbol: string; eventId: number }>('open-history-chart', (e) => {
+          const { symbol: sym, eventId } = e.payload
+          if (sym) {
             void router.push({
               name: 'chart',
               params: { symbol: sym },

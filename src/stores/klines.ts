@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
-import type { KlineRow, Timeframe } from '../types'
+import { notify } from '../utils/notify'
+import type { ChartKlineResponse, KlineRow, Timeframe } from '../types'
 
 export const useKlinesStore = defineStore('klines', {
   state: () => ({
@@ -16,6 +17,16 @@ export const useKlinesStore = defineStore('klines', {
     loadSeq: 0,
   }),
   actions: {
+    acceptRefreshed(symbol: string, timeframe: Timeframe, response: ChartKlineResponse) {
+      if (this.symbol !== symbol || this.timeframe !== timeframe) return false
+      this.loadSeq++
+      this.rows = response.rows
+      this.partialBar = response.partial_bar ?? null
+      this.chartStatus = response.status
+      this.chartMessage = response.message
+      this.error = ''
+      return true
+    },
     async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
       // silent：后台静默刷新（如定时入库后），不弹加载遮罩
       if (!silent) {
@@ -41,9 +52,12 @@ export const useKlinesStore = defineStore('klines', {
         this.partialBar = response.partial_bar ?? null
         this.chartStatus = response.status
         this.chartMessage = response.message
-      } catch (e) {
+      } catch (e: any) {
         if (seq !== this.loadSeq) return
-        this.error = String(e)
+        this.error = e?.message || String(e)
+        if (!silent) {
+          notify.error(`获取 [${symbol}] ${timeframe} K线失败: ${this.error}`)
+        }
       } finally {
         if (!silent) {
           this.loadingCount = Math.max(0, this.loadingCount - 1)

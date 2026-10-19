@@ -379,26 +379,71 @@ pub async fn get_klines(
 #[tauri::command]
 pub async fn get_chart_klines(
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
     symbol: String,
     timeframe: String,
     limit: Option<usize>,
 ) -> Result<ChartKlineResponse, String> {
+    let started = std::time::Instant::now();
     // Automatically subscribe active symbol and timeframe in realtime client
     state
         .realtime
         .subscribe(vec![symbol.clone()], vec![timeframe.clone()])
         .await;
 
-    // Check memory cache first
+    // 1. 如果有极新鲜的内存缓存（3秒内，如快速来回切换周期/品种），直接命中返回，实现 0ms 秒出图
+    if let Some(fresh) = state
+        .kline_cache
+        .get_fresh(&symbol, &timeframe, std::time::Duration::from_secs(3))
+    {
+        tracing::debug!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "K线命中3秒内存缓存");
+        return Ok(fresh);
+    }
+
     let cached = state.kline_cache.get(&symbol, &timeframe);
 
-    // Fetch latest from server
-    match state
-        .api
-        .get_chart_klines(&symbol, &timeframe, limit, None)
-        .await
-    {
+    // 2. 正常请求服务端最新K线；若存在历史缓存，则设置 1500ms 快速超时回退，绝不让用户干等十秒
+    let fetch_fut = state.api.get_chart_klines(&symbol, &timeframe, limit, None);
+    let resp_res = if cached.is_some() {
+        match tokio::time::timeout(std::time::Duration::from_millis(1500), fetch_fut).await {
+            Ok(res) => res.map_err(|e| e.message),
+            Err(_) => {
+                tracing::warn!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "网络或服务端响应慢，先显示内存缓存");
+                let bg_state = state.inner().clone();
+                let bg_app = app.clone();
+                let sym = symbol.clone();
+                let tf = timeframe.clone();
+                tokio::spawn(async move {
+                    if let Ok(resp) = bg_state.api.get_chart_klines(&sym, &tf, limit, None).await {
+                        bg_state.kline_cache.put(&sym, &tf, &resp);
+                        let _ = bg_app.emit("chart-klines-refreshed", serde_json::json!({
+                            "symbol": sym,
+                            "timeframe": tf,
+                            "response": resp,
+                        }));
+                    }
+                });
+                return Ok(cached.unwrap());
+            }
+        }
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), fetch_fut).await {
+            Ok(res) => res.map_err(|e| {
+                tracing::warn!("获取K线失败 [{}/{}]: {:?}", symbol, timeframe, e);
+                e.message
+            }),
+            Err(_) => {
+                tracing::warn!("获取K线超时(30s) [{}/{}]，可能因远端派生计算较慢或网络延迟", symbol, timeframe);
+                Err("获取K线超时，请检查网络或服务端状态".to_string())
+            }
+        }
+    };
+
+    match resp_res {
         Ok(resp) => {
+            if started.elapsed() >= std::time::Duration::from_millis(500) {
+                tracing::warn!(symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), "K线客户端请求较慢");
+            }
             state.kline_cache.put(&symbol, &timeframe, &resp);
             Ok(resp)
         }
@@ -407,7 +452,7 @@ pub async fn get_chart_klines(
                 tracing::warn!("网络异常，展示内存缓存K线数据: {e}");
                 Ok(c)
             } else {
-                Err(e.message)
+                Err(e)
             }
         }
     }
@@ -420,11 +465,18 @@ pub async fn get_trend_series(
     timeframe: String,
     limit: Option<usize>,
 ) -> Result<Vec<TrendPointDto>, String> {
-    state
-        .api
-        .get_trend_series(&symbol, &timeframe, limit)
-        .await
-        .map_err(|e| e.message)
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.api.get_trend_series(&symbol, &timeframe, limit),
+    )
+    .await
+    {
+        Ok(res) => res.map_err(|e| e.message),
+        Err(_) => {
+            tracing::warn!("获取趋势线超时，返回空序列以防阻塞页面");
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[tauri::command]
@@ -1225,15 +1277,11 @@ pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
-        return state
-            .api
-            .get_trader_snapshot()
-            .await
-            .map_err(|e| e.to_string());
+    if let Ok(snapshot) = state.api.get_trader_snapshot().await {
+        return Ok(snapshot);
     }
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .map_err(|e| e.to_string())?;
     let mut snapshot = client
@@ -1252,14 +1300,12 @@ pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Valu
 
 #[tauri::command]
 pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
-        if let Ok(res) = state.api.get_trader_status().await {
-            return Ok(res);
-        }
+    if let Ok(res) = state.api.get_trader_status().await {
+        return Ok(res);
     }
     // 当 n-headless 未启动时，直接直连本地运行的 CTP 桥接守护进程 (port 8766)
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .unwrap_or_default();
     match client.get("http://127.0.0.1:8766/health").send().await {
@@ -1292,13 +1338,11 @@ pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value,
 
 #[tauri::command]
 pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
-        if let Ok(res) = state.api.get_trader_account().await {
-            return Ok(res);
-        }
+    if let Ok(res) = state.api.get_trader_account().await {
+        return Ok(res);
     }
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .unwrap_or_default();
     match client.get("http://127.0.0.1:8766/account").send().await {
@@ -1328,13 +1372,11 @@ pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value
 
 #[tauri::command]
 pub async fn get_trader_positions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.realtime.get_state().await.status == ConnectionStatus::Connected {
-        if let Ok(res) = state.api.get_trader_positions().await {
-            return Ok(res);
-        }
+    if let Ok(res) = state.api.get_trader_positions().await {
+        return Ok(res);
     }
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_millis(500))
         .build()
         .unwrap_or_default();
     match client.get("http://127.0.0.1:8766/positions").send().await {

@@ -154,14 +154,106 @@ export function formatPnlPoints(points: number | null | undefined): string {
 /**
  * 格式化金额展示（人民币元，带千分位与正负号）
  */
-export function formatPnlAmount(amount: number | null | undefined): string {
+export function formatPnlAmount(
+  amount: number | null | undefined,
+  options?: { decimals?: number; autoWan?: boolean },
+): string {
   if (amount == null || Number.isNaN(amount)) return '—'
-  const sign = amount > 0 ? '+' : ''
   const abs = Math.abs(amount)
-  const formatted = abs >= 10000
-    ? (amount / 10000).toFixed(2) + ' 万'
-    : Math.round(amount).toLocaleString('zh-CN')
-  return `${sign}¥${formatted}`
+  const sign = amount > 0 ? '+' : amount < 0 ? '-' : ''
+  const decimals = options?.decimals
+  const autoWan = options?.autoWan ?? (decimals == null)
+
+  if (autoWan && abs >= 10000) {
+    const wanFormatted = (abs / 10000).toFixed(2) + ' 万'
+    return `${sign}¥${wanFormatted}`
+  }
+
+  const numFormatted = decimals != null
+    ? abs.toLocaleString('zh-CN', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
+    : Math.round(abs).toLocaleString('zh-CN')
+
+  return `${sign}¥${numFormatted}`
+}
+
+/**
+ * 计算平仓记录的金额盈亏（元）
+ */
+export function calcTradeRecordPnlAmount(
+  instrumentIdOrSymbol: string,
+  realizedPnlPts: number,
+  volume: number = 1,
+): number {
+  const mult = getSymbolMultiplier(instrumentIdOrSymbol)
+  return (realizedPnlPts || 0) * mult * (volume || 1)
+}
+
+/**
+ * 常见品种最小变动价位 (Tick Size)
+ */
+export const DEFAULT_TICKS: Record<string, number> = {
+  I: 0.5,
+  AU: 0.02,
+  AG: 1,
+  SC: 0.1,
+  EC: 0.1,
+  LH: 5,
+  JD: 1,
+  PK: 2,
+  CJ: 5,
+  AP: 1,
+  SI: 5,
+  LC: 50,
+  TS: 0.005,
+  TF: 0.005,
+  T: 0.005,
+  TL: 0.01,
+  IF: 0.2,
+  IH: 0.2,
+  IC: 0.2,
+  IM: 0.2,
+}
+
+export function getSymbolTick(symbol: string): number {
+  const prefix = getSymbolPrefix(symbol)
+  return DEFAULT_TICKS[prefix] ?? 1.0
+}
+
+export interface SlippageInfo {
+  diffPts: number
+  ticks: number
+  isAdverse: boolean
+  label: string
+}
+
+export function calcSlippage(
+  fillPrice: number,
+  plannedPrice: number,
+  direction: string,
+  instrumentIdOrSymbol: string = '',
+): SlippageInfo {
+  const isBuy = direction === 'up' || direction === 'buy' || direction === 'long'
+  const tick = getSymbolTick(instrumentIdOrSymbol)
+  const adversePts = isBuy ? (fillPrice - plannedPrice) : (plannedPrice - fillPrice)
+  const diffPts = Math.abs(fillPrice - plannedPrice)
+  const ticks = Math.round(diffPts / (tick > 0 ? tick : 1))
+  const isAdverse = adversePts > 1e-4
+
+  let label = ''
+  if (Math.abs(adversePts) < 1e-4) {
+    label = '零滑点'
+  } else if (isAdverse) {
+    label = `滑点 +${diffPts.toFixed(1)}点 (${ticks}跳)`
+  } else {
+    label = `优于计划 -${diffPts.toFixed(1)}点 (${ticks}跳)`
+  }
+
+  return {
+    diffPts: adversePts,
+    ticks,
+    isAdverse,
+    label,
+  }
 }
 
 /**
@@ -172,3 +264,5 @@ export function formatRMultiple(r: number | null | undefined): string {
   const sign = r >= 0 ? '+' : ''
   return `${sign}${r.toFixed(2)}R`
 }
+
+

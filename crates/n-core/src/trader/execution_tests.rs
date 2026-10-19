@@ -346,3 +346,192 @@ async fn stop_during_partial_entry_cancels_open_and_exits_late_fills_without_ree
         1
     );
 }
+
+#[tokio::test]
+async fn sub_1r_target_presets_1to1_and_ignores_s1_until_reaching_1r() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+
+    // Register a long condition where S1 target (1015.0) is smaller than risk (1010 - 1000 = 10.0):
+    // Target space = 5.0 <= 10.0 risk (RR = 0.5 <= 1.0).
+    let id = engine
+        .register_condition(
+            Some(201),
+            "PB0",
+            "pb2611",
+            Dir::Up,
+            1010.0,
+            1000.0,
+            1015.0, // S1 target is 5 pts above entry, but risk is 10 pts
+            3.6,
+            "2026-10-16 10:00:00",
+        )
+        .await
+        .unwrap();
+
+    // 1. Verify condition target_price is preset to 1:1 (1020.0), not S1 (1015.0)
+    {
+        let s = engine.state.lock().await;
+        let cond = s.conditions.get(&id).unwrap();
+        assert_eq!(cond.target_price, 1020.0);
+        assert!(cond.note.contains("目标空间<1R(S1:1015.0)，止盈预设1:1"));
+    }
+
+    // 2. Trigger entry and fill at 1010.0
+    quote(&engine, 1010.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    let open = counter.inserts()[0].clone();
+    assert_eq!(open["volume"], 2);
+    let opened = trade(&open, "open1", 2, 1010.0);
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![opened.clone()],
+    )
+    .await;
+
+    // Position is established with 2 lots, target_price = 1020.0
+    let pos = &engine.list_positions().await[0];
+    assert_eq!(pos.volume, 2);
+    assert_eq!(pos.target_price, 1020.0);
+
+    // 3. Price touches original S1 (1015.0):
+    // Must NOT exit or latch target_s1! Still holds 2 lots.
+    age(&engine).await;
+    quote(&engine, 1015.0).await;
+    assert_eq!(counter.inserts().len(), 1); // No new order inserted
+    assert_eq!(engine.list_positions().await[0].volume, 2);
+
+    // 4. Price touches 1.0R (1020.0):
+    // Should trigger target_1r for lot 1 (1 lot)
+    age(&engine).await;
+    quote(&engine, 1020.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+    let close1 = counter.inserts()[1].clone();
+    assert_eq!(close1["volume"], 1);
+    assert_eq!(close1["offset"], "auto");
+    assert_eq!(close1["direction"], "sell");
+
+    // 5. Lot 1 fills at 1020.0:
+    let close1_fill = trade(&close1, "close1", 1, 1020.0);
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2), order(&close1, "all_traded", 1)],
+        vec![opened, close1_fill],
+    )
+    .await;
+
+    // Remaining 1 lot moves to breakeven, and must NOT exit at target_s1
+    let pos = &engine.list_positions().await[0];
+    assert_eq!(pos.volume, 1);
+    assert!(pos.lot1_closed);
+    assert_eq!(pos.current_stop_price, 1010.0); // breakeven stop
+
+    // Quote 1020.0 again - target_r is 1.0, not > 1.0, so no target_s1 exit
+    age(&engine).await;
+    quote(&engine, 1020.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+
+    // Also verify registering inverted S1 (target below entry for long) does not fail
+    let inverted_id = engine
+        .register_condition(
+            Some(202),
+            "PB0",
+            "pb2611",
+            Dir::Up,
+            1010.0,
+            1000.0,
+            1005.0, // inverted S1 (below entry)
+            3.6,
+            "2026-10-16 10:05:00",
+        )
+        .await
+        .unwrap();
+    {
+        let s = engine.state.lock().await;
+        let cond = s.conditions.get(&inverted_id).unwrap();
+        assert_eq!(cond.target_price, 1020.0);
+        assert!(cond.note.contains("目标空间<1R(S1:1005.0)，止盈预设1:1"));
+    }
+}
+
+#[tokio::test]
+async fn entry_overshoot_beyond_point_two_r_suspends_order_until_pullback() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+
+    // entry = 1000.0, stop = 990.0 (risk = 10.0) -> max slippage = max(10 * 0.2, 2 * 1) = 2.0 (max buy 1002.0)
+    let id = register(&engine, 1000.0, 990.0).await;
+
+    // Market gaps up to 1005.0 (ask = 1006.0, exceeding 1002.0 limit)
+    quote(&engine, 1005.0).await;
+
+    // Must NOT insert any buy order at sky-high price!
+    assert!(counter.inserts().is_empty());
+    {
+        let s = engine.state.lock().await;
+        let cond = s.conditions.get(&id).unwrap();
+        assert!(cond.note.contains("超入场滑点限制(上限1002.0)"));
+    }
+
+    // Market pulls back to 1000.0 (ask = 1001.0, within 1002.0 limit)
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+
+    // Order is now safely inserted!
+    assert_eq!(counter.inserts().len(), 1);
+    let open = counter.inserts()[0].clone();
+    assert_eq!(open["volume"], 2);
+    assert_eq!(open["direction"], "buy");
+    assert!(open["price"].as_f64().unwrap() <= 1002.0);
+}
+
+#[tokio::test]
+async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+
+    // Condition A has an order that was sent to cancel, but counter was non-responsive
+    let id_a = register(&engine, 1000.0, 990.0).await;
+    {
+        let mut s = engine.state.lock().await;
+        s.orders.insert(
+            "ref_stuck".to_string(),
+            ExecutionOrder {
+                request: OrderInsertRequest {
+                    instrument_id: "inst_a".to_string(),
+                    exchange_id: Some("DCE".to_string()),
+                    direction: "buy".to_string(),
+                    offset: "open".to_string(),
+                    price: 1000.0,
+                    volume: 1,
+                    order_ref: Some("ref_stuck".to_string()),
+                },
+                condition_id: id_a.clone(),
+                reason: None,
+                phase: OrderPhase::CancelPending,
+                reported_filled: 0,
+                filled: 0,
+                action_at: chrono::Utc::now().timestamp() - 20, // 20s ago
+                trading_day: "20261019".to_string(),
+                note: "waiting for counter".into(),
+                cancel_attempts: 3,
+            },
+        );
+    }
+
+    // Now drive runs. It should unblock stuck order to Rejected and not loop endlessly!
+    engine.drive().await.unwrap();
+
+    {
+        let s = engine.state.lock().await;
+        let o = s.orders.get("ref_stuck").unwrap();
+        assert_eq!(o.phase, OrderPhase::Rejected);
+        assert!(o.note.contains("撤单多次未获回报"));
+    }
+}
+
+

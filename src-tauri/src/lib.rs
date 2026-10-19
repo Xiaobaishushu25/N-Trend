@@ -129,7 +129,10 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
-                    if _window.label() == "main" && !QUITTING.load(Ordering::SeqCst) {
+                    if (_window.label() == "main" || _window.label() == "live-trader" || _window.label() == "history-chart") && !QUITTING.load(Ordering::SeqCst) {
+                        let _ = _window
+                            .app_handle()
+                            .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
                         api.prevent_close();
                         let _ = _window.hide();
                     } else if _window.label() != "main" {

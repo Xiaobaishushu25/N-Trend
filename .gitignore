@@ -16,6 +16,12 @@ _tmp*
 tmp_*.py
 tmp_*.csv
 temp_stats2.py
+reports/
+eg0_*.json
+signal_*.json
+snapshot*.json
+trader_snapshot.json
+recent_transcript.txt
 read_zhihu.mjs
 zhihu_screenshot.png
 *.db
