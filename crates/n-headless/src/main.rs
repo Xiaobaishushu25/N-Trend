@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod ctp_sidecar;
 mod lock;
 mod realtime;
 mod runtime;
@@ -184,6 +185,15 @@ async fn main() -> anyhow::Result<()> {
 
     let services = Arc::new(Services::new(db.clone(), config.clone(), config_path.clone()).await?);
 
+    // CTP 生命周期独立于天勤的连通状态；后台拉起，不以柜台登录阻塞 HTTP 启动。
+    let ctp_sidecar = match ctp_sidecar::CtpSidecar::start(config.data_source.python_path.as_deref()) {
+        Ok(sidecar) => Some(sidecar),
+        Err(error) => {
+            tracing::warn!("CTP 自动启动不可用: {error:#}");
+            None
+        }
+    };
+
     // 启动天勤 Python Sidecar（若已配置自动拉起）
     if config.data_source.auto_spawn_bridge {
         let _ = n_core::process::SidecarManager::start(&config.data_source).await;
@@ -212,6 +222,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
+    if let Some(sidecar) = ctp_sidecar {
+        sidecar.stop().await;
+    }
     n_core::process::SidecarManager::stop();
     tracing::info!("👋 ntrend-server 已完全退出");
     Ok(())

@@ -3,6 +3,7 @@ import importlib.util
 import json
 import pathlib
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -84,6 +85,18 @@ class QueryTests(unittest.TestCase):
 
     def begin(self, kind, req_id=1):
         self.m._inflight = dict(id=req_id, kind=kind, started=time.monotonic(), rows={}, error=None)
+
+    def test_parent_probe_does_not_kill_live_parent_and_detects_exited_process(self):
+        self.assertTrue(bridge._parent_is_alive(bridge.os.getpid()))
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait(timeout=5)
+        self.assertFalse(bridge._parent_is_alive(process.pid))
+
+    def test_bridge_exits_when_owning_backend_disappears(self):
+        with patch.object(bridge, "_parent_is_alive", side_effect=[True, False]), \
+             patch.object(bridge.time, "sleep"), patch.object(bridge.os, "_exit") as terminate:
+            bridge._watch_parent(123)
+        terminate.assert_called_once_with(0)
 
     def test_order_rejection_refreshes_funds_before_new_entry_decisions(self):
         rejected = types.SimpleNamespace(OrderRef="funds-test", InstrumentID="pb2611")

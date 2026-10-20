@@ -1001,11 +1001,51 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(404, {"error": f"Unknown POST endpoint: {path}"})
 
 
+def _parent_is_alive(parent_pid):
+    if os.name == "nt":
+        # Windows os.kill(pid, 0) terminates the process; use a read-only handle.
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, parent_pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x00000102
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(parent_pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _watch_parent(parent_pid):
+    while True:
+        time.sleep(2)
+        if not _parent_is_alive(parent_pid):
+            logger.warning("Parent process %d exited; terminating CTP bridge", parent_pid)
+            os._exit(0)
+            return
+
+
 def main():
     parser = argparse.ArgumentParser(description="SimNow CTP Local HTTP Bridge")
     parser.add_argument("--port", type=int, default=8766, help="HTTP service port (default: 8766)")
     parser.add_argument("--config", type=str, default="", help="Path to config JSON")
+    parser.add_argument("--parent-pid", type=int, default=0, help="Owning backend PID; exit when it exits")
     args = parser.parse_args()
+    if args.parent_pid > 0:
+        threading.Thread(target=_watch_parent, args=(args.parent_pid,), daemon=True).start()
 
     # Load configuration
     config = {
