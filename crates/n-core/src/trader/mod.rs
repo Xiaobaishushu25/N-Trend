@@ -1,4 +1,5 @@
 pub mod client;
+pub mod comparison;
 pub mod execution;
 pub mod model;
 pub mod overnight;

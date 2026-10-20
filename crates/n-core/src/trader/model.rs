@@ -23,7 +23,11 @@ pub struct ExecutionQuote {
 
 impl ExecutionQuote {
     pub fn valid(&self) -> bool {
-        let age = chrono::Utc::now().timestamp() - self.timestamp;
+        self.valid_at(chrono::Utc::now().timestamp())
+    }
+
+    pub fn valid_at(&self, now: i64) -> bool {
+        let age = now - self.timestamp;
         (0..=15).contains(&age)
             && self.last.is_finite()
             && self.last > 0.0

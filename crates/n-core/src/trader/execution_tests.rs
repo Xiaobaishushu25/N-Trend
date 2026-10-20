@@ -14,6 +14,7 @@ struct Counter {
     url: String,
     requests: Arc<StdMutex<Vec<(String, Value)>>>,
     drop_reply: Arc<AtomicBool>,
+    reject_funds: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     directory: PathBuf,
@@ -30,6 +31,8 @@ impl Counter {
         let stopped = stop.clone();
         let drop_reply = Arc::new(AtomicBool::new(false));
         let drop_response = drop_reply.clone();
+        let reject_funds = Arc::new(AtomicBool::new(false));
+        let reject_response = reject_funds.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) {
                 let Ok((mut socket, _)) = listener.accept() else {
@@ -69,7 +72,9 @@ impl Counter {
                     bytes.extend_from_slice(&part[..n]);
                 }
                 let request: Value = serde_json::from_slice(&bytes[start..start + length]).unwrap();
-                let response = json!({"success":true,"order_ref":request["order_ref"],"msg":"submitted; no synthetic fill"}).to_string();
+                let reject = reject_response.swap(false, Ordering::Relaxed);
+                let response = json!({"success":!reject,"order_ref":request["order_ref"],
+                    "msg":if reject {"柜台拒绝报单 [31]: CTP:资金不足，约缺少资金[1000.00]"} else {"submitted; no synthetic fill"}}).to_string();
                 log.lock().unwrap().push((route, request));
                 if drop_response.swap(false, Ordering::Relaxed) {
                     continue;
@@ -84,6 +89,7 @@ impl Counter {
             url,
             requests,
             drop_reply,
+            reject_funds,
             stop,
             thread: Some(thread),
             directory,
@@ -119,6 +125,15 @@ impl Drop for Counter {
 }
 
 async fn ready(engine: &ExecutionEngine, orders: Vec<Value>, trades: Vec<Value>) {
+    ready_with_funds(engine, orders, trades, 50000.0, 0.0).await;
+}
+async fn ready_with_funds(
+    engine: &ExecutionEngine,
+    orders: Vec<Value>,
+    trades: Vec<Value>,
+    available: f64,
+    margin: f64,
+) {
     engine
         .reconcile_entry_age("PB0", &["2026-10-16 10:00:00".into()])
         .await
@@ -127,7 +142,8 @@ async fn ready(engine: &ExecutionEngine, orders: Vec<Value>, trades: Vec<Value>)
         .reconcile(&json!({"bridge_online":true,"health": {
         "ready":true,"logged_in":true,"sync_pending":false,"trading_day":"20261016",
         "broker_id":"fake","user_id":"offline-test"
-    }, "orders":orders,"trades":trades,"broker_positions":[]}))
+    }, "account":{"available":available,"curr_margin":margin,"updated_at":chrono::Utc::now().timestamp_micros() as f64 / 1000000.0},
+       "orders":orders,"trades":trades,"broker_positions":[]}))
         .await
         .unwrap();
 }
@@ -191,7 +207,10 @@ async fn one_signal_survives_restart_unknown_ack_and_repeated_crossings_without_
     engine.state.lock().await.entry_symbols_ready.clear();
     quote(&engine, 1000.0).await;
     assert!(counter.inserts().is_empty()); // Startup waits for pending-signal age reconciliation.
-    engine.reconcile_entry_age("PB0", &["2026-10-16 10:00:00".into()]).await.unwrap();
+    engine
+        .reconcile_entry_age("PB0", &["2026-10-16 10:00:00".into()])
+        .await
+        .unwrap();
     counter.drop_reply.store(true, Ordering::Relaxed);
     quote(&engine, 1000.0).await;
     assert!(engine.list_positions().await.is_empty());
@@ -417,7 +436,10 @@ async fn sub_1r_target_presets_1to1_and_ignores_s1_until_reaching_1r() {
     let close1_fill = trade(&close1, "close1", 1, 1020.0);
     ready(
         &engine,
-        vec![order(&open, "all_traded", 2), order(&close1, "all_traded", 1)],
+        vec![
+            order(&open, "all_traded", 2),
+            order(&close1, "all_traded", 1),
+        ],
         vec![opened, close1_fill],
     )
     .await;
@@ -519,6 +541,8 @@ async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions()
                 trading_day: "20261019".to_string(),
                 note: "waiting for counter".into(),
                 cancel_attempts: 3,
+                funds_at_submit: None,
+                entry_rules: None,
             },
         );
     }
@@ -534,4 +558,261 @@ async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions()
     }
 }
 
+#[tokio::test]
+async fn insufficient_funds_wait_survives_quote_spam_replay_restart_and_small_balance_changes() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let first = counter.inserts()[0].clone();
+    let mut denied = order(&first, "rejected", 0);
+    denied["status_msg"] = json!("交易所拒绝报单 [31]: CTP:资金不足，约缺少资金[1000.00]");
+    ready_with_funds(&engine, vec![denied.clone()], vec![], 1000.0, 40000.0).await;
+    for _ in 0..100 {
+        age(&engine).await;
+        quote(&engine, 1000.0).await;
+    }
+    assert_eq!(counter.inserts().len(), 1);
+    assert!(engine.list_conditions().await[0].note.contains("资金不足"));
+    drop(engine);
 
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![denied.clone()], vec![], 1500.0, 40000.0).await;
+    for _ in 0..100 {
+        age(&engine).await;
+        quote(&engine, 1000.0).await;
+    }
+    assert_eq!(counter.inserts().len(), 1); // More funds, still below required amount.
+    ready_with_funds(&engine, vec![denied.clone()], vec![], 2001.0, 39000.0).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+    assert!(!engine
+        .state
+        .lock()
+        .await
+        .entry_funding_waits
+        .contains_key(&id));
+    // Replaying the old rejection must not reinstate a wait over the newer intent.
+    ready_with_funds(&engine, vec![denied], vec![], 2001.0, 39000.0).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+}
+
+#[tokio::test]
+async fn immediate_funds_rejection_is_not_retried_by_the_next_drive() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
+    register(&engine, 1000.0, 990.0).await;
+    counter.reject_funds.store(true, Ordering::Relaxed);
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    for _ in 0..10 {
+        age(&engine).await;
+        quote(&engine, 1000.0).await;
+    }
+    assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn rejection_without_numeric_shortfall_waits_for_margin_release_not_floating_profit() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
+    register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let mut denied = order(&counter.inserts()[0], "rejected", 0);
+    denied["status_msg"] = json!("柜台拒绝报单 [31]: 资金不足");
+    ready_with_funds(&engine, vec![denied.clone()], vec![], 1000.0, 40000.0).await;
+    ready_with_funds(&engine, vec![denied.clone()], vec![], 1001.0, 40000.0).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    ready_with_funds(&engine, vec![denied], vec![], 15000.0, 20000.0).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+}
+
+#[tokio::test]
+async fn narrow_stop_filter_is_configurable_and_old_conditions_cannot_bypass_it() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    let mut cfg = engine.get_config().await;
+    cfg.min_entry_risk_ticks = 10;
+    engine.update_config(cfg).await.unwrap();
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 995.0).await;
+    quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+    assert!(engine.list_conditions().await[0]
+        .note
+        .contains("止损距离5.00 tick小于10 tick"));
+    let mut cfg = engine.get_config().await;
+    cfg.min_entry_risk_ticks = 5;
+    engine.update_config(cfg).await.unwrap();
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    assert_eq!(counter.inserts()[0]["volume"], 2);
+    assert_eq!(engine.list_conditions().await[0].id, id);
+}
+
+#[test]
+fn user_selected_live_entry_filter_defaults_to_ten_for_new_and_legacy_configs() {
+    assert_eq!(ExecutionConfig::default().min_entry_risk_ticks, 10);
+    let mut legacy = serde_json::to_value(ExecutionConfig::default()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("min_entry_risk_ticks");
+    let loaded: ExecutionConfig = serde_json::from_value(legacy).unwrap();
+    assert_eq!(loaded.min_entry_risk_ticks, 10);
+}
+
+#[tokio::test]
+async fn zero_or_stale_account_funds_block_new_entries_but_never_block_stop_exits() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 0.0, 50000.0).await;
+    register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+    ready(&engine, vec![], vec![]).await;
+    engine
+        .state
+        .lock()
+        .await
+        .entry_funds
+        .as_mut()
+        .unwrap()
+        .updated_at -= 120.0;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+    ready(&engine, vec![], vec![]).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready_with_funds(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+        0.0,
+        50000.0,
+    )
+    .await;
+    let mut cfg = engine.get_config().await;
+    cfg.min_entry_risk_ticks = 100;
+    engine.update_config(cfg).await.unwrap();
+    age(&engine).await;
+    quote(&engine, 990.0).await;
+    let inserts = counter.inserts();
+    assert_eq!(inserts.len(), 2);
+    assert_eq!(inserts[1]["offset"], "auto");
+    assert_eq!(inserts[1]["direction"], "sell");
+}
+
+#[tokio::test]
+async fn legacy_funds_rejection_is_migrated_to_wait_and_expiry_prevents_late_reentry() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    counter.reject_funds.store(true, Ordering::Relaxed);
+    quote(&engine, 1000.0).await;
+    drop(engine);
+    let path = counter.directory.join("trader_execution.json");
+    let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("entry_funding_waits");
+    for order in old["orders"].as_object_mut().unwrap().values_mut() {
+        order.as_object_mut().unwrap().remove("funds_at_submit");
+    }
+    std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    assert!(engine
+        .state
+        .lock()
+        .await
+        .entry_funding_waits
+        .contains_key(&id));
+    // Signal expires while waiting for capital; a later replenishment is not a new signal.
+    let bars: Vec<String> = (0..=13)
+        .map(|i| format!("2026-10-16 10:{i:02}:00"))
+        .collect();
+    engine.reconcile_entry_age("PB0", &bars).await.unwrap();
+    ready_with_funds(&engine, vec![], vec![], 50000.0, 0.0).await;
+    age(&engine).await;
+    quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts().len(), 1);
+    assert_eq!(
+        engine.list_conditions().await[0].state,
+        ConditionState::Expired
+    );
+}
+
+#[tokio::test]
+async fn real_filter_skips_orders_while_baseline_shadows_continue_and_archive() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 995.0).await;
+    quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+    let summary = engine.comparison_summary().await;
+    assert_eq!(summary["runs"][0]["groups"][0]["opened"], 1);
+    assert_eq!(summary["runs"][0]["groups"][1]["filtered"], 1);
+    engine.cancel_condition(&id).await.unwrap();
+    assert!(engine
+        .requested_contracts()
+        .await
+        .contains(&"pb2611".to_owned()));
+    quote(&engine, 1008.0).await;
+    quote(&engine, 1001.0).await;
+    assert!(counter.inserts().is_empty());
+    let summary = engine.comparison_summary().await;
+    assert_eq!(summary["runs"][0]["groups"][0]["closed"], 1);
+    assert!(counter.directory.join("strategy_comparison.jsonl").exists());
+    drop(engine);
+    let restored = counter.engine(ExecutionMode::FullAuto, 2);
+    assert_eq!(restored.comparison_summary().await, summary);
+}
+
+#[tokio::test]
+async fn comparison_archive_failure_does_not_disable_real_stop_orders() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    let orders = engine.list_orders().await;
+    assert_eq!(
+        orders[0]
+            .entry_rules
+            .as_ref()
+            .unwrap()
+            .config
+            .min_entry_risk_ticks,
+        10
+    );
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+    )
+    .await;
+    std::fs::create_dir(counter.directory.join("strategy_comparison.jsonl")).unwrap();
+    age(&engine).await;
+    quote(&engine, 990.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+    assert_eq!(counter.inserts()[1]["offset"], "auto");
+    assert!(engine.state.lock().await.persistence_error.is_none());
+    assert!(engine.comparison_summary().await["archive_error"].is_string());
+}

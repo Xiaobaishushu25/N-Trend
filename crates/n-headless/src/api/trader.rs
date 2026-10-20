@@ -53,6 +53,12 @@ pub async fn get_trader_snapshot(State(ctx): State<Arc<ServerContext>>) -> impl 
     }
 }
 
+pub async fn get_strategy_comparison(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
+    Json(ApiResponse::ok(
+        ctx.execution_engine.comparison_details().await,
+    ))
+}
+
 pub async fn get_trader_account(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let client = CtpTraderClient::for_port(8766);
     match client.account().await {

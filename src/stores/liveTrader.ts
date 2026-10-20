@@ -28,6 +28,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     history: [] as LiveTradeRecord[],
     executionOrders: [] as NonNullable<LiveTraderSnapshot['execution_orders']>,
     statistics: null as LiveTradeStatistics | null,
+    strategyComparison: null as LiveTraderSnapshot['strategy_comparison'],
+    updatingEntryFilter: false,
     loading: false,
     refreshing: false,
     activeTab: 'positions' as LiveTraderTab,
@@ -259,7 +261,10 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     },
 
     applySnapshot(snapshot: LiveTraderSnapshot) {
-      if (snapshot.source && snapshot.source !== this.snapshotSource) this.quotes = {}
+      if (snapshot.source && snapshot.source !== this.snapshotSource) {
+        this.quotes = {}
+        this.strategyComparison = null
+      }
       if (snapshot.source) this.snapshotSource = snapshot.source
       this.health = snapshot.health
       this.bridgeOnline = snapshot.bridge_online !== false
@@ -270,6 +275,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.conditions) this.conditions = snapshot.conditions
       if (snapshot.history) this.history = snapshot.history
       if (snapshot.statistics !== undefined) this.statistics = snapshot.statistics
+      if (snapshot.strategy_comparison !== undefined) this.strategyComparison = snapshot.strategy_comparison
       if (snapshot.execution_orders) this.executionOrders = snapshot.execution_orders
       this.errorMsg = snapshot.execution_error || snapshot.health?.sync_error || null
     },
@@ -378,6 +384,21 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         await this.refresh()
       } catch (e: any) {
         notify.error(`撤销失败: ${e}`)
+      }
+    },
+
+    async setEntryRiskFilter(ticks: number) {
+      if (!this.config || this.updatingEntryFilter || ![0, 10].includes(ticks)) return
+      this.updatingEntryFilter = true
+      const next = { ...this.config, min_entry_risk_ticks: ticks }
+      try {
+        await api.updateTraderConfig(next)
+        this.config = next
+        notify.success(ticks ? '实际新开仓启用10 tick过滤；原规则继续影子观察' : '实际新开仓采用原规则；10 tick组继续影子观察')
+      } catch (e: any) {
+        notify.error(`修改入场过滤失败: ${e}`)
+      } finally {
+        this.updatingEntryFilter = false
       }
     },
 

@@ -92,7 +92,7 @@ pub async fn register_execution_signals(
         };
         if let Err(e) = ctx
             .execution_engine
-            .register_condition(
+            .register_condition_with_evidence(
                 Some(signal.id),
                 &signal.symbol,
                 actual,
@@ -102,6 +102,7 @@ pub async fn register_execution_signals(
                 signal.target,
                 signal.entry_score,
                 &signal.warning_ts,
+                Some(serde_json::to_value(signal).unwrap_or_default()),
             )
             .await
         {
@@ -334,6 +335,7 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
             snapshot["execution_error"] =
                 serde_json::to_value(ctx.execution_engine.execution_error().await)
                     .unwrap_or_default();
+            snapshot["strategy_comparison"] = ctx.execution_engine.comparison_summary().await;
             if snapshot != last {
                 *ctx.trader_snapshot.write().await = snapshot.clone();
                 ctx.realtime_hub

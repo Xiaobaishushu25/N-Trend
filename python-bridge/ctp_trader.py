@@ -631,6 +631,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             self.orders[ref] = record
             self._order_versions[ref] = self._data_revision + 1
         self.emit_event("order_error", record)
+        # A rejected opening order can exhaust capital. Refresh funds before the
+        # executor decides whether the signal can resume; quotes are not funds.
+        self.request_sync(delay=0.5)
 
     def OnRspOrderInsert(self, pInputOrder, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:

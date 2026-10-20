@@ -176,6 +176,7 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         // SimNow 自动化交易与持仓风控
         .route("/trader/status", get(trader::get_trader_status))
         .route("/trader/snapshot", get(trader::get_trader_snapshot))
+        .route("/trader/comparison", get(trader::get_strategy_comparison))
         .route("/trader/account", get(trader::get_trader_account))
         .route("/trader/positions", get(trader::get_trader_positions))
         .route("/trader/conditions", get(trader::get_condition_orders))

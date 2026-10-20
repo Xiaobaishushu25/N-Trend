@@ -40,6 +40,7 @@ import {
   Trash,
 } from '@vicons/tabler'
 import { useLiveTraderStore } from '../stores/liveTrader'
+import StrategyComparisonPanel from '../components/StrategyComparisonPanel.vue'
 import { useTradeReviewStore } from '../stores/tradeReview'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
@@ -403,6 +404,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             >
               {{ (trader.config?.mode || 'SemiAuto') === 'FullAuto' ? '⚡ 自动报单中' : (trader.config?.mode || 'SemiAuto') === 'SemiAuto' ? '🛡️ 待人工核准' : '👁️ 仅生成信号' }}
             </n-tag>
+            <n-tooltip v-if="(trader.config?.min_entry_risk_ticks ?? 0) > 0">
+              <template #trigger>
+                <n-tag size="small" round type="info">
+                  入场止损 ≥ {{ trader.config?.min_entry_risk_ticks }} tick
+                </n-tag>
+              </template>
+              过滤止损距离过窄的新开仓信号；资金不足时等待资金恢复。已有持仓的止损和平仓继续执行。
+            </n-tooltip>
           </div>
 
           <n-divider vertical style="height: 22px; margin: 0 4px" />
@@ -540,6 +549,9 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             <span class="kpi-sub">获利金额/亏损金额</span>
           </div>
         </div>
+
+        <StrategyComparisonPanel :comparison="trader.strategyComparison" :live-config="trader.config"
+          :updating="trader.updatingEntryFilter" @change-filter="trader.setEntryRiskFilter" />
 
         <!-- 理论复盘 vs 实盘对比卡条 -->
         <div class="comparison-card">

@@ -85,6 +85,13 @@ class QueryTests(unittest.TestCase):
     def begin(self, kind, req_id=1):
         self.m._inflight = dict(id=req_id, kind=kind, started=time.monotonic(), rows={}, error=None)
 
+    def test_order_rejection_refreshes_funds_before_new_entry_decisions(self):
+        rejected = types.SimpleNamespace(OrderRef="funds-test", InstrumentID="pb2611")
+        self.m._record_order_error(rejected, "柜台拒绝报单 [31]: CTP:资金不足")
+        self.assertEqual(self.m.orders["funds-test"]["status"], "rejected")
+        self.assertIn("account", self.m._pending_queries)
+        self.assertFalse(self.m.is_ready)
+
     def test_forced_bursts_coalesce_and_share_one_inflight_slot(self):
         for _ in range(100):
             self.m.query_account(force=True)

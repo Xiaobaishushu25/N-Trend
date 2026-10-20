@@ -33,6 +33,7 @@ pub(crate) fn prepare_local_trader_snapshot(snapshot: &mut Value) {
         snapshot[key] = serde_json::json!([]);
     }
     snapshot["statistics"] = Value::Null;
+    snapshot["strategy_comparison"] = Value::Null;
 }
 
 #[tauri::command]

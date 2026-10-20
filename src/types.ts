@@ -895,6 +895,7 @@ export interface ExecutionConfig {
   slippage_ticks?: number
   max_slippage_ticks?: number
   max_exit_slippage_ticks?: number
+  min_entry_risk_ticks?: number
 }
 
 export interface TraderAccount {
@@ -923,6 +924,7 @@ export interface LiveBrokerPosition {
 }
 
 export interface LiveTraderSnapshot {
+  strategy_comparison?: StrategyComparisonSummary | null
   source?: 'server' | 'local'
   health: CtpHealth | null
   account?: TraderAccount | null
@@ -940,6 +942,33 @@ export interface LiveTraderSnapshot {
     phase: 'Unknown' | 'Working' | 'CancelPending' | 'Terminal' | 'Rejected'
     filled: number
     note: string
+  }>
+}
+
+export interface StrategyComparisonSummary {
+  archive_error?: string | null
+  active_run: string | null
+  archived_runs: number
+  basis: string
+  runs: Array<{
+    definition: {
+      id: string; version: string; started_at: number; config_hash: string
+      execution_config: ExecutionConfig; candidate_min_risk_ticks: number
+      extra_roundtrip_cost_ticks: number; close_minutes_before: number; basis: string
+    }
+    signals: number
+    groups: Array<{
+      id: string; label: string; signals: number; filtered: number; pending: number; opened: number
+      closed: number; invalid: number; wins: number; losses: number; flat: number
+      gross_amount: number; estimated_net_amount: number; sum_r: number; net_wins: number
+      win_rate_pct: number | null; avg_r: number | null; quote_gap_signals: number
+    }>
+    pairs: Array<{ base: string; candidate: string; matched_signals: number; gross_delta: number; estimated_net_delta: number }>
+    recent: Array<{
+      condition_id: string; event_id: number | null; instrument_id: string
+      observed_at: number; risk_ticks: number | null; quote_gap_count: number
+      variants: Array<{ id: string; status: string; reason: string }>
+    }>
   }>
 }
 

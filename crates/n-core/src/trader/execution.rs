@@ -180,6 +180,9 @@ pub struct ExecutionConfig {
     pub max_slippage_ticks: u32,
     #[serde(default)]
     pub max_exit_slippage_ticks: u32,
+    /// Reject new entries whose structural stop is too narrow for trading costs.
+    #[serde(default = "default_min_entry_risk_ticks")]
+    pub min_entry_risk_ticks: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -194,12 +197,17 @@ impl Default for ExecutionConfig {
             slippage_ticks: default_slippage(),
             max_slippage_ticks: default_max_slippage(),
             max_exit_slippage_ticks: 0,
+            min_entry_risk_ticks: default_min_entry_risk_ticks(),
         }
     }
 }
 
 fn default_wait() -> u64 {
     3
+}
+fn default_min_entry_risk_ticks() -> u32 {
+    // User-selected live lane; baseline remains a paired shadow observation.
+    10
 }
 fn default_slippage() -> u32 {
     2
@@ -230,6 +238,55 @@ pub struct ExecutionOrder {
     pub note: String,
     #[serde(default)]
     pub cancel_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funds_at_submit: Option<EntryFunds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_rules: Option<EntryRuleSnapshot>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntryRuleSnapshot {
+    pub version: String,
+    pub config: ExecutionConfig,
+    pub planned_risk_ticks: f64,
+    pub comparison_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntryFunds {
+    available: f64,
+    margin: f64,
+    updated_at: f64,
+}
+
+impl EntryFunds {
+    fn fresh(&self, now: i64) -> bool {
+        self.available.is_finite()
+            && self.margin.is_finite()
+            && self.margin >= 0.0
+            && self.updated_at.is_finite()
+            && (-1.0..=60.0).contains(&(now as f64 - self.updated_at))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct EntryFundingWait {
+    order_ref: String,
+    checkpoint: Option<EntryFunds>,
+    required_available: Option<f64>,
+}
+
+fn insufficient_funds(note: &str) -> bool {
+    note.contains("[31]") || note.starts_with("31:") || note.contains("资金不足")
+}
+
+fn missing_funds(note: &str) -> Option<f64> {
+    // The final bracket contains the broker's approximate shortfall, not error 31.
+    let amount = note.rsplit_once("资金[")?.1.split(']').next()?;
+    amount
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n > 0.0)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -262,6 +319,10 @@ struct ExecutionState {
     overnight_snapshots: HashMap<String, OvernightSnapshot>,
     #[serde(default)]
     recorded_checkpoints: HashSet<String>,
+    entry_funding_waits: HashMap<String, EntryFundingWait>,
+    comparison: super::comparison::ComparisonBook,
+    #[serde(skip)]
+    entry_funds: Option<EntryFunds>,
     #[serde(skip)]
     broker_ready: bool,
     #[serde(skip)]
@@ -369,6 +430,18 @@ impl ExecutionEngine {
             anyhow::bail!("{error}");
         }
         if let Some(path) = &self.state_path {
+            if let Err(e) = state
+                .comparison
+                .archive_completed(&path.with_file_name("strategy_comparison.jsonl"))
+            {
+                let message = format!("策略对比归档失败，完整记录暂存执行状态文件: {e}");
+                if state.comparison.archive_error.as_ref() != Some(&message) {
+                    tracing::warn!("{message}");
+                }
+                state.comparison.archive_error = Some(message);
+            } else {
+                state.comparison.archive_error = None;
+            }
             if let Err(e) = atomic_json(path, state) {
                 state.persistence_error = Some(format!("执行状态保存失败，禁止报单: {e}"));
                 anyhow::bail!("{}", state.persistence_error.as_ref().unwrap());
@@ -427,12 +500,116 @@ impl ExecutionEngine {
     pub async fn get_trade_history(&self) -> Vec<TradeRecord> {
         self.state.lock().await.history.clone()
     }
+
+    pub async fn comparison_summary(&self) -> serde_json::Value {
+        self.state.lock().await.comparison.summary()
+    }
+
+    pub async fn comparison_details(&self) -> serde_json::Value {
+        serde_json::json!({"active_and_aggregate": &self.state.lock().await.comparison,
+            "archive_file":self.state_path.as_ref().map(|p|p.with_file_name("strategy_comparison.jsonl")),
+            "archive_dedup_key":"archive_id"})
+    }
+
     pub async fn execution_error(&self) -> Option<String> {
         let s = self.state.lock().await;
         s.persistence_error
             .clone()
             .or_else(|| s.error.clone())
             .or_else(|| s.market_error.clone())
+    }
+
+    fn set_entry_note(s: &mut ExecutionState, id: &str, note: String) -> bool {
+        if let Some(cond) = s.conditions.get_mut(id) {
+            if cond.note != note {
+                cond.note = note;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Persist the capital wait once per rejection, including legacy saved orders.
+    /// Replayed counter snapshots must not move the recovery threshold each time.
+    fn refresh_entry_funding_waits(s: &mut ExecutionState) -> bool {
+        let mut latest: HashMap<String, &ExecutionOrder> = HashMap::new();
+        for order in s.orders.values().filter(|o| o.reason.is_none()) {
+            let old = latest.entry(order.condition_id.clone()).or_insert(order);
+            if (order.action_at, &order.request.order_ref) > (old.action_at, &old.request.order_ref)
+            {
+                *old = order;
+            }
+        }
+        let mut changed = false;
+        for (id, order) in latest {
+            if order.phase != OrderPhase::Rejected || !insufficient_funds(&order.note) {
+                continue;
+            }
+            let order_ref = order.request.order_ref.clone().unwrap_or_default();
+            if s.entry_funding_waits
+                .get(&id)
+                .is_some_and(|w| w.order_ref == order_ref && w.checkpoint.is_some())
+            {
+                continue;
+            }
+            let checkpoint = order
+                .funds_at_submit
+                .clone()
+                .or_else(|| s.entry_funds.clone());
+            let required_available = checkpoint
+                .as_ref()
+                .zip(missing_funds(&order.note))
+                .map(|(funds, shortfall)| funds.available.max(0.0) + shortfall + 0.01);
+            if checkpoint.is_none() && s.entry_funding_waits.contains_key(&id) {
+                continue;
+            }
+            s.entry_funding_waits.insert(
+                id,
+                EntryFundingWait {
+                    order_ref,
+                    checkpoint,
+                    required_available,
+                },
+            );
+            changed = true;
+        }
+        changed
+    }
+
+    fn entry_funding_note(s: &ExecutionState, id: &str, now: i64) -> Option<String> {
+        let Some(funds) = s.entry_funds.as_ref().filter(|f| f.fresh(now)) else {
+            return Some("等待柜台最新资金同步，暂缓新开仓".into());
+        };
+        if funds.available <= 0.0 {
+            return Some("可用资金不足，暂缓新开仓，等待资金恢复".into());
+        }
+        let Some(wait) = s.entry_funding_waits.get(id) else {
+            return None;
+        };
+        let fresh = wait
+            .checkpoint
+            .as_ref()
+            .is_some_and(|old| funds.updated_at > old.updated_at);
+        let recovered = if let Some(required) = wait.required_available {
+            funds.available >= required
+        } else {
+            // Without a numeric broker shortfall, a quote/P&L fluctuation is not
+            // evidence that capital was released. Wait for a new margin release.
+            wait.checkpoint.as_ref().is_some_and(|old| {
+                funds.margin + 0.01 < old.margin && funds.available > old.available + 0.01
+            })
+        };
+        if fresh && recovered {
+            None
+        } else {
+            Some(match wait.required_available {
+                Some(required) => format!(
+                    "资金不足，暂缓新开仓；可用{:.2}，等待至少{:.2}及新的资金确认",
+                    funds.available, required
+                ),
+                None => "资金不足，暂缓新开仓；等待柜台确认保证金释放".into(),
+            })
+        }
     }
 
     pub fn overnight_tracking_path(&self) -> Option<PathBuf> {
@@ -448,7 +625,13 @@ impl ExecutionEngine {
     }
 
     pub async fn get_overnight_snapshots(&self) -> Vec<OvernightSnapshot> {
-        self.state.lock().await.overnight_snapshots.values().cloned().collect()
+        self.state
+            .lock()
+            .await
+            .overnight_snapshots
+            .values()
+            .cloned()
+            .collect()
     }
 
     fn check_overnight_checkpoints(&self, s: &mut ExecutionState) {
@@ -465,8 +648,13 @@ impl ExecutionEngine {
             if let Some(checkpoint_type) = check_pre_close_checkpoint(&pos.symbol, &now, 2) {
                 let checkpoint_key = format!("{}:{}:{:?}", pos.id, s.trading_day, checkpoint_type);
                 if !s.recorded_checkpoints.contains(&checkpoint_key) {
-                    if let Some(quote) = s.quotes.get(&pos.instrument_id.to_uppercase()).filter(|q| q.valid()) {
-                        let snap = OvernightSnapshot::create(&pos, quote, checkpoint_type, &s.trading_day);
+                    if let Some(quote) = s
+                        .quotes
+                        .get(&pos.instrument_id.to_uppercase())
+                        .filter(|q| q.valid())
+                    {
+                        let snap =
+                            OvernightSnapshot::create(&pos, quote, checkpoint_type, &s.trading_day);
                         tracing::info!(
                             "🌙 [影子跟踪] 记录收盘前2分钟快照: 合约={} 方向={} 最新={:.2} 假设平仓价={:.2} 盈亏={:+.2}点({:+.2}R)",
                             snap.instrument_id,
@@ -497,7 +685,11 @@ impl ExecutionEngine {
         for (pos_id, snap) in s.overnight_snapshots.iter_mut() {
             if snap.next_open_price.is_none() && now_ts - snap.created_at >= 180 {
                 if let Some(_pos) = s.positions.get(pos_id).filter(|p| !p.is_closed) {
-                    if let Some(quote) = s.quotes.get(&snap.instrument_id.to_uppercase()).filter(|q| q.valid()) {
+                    if let Some(quote) = s
+                        .quotes
+                        .get(&snap.instrument_id.to_uppercase())
+                        .filter(|q| q.valid())
+                    {
                         let open_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
                         snap.update_next_open(quote.last, &open_ts);
                         tracing::info!(
@@ -563,6 +755,34 @@ impl ExecutionEngine {
         score: f64,
         warning_ts: &str,
     ) -> Result<String> {
+        self.register_condition_with_evidence(
+            event_id,
+            symbol,
+            instrument_id,
+            dir,
+            entry,
+            stop,
+            target,
+            score,
+            warning_ts,
+            None,
+        )
+        .await
+    }
+
+    pub async fn register_condition_with_evidence(
+        &self,
+        event_id: Option<i64>,
+        symbol: &str,
+        instrument_id: &str,
+        dir: Dir,
+        entry: f64,
+        stop: f64,
+        target: f64,
+        score: f64,
+        warning_ts: &str,
+        evidence: Option<serde_json::Value>,
+    ) -> Result<String> {
         let long = dir == Dir::Up;
         anyhow::ensure!(
             entry.is_finite()
@@ -570,11 +790,7 @@ impl ExecutionEngine {
                 && target.is_finite()
                 && entry > 0.0
                 && stop > 0.0
-                && (if long {
-                    stop < entry
-                } else {
-                    stop > entry
-                }),
+                && (if long { stop < entry } else { stop > entry }),
             "入场/止损价格不合法"
         );
         let risk = (entry - stop).abs();
@@ -646,6 +862,12 @@ impl ExecutionEngine {
                 },
             },
         );
+        let condition = s.conditions[&id].clone();
+        s.comparison
+            .register(&condition, &cfg, condition.created_at);
+        if let Some(evidence) = evidence {
+            s.comparison.attach_evidence(&id, evidence);
+        }
         self.save(&mut s)?;
         Ok(id)
     }
@@ -736,6 +958,27 @@ impl ExecutionEngine {
             return Ok(());
         }
         s.account = Some(account);
+        if let (Some(available), Some(margin), Some(updated_at)) = (
+            snapshot["account"]["available"].as_f64(),
+            snapshot["account"]["curr_margin"]
+                .as_f64()
+                .or_else(|| snapshot["account"]["margin"].as_f64()),
+            snapshot["account"]["updated_at"].as_f64(),
+        ) {
+            if available.is_finite()
+                && margin.is_finite()
+                && updated_at.is_finite()
+                && s.entry_funds
+                    .as_ref()
+                    .is_none_or(|old| updated_at >= old.updated_at)
+            {
+                s.entry_funds = Some(EntryFunds {
+                    available,
+                    margin,
+                    updated_at,
+                });
+            }
+        }
         let day = h["trading_day"].as_str().unwrap_or("").to_string();
         if !day.is_empty() && h["logged_in"].as_bool().unwrap_or(false) && s.trading_day != day {
             s.trading_day = day.clone();
@@ -840,7 +1083,11 @@ impl ExecutionEngine {
             if order.reason.is_none() {
                 let order_insert_ts = s.orders.get(&trade.order_ref).map(|o| {
                     chrono::DateTime::from_timestamp(o.action_at, 0)
-                        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                        .map(|dt| {
+                            dt.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string()
+                        })
                         .unwrap_or_else(|| {
                             chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
                         })
@@ -947,7 +1194,8 @@ impl ExecutionEngine {
                     event_id: cond.event_id.or(pos.event_id),
                     planned_entry_price: Some(cond.entry_price).or(pos.planned_entry_price),
                     score: Some(cond.score).or(pos.score),
-                    warning_bar_ts: Some(cond.warning_bar_ts.clone()).or_else(|| pos.warning_bar_ts.clone()),
+                    warning_bar_ts: Some(cond.warning_bar_ts.clone())
+                        .or_else(|| pos.warning_bar_ts.clone()),
                     trigger_ts: cond.trigger_ts.clone().or_else(|| pos.trigger_ts.clone()),
                     order_insert_ts: pos.order_insert_ts.clone(),
                 };
@@ -1080,6 +1328,7 @@ impl ExecutionEngine {
                     .filter(|p| !p.is_closed)
                     .map(|p| p.instrument_id.clone()),
             )
+            .chain(s.comparison.contracts())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -1159,12 +1408,16 @@ impl ExecutionEngine {
 
     pub async fn market_unavailable(&self) {
         let mut s = self.state.lock().await;
+        if s.market_error.is_none() {
+            s.comparison.mark_quote_gap();
+        }
         s.quotes.clear();
         s.market_error = Some("执行行情连接中断，暂停新报单并保留未完成任务".into());
     }
 
     pub async fn quote_gap(&self) -> Result<()> {
         let mut s = self.state.lock().await;
+        s.comparison.mark_quote_gap();
         let ids = s
             .orders
             .values()
@@ -1196,6 +1449,10 @@ impl ExecutionEngine {
             s.market_error = None;
         }
         s.quotes.extend(quotes);
+        let state = &mut *s;
+        state
+            .comparison
+            .advance(&state.quotes, chrono::Utc::now().timestamp());
         let entries = s.conditions.values().cloned().collect::<Vec<_>>();
         for cond in entries {
             let Some(q) = s
@@ -1218,7 +1475,8 @@ impl ExecutionEngine {
                 if hit {
                     let o = s.conditions.get_mut(&cond.id).unwrap();
                     if o.trigger_ts.is_none() {
-                        o.trigger_ts = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                        o.trigger_ts =
+                            Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
                     }
                     o.state = if mode == ExecutionMode::SemiAuto {
                         ConditionState::WaitingConfirm
@@ -1297,7 +1555,8 @@ impl ExecutionEngine {
                             true,
                         );
                     } else if (q.last - pos.target_price) * sign >= 0.0 {
-                        let target_r = (pos.target_price - pos.fill_price) * sign / pos.risk.max(1e-9);
+                        let target_r =
+                            (pos.target_price - pos.fill_price) * sign / pos.risk.max(1e-9);
                         if target_r > 1.0 {
                             Self::latch_exit(&mut s, &cond.id, "target_s1", q.last, true);
                         }
@@ -1348,6 +1607,10 @@ impl ExecutionEngine {
         let cfg = self.get_config().await;
         let now = chrono::Utc::now().timestamp();
         let mut s = self.state.lock().await;
+        let state = &mut *s;
+        if state.comparison.advance(&state.quotes, now) {
+            self.save(&mut s)?;
+        }
         self.check_overnight_checkpoints(&mut s);
         self.update_overnight_next_open(&mut s);
         if cfg.mode == ExecutionMode::MonitorOnly {
@@ -1359,7 +1622,10 @@ impl ExecutionEngine {
         // 解除长时间处于 CancelPending 且已重试多次的死锁报单，防止阻塞驱动循环与其它品种交易
         let mut unblocked_any = false;
         for (r, o) in s.orders.iter_mut() {
-            if o.phase == OrderPhase::CancelPending && o.cancel_attempts >= 3 && now - o.action_at >= 15 {
+            if o.phase == OrderPhase::CancelPending
+                && o.cancel_attempts >= 3
+                && now - o.action_at >= 15
+            {
                 tracing::warn!(
                     "⚠️ 报单 {} ({}) 处于 CancelPending 且已重试 {} 次超时未获柜台终态回报，将其标记为 Rejected 避免阻塞其它品种交易",
                     r,
@@ -1438,6 +1704,7 @@ impl ExecutionEngine {
         if !s.broker_ready || s.error.is_some() || s.market_error.is_some() {
             return Ok(());
         }
+        let mut entry_state_changed = Self::refresh_entry_funding_waits(&mut s);
         let mut conditions = s.conditions.values().cloned().collect::<Vec<_>>();
         conditions.sort_by_key(|o| (!s.closes.contains_key(&o.id), o.created_at, o.id.clone()));
         let mut candidate = None;
@@ -1477,9 +1744,25 @@ impl ExecutionEngine {
                     || !s.entry_symbols_ready.contains(&cond.symbol)
                     || !s.authorized_entries.contains(&cond.id)
                     || s.aborted_entries.contains(&cond.id)
-                    // 暂时停用日内亏损熔断限制（后续如需重新启用，解开下方注释即可）：
-                    // || (cfg.daily_loss_limit_r > 0.0 && s.loss_r >= cfg.daily_loss_limit_r)
+                // 暂时停用日内亏损熔断限制（后续如需重新启用，解开下方注释即可）：
+                // || (cfg.daily_loss_limit_r > 0.0 && s.loss_r >= cfg.daily_loss_limit_r)
                 {
+                    continue;
+                }
+                let risk_ticks = cond.risk / q.tick;
+                if risk_ticks + 1e-6 < cfg.min_entry_risk_ticks as f64 {
+                    entry_state_changed |= Self::set_entry_note(
+                        &mut s,
+                        &cond.id,
+                        format!(
+                            "入场筛选：止损距离{risk_ticks:.2} tick小于{} tick，暂缓新开仓",
+                            cfg.min_entry_risk_ticks,
+                        ),
+                    );
+                    continue;
+                }
+                if let Some(note) = Self::entry_funding_note(&s, &cond.id, now) {
+                    entry_state_changed |= Self::set_entry_note(&mut s, &cond.id, note);
                     continue;
                 }
                 (cond.volume - filled, None, cond.entry_price, 0)
@@ -1516,7 +1799,10 @@ impl ExecutionEngine {
                         cond.entry_price - max_entry_slippage
                     };
                     if let Some(o) = s.conditions.get_mut(&cond.id) {
-                        o.note = format!("盘口{:.1}超入场滑点限制({}{:.1})，暂缓报单", market_price, limit_desc, max_p);
+                        o.note = format!(
+                            "盘口{:.1}超入场滑点限制({}{:.1})，暂缓报单",
+                            market_price, limit_desc, max_p
+                        );
                     }
                     continue;
                 }
@@ -1537,13 +1823,32 @@ impl ExecutionEngine {
                 exchange_id: Some(q.exchange_id.clone()),
                 order_ref: Some(r.clone()),
             };
-            candidate = Some((r, req, cond.id.clone(), reason));
+            let entry_rules = reason.is_none().then(|| EntryRuleSnapshot {
+                version: "live-entry-funding-v1".into(),
+                config: cfg.clone(),
+                planned_risk_ticks: cond.risk / q.tick,
+                comparison_run_id: s
+                    .comparison
+                    .runs
+                    .iter()
+                    .find(|r| r.signals.contains_key(&cond.id))
+                    .map(|r| r.definition.id.clone()),
+            });
+            candidate = Some((r, req, cond.id.clone(), reason, entry_rules));
             break;
         }
-        let Some((r, req, id, reason)) = candidate else {
+        let Some((r, req, id, reason, entry_rules)) = candidate else {
+            if entry_state_changed {
+                self.save(&mut s)?;
+            }
             return Ok(());
         };
         let day = s.trading_day.clone();
+        let funds_at_submit = if reason.is_none() {
+            s.entry_funds.clone()
+        } else {
+            None
+        };
         s.orders.insert(
             r.clone(),
             ExecutionOrder {
@@ -1557,8 +1862,13 @@ impl ExecutionEngine {
                 trading_day: day,
                 note: "已持久化提交意图，等待柜台回报".into(),
                 cancel_attempts: 0,
+                funds_at_submit,
+                entry_rules,
             },
         );
+        if reason.is_none() {
+            s.entry_funding_waits.remove(&id);
+        }
         if let Some(task) = s.closes.get_mut(&id) {
             task.attempts += 1;
         }
@@ -1602,6 +1912,7 @@ impl ExecutionEngine {
                 }
             }
         }
+        Self::refresh_entry_funding_waits(&mut s);
         self.save(&mut s)
     }
 
@@ -1624,6 +1935,7 @@ impl ExecutionEngine {
         {
             return Ok(());
         }
+        s.comparison.on_bar(symbol, bar_ts);
         let first = s.last_bars.insert(symbol.into(), bar_ts.into()).is_none();
         // Startup establishes a baseline; old bars must not advance a recovered holding.
         if first {

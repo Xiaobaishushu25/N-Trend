@@ -26,7 +26,7 @@ function setup(listenOverride) {
         return () => events.delete(name)
       }) }
       if (name === '../services/api') return { api, onQuotesUpdated: async () => () => {} }
-      if (name === '../utils/notify') return { notify: {} }
+      if (name === '../utils/notify') return { notify: { success() {}, error() {} } }
       if (name === '../utils/multipliers') return {
         DEFAULT_MULTIPLIERS: { PB: 5 }, getSymbolPrefix: (s) => s.match(/^[a-z]+/i)?.[0].toUpperCase(),
       }
@@ -43,6 +43,31 @@ function snapshot() {
   return { source: 'server', bridge_online: true, health: { ready: true, healthy: true },
     account: { balance: 1000 }, broker_positions: [] }
 }
+
+test('changing the live comparison lane preserves all other execution settings', async () => {
+  const { store, api } = setup()
+  store.config = { mode: 'FullAuto', max_risk_percent: 0.5, default_large_volume: 2,
+    default_small_volume: 1, daily_loss_limit_r: 3, min_entry_risk_ticks: 0, slippage_ticks: 2 }
+  let sent
+  api.updateTraderConfig = async (config) => { sent = config }
+  await store.setEntryRiskFilter(10)
+  assert.equal(sent.mode, 'FullAuto')
+  assert.equal(sent.max_risk_percent, 0.5)
+  assert.equal(sent.default_large_volume, 2)
+  assert.equal(store.config.min_entry_risk_ticks, 10)
+  api.updateTraderConfig = async () => { throw new Error('offline') }
+  await store.setEntryRiskFilter(0)
+  assert.equal(store.config.min_entry_risk_ticks, 10)
+  assert.equal(store.updatingEntryFilter, false)
+})
+
+test('switching to local account data clears the server-only strategy comparison', () => {
+  const { store } = setup()
+  store.applySnapshot({ ...snapshot(), strategy_comparison: { runs: [] } })
+  assert.ok(store.strategyComparison)
+  store.applySnapshot({ ...snapshot(), source: 'local' })
+  assert.equal(store.strategyComparison, null)
+})
 
 test('push replaces snapshot without HTTP reads and listeners are removed on close', async () => {
   const { store, events, api } = setup()
