@@ -1,5 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use n_protocol::dto::*;
+use n_protocol::trader_stream::{TraderDelta, TraderSnapshotCache};
 use n_protocol::ws::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -45,6 +46,7 @@ pub struct RealtimeClient {
     status: Arc<RwLock<ConnectionStatus>>,
     quote_delay_ms: Arc<AtomicU64>,
     reconnect: Notify,
+    trader_cache: RwLock<TraderSnapshotCache>,
 }
 
 impl RealtimeClient {
@@ -64,6 +66,7 @@ impl RealtimeClient {
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             quote_delay_ms: Arc::new(AtomicU64::new(0)),
             reconnect: Notify::new(),
+            trader_cache: RwLock::new(TraderSnapshotCache::default()),
         });
 
         // Spawn background connection worker
@@ -243,12 +246,15 @@ impl RealtimeClient {
             }
 
             let mut reconnect_requested = false;
+            req.headers_mut()
+                .insert("X-Ntrend-Trader-Delta", HeaderValue::from_static("1"));
             let connection = tokio::select! {
                 _ = &mut reconnect => { backoff_idx = 0; continue; }
                 result = tokio::time::timeout(Duration::from_secs(8), connect_async(req)) => result,
             };
             match connection {
                 Ok(Ok((ws_stream, _resp))) => {
+                    self.trader_cache.write().await.reset();
                     tracing::info!("✅ 实时 WebSocket 连接已建立");
                     self.set_status(ConnectionStatus::Connected).await;
                     let _ = self.app.emit("trader-resync-needed", ());
@@ -414,9 +420,30 @@ impl RealtimeClient {
                     // Forward based on topic
                     match topic.as_str() {
                         "trader.updated" => {
-                            let _ = self.app.emit("trader-updated", &payload);
+                            if let Some(snapshot) = self.trader_cache.write().await.replace(payload) {
+                                let _ = self.app.emit("trader-updated", &snapshot);
+                            }
+                        }
+                        "trader.delta" => {
+                            let result = match serde_json::from_value::<TraderDelta>(payload) {
+                                Ok(delta) => self.trader_cache.write().await.apply(delta),
+                                Err(_) => Err("invalid trader delta"),
+                            };
+                            match result {
+                                Ok(Some(snapshot)) => {
+                                    let _ = self.app.emit("trader-updated", &snapshot);
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(error, "交易状态增量不连续，重新连接获取基线");
+                                    self.reconnect.notify_one();
+                                }
+                            }
                         }
                         "trader.heartbeat" => {
+                            if let Some(snapshot) = self.trader_cache.write().await.refresh_metadata(&payload) {
+                                let _ = self.app.emit("trader-updated", &snapshot);
+                            }
                             let _ = self.app.emit("trader-heartbeat", ());
                         }
                         "quote.updated" => {

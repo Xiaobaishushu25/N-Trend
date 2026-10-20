@@ -175,7 +175,8 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/integrity/repair", post(integrity::repair_integrity))
         // SimNow 自动化交易与持仓风控
         .route("/trader/status", get(trader::get_trader_status))
-        .route("/trader/snapshot", get(trader::get_trader_snapshot))
+        .route("/trader/snapshot", get(trader::get_trader_snapshot).layer(CompressionLayer::new()))
+        .route("/trader/execution-orders", get(trader::get_execution_orders).layer(CompressionLayer::new()))
         .route("/trader/comparison", get(trader::get_strategy_comparison))
         .route("/trader/account", get(trader::get_trader_account))
         .route("/trader/positions", get(trader::get_trader_positions))

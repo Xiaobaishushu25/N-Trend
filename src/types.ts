@@ -936,13 +936,24 @@ export interface LiveTraderSnapshot {
   history?: LiveTradeRecord[]
   statistics?: LiveTradeStatistics | null
   execution_error?: string | null
-  execution_orders?: Array<{
-    condition_id: string
-    request: { instrument_id: string; direction: string; volume: number; price: number; order_ref: string }
-    phase: 'Unknown' | 'Working' | 'CancelPending' | 'Terminal' | 'Rejected'
-    filled: number
-    note: string
-  }>
+  execution_orders?: ExecutionOrder[] // Legacy servers only; never used as the paged archive.
+}
+
+export interface ExecutionOrder {
+  condition_id: string
+  request: { instrument_id: string; direction: string; offset?: string; volume: number; price: number; order_ref: string }
+  phase: 'Unknown' | 'Working' | 'CancelPending' | 'Terminal' | 'Rejected'
+  filled: number
+  note: string
+  trading_day: string
+  action_at: number
+}
+
+export interface ExecutionOrdersPage {
+  items: ExecutionOrder[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface StrategyComparisonSummary {

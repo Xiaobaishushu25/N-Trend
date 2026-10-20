@@ -13,9 +13,10 @@ import type {
   LiveManagedPosition,
   LiveTradeRecord,
   LiveTradeStatistics,
+  ExecutionOrder,
 } from '../types'
 
-export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison'
+export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison' | 'orders'
 
 export const useLiveTraderStore = defineStore('liveTrader', {
   state: () => ({
@@ -26,7 +27,13 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     managedPositions: [] as LiveManagedPosition[],
     conditions: [] as LiveConditionOrder[],
     history: [] as LiveTradeRecord[],
-    executionOrders: [] as NonNullable<LiveTraderSnapshot['execution_orders']>,
+    executionOrders: [] as ExecutionOrder[],
+    executionOrdersTotal: 0,
+    executionOrdersPage: 1,
+    executionOrdersPageSize: 20,
+    executionOrdersLoading: false,
+    executionOrdersError: '',
+    executionOrdersSeq: 0,
     statistics: null as LiveTradeStatistics | null,
     strategyComparison: null as LiveTraderSnapshot['strategy_comparison'],
     updatingEntryFilter: false,
@@ -264,6 +271,12 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.source && snapshot.source !== this.snapshotSource) {
         this.quotes = {}
         this.strategyComparison = null
+        this.executionOrdersSeq++
+        this.executionOrders = []
+        this.executionOrdersTotal = 0
+        this.executionOrdersPage = 1
+        this.executionOrdersError = ''
+        this.executionOrdersLoading = false
       }
       if (snapshot.source) this.snapshotSource = snapshot.source
       this.health = snapshot.health
@@ -276,8 +289,27 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.history) this.history = snapshot.history
       if (snapshot.statistics !== undefined) this.statistics = snapshot.statistics
       if (snapshot.strategy_comparison !== undefined) this.strategyComparison = snapshot.strategy_comparison
-      if (snapshot.execution_orders) this.executionOrders = snapshot.execution_orders
       this.errorMsg = snapshot.execution_error || snapshot.health?.sync_error || null
+    },
+
+    async loadExecutionOrders(page?: number) {
+      const requestedPage = page ?? this.executionOrdersPage
+      const seq = ++this.executionOrdersSeq
+      this.executionOrdersLoading = true
+      this.executionOrdersError = ''
+      try {
+        const result = await api.getExecutionOrders(requestedPage, this.executionOrdersPageSize)
+        if (seq !== this.executionOrdersSeq) return
+        this.executionOrders = result.items
+        this.executionOrdersTotal = result.total
+        this.executionOrdersPage = result.page
+        this.executionOrdersPageSize = result.page_size
+      } catch (e: any) {
+        if (seq !== this.executionOrdersSeq) return
+        this.executionOrdersError = typeof e === 'string' ? e : e?.message || '报单记录加载失败'
+      } finally {
+        if (seq === this.executionOrdersSeq) this.executionOrdersLoading = false
+      }
     },
 
     async refresh() {
@@ -328,8 +360,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
             if (this.health) this.health = { ...this.health, ready: false, healthy: false }
           }
         }))
-        // Trader messages are complete snapshots. Global sequence gaps also occur
-        // for intentionally filtered chart events and do not require a trader read.
+        // Native transport reconstructs versioned trader deltas before emitting.
+        // Global sequence gaps from chart filtering do not require a trader read.
         await add(listen('trader-stream-disconnected', () => {
           this.lastPushAt = 0
           this.bridgeOnline = false
@@ -362,6 +394,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
     stopRealtime() {
       this.realtimeGeneration++
+      this.executionOrdersSeq++
+      this.executionOrdersLoading = false
       if (this.pollTimer) clearInterval(this.pollTimer)
       this.pollTimer = null
       this.realtimeListeners.splice(0).forEach((unlisten) => unlisten())

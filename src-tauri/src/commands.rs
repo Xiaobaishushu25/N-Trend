@@ -1403,6 +1403,11 @@ pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value,
 }
 
 #[tauri::command]
+pub async fn get_execution_orders(state: State<'_, Arc<AppState>>, page: usize, page_size: usize) -> Result<Value, String> {
+    state.api.get_execution_orders(page, page_size).await.map_err(|e| e.message)
+}
+
+#[tauri::command]
 pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
     if let Ok(res) = state.api.get_trader_account().await {
         return Ok(res);

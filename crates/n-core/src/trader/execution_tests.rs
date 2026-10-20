@@ -10,6 +10,36 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[tokio::test]
+async fn historical_orders_are_paged_newest_first_without_changing_archive() {
+    let engine = ExecutionEngine::new(CtpTraderClient::new("http://127.0.0.1:1".into()), ExecutionConfig::default());
+    {
+        let mut state = engine.state.lock().await;
+        for reference in 1..=4031 {
+            let order: ExecutionOrder = serde_json::from_value(json!({
+                "request":{"instrument_id":"pb2611", "direction":"buy", "offset":"open",
+                    "price":1000, "volume":2, "order_ref":reference.to_string()},
+                "condition_id":"condition", "reason":null, "phase":"Rejected", "reported_filled":0,
+                "filled":0, "action_at":1, "trading_day":if reference>4000 {"20261021"} else {"20261020"},
+                "note":"funds rejected"
+            })).unwrap();
+            state.orders.insert(reference.to_string(), order);
+        }
+    }
+    let first = engine.execution_orders_page(1, 20).await;
+    let second = engine.execution_orders_page(2, 20).await;
+    assert_eq!(first.total, 4031);
+    assert_eq!(first.items.len(), 20);
+    assert_eq!(first.items[0].request.order_ref.as_deref(), Some("4031"));
+    assert_eq!(first.items[19].request.order_ref.as_deref(), Some("4012"));
+    assert_eq!(second.items[0].request.order_ref.as_deref(), Some("4011"));
+    assert_eq!(engine.execution_orders_page(202, 20).await.items.len(), 11);
+    assert!(engine.execution_orders_page(usize::MAX, 100).await.items.is_empty());
+    assert_eq!(engine.execution_orders_page(0, usize::MAX).await.items.len(), 100);
+    assert_eq!(engine.execution_orders_page(0, 0).await.page_size, 1);
+    assert_eq!(engine.state.lock().await.orders.len(), 4031);
+}
+
 struct Counter {
     url: String,
     requests: Arc<StdMutex<Vec<(String, Value)>>>,

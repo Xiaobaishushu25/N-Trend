@@ -3,6 +3,7 @@ pub mod config;
 pub mod dto;
 pub mod error;
 pub mod ws;
+pub mod trader_stream;
 
 pub use auth::*;
 pub use config::*;

@@ -1,4 +1,4 @@
-use axum::extract::{Json, State};
+use axum::extract::{Json, Query, State};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -57,6 +57,22 @@ pub async fn get_strategy_comparison(State(ctx): State<Arc<ServerContext>>) -> i
     Json(ApiResponse::ok(
         ctx.execution_engine.comparison_details().await,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecutionOrdersQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+pub async fn get_execution_orders(
+    State(ctx): State<Arc<ServerContext>>,
+    _device: crate::auth::AuthDevice,
+    Query(query): Query<ExecutionOrdersQuery>,
+) -> impl IntoResponse {
+    Json(ctx.execution_engine.execution_orders_page(
+        query.page.unwrap_or(1), query.page_size.unwrap_or(20),
+    ).await)
 }
 
 pub async fn get_trader_account(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {

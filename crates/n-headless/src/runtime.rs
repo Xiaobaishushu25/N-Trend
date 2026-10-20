@@ -298,7 +298,8 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last = serde_json::Value::Null;
+        let mut publisher =
+            n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
         let mut last_sent = Instant::now();
         loop {
             // The timer only reads strategy memory; it never queries CTP or HTTP.
@@ -330,25 +331,24 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
             snapshot["statistics"] =
                 serde_json::to_value(ctx.execution_engine.get_trade_statistics().await)
                     .unwrap_or_default();
-            snapshot["execution_orders"] =
-                serde_json::to_value(ctx.execution_engine.list_orders().await).unwrap_or_default();
             snapshot["execution_error"] =
                 serde_json::to_value(ctx.execution_engine.execution_error().await)
                     .unwrap_or_default();
             snapshot["strategy_comparison"] = ctx.execution_engine.comparison_summary().await;
-            if snapshot != last {
-                *ctx.trader_snapshot.write().await = snapshot.clone();
+            let (snapshot, delta) = publisher.update(snapshot);
+            // Keep the REST/bootstrap baseline fresh, including query timestamps.
+            *ctx.trader_snapshot.write().await = snapshot.clone();
+            if let Some(delta) = delta {
                 ctx.realtime_hub
-                    .broadcast(ctx.next_event_seq(), "trader.updated", snapshot.clone())
+                    .broadcast_trader(ctx.next_event_seq(), &delta, &snapshot)
                     .await;
-                last = snapshot;
                 last_sent = Instant::now();
             } else if last_sent.elapsed() >= Duration::from_secs(15) {
                 ctx.realtime_hub
                     .broadcast(
                         ctx.next_event_seq(),
                         "trader.heartbeat",
-                        serde_json::Value::Null,
+                        publisher.heartbeat(),
                     )
                     .await;
                 last_sent = Instant::now();

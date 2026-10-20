@@ -142,3 +142,58 @@ test('closing during listener registration cleans up all late listeners', async 
   assert.equal(store.pollTimer, null)
   assert.equal(removed, 5)
 })
+
+test('history is fetched only on demand and legacy pushes cannot replace the selected page', async () => {
+  const { store, api, events } = setup()
+  let calls = 0
+  api.getExecutionOrders = async (page, pageSize) => {
+    calls++
+    return { items: [{ note: `page ${page}` }], total: 4031, page, page_size: pageSize }
+  }
+  await store.startRealtime()
+  await store.loadAll()
+  assert.equal(calls, 0)
+  await store.loadExecutionOrders(2)
+  assert.equal(calls, 1)
+  assert.equal(store.executionOrdersPage, 2)
+  events.get('trader-updated')({ payload: { ...snapshot(), execution_orders: [{ note: 'entire archive' }] } })
+  assert.equal(store.executionOrders[0].note, 'page 2')
+  assert.equal(store.executionOrdersTotal, 4031)
+})
+
+test('late page responses and failures cannot overwrite a newer page', async () => {
+  const { store, api } = setup()
+  let resolveFirst
+  api.getExecutionOrders = () => new Promise((resolve) => { resolveFirst = resolve })
+  const first = store.loadExecutionOrders(1)
+  api.getExecutionOrders = async () => ({ items: [{ note: 'new page' }], total: 30, page: 2, page_size: 20 })
+  await store.loadExecutionOrders(2)
+  resolveFirst({ items: [{ note: 'old page' }], total: 30, page: 1, page_size: 20 })
+  await first
+  assert.equal(store.executionOrders[0].note, 'new page')
+  assert.equal(store.executionOrdersLoading, false)
+  api.getExecutionOrders = async () => { throw new Error('offline') }
+  await store.loadExecutionOrders(1)
+  assert.equal(store.executionOrdersPage, 2)
+  assert.equal(store.executionOrdersError, 'offline')
+  assert.equal(store.executionOrders[0].note, 'new page')
+})
+
+test('closing or switching account source invalidates an outstanding history request', async () => {
+  const { store, api } = setup()
+  store.applySnapshot(snapshot())
+  let resolve
+  api.getExecutionOrders = () => new Promise((r) => { resolve = r })
+  const pending = store.loadExecutionOrders(2)
+  store.applySnapshot({ ...snapshot(), source: 'local' })
+  resolve({ items: [{ note: 'server archive' }], total: 10, page: 2, page_size: 20 })
+  await pending
+  assert.equal(store.executionOrders.length, 0)
+  assert.equal(store.executionOrdersPage, 1)
+  assert.equal(store.executionOrdersLoading, false)
+  const closed = store.loadExecutionOrders(1)
+  store.stopRealtime()
+  resolve({ items: [{ note: 'closed page' }], total: 10, page: 1, page_size: 20 })
+  await closed
+  assert.equal(store.executionOrders.length, 0)
+})

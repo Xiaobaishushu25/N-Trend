@@ -1053,6 +1053,11 @@ impl RemoteApiClient {
             .await
     }
 
+    pub async fn get_execution_orders(&self, page: usize, page_size: usize) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, &format!("trader/execution-orders?page={}&page_size={}", page.max(1), page_size.clamp(1, 100))))
+            .await
+    }
+
     pub async fn get_trader_account(&self) -> Result<serde_json::Value, ApiErrorResponse> {
         self.execute(self.request(Method::GET, "trader/account"))
             .await

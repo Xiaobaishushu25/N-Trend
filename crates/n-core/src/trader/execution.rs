@@ -254,6 +254,14 @@ pub struct EntryRuleSnapshot {
     pub comparison_run_id: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionOrdersPage {
+    pub items: Vec<ExecutionOrder>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntryFunds {
     available: f64,
@@ -501,6 +509,25 @@ impl ExecutionEngine {
     }
     pub async fn get_trade_history(&self) -> Vec<TradeRecord> {
         self.state.lock().await.history.clone()
+    }
+
+    /// Sort references under the lock; clone only the requested page, never the archive.
+    pub async fn execution_orders_page(&self, page: usize, page_size: usize) -> ExecutionOrdersPage {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 100);
+        let state = self.state.lock().await;
+        let mut orders: Vec<_> = state.orders.values().collect();
+        let total = orders.len();
+        orders.sort_by_cached_key(|order| {
+            std::cmp::Reverse((
+                order.trading_day.clone(),
+                order.request.order_ref.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0),
+                order.request.order_ref.clone().unwrap_or_default(),
+            ))
+        });
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        let items = orders.into_iter().skip(offset).take(page_size).cloned().collect();
+        ExecutionOrdersPage { items, total, page, page_size }
     }
 
     pub async fn comparison_summary(&self) -> serde_json::Value {

@@ -277,6 +277,11 @@ const reviewMode = computed(() => reviewSignalId.value != null)
 const reviewRows = ref<OutcomeDetail[]>([])
 const reviewLoading = ref(false)
 const reviewListKey = ref('')
+// 默认列表跟随当前品种；从复盘统计带来的筛选则允许跨品种切换。
+const reviewListFilters = computed(() =>
+  appStore.reviewJumpFilters ?? (symbol.value ? { symbol: symbol.value } : undefined),
+)
+const reviewListContextKey = computed(() => JSON.stringify(reviewListFilters.value ?? {}))
 const reviewIndex = computed(() =>
   reviewSignalId.value == null
     ? -1
@@ -324,40 +329,55 @@ async function loadReviewOverlay() {
 }
 
 let reviewListSeq = 0
-/** 进入复盘模式后按复盘窗口的筛选条件拉取一次明细列表，切换信号时复用该列表 */
+/** 按实际筛选条件缓存列表；切换到列表外的信号时补入当前事件。 */
 async function loadReviewList(force = false) {
   const id = reviewSignalId.value
-  if (id == null) return
-  const filters = appStore.reviewJumpFilters
-  const key = filters ? JSON.stringify(filters) : 'default'
-  if (!force && reviewListKey.value === key) return
   const seq = ++reviewListSeq
+  if (id == null) {
+    reviewRows.value = []
+    reviewListKey.value = ''
+    reviewLoading.value = false
+    return
+  }
+  const key = reviewListContextKey.value
+  const reuseRows = !force && reviewListKey.value === key
+  // 即使命中缓存，也要作废上次补拉事件的请求。
+  if (reuseRows && reviewRows.value.some((r) => r.event_id === id)) {
+    reviewLoading.value = false
+    return
+  }
+  const isCurrent = () => seq === reviewListSeq
+    && id === reviewSignalId.value && key === reviewListContextKey.value
   reviewLoading.value = true
+  if (!reuseRows) {
+    reviewRows.value = []
+    reviewListKey.value = ''
+  }
   try {
     // 优先带上当前品种以走单品种极速路径（~100ms），避免无筛选时全量扫描50+品种SQLite（~8秒）
-    const effectiveFilters = filters ?? (symbol.value ? { symbol: symbol.value } : undefined)
-    let rows = await api.getRecentOutcomes(150, effectiveFilters)
+    let rows = reuseRows ? [...reviewRows.value] : await api.getRecentOutcomes(150, reviewListFilters.value)
+    if (!isCurrent()) return
     // 目标信号不在筛选结果里时，单查当前信号并补入列表头部，保证滚轮能覆盖当前信号而无需重拉全量
     if (!rows.some((r) => r.event_id === id)) {
       try {
         const detail = await api.getReviewSignal(id)
-        if (detail) {
-          rows = [detail as any, ...rows]
+        if (detail?.outcome) {
+          rows = [{ ...detail.outcome, annotations: detail.annotations, opened: detail.opened }, ...rows]
         }
       } catch {
         // 忽略补拉失败
       }
     }
-    if (seq !== reviewListSeq || reviewSignalId.value == null) return
+    if (!isCurrent()) return
     reviewRows.value = rows
     reviewListKey.value = key
   } catch {
-    if (seq === reviewListSeq) {
+    if (isCurrent()) {
       reviewRows.value = []
       reviewListKey.value = ''
     }
   } finally {
-    if (seq === reviewListSeq) reviewLoading.value = false
+    if (isCurrent()) reviewLoading.value = false
   }
 }
 
@@ -2154,12 +2174,10 @@ watch([symbol, reviewSignalId], async () => {
   await loadReviewOverlay()
 }, { immediate: true })
 
-// 复盘模式：首次进入或筛选上下文变化时拉取一次明细列表，后续切换信号直接复用
+// 复盘模式：首次进入或实际筛选变化时刷新列表，同一列表内切换信号直接复用。
 watch(
-  [reviewSignalId, () => appStore.reviewJumpFilters],
-  () => {
-    if (reviewMode.value) void loadReviewList()
-  },
+  [reviewSignalId, reviewListContextKey],
+  () => { void loadReviewList() },
   { immediate: true },
 )
 

@@ -220,6 +220,8 @@ export const api = {
   // ---- Live Trader ----
   getTraderStatus: () => invoke<{ health: CtpHealth; config: ExecutionConfig }>('get_trader_status'),
   getTraderSnapshot: () => invoke<import('../types').LiveTraderSnapshot>('get_trader_snapshot'),
+  getExecutionOrders: (page = 1, pageSize = 20) =>
+    invoke<import('../types').ExecutionOrdersPage>('get_execution_orders', { page, pageSize }),
   getTraderAccount: () => invoke<TraderAccount>('get_trader_account'),
   getTraderPositions: () =>
     invoke<{ broker_positions: LiveBrokerPosition[]; managed_positions: LiveManagedPosition[] }>('get_trader_positions'),

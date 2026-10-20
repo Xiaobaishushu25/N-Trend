@@ -263,6 +263,7 @@ pub fn run() {
             commands::open_log_directory,
             commands::get_trader_status,
             commands::get_trader_snapshot,
+            commands::get_execution_orders,
             commands::get_trader_account,
             commands::get_trader_positions,
             commands::get_condition_orders,

@@ -28,6 +28,7 @@ pub struct ClientSession {
     disconnect: Arc<Notify>,
     pub subscribed_symbols: HashSet<String>,
     pub subscribed_timeframes: HashSet<String>,
+    trader_delta: bool,
 }
 
 #[cfg(test)]
@@ -115,6 +116,30 @@ mod tests {
         assert_eq!(hub.active_connections().await, 0);
         assert!(disconnect.notified().now_or_never().is_some());
     }
+
+    #[tokio::test]
+    async fn trader_delta_peers_get_only_changes_and_legacy_peers_get_light_baseline() {
+        let hub = RealtimeHub::new();
+        let (id, mut modern, _) = hub.register_client("new".into(), "admin".into()).await;
+        hub.set_trader_delta(id, true).await;
+        let (_, mut legacy, _) = hub.register_client("old".into(), "admin".into()).await;
+        let mut publisher = n_protocol::trader_stream::TraderPublisher::new("boot".into());
+        let mut raw = serde_json::json!({"account":{"balance":1,"updated_at":1},
+            "broker_positions":[{"position":2}], "execution_orders":vec![serde_json::json!({"note":"rejected"});4031]});
+        publisher.update(raw.clone());
+        raw["account"]["balance"] = serde_json::json!(2);
+        let (snapshot, delta) = publisher.update(raw);
+        hub.broadcast_trader(2, &delta.unwrap(), &snapshot).await;
+        let (Message::Text(new), _) = modern.recv().await.unwrap().into_parts() else { panic!() };
+        let (Message::Text(old), _) = legacy.recv().await.unwrap().into_parts() else { panic!() };
+        let new: serde_json::Value = serde_json::from_str(&new).unwrap();
+        let old: serde_json::Value = serde_json::from_str(&old).unwrap();
+        assert_eq!(new["topic"], "trader.delta");
+        assert_eq!(new["payload"]["changes"].as_object().unwrap().len(), 1);
+        assert_eq!(old["topic"], "trader.updated");
+        assert!(old["payload"].get("execution_orders").is_none());
+        assert_eq!(old["payload"]["broker_positions"][0]["position"], 2);
+    }
 }
 
 pub struct RealtimeHub {
@@ -146,6 +171,7 @@ impl RealtimeHub {
             disconnect: disconnect.clone(),
             subscribed_symbols: HashSet::new(),
             subscribed_timeframes: HashSet::new(),
+            trader_delta: false,
         };
         self.clients.write().await.insert(client_id, session);
         (client_id, rx, disconnect)
@@ -153,6 +179,34 @@ impl RealtimeHub {
 
     pub async fn unregister_client(&self, client_id: usize) {
         self.clients.write().await.remove(&client_id);
+    }
+
+    pub async fn set_trader_delta(&self, client_id: usize, enabled: bool) {
+        if let Some(session) = self.clients.write().await.get_mut(&client_id) {
+            session.trader_delta = enabled;
+        }
+    }
+
+    pub async fn broadcast_trader(
+        &self,
+        event_seq: u64,
+        delta: &n_protocol::trader_stream::TraderDelta,
+        snapshot: &serde_json::Value,
+    ) {
+        let delta = WsServerMessage::new_event(event_seq, "trader.delta", delta);
+        let legacy = WsServerMessage::new_event(event_seq, "trader.updated", snapshot);
+        let (Ok(delta), Ok(legacy)) = (serde_json::to_string(&delta), serde_json::to_string(&legacy)) else {
+            return;
+        };
+        tracing::debug!(
+            delta_bytes = delta.len(), baseline_bytes = legacy.len(), "交易状态增量推送"
+        );
+        let mut map = self.clients.write().await;
+        map.retain(|id, session| {
+            // Older clients still get a light baseline, without historical orders.
+            let text = if session.trader_delta { &delta } else { &legacy };
+            Self::enqueue(*id, session, Message::Text(text.clone()))
+        });
     }
 
     pub async fn send_to(&self, client_id: usize, msg: Message) {

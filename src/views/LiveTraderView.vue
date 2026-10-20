@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -12,6 +12,7 @@ import {
   NEmpty,
   NIcon,
   NModal,
+  NPagination,
   NPopconfirm,
   NRadioGroup,
   NRadioButton,
@@ -55,6 +56,9 @@ import {
 import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from '../types'
 
 const trader = useLiveTraderStore()
+watch(() => trader.activeTab, (tab) => {
+  if (tab === 'orders') void trader.loadExecutionOrders(1)
+})
 const review = useTradeReviewStore()
 
 function onHeaderMouseDown(e: MouseEvent) {
@@ -162,6 +166,7 @@ async function loadTheoreticalWinRate() {
 onMounted(async () => {
   await trader.startRealtime()
   await trader.loadAll()
+  if (trader.activeTab === 'orders') void trader.loadExecutionOrders(1)
   void loadTheoreticalWinRate()
 })
 
@@ -632,6 +637,15 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         </n-button>
 
         <n-button
+          :type="trader.activeTab === 'orders' ? 'primary' : 'default'"
+          size="small"
+          @click="trader.activeTab = 'orders'"
+        >
+          <template #icon><n-icon :component="Clock" /></template>
+          报单记录
+        </n-button>
+
+        <n-button
           :type="trader.activeTab === 'comparison' ? 'primary' : 'default'"
           size="small"
           @click="trader.activeTab = 'comparison'"
@@ -960,18 +974,40 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             </div>
           </div>
         </div>
-        <div v-if="trader.executionOrders.length" class="history-list" style="margin-top: 20px">
-          <div v-for="order in trader.executionOrders.slice(-20)" :key="order.request.order_ref" class="cond-card">
-            <div class="cond-head">
-              <span>{{ order.request.instrument_id }} · {{ order.request.direction === 'buy' ? '买入' : '卖出' }}</span>
-              <n-tag size="small">{{ orderLabel(order.phase) }}</n-tag>
-            </div>
-            <div class="cond-body">
-              委托 {{ order.request.volume }} 手 @ {{ fmtPrice(order.request.price) }} · 柜台成交 {{ order.filled }} 手
-              <div class="cond-note">{{ order.note }}</div>
+      </section>
+
+      <section v-else-if="trader.activeTab === 'orders'" class="tab-pane">
+        <div class="orders-toolbar">
+          <span>报单记录 · 共 {{ trader.executionOrdersTotal }} 条（包含未成交、撤销与拒单）</span>
+          <n-button size="small" :loading="trader.executionOrdersLoading" @click="trader.loadExecutionOrders()">
+            <template #icon><n-icon :component="Refresh" /></template>
+            刷新
+          </n-button>
+        </div>
+        <div v-if="trader.executionOrdersError" class="cond-note">{{ trader.executionOrdersError }}</div>
+        <n-spin :show="trader.executionOrdersLoading">
+          <div v-if="!trader.executionOrders.length && !trader.executionOrdersLoading" class="empty-holder">
+            <n-empty :description="trader.executionOrdersError ? '暂时无法读取报单记录，请刷新重试' : '暂无报单记录'" />
+          </div>
+          <div class="history-list">
+            <div v-for="order in trader.executionOrders" :key="`${order.trading_day}-${order.request.order_ref}`" class="cond-card">
+              <div class="cond-head">
+                <span>{{ order.request.instrument_id }} · {{ order.request.direction === 'buy' ? '买入' : '卖出' }}</span>
+                <n-tag size="small">
+                  {{ orderLabel(order.phase) }}
+                </n-tag>
+              </div>
+              <div class="cond-body">
+                委托 {{ order.request.volume }} 手 @ {{ fmtPrice(order.request.price) }} · 柜台成交 {{ order.filled }} 手
+                <div>交易日 {{ order.trading_day }} · 报单号 {{ order.request.order_ref }}</div>
+                <div class="cond-note">{{ order.note }}</div>
+              </div>
             </div>
           </div>
-        </div>
+        </n-spin>
+        <n-pagination class="orders-pagination" :page="trader.executionOrdersPage"
+          :page-size="trader.executionOrdersPageSize" :item-count="trader.executionOrdersTotal"
+          :disabled="trader.executionOrdersLoading" @update:page="trader.loadExecutionOrders" />
       </section>
 
       <!-- C. 真实成交平仓流水标签页 -->
@@ -1149,6 +1185,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 </template>
 
 <style scoped>
+.orders-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.orders-pagination { margin-top: 20px; }
 /* 全局页面：纯白/浅灰高雅现代风格 */
 .live-trader-page {
   display: flex;

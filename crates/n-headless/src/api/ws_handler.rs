@@ -2,6 +2,7 @@ use crate::auth::AuthDevice;
 use crate::state::ServerContext;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use n_protocol::ws::{WsClientMessage, WsServerMessage};
@@ -12,15 +13,38 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(ctx): State<Arc<ServerContext>>,
     device: AuthDevice,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device))
+    let trader_delta = headers
+        .get("X-Ntrend-Trader-Delta")
+        .and_then(|v| v.to_str().ok()) == Some("1");
+    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, trader_delta))
 }
 
-async fn handle_socket(socket: WebSocket, ctx: Arc<ServerContext>, device: AuthDevice) {
+async fn handle_socket(
+    socket: WebSocket,
+    ctx: Arc<ServerContext>,
+    device: AuthDevice,
+    trader_delta: bool,
+) {
     let (client_id, mut rx, disconnect) = ctx
         .realtime_hub
         .register_client(device.id.clone(), device.role.clone())
         .await;
+    ctx.realtime_hub
+        .set_trader_delta(client_id, trader_delta)
+        .await;
+    // Hold the baseline read guard until it is queued. The publisher writes the
+    // baseline before broadcasting, so a newer delta cannot overtake this snapshot.
+    {
+        let snapshot = ctx.trader_snapshot.read().await;
+        if !snapshot.is_null() {
+            let event = WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot);
+            if let Ok(text) = serde_json::to_string(&event) {
+                ctx.realtime_hub.send_to(client_id, Message::Text(text)).await;
+            }
+        }
+    }
 
     tracing::info!(
         "🔌 WebSocket 客户端已建立连接 | ClientID: {} | 设备: {} ({})",
