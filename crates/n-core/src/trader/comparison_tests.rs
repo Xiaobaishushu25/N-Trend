@@ -138,6 +138,71 @@ fn changed_parameters_create_a_new_batch_and_evidence_is_immutable() {
 }
 
 #[test]
+fn continuous_trailing_shadow_matches_live_policy_for_longs_and_shorts() {
+    let now = ts("2026-10-20 10:00:00");
+    for sign in [1.0, -1.0] {
+        let mut s = signal("continuous", now, 10.0);
+        s.direction = if sign > 0.0 { "up" } else { "down" }.into();
+        s.stop_price = 100.0 - sign * 10.0;
+        s.target_price = 100.0 + sign * 100.0;
+        s.tier = PositionTier::Large;
+        s.volume = 2;
+        let mut book = ComparisonBook::default();
+        book.register(&s, &ExecutionConfig::default(), now);
+        book.advance(&quote(now, 100.0), now);
+        let lane = &record(&book).variants[0];
+        let fill = lane.fill_price.unwrap();
+        let risk = lane.initial_risk.unwrap();
+        book.advance(&quote(now + 1, fill + sign * 1.1 * risk), now + 1);
+        assert!(record(&book).variants[0].first_leg_closed);
+        assert_eq!(record(&book).variants[0].stop, fill);
+        for (index, (mfe, locked)) in [(1.59, 0.0), (1.6, 0.8), (2.08, 1.28), (2.09, 1.29)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = now + 2 + index as i64;
+            book.advance(&quote(at, fill + sign * mfe * risk), at);
+            let lane = &record(&book).variants[0];
+            assert!((lane.stop - (fill + sign * locked * risk)).abs() < 1e-8);
+            assert_eq!(lane.remaining, 1);
+        }
+        let stop = record(&book).variants[0].stop;
+        let mut restored: ComparisonBook =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        restored.advance(&quote(now + 10, fill + sign * 2.0 * risk), now + 10);
+        assert!((record(&restored).variants[0].stop - stop).abs() < 1e-8);
+        restored.advance(&quote(now + 11, stop - sign * 0.01), now + 11);
+        let lane = &record(&restored).variants[0];
+        assert_eq!(lane.status, "closed");
+        assert_eq!(lane.reason, "trailing");
+        assert_eq!(lane.fills.len(), 2);
+    }
+}
+
+#[test]
+fn continuous_policy_version_starts_new_batches_without_recalculating_old_observations() {
+    let now = ts("2026-10-20 10:00:00");
+    let mut book = ComparisonBook::default();
+    book.register(&signal("old", now, 10.0), &ExecutionConfig::default(), now);
+    book.advance(&quote(now, 100.0), now);
+    book.runs[0].definition.version = "paired-quote-v1".into();
+    book.runs[0].definition.config_hash = "old-policy".into();
+    book.register(
+        &signal("new", now + 1, 10.0),
+        &ExecutionConfig::default(),
+        now + 1,
+    );
+    book.advance(&quote(now + 1, 100.0), now + 1);
+    assert_eq!(book.runs.len(), 2);
+    assert_eq!(book.runs[1].definition.version, COMPARISON_VERSION);
+    for lane in &book.runs[0].signals["old"].variants {
+        assert_eq!(lane.status, "missing_data");
+        assert!(lane.fills.is_empty());
+    }
+    assert_eq!(book.runs[1].signals["new"].variants[0].status, "open");
+}
+
+#[test]
 fn archived_observations_keep_totals_after_restart_and_crash_replay_uses_stable_keys() {
     let now = ts("2026-10-20 10:00:00");
     let mut b = ComparisonBook::default();

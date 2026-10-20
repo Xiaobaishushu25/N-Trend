@@ -3,6 +3,7 @@ pub mod comparison;
 pub mod execution;
 pub mod model;
 pub mod overnight;
+mod trailing;
 
 pub use client::CtpTraderClient;
 pub use execution::{

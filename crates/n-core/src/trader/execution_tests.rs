@@ -199,6 +199,97 @@ fn trade(request: &Value, id: &str, volume: i32, price: f64) -> Value {
 }
 
 #[tokio::test]
+async fn continuous_trailing_waits_for_first_fill_tracks_each_quote_and_survives_restart() {
+    for (direction, sign) in [(Dir::Up, 1.0), (Dir::Down, -1.0)] {
+        let counter = Counter::new();
+        let mut engine = counter.engine(ExecutionMode::FullAuto, 2);
+        ready(&engine, vec![], vec![]).await;
+        let id = engine
+            .register_condition(
+                Some(321),
+                "PB0",
+                "pb2611",
+                direction,
+                1000.0,
+                1000.0 - sign * 10.0,
+                1000.0 + sign * 200.0,
+                3.6,
+                "2026-10-16 10:00:00",
+            )
+            .await
+            .unwrap();
+        quote(&engine, 1000.0).await;
+        let open = counter.inserts()[0].clone();
+        let opened = trade(&open, "open", 2, 1000.0);
+        ready(
+            &engine,
+            vec![order(&open, "all_traded", 2)],
+            vec![opened.clone()],
+        )
+        .await;
+
+        age(&engine).await;
+        quote(&engine, 1000.0 + sign * 10.0).await;
+        let close1 = counter.inserts()[1].clone();
+        assert_eq!(close1["volume"], 1);
+        quote(&engine, 1000.0 + sign * 12.0).await;
+        let pos = engine.list_positions().await.remove(0);
+        assert!(!pos.lot1_closed);
+        assert_eq!(pos.current_stop_price, 1000.0 - sign * 10.0);
+
+        let first_exit = trade(&close1, "first-exit", 1, 1000.0 + sign * 10.0);
+        let mut orders = vec![
+            order(&open, "all_traded", 2),
+            order(&close1, "all_traded", 1),
+        ];
+        let mut trades = vec![opened, first_exit];
+        ready(&engine, orders.clone(), trades.clone()).await;
+        let pos = engine.list_positions().await.remove(0);
+        assert!(pos.lot1_closed);
+        assert_eq!(pos.volume, 1);
+        assert_eq!(pos.current_stop_price, 1000.0);
+
+        for (mfe, locked) in [
+            (1.59, 0.0),
+            (1.6, 0.8),
+            (2.08, 1.28),
+            (2.09, 1.29),
+            (2.69, 1.89),
+        ] {
+            quote(&engine, 1000.0 + sign * mfe * 10.0).await;
+            let pos = engine.list_positions().await.remove(0);
+            assert!((pos.current_stop_price - (1000.0 + sign * locked * 10.0)).abs() < 1e-8);
+            assert_eq!(pos.trailing_grade > 1, locked > 0.0);
+        }
+        assert_eq!(counter.inserts().len(), 2);
+        let stop = engine.list_positions().await[0].current_stop_price;
+        drop(engine);
+        engine = counter.engine(ExecutionMode::FullAuto, 2);
+        ready(&engine, orders.clone(), trades.clone()).await;
+        quote(&engine, 1000.0 + sign * 25.0).await;
+        assert_eq!(engine.list_positions().await[0].current_stop_price, stop);
+        assert_eq!(counter.inserts().len(), 2);
+
+        age(&engine).await;
+        quote(&engine, stop - sign * 0.01).await;
+        let close2 = counter.inserts()[2].clone();
+        assert_eq!(close2["volume"], 1);
+        assert_eq!(close2["direction"], if sign > 0.0 { "sell" } else { "buy" });
+        {
+            let state = engine.state.lock().await;
+            assert_eq!(state.closes[&id].reason, "trailing");
+            assert_eq!(state.closes[&id].reference, stop);
+        }
+        assert!(!engine.list_positions().await[0].is_closed); // Wait for the actual fill.
+        orders.push(order(&close2, "all_traded", 1));
+        trades.push(trade(&close2, "second-exit", 1, stop));
+        ready(&engine, orders, trades).await;
+        assert!(engine.list_positions().await[0].is_closed);
+        assert_eq!(engine.get_trade_history().await.len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn one_signal_survives_restart_unknown_ack_and_repeated_crossings_without_fake_fills() {
     let counter = Counter::new();
     let engine = counter.engine(ExecutionMode::FullAuto, 2);

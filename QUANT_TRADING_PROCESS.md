@@ -13,7 +13,7 @@
    - [第三阶段：行情监控与触价触发](#3-第三阶段行情监控与触价触发)
    - [第四阶段：执行报单与动态滑点保护 (0.2R防追高)](#4-第四阶段执行报单与动态滑点保护-02r防追高)
    - [第五阶段：成交回报驱动与持仓建立](#5-第五阶段成交回报驱动与持仓建立)
-   - [第六阶段：多级分批出场与阶梯追踪止盈](#6-第六阶段多级分批出场与阶梯追踪止盈)
+   - [第六阶段：多级分批出场与连续追踪止盈](#6-第六阶段多级分批出场与连续追踪止盈)
    - [第七阶段：流水结算与统计分析](#7-第七阶段流水结算与统计分析)
 4. [风控安全边界与异常防御机制](#四风控安全边界与异常防御机制)
 5. [常见问题与典型场景问答](#五常见问题与典型场景问答)
@@ -94,7 +94,7 @@ sequenceDiagram
     E->>E: 建立 ManagedPosition
     E->>E: 若为 1:1 预设单，以实际成交均价重算 target_price = fill ± risk
 
-    Note over M,B: 5. 阶梯追踪与分批止盈出场
+    Note over M,B: 5. 连续追踪与分批止盈出场
     M->>E: 行情持续推进
     alt 触及 stop 止损线
         E->>C: 发出全平止损单 (all = true)
@@ -102,7 +102,7 @@ sequenceDiagram
         E->>C: 发出 target_1r 平仓单
     else 大仓位 (2手) 达 1.0R
         E->>C: 平仓第 1 手 (target_1r, all = false)
-        E->>E: 第 2 手锁保本 (stop = fill_price)，启动 0.8R 阶梯移动止盈
+        E->>E: 第 2 手锁保本，最高浮盈达 1.6R 后按回撤 0.8R 连续追踪
     end
 ```
 
@@ -128,7 +128,7 @@ sequenceDiagram
 预警推送到执行引擎后，执行 [`register_condition`](file:///h:/WorkSpace2/Rust/RustRover/ntrend/crates/n-core/src/trader/execution.rs#L450)：
 
 #### ① 仓位规模分级 (Tier)
-- **大仓位 (`PositionTier::Large`)**：评分 $\ge 3.5$ 分，默认开仓 **2 手**，采用“首手 1.0R 止盈 + 次手保本及阶梯移动追踪”；
+- **大仓位 (`PositionTier::Large`)**：评分 $\ge 3.5$ 分，默认开仓 **2 手**，采用“首手 1.0R 止盈 + 次手保本及连续追踪”；
 - **小仓位 (`PositionTier::Small`)**：评分在 $2.5 \sim 3.5$ 之间，默认开仓 **1 手**，采用“1.0R 固定止盈”。
 
 #### ② 目标空间自适应 1:1 预设机制
@@ -187,7 +187,7 @@ $$\text{max\_entry\_slippage} = \max\Big(\text{risk} \times 0.2,\;\; 2 \times \t
 
 ---
 
-### 6. 第六阶段：多级分批出场与阶梯追踪止盈
+### 6. 第六阶段：多级分批出场与连续追踪止盈
 
 持仓建立后，执行引擎在每个 Tick 行情更新时进行出场研判：
 
@@ -206,7 +206,7 @@ graph TD
     Check1R -- 是 --> ExitLot1["平仓第 1 手 (1手)\n(exit_reason: target_1r)"]
     ExitLot1 --> MoveBE["第 2 手自动锁保本\ncurrent_stop = fill_price\nlot1_closed = true"]
     
-    CheckLot1 -- 是 (剩余第2手) --> CheckTrail{"阶梯移动追踪\n每上涨 0.8R 上移止损线"}
+    CheckLot1 -- 是 (剩余第2手) --> CheckTrail{"最高浮盈达 1.6R 后连续追踪\n锁盈 R = 最高浮盈 R - 0.8"}
     CheckTrail --> FallBack{"行情跌破移动止损线？"}
     FallBack -- 是 --> ExitTrail["保本/移动止盈平仓\n(breakeven / trailing)"]
     
@@ -220,10 +220,19 @@ graph TD
 3. **彻底隔离 S1 误平漏洞**：
    - 删除了旧版在顶层无保护的 `target_s1` 全平判断；
    - 仅当 $S_1$ 目标位盈亏比大于 1.0R，且第 1 手已经锁定利润后，第 2 手才允许按 `target_s1` 止盈；
-   - 若目标空间原本就不足 1.0R，第 2 手完全交由阶梯移动止损保护，绝不提前夭折。
+   - 若目标空间原本就不足 1.0R，第 2 手完全交由连续移动止损保护。
 4. **无跟随时效退出 (`no_follow` / `time_exit`)**：
    - 持仓达到指定 K 线数（如 6 根）但最高盈利从未突破 $+0.3R$，判定动能衰竭平仓 (`no_follow`)；
    - 达到最大持仓周期（如 48 根 K 线）强制时间平仓 (`time_exit`)。
+
+#### 方案 B：连续追踪（2026-10-20）
+
+- 第 1 手真实平仓完成后，第 2 手先按开仓成本线保本；最高浮盈未到 1.6R 时不提前追踪。
+- 最高浮盈达到 1.6R 后，每个有效实际合约行情更新止损：锁盈 R = 最高浮盈 R − 0.8R，不再按 0.8R 向下取整。
+- 多单止损 = 开仓价 + 锁盈 R × 初始风险点数；空单止损 = 开仓价 − 锁盈 R × 初始风险点数。止损只收紧，恢复旧持仓时也不放宽已保存止损。
+- 例如 EG 开仓 4978、风险 55.295 点、最高 5127，理论追踪线为 5082.764。触发后仍按现有盘口报单流程成交，不保证按止损线成交。
+- 实盘执行与盘口影子推演共用该规则。前瞻对比版本为 `paired-quote-v2-continuous-08r`，旧版未结束观察停止续算并标记缺数据，旧版已结束记录保留。
+- 历史信号复盘与旧研究回测中的阶梯口径不随本次实盘改动重算。
 
 ---
 
@@ -249,7 +258,7 @@ graph TD
 | **开仓前行情已破止损** | 在发单前实时校验：`q.last <= stop` 则直接将条件单标记为 `Canceled` 废弃 | `crates/n-core/src/trader/execution.rs` (`on_quotes`) |
 | **报单超时 / 盘口拉升挂空** | 3 秒未成交自动发起撤单确认，撤单成功后再根据最新盘口改价重报 | `crates/n-core/src/trader/execution.rs` (`drive()`) |
 | **目标空间过窄秒平风险** | 目标空间 $\le 1.0R$ 自动预设 1:1 止盈；开仓成交根据真实均价自适应调整目标点 | `crates/n-core/src/trader/execution.rs` (`register_condition` & `on_trade`) |
-| **大仓位一次性全平** | 1.0R 仅平第 1 手 (`all=false`)；第 2 手锁保本后转入阶梯追踪；移除顶层裸露的 `target_s1` | `crates/n-core/src/trader/execution.rs` (`on_price_update`) |
+| **大仓位一次性全平** | 1.0R 仅平第 1 手 (`all=false`)；第 2 手锁保本，1.6R 起连续追踪；移除顶层裸露的 `target_s1` | `crates/n-core/src/trader/execution.rs` (`on_quotes`) |
 | **单日累计巨额亏损** | 单日累计浮亏/亏损达 `daily_loss_limit_r`（默认 3.0R）时，执行引擎启动全天熔断，停止新开仓 | `crates/n-core/src/trader/execution.rs` (`drive()`) |
 
 ---

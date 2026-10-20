@@ -202,7 +202,7 @@ function exitReasonBadge(reason: string) {
     case 'target_1r':
       return { text: '🎯 1.0R 锁定保本', type: 'success' as const, tip: '浮盈触及 1.0R，第一手平仓保本' }
     case 'trailing':
-      return { text: '📈 阶梯追踪止盈', type: 'success' as const, tip: '浮盈推进触发阶梯锁盈，回撤跌破锁定线' }
+      return { text: '📈 追踪止盈', type: 'success' as const, tip: '回撤触及追踪止损线；当前规则为1.6R起按最高浮盈回撤0.8R连续追踪' }
     case 'breakeven':
       return { text: '🛡️ 成本线保本出场', type: 'info' as const, tip: '第一手止盈后回落至开仓成本线，零损失了结' }
     case 'stop':
@@ -550,9 +550,6 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </div>
         </div>
 
-        <StrategyComparisonPanel :comparison="trader.strategyComparison" :live-config="trader.config"
-          :updating="trader.updatingEntryFilter" @change-filter="trader.setEntryRiskFilter" />
-
         <!-- 理论复盘 vs 实盘对比卡条 -->
         <div class="comparison-card">
           <div class="cmp-title">
@@ -633,6 +630,15 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           <template #icon><n-icon :component="Clock" /></template>
           真实平仓流水 ({{ trader.history.length }})
         </n-button>
+
+        <n-button
+          :type="trader.activeTab === 'comparison' ? 'primary' : 'default'"
+          size="small"
+          @click="trader.activeTab = 'comparison'"
+        >
+          <template #icon><n-icon :component="LayersSubtract" /></template>
+          策略前瞻对比
+        </n-button>
       </div>
 
       <!-- 仅在流水页显示的过滤器 -->
@@ -649,6 +655,11 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
     <!-- 5. 视图主体内容区（浅色背景卡片流） -->
     <main class="trader-content-box">
+      <section v-if="trader.activeTab === 'comparison'" class="tab-pane">
+        <StrategyComparisonPanel :comparison="trader.strategyComparison" :live-config="trader.config"
+          :updating="trader.updatingEntryFilter" @change-filter="trader.setEntryRiskFilter" />
+      </section>
+
       <!-- A. 在手持仓标签页（展示 SimNow 柜台真实持仓如 pb2612 与托管策略持仓） -->
       <section v-if="trader.activeTab === 'positions'" class="tab-pane">
         <div v-if="!trader.combinedPositions.length" class="empty-holder">
@@ -798,7 +809,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                     {{ pos.position_profit >= 0 ? '+' : '' }}{{ pos.position_profit.toFixed(2) }}{{ pos.profit_is_estimated ? '（估算）' : '（柜台）' }}
                   </span>
                   <span v-if="pos.managed" class="stop-nature-tag" :class="pos.managed.lot1_closed ? 'is-breakeven' : ''">
-                    {{ pos.managed.lot1_closed ? (pos.managed.trailing_grade > 1 ? `阶梯锁盈档位 ${pos.managed.trailing_grade}` : '开仓成本线保本') : '初始硬止损' }}
+                    {{ pos.managed.lot1_closed ? (pos.managed.trailing_grade > 1 ? '连续追踪 · 最高浮盈回撤0.8R' : '成本线保本 · 1.6R起连续追踪') : '初始硬止损' }}
                   </span>
                 </div>
                 <div class="flow-arrow">➔</div>
@@ -1162,6 +1173,8 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 .header-top-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
@@ -1197,12 +1210,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 .header-control-box {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
 }
 
 .mode-switch-group {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   background: #f8fafc;
@@ -1333,14 +1348,17 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 /* KPI & 比对行 */
 .kpi-and-diff-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
   gap: 12px;
   align-items: stretch;
 }
 
 .live-kpi-bar {
-  flex: 3;
-  display: flex;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
   align-items: center;
   background: #ffffff;
   border: 1px solid #e2e8f0;
@@ -1367,6 +1385,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   font-weight: 800;
   line-height: 1.2;
   color: #0f172a;
+  white-space: nowrap;
 }
 
 .kpi-num .unit {
@@ -1381,14 +1400,11 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 }
 
 .kpi-divider {
-  width: 1px;
-  height: 30px;
-  background: #e2e8f0;
-  margin: 0 12px;
+  display: none;
 }
 
 .comparison-card {
-  flex: 2;
+  min-width: 0;
   background: #f0fdf4;
   border: 1px solid #bbf7d0;
   border-radius: 8px;
@@ -1438,6 +1454,8 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 /* 工具栏 Tabs */
 .main-tabs-toolbar {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: space-between;
   align-items: center;
   padding: 8px 18px;
@@ -1448,16 +1466,30 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 .tabs-buttons {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
 /* 主内容区 */
 .trader-content-box {
   flex: 1 1 0%;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
   padding: 14px 20px 60px 20px;
   box-sizing: border-box;
+}
+
+@media (max-width: 1100px) {
+  .kpi-and-diff-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 640px) {
+  .live-kpi-bar {
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  }
 }
 
 .trader-content-box::-webkit-scrollbar {

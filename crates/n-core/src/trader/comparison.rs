@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use super::execution::{ConditionOrder, ExecutionConfig, PositionTier};
 use super::model::ExecutionQuote;
 use super::overnight::check_pre_close_checkpoint;
-use crate::analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, TIME_HORIZON_BARS, TRAIL_STEP_R};
+use super::trailing::continuous_stop_price;
+use crate::analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, TIME_HORIZON_BARS};
 
-pub const COMPARISON_VERSION: &str = "paired-quote-v1";
+pub const COMPARISON_VERSION: &str = "paired-quote-v2-continuous-08r";
 pub const COST_TICKS: f64 = 2.5;
 pub const FILTER_TICKS: u32 = 10;
 
@@ -205,14 +206,16 @@ impl VariantTrade {
             self.trailing_grade = 1;
             self.stop = self.fill_price.unwrap();
         } else if self.first_leg_closed {
-            self.trailing_grade = self
-                .trailing_grade
-                .max(((self.max_mfe_r / TRAIL_STEP_R).floor() as usize).max(1));
-            self.stop = self.fill_price.unwrap()
-                + sign
-                    * TRAIL_STEP_R
-                    * self.trailing_grade.saturating_sub(1) as f64
-                    * self.initial_risk.unwrap();
+            self.stop = continuous_stop_price(
+                self.fill_price.unwrap(),
+                self.initial_risk.unwrap(),
+                sign,
+                self.max_mfe_r,
+                self.stop,
+            );
+            if (self.stop - self.fill_price.unwrap()) * sign > 0.0 {
+                self.trailing_grade = self.trailing_grade.max(2);
+            }
             if (q.last - self.stop) * sign <= 0.0 {
                 self.exit(
                     signal,
@@ -305,7 +308,7 @@ impl ComparisonBook {
                     candidate_min_risk_ticks: FILTER_TICKS,
                     extra_roundtrip_cost_ticks: COST_TICKS,
                     close_minutes_before: 2,
-                    basis: "同信号盘口影子推演；不模拟五万元组合保证金和排队成交".into(),
+                    basis: "同信号盘口影子推演；首手1R兑现，次手1.6R起回撤0.8R连续追踪；不模拟五万元组合保证金和排队成交".into(),
                 },
                 signals: BTreeMap::new(),
                 archive: RunArchive::default(),

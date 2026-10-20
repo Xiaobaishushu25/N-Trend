@@ -15,7 +15,7 @@ import type {
   LiveTradeStatistics,
 } from '../types'
 
-export type LiveTraderTab = 'positions' | 'conditions' | 'history'
+export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison'
 
 export const useLiveTraderStore = defineStore('liveTrader', {
   state: () => ({

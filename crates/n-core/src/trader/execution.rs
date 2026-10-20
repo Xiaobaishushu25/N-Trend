@@ -7,15 +7,16 @@ use tokio::sync::{Mutex, RwLock};
 use super::client::CtpTraderClient;
 use super::model::*;
 use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
+use super::trailing::continuous_stop_price;
 use crate::analyze::model::Dir;
 use crate::analyze::outcome::{
-    NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS, TRAIL_START_R, TRAIL_STEP_R,
+    NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS, TRAIL_START_R,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionTier {
-    /// 大仓位：2手，评分 >= 3.5，采用阶梯追踪止盈 (1.0R锁保本，0.8R步长上移)
+    /// 大仓位：2手，评分 >= 3.5；首手1R兑现，次手1.6R起按最高浮盈回撤0.8R追踪。
     Large,
     /// 小仓位：1手，评分 2.5 ~ 3.5，采用 1:1 盈亏比固定止盈 (达1.0R即止盈)
     Small,
@@ -89,6 +90,7 @@ pub struct ManagedPosition {
     pub bars_held: usize,
     pub max_mfe_r: f64,
     pub max_mae_r: f64,
+    /// Legacy wire field: 0 = initial stop, 1 = breakeven, >= 2 = trailing active.
     pub trailing_grade: usize,
     pub current_stop_price: f64,
     pub lot1_closed: bool,
@@ -1538,10 +1540,16 @@ impl ExecutionEngine {
                 {
                     Self::latch_exit(&mut s, &cond.id, "target_1r", q.last, false);
                 } else if pos.lot1_closed {
-                    let grade = (pos.max_mfe_r / TRAIL_STEP_R).floor() as usize;
-                    pos.trailing_grade = pos.trailing_grade.max(grade.max(1));
-                    let lock_r = TRAIL_STEP_R * pos.trailing_grade.saturating_sub(1) as f64;
-                    pos.current_stop_price = pos.fill_price + sign * lock_r * pos.risk;
+                    pos.current_stop_price = continuous_stop_price(
+                        pos.fill_price,
+                        pos.risk,
+                        sign,
+                        pos.max_mfe_r,
+                        pos.current_stop_price,
+                    );
+                    if (pos.current_stop_price - pos.fill_price) * sign > 0.0 {
+                        pos.trailing_grade = pos.trailing_grade.max(2);
+                    }
                     if (q.last - pos.current_stop_price) * sign <= 0.0 {
                         Self::latch_exit(
                             &mut s,

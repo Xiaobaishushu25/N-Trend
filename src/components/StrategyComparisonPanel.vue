@@ -53,6 +53,7 @@ const states: Record<string, string> = {
       <p class="batch-note">
         自 {{ time(run.definition.started_at) }} 起记录 · {{ run.signals }} 个信号 · {{ run.definition.version }}
         · 注册时实际门槛：{{ run.definition.execution_config.min_entry_risk_ticks ? `${run.definition.execution_config.min_entry_risk_ticks} tick` : '原规则' }}
+        · {{ run.definition.version === 'paired-quote-v2-continuous-08r' ? '首手1R兑现，次手1.6R起回撤0.8R连续追踪' : '旧版退出规则' }}
       </p>
       <div class="table-scroll">
         <table>
@@ -93,7 +94,7 @@ const states: Record<string, string> = {
 </template>
 
 <style scoped>
-.strategy-comparison { background: #fff; border: 1px solid #dbe4ef; border-radius: 12px; padding: 18px; margin: 16px 0; color: #1e293b; }
+.strategy-comparison { min-width: 0; max-width: 100%; box-sizing: border-box; background: #fff; border: 1px solid #dbe4ef; border-radius: 12px; padding: 18px; margin: 0; color: #1e293b; }
 .comparison-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
 .comparison-heading strong { font-size: 16px; }
 .shadow-badge { margin-left: 10px; color: #0369a1; background: #e0f2fe; border-radius: 5px; padding: 2px 7px; font-size: 12px; }
