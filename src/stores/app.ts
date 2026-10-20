@@ -79,6 +79,21 @@ export const useAppStore = defineStore('app', {
     },
   },
   actions: {
+    async loadNotificationHistory() {
+      try {
+        const history = await api.getNotificationHistory()
+        const latestByLevel = new Map<number, ManualLevelAlert>()
+        for (const alert of this.manualLevelAlerts) latestByLevel.set(alert.level_id, alert)
+        for (const item of history) {
+          if (item.manual_level && !latestByLevel.has(item.manual_level.level_id)) {
+            latestByLevel.set(item.manual_level.level_id, item.manual_level)
+          }
+        }
+        this.manualLevelAlerts = [...latestByLevel.values()].slice(0, 80)
+      } catch {
+        // 历史通知不可用时不影响实时事件监听
+      }
+    },
     async init() {
       if (this.initialized) return
       this.initialized = true
@@ -113,18 +128,6 @@ export const useAppStore = defineStore('app', {
           }
         }),
       )
-      try {
-        const history = await api.getNotificationHistory()
-        const latestByLevel = new Map<number, ManualLevelAlert>()
-        for (const item of history) {
-          if (item.manual_level && !latestByLevel.has(item.manual_level.level_id)) {
-            latestByLevel.set(item.manual_level.level_id, item.manual_level)
-          }
-        }
-        this.manualLevelAlerts = [...latestByLevel.values()].slice(0, 80)
-      } catch {
-        // 历史通知不可用时不影响实时事件监听
-      }
       this.listeners.push(
         await onDataUpdated((stats) => {
           console.info('[data-updated]', stats)
@@ -220,6 +223,8 @@ export const useAppStore = defineStore('app', {
           }
         }),
       )
+      // Install every live listener before starting a potentially slow HTTP read.
+      void this.loadNotificationHistory()
     },
   },
 })

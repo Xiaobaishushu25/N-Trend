@@ -11,6 +11,7 @@ _*.py
 _report_out.txt
 
 # local tmp/backtest artifacts
+backtests/
 _backtest*
 _tmp*
 tmp_*.py

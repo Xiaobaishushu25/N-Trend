@@ -44,6 +44,15 @@ fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // UI content is local (Vite in development, bundled assets in production).
+    // Keep every WebView in this process off system proxy/PAC discovery; remote
+    // data is fetched by the Rust HTTP/WebSocket clients instead.
+    #[cfg(target_os = "windows")]
+    {
+        let mut args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        args.push_str(" --no-proxy-server");
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", args);
+    }
     let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
 
     #[cfg(desktop)]

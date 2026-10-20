@@ -91,6 +91,8 @@ const defaultConfig = (): Config => ({
   },
 })
 
+let settingsLoad: Promise<void> | null = null
+
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     settings: defaultConfig() as Config,
@@ -98,17 +100,20 @@ export const useSettingsStore = defineStore('settings', {
     status: { running: false, last_refresh: null, last_scan: null, active_data_source: '天勤' } as SchedulerStatus,
   }),
   actions: {
-    async load() {
-      this.settings = await api.getConfig()
-      this.status = await api.schedulerStatus()
-      try {
-        const client = await api.getClientSettings()
-        if (client) {
-          this.setClientSettings(client)
+    load(): Promise<void> {
+      if (settingsLoad) return settingsLoad
+      settingsLoad = (async () => {
+        // Local preferences and live status do not depend on the server config.
+        const results = await Promise.allSettled([
+          api.getClientSettings().then((client) => { if (client) this.setClientSettings(client) }),
+          api.getConfig().then((config) => { this.settings = config }),
+          api.schedulerStatus().then((status) => { this.status = status }),
+        ])
+        for (const result of results.slice(1)) {
+          if (result.status === 'rejected') throw result.reason
         }
-      } catch {
-        // 静默降级
-      }
+      })().finally(() => { settingsLoad = null })
+      return settingsLoad
     },
     setClientSettings(client: Partial<ClientLocalSettings>) {
       this.clientSettings = {

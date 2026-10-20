@@ -21,6 +21,11 @@ pub struct RemoteApiClient {
 impl RemoteApiClient {
     pub fn new(credentials: Arc<CredentialStore>) -> Self {
         let client = Client::builder()
+            // WebSocket uses a direct socket too. Do not route REST through an
+            // unrelated system proxy (which can leave HTTP offline while WS works).
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(10))
             .tcp_keepalive(Duration::from_secs(10))

@@ -73,6 +73,7 @@ interface WatchRow {
 }
 
 const rows = ref<WatchRow[]>([])
+let dashboardInitialized = false
 const precloseSignals = ref<PrecloseSignal[]>([])
 const precloseCandidates = ref<PrecloseCandidate[]>([])
 const precloseClock = ref(Date.now())
@@ -182,13 +183,31 @@ function bestSignal(signals: PatternEvent[]): PatternEvent | null {
 async function loadAll() {
   const started = performance.now()
   reportPerformance('dashboard_load_started', started)
-  loading.value = true
+  // Keep existing rows visible during refresh; the first load shows the table
+  // as soon as symbols arrive, without waiting for every remote signal API.
+  loading.value = rows.value.length === 0
   try {
     await symbolsStore.load()
     reportPerformance('dashboard_symbols_loaded', performance.now() - started, { rows: symbolsStore.symbols.length })
     let symbols = symbolsStore.symbols
     if (groupsStore.selectedId != null) {
       symbols = await api.getGroupSymbols(groupsStore.selectedId)
+    }
+    if (rows.value.length !== symbols.length || symbols.some((sym, index) => rows.value[index]?.symbol.code !== sym.code)) {
+      const previous = new Map(rows.value.map((row) => [row.symbol.code, row]))
+      rows.value = symbols.map((sym) => {
+        const old = previous.get(sym.code)
+        return {
+          symbol: sym,
+          latest: old?.latest ?? null,
+          changePct: old?.changePct ?? null,
+          changePts: old?.changePts ?? null,
+          signal: old?.signal ?? null,
+          flash: null,
+        }
+      })
+      loading.value = false
+      reportPerformance('dashboard_rows_ready', performance.now() - started, { rows: rows.value.length })
     }
     // 信号（缓存秒级）与行情快照并行，互不阻塞
     const [signals, snapshots, preclose, candidates, activeSingleBars] = await Promise.all([
@@ -978,12 +997,6 @@ onMounted(async () => {
   // 设置与分组并行加载，不串行阻塞首绘
   const settingsP = settingsStore.load().catch(() => {})
   const groupsP = groupsStore.load().catch(() => {})
-  await Promise.all([settingsP, groupsP])
-  reportPerformance('dashboard_settings_ready', performance.now() - mountedAt)
-  // 恢复上次打开的分组表格；分组已不存在时回退到“全部品种”
-  const last = settingsStore.settings.ui.last_group_id
-  groupsStore.selectedId =
-    last != null && groupsStore.groups.some((g) => g.id === last) ? last : null
   unlisteners.push(
     await onDataUpdated(() => {
       if (listDragging.value) return
@@ -1033,7 +1046,17 @@ onMounted(async () => {
     }),
   )
   reportPerformance('dashboard_events_ready', performance.now() - mountedAt)
-  await loadAll()
+  await Promise.all([settingsP, groupsP])
+  reportPerformance('dashboard_settings_ready', performance.now() - mountedAt)
+  // 恢复上次打开的分组表格；分组已不存在时回退到“全部品种”
+  const last = settingsStore.settings.ui.last_group_id
+  groupsStore.selectedId =
+    last != null && groupsStore.groups.some((g) => g.id === last) ? last : null
+  try {
+    await loadAll()
+  } finally {
+    dashboardInitialized = true
+  }
   await nextTick()
   setupTableSortable()
 })
@@ -1043,21 +1066,11 @@ watch(() => groupsStore.revision, () => {
   if (listDragging.value) return
   loadAll()
 })
-// 在线状态变为连通时，重新拉取分组与全部表格数据
-watch(
-  () => appStore.isOnline,
-  async (online) => {
-    if (online && !listDragging.value) {
-      await groupsStore.load().catch(() => {})
-      await loadAll()
-    }
-  },
-)
 // 标题栏操作完成（刷新/添加品种/刷新名称）后重拉表格；扫描由 scan-completed 事件驱动
 watch(
   () => actionsStore.reloadTick,
   () => {
-    if (listDragging.value) return
+    if (!dashboardInitialized || listDragging.value) return
     loadAll()
   },
 )
@@ -1080,7 +1093,7 @@ watch(groupModal, (v) => {
 // keep-alive 缓存页面：从K线图返回时重拉数据，避免表格停留在旧扫描结果
 onActivated(() => {
   setupTableSortable()
-  loadAll()
+  if (dashboardInitialized) loadAll()
 })
 
 onBeforeUnmount(() => {

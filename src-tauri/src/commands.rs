@@ -56,7 +56,7 @@ pub fn report_frontend_perf(
     if !matches!(stage.as_str(),
         "layout_mounted" | "layout_events_ready" | "settings_loaded" | "settings_load_failed" | "symbols_loaded" | "symbols_load_failed" |
         "route_navigation_started" | "route_navigation_finished" | "route_navigation_failed" |
-        "dashboard_mounted" | "dashboard_settings_ready" | "dashboard_events_ready" | "dashboard_load_started" | "dashboard_symbols_loaded" | "dashboard_data_loaded" | "dashboard_load_finished" | "dashboard_load_failed" |
+        "dashboard_mounted" | "dashboard_settings_ready" | "dashboard_events_ready" | "dashboard_load_started" | "dashboard_symbols_loaded" | "dashboard_rows_ready" | "dashboard_data_loaded" | "dashboard_load_finished" | "dashboard_load_failed" |
         "chart_load_started" | "chart_load_finished" | "chart_load_failed" | "chart_load_superseded" |
         "chart_created" | "chart_render_finished") || !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
         return;
@@ -140,7 +140,11 @@ pub async fn update_auth_record(
     state: State<'_, Arc<AppState>>,
     record: AuthRecord,
 ) -> Result<(), String> {
-    state.credentials.update_auth(record)
+    let mut record = record;
+    record.server_url = record.server_url.trim().trim_end_matches('/').to_string();
+    state.credentials.update_auth(record)?;
+    state.realtime.reconnect();
+    Ok(())
 }
 
 #[tauri::command]
@@ -451,20 +455,35 @@ pub async fn get_chart_klines(
     let cached = state.kline_cache.get(&symbol, &timeframe);
     tracing::info!(%trace_id, cached = cached.is_some(), elapsed_ms = started.elapsed().as_millis(), "K线缓存检查完成");
 
-    // 2. 正常请求服务端最新K线；若存在历史缓存，则设置 1500ms 快速超时回退，绝不让用户干等十秒
-    let fetch_fut = state.api.get_chart_klines(&symbol, &timeframe, limit, None, &trace_id);
-    let resp_res = if cached.is_some() {
-        match tokio::time::timeout(std::time::Duration::from_millis(1500), fetch_fut).await {
+    // 回退缓存后继续同一次下载；不能在 1500ms 时取消下载并从头重发。
+    let fetch_state = state.inner().clone();
+    let fetch_symbol = symbol.clone();
+    let fetch_timeframe = timeframe.clone();
+    let fetch_trace_id = trace_id.clone();
+    let mut fetch_fut = Box::pin(async move {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_state.api.get_chart_klines(&fetch_symbol, &fetch_timeframe, limit, None, &fetch_trace_id),
+        ).await {
             Ok(res) => res.map_err(|e| e.message),
+            Err(_) => {
+                tracing::warn!(trace_id = %fetch_trace_id, symbol = %fetch_symbol, timeframe = %fetch_timeframe, "获取K线超时(30s)");
+                Err("获取K线超时，请检查网络或服务端状态".to_string())
+            }
+        }
+    });
+    let resp_res = if cached.is_some() {
+        match tokio::time::timeout(std::time::Duration::from_millis(1500), &mut fetch_fut).await {
+            Ok(res) => res,
             Err(_) => {
                 tracing::warn!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "网络或服务端响应慢，先显示内存缓存");
                 let bg_state = state.inner().clone();
                 let bg_app = app.clone();
                 let sym = symbol.clone();
                 let tf = timeframe.clone();
-                let bg_trace_id = format!("{trace_id}-refresh");
+                let bg_trace_id = trace_id.clone();
                 tokio::spawn(async move {
-                    if let Ok(resp) = bg_state.api.get_chart_klines(&sym, &tf, limit, None, &bg_trace_id).await {
+                    if let Ok(resp) = fetch_fut.await {
                         tracing::info!(trace_id = %bg_trace_id, rows = resp.rows.len(), "K线后台刷新完成");
                         bg_state.kline_cache.put(&sym, &tf, &resp);
                         let _ = bg_app.emit("chart-klines-refreshed", serde_json::json!({
@@ -480,16 +499,7 @@ pub async fn get_chart_klines(
             }
         }
     } else {
-        match tokio::time::timeout(std::time::Duration::from_secs(30), fetch_fut).await {
-            Ok(res) => res.map_err(|e| {
-                tracing::warn!(%trace_id, "获取K线失败 [{}/{}]: {:?}", symbol, timeframe, e);
-                e.message
-            }),
-            Err(_) => {
-                tracing::warn!(%trace_id, elapsed_ms = started.elapsed().as_millis(), "获取K线超时(30s) [{}/{}]", symbol, timeframe);
-                Err("获取K线超时，请检查网络或服务端状态".to_string())
-            }
-        }
+        fetch_fut.await
     };
 
     match resp_res {

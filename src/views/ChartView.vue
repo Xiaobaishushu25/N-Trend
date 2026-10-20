@@ -642,10 +642,14 @@ const showExtremes = ref(true)
 /** 当前周期 MA20 长期趋势线（叠加在当前周期K线图上） */
 const trendPoints = ref<TrendPointDto[]>([])
 let trendSeq = 0
+let chartLoadSeq = 0
 async function loadTrendLine() {
   const sym = symbol.value
   const tf = timeframe.value
   const seq = ++trendSeq
+  const chartSeq = chartLoadSeq
+  const isCurrent = () => seq === trendSeq && chartSeq === chartLoadSeq
+    && sym === symbol.value && tf === timeframe.value
   if (!sym) {
     trendPoints.value = []
     return
@@ -656,9 +660,9 @@ async function loadTrendLine() {
   }
   try {
     const points = await api.getTrendSeries(sym, tf, chartLoadLimit.value)
-    if (seq === trendSeq) trendPoints.value = points
+    if (isCurrent()) trendPoints.value = points
   } catch {
-    if (seq === trendSeq) trendPoints.value = []
+    if (isCurrent()) trendPoints.value = []
   }
 }
 
@@ -2167,6 +2171,11 @@ watch([reviewIndex, reviewRows], async () => {
 })
 
 watch([symbol, timeframe], async () => {
+  const sym = symbol.value
+  const tf = timeframe.value
+  const seq = ++chartLoadSeq
+  // 在等待新品种K线之前作废旧均线请求；否则旧响应会暂时拉歪新品种价格轴。
+  ++trendSeq
   lastRepairResult.value = null
   manualLevelChartPreviews.value = {}
   editingManualLevelId.value = null
@@ -2177,9 +2186,10 @@ watch([symbol, timeframe], async () => {
   liveBars.value = []
   shownRecentNumbers.value = new Set()
   trendPoints.value = []
-  if (symbol.value) {
-    void manualLevelsStore.load(symbol.value, timeframe.value)
-    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value)
+  if (sym) {
+    void manualLevelsStore.load(sym, tf)
+    await klinesStore.load(sym, tf, chartLoadLimit.value)
+    if (seq !== chartLoadSeq || sym !== symbol.value || tf !== timeframe.value) return
     if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
       liveBars.value = [klinesStore.partialBar]
     }
@@ -2334,6 +2344,8 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  ++chartLoadSeq
+  ++trendSeq
   window.removeEventListener('keydown', onReviewKeydown)
   window.removeEventListener('popstate', onPopState)
   document.removeEventListener('fullscreenchange', onDocumentFullscreenChange)

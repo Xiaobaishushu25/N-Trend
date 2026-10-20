@@ -415,20 +415,6 @@ onMounted(async () => {
     // 浏览器预览等环境无 Tauri 事件 API，忽略
   }
   reportPerformance('layout_events_ready', performance.now() - mountedAt)
-  try {
-    await settingsStore.load()
-    reportPerformance('settings_loaded', performance.now() - mountedAt)
-  } catch {
-    reportPerformance('settings_load_failed', performance.now() - mountedAt)
-    // 浏览器预览环境下无后端命令，忽略
-  }
-  try {
-    await symbolsStore.load()
-    reportPerformance('symbols_loaded', performance.now() - mountedAt, { rows: symbolsStore.symbols.length })
-  } catch {
-    reportPerformance('symbols_load_failed', performance.now() - mountedAt)
-    // 浏览器预览环境下无后端命令，忽略
-  }
   // 定时任务每次成功后，顶部时间信息实时跟随刷新
   unlisteners.push(
     await onDataUpdated(() => {
@@ -439,6 +425,24 @@ onMounted(async () => {
   // 实时现价轮询每 3 秒返回一次行情，作为呼吸灯的主要驱动信号
   unlisteners.push(await onQuotesUpdated(() => kickBreathe()))
   unlisteners.push(await onScanCompleted(() => settingsStore.refreshStatus()))
+  await Promise.all([
+    (async () => {
+      try {
+        await settingsStore.load()
+        reportPerformance('settings_loaded', performance.now() - mountedAt)
+      } catch {
+        reportPerformance('settings_load_failed', performance.now() - mountedAt)
+      }
+    })(),
+    (async () => {
+      try {
+        await symbolsStore.load()
+        reportPerformance('symbols_loaded', performance.now() - mountedAt, { rows: symbolsStore.symbols.length })
+      } catch {
+        reportPerformance('symbols_load_failed', performance.now() - mountedAt)
+      }
+    })(),
+  ])
 })
 
 onBeforeUnmount(() => {

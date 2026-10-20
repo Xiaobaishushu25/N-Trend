@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -44,6 +44,7 @@ pub struct RealtimeClient {
     last_event_seq: Arc<AtomicU64>,
     status: Arc<RwLock<ConnectionStatus>>,
     quote_delay_ms: Arc<AtomicU64>,
+    reconnect: Notify,
 }
 
 impl RealtimeClient {
@@ -62,6 +63,7 @@ impl RealtimeClient {
             last_event_seq: Arc::new(AtomicU64::new(0)),
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             quote_delay_ms: Arc::new(AtomicU64::new(0)),
+            reconnect: Notify::new(),
         });
 
         // Spawn background connection worker
@@ -79,6 +81,7 @@ impl RealtimeClient {
 
     async fn run_local_trader_stream(&self) {
         let Ok(client) = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(2))
             .build()
         else {
@@ -145,6 +148,10 @@ impl RealtimeClient {
         }
     }
 
+    pub fn reconnect(&self) {
+        self.reconnect.notify_one();
+    }
+
     pub async fn subscribe(&self, symbols: Vec<String>, timeframes: Vec<String>) {
         {
             let mut sym_lock = self.subscribed_symbols.write().await;
@@ -200,7 +207,10 @@ impl RealtimeClient {
         let mut backoff_idx = 0;
 
         loop {
+            let reconnect = self.reconnect.notified();
+            tokio::pin!(reconnect);
             let server_url = self.credentials.get_server_url();
+            let server_url = server_url.trim().trim_end_matches('/');
             let token = self.credentials.get_token();
 
             let ws_url = if server_url.starts_with("https://") {
@@ -218,7 +228,10 @@ impl RealtimeClient {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!("WebSocket URL 格式错误: {e}");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::select! {
+                        _ = &mut reconnect => { backoff_idx = 0; }
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
                     continue;
                 }
             };
@@ -229,8 +242,13 @@ impl RealtimeClient {
                 }
             }
 
-            match connect_async(req).await {
-                Ok((ws_stream, _resp)) => {
+            let mut reconnect_requested = false;
+            let connection = tokio::select! {
+                _ = &mut reconnect => { backoff_idx = 0; continue; }
+                result = tokio::time::timeout(Duration::from_secs(8), connect_async(req)) => result,
+            };
+            match connection {
+                Ok(Ok((ws_stream, _resp))) => {
                     tracing::info!("✅ 实时 WebSocket 连接已建立");
                     self.set_status(ConnectionStatus::Connected).await;
                     let _ = self.app.emit("trader-resync-needed", ());
@@ -267,10 +285,16 @@ impl RealtimeClient {
 
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
                     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut last_received = tokio::time::Instant::now();
 
                     loop {
                         tokio::select! {
+                            _ = &mut reconnect => { reconnect_requested = true; break; }
                             _ = ping_interval.tick() => {
+                                if last_received.elapsed() > Duration::from_secs(75) {
+                                    tracing::warn!("WebSocket 心跳超时，重新连接");
+                                    break;
+                                }
                                 let ping_msg = WsClientMessage::Ping {
                                     client_time: chrono::Utc::now().timestamp_millis(),
                                 };
@@ -288,6 +312,7 @@ impl RealtimeClient {
                                 }
                             }
                             msg_opt = read.next() => {
+                                last_received = tokio::time::Instant::now();
                                 match msg_opt {
                                     Some(Ok(Message::Text(text))) => {
                                         self.handle_incoming_text(&text).await;
@@ -308,18 +333,38 @@ impl RealtimeClient {
 
                     *self.tx_sub.write().await = None;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("❌ WebSocket 连接失败: {e}");
+                    if let tokio_tungstenite::tungstenite::Error::Http(response) = &e {
+                        match response.status().as_u16() {
+                            401 | 403 => self.set_status(ConnectionStatus::Unauthorized).await,
+                            426 => self.set_status(ConnectionStatus::VersionMismatch).await,
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("WebSocket 连接/握手超过 8 秒，准备重试");
                 }
             }
 
-            self.set_status(ConnectionStatus::Reconnecting).await;
+            let status = self.status.read().await.clone();
+            if !matches!(status, ConnectionStatus::Unauthorized | ConnectionStatus::VersionMismatch) {
+                self.set_status(ConnectionStatus::Reconnecting).await;
+            }
+            if reconnect_requested {
+                backoff_idx = 0;
+                continue;
+            }
             let wait_secs = backoffs[backoff_idx];
             if backoff_idx + 1 < backoffs.len() {
                 backoff_idx += 1;
             }
             tracing::info!("⏱️ 将在 {wait_secs} 秒后重试连接...");
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            tokio::select! {
+                _ = &mut reconnect => { backoff_idx = 0; }
+                _ = tokio::time::sleep(Duration::from_secs(wait_secs)) => {}
+            }
         }
     }
 

@@ -1,10 +1,9 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
-import DashboardView from '../views/DashboardView.vue'
 
 export default createRouter({
   history: createWebHashHistory(),
   routes: [
-    { path: '/', name: 'dashboard', component: DashboardView },
+    { path: '/', name: 'dashboard', component: () => import('../views/DashboardView.vue') },
     {
       path: '/chart/:symbol',
       name: 'chart',
