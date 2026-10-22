@@ -1,699 +1,190 @@
-//! V2 model inference and prediction persistence.
-//!
-//! Training produces model registry rows and bundles, while the application
-//! consumes per-event rows from `v2_model_predictions`.  This module bridges
-//! those two pieces for both historical backfill and live trigger events.
-
-use anyhow::{Context, Result};
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait, QueryFilter,
-    Statement,
+//! Warning-time inference. Old trigger-close predictions have no runtime fallback.
+use crate::{
+    analyze::model::Bar,
+    storage::{entities::pattern_events, repo},
+    v2::{dataset::DatasetRow, model::LogisticModel},
 };
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-
-use crate::analyze::indicators;
-use crate::analyze::model::{Bar, ATR_PERIOD, DT};
-use crate::analyze::outcome;
-use crate::derive::{aggregate, Timeframe};
-use crate::storage::entities::{klines, pattern_events, rollovers, v2_model_registry};
-use crate::storage::repo;
-use crate::v2::dataset::DatasetRow;
-use crate::v2::features::{
-    extract_market_context, extract_trigger_features, normalize_direction, MarketContextSnapshot,
-    SetupFeatures,
-};
-use crate::v2::model::{
-    predict_gam, predict_logistic, GamModel, InferenceBundle, LogisticModel, Prediction,
-    SplineTable,
-};
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct BackfillResult {
-    pub models: usize,
-    pub events_seen: usize,
-    pub events_scored: usize,
-    pub predictions_written: usize,
-    pub current_cohort_events: usize,
-    pub legacy_cohort_events: usize,
-}
-
+use anyhow::Result;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChampionWinRate {
     pub model_id: String,
     pub p_win: f64,
 }
-
-fn json_f64_array(value: &serde_json::Value, key: &str) -> Option<Vec<f64>> {
-    value
-        .get(key)?
-        .as_array()?
+pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Option<DatasetRow> {
+    let w = bars
         .iter()
-        .map(|v| v.as_f64())
-        .collect()
-}
-
-fn json_string_array(value: &serde_json::Value, key: &str) -> Option<Vec<String>> {
-    value
-        .get(key)?
-        .as_array()?
+        .position(|b| b.dt.to_bar_ts().starts_with(&event.warning_ts))?;
+    let prefix = &bars[..=w];
+    let atr = crate::analyze::indicators::atr(prefix, 20);
+    let s1 = prefix
         .iter()
-        .map(|v| v.as_str().map(str::to_string))
-        .collect()
-}
-
-fn bundle_from_registry(row: &v2_model_registry::Model) -> Option<InferenceBundle> {
-    let feature_whitelist: Vec<String> = serde_json::from_str(&row.feature_whitelist).ok()?;
-    let coefficients: serde_json::Value = serde_json::from_str(&row.coefficients).ok()?;
-
-    if row.name == "gam-v1" || row.spline_knots.is_some() {
-        let linear_features =
-            json_string_array(&coefficients, "linear_features").unwrap_or_default();
-        let linear_coefficients =
-            json_f64_array(&coefficients, "linear_coefficients").unwrap_or_default();
-        let splines: Vec<SplineTable> = row
-            .spline_knots
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default();
-        return Some(InferenceBundle {
-            model_id: row.model_id.clone(),
-            feature_whitelist,
-            scaler_means: Vec::new(),
-            scaler_stds: Vec::new(),
-            logistic: None,
-            gam: Some(GamModel {
-                intercept: coefficients.get("intercept")?.as_f64()?,
-                splines,
-                linear_coefficients,
-                linear_features,
-            }),
-            schema_version: row.schema_version.clone(),
-        });
-    }
-
-    let feature_names = json_string_array(&coefficients, "feature_names")
-        .unwrap_or_else(|| feature_whitelist.clone());
-    let coefficients_vec = json_f64_array(&coefficients, "coefficients")?;
-    let scaler_means = json_f64_array(&coefficients, "scaler_means")
-        .unwrap_or_else(|| vec![0.0; feature_names.len()]);
-    let scaler_stds = json_f64_array(&coefficients, "scaler_stds")
-        .unwrap_or_else(|| vec![1.0; feature_names.len()]);
-    if coefficients_vec.len() != feature_names.len()
-        || scaler_means.len() != feature_names.len()
-        || scaler_stds.len() != feature_names.len()
-    {
+        .position(|b| b.dt.to_bar_ts().starts_with(&event.s1_ts))?;
+    let s2 = prefix
+        .iter()
+        .position(|b| b.dt.to_bar_ts().starts_with(&event.s2_ts))?;
+    let a = atr.get(s1).and_then(|x| *x)?;
+    let b = atr.get(s2).and_then(|x| *x)?;
+    if a <= 0. || b <= 0. {
         return None;
     }
-    Some(InferenceBundle {
-        model_id: row.model_id.clone(),
-        feature_whitelist,
-        scaler_means: scaler_means.clone(),
-        scaler_stds: scaler_stds.clone(),
-        logistic: Some(LogisticModel {
-            intercept: coefficients.get("intercept")?.as_f64()?,
-            coefficients: coefficients_vec,
-            feature_names,
-            scaler_means,
-            scaler_stds,
-        }),
-        gam: None,
-        schema_version: row.schema_version.clone(),
-    })
-}
-
-async fn load_bundles(db: &DatabaseConnection) -> Result<Vec<InferenceBundle>> {
-    let rows = v2_model_registry::Entity::find()
-        .filter(v2_model_registry::Column::Status.eq("champion"))
-        .all(db)
-        .await?;
-    Ok(rows.iter().filter_map(bundle_from_registry).collect())
-}
-
-fn to_bars(rows: &[klines::Model]) -> Vec<Bar> {
-    rows.iter()
-        .filter_map(|row| {
-            let dt = DT::from_bar_ts(&row.ts)?;
-            Some(Bar {
-                dt,
-                open: row.open,
-                high: row.high,
-                low: row.low,
-                close: row.close,
-                volume: row.volume,
-                hold: row.hold,
-                rollover: false,
-            })
-        })
-        .collect()
-}
-
-fn to_rollover_records(rows: &[rollovers::Model]) -> Vec<crate::derive::rollover::RolloverRecord> {
-    rows.iter()
-        .filter(|r| r.confirmed)
-        .map(|r| crate::derive::rollover::RolloverRecord {
-            symbol: r.symbol.clone(),
-            ts: r.ts.clone(),
-            from_contract: r.from_contract.clone(),
-            to_contract: r.to_contract.clone(),
-            confirmed: r.confirmed,
-        })
-        .collect()
-}
-
-fn find_bar_index(bars: &[Bar], ts: &str) -> Option<usize> {
-    bars.iter().position(|bar| {
-        let actual = bar.dt.to_bar_ts();
-        actual == ts || actual.starts_with(ts) || ts.starts_with(&actual)
-    })
-}
-
-fn event_dim_string(event: &pattern_events::Model, key: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(&event.entry_score_dims)
-        .ok()?
-        .get(key)?
-        .as_str()
-        .map(str::to_string)
-}
-
-fn is_current_event_cohort(event: &pattern_events::Model) -> bool {
-    event_dim_string(event, "event_logic_version").as_deref()
-        == Some(crate::v2::version::EVENT_LOGIC_VERSION)
-        && event_dim_string(event, "pattern_version").as_deref()
-            == Some(crate::v2::PATTERN_LOGIC_VERSION)
-        && event_dim_string(event, "execution_version").as_deref()
-            == Some(crate::v2::EXECUTION_VERSION)
-        && event_dim_string(event, "feature_schema_version").as_deref()
-            == Some(crate::v2::FEATURE_SCHEMA_VERSION)
-}
-
-/// Convert a persisted forward event into the exact feature shape consumed by
-/// the trained models.  Trigger features are calculated only from the closed
-/// trigger bar and bars before it.
-pub fn dataset_row_from_event(event: &pattern_events::Model, bars: &[Bar]) -> Option<DatasetRow> {
-    dataset_row_from_event_with_context(event, bars, None)
-}
-
-pub fn dataset_row_from_event_with_context(
-    event: &pattern_events::Model,
-    bars: &[Bar],
-    market_context: Option<MarketContextSnapshot>,
-) -> Option<DatasetRow> {
-    let trigger_ts = event.trigger_bar_ts.as_deref()?;
-    let trigger_index = find_bar_index(bars, trigger_ts)?;
-    let trigger_bar = bars.get(trigger_index)?;
-    let atr_series = indicators::atr(bars, ATR_PERIOD);
-    let atr = atr_series.get(trigger_index).and_then(|value| *value);
-    let trigger_volume = event
-        .trigger_volume_ratio
-        .or_else(|| outcome::vol_ratio_at(bars, trigger_index));
-    let mut trigger = extract_trigger_features(
-        trigger_bar,
-        // The legacy pattern event stores the trigger price as `entry`.
-        event.entry,
-        event.risk,
-        atr,
-        trigger_volume,
-        None,
-        None,
-    );
-
-    let s1_index = find_bar_index(bars, &event.s1_ts);
-    let s2_index = find_bar_index(bars, &event.s2_ts);
-    let warning_index = find_bar_index(bars, &event.warning_ts).or(s2_index);
-    let a_atr = s1_index
-        .and_then(|index| atr_series.get(index).and_then(|value| *value))
-        .unwrap_or(0.0);
-    let b_atr = s2_index
-        .and_then(|index| atr_series.get(index).and_then(|value| *value))
-        .unwrap_or(0.0);
-    let warning_volume = warning_index.and_then(|index| outcome::vol_ratio_at(bars, index));
-    let (warning_close_location, warning_body_atr, warning_wick_ratio) = warning_index
-        .and_then(|index| {
-            bars.get(index).map(|bar| {
-                let range = (bar.high - bar.low).max(1e-9);
-                let body = (bar.close - bar.open).abs();
-                let upper = bar.high - bar.open.max(bar.close);
-                let lower = bar.open.min(bar.close) - bar.low;
-                (
-                    Some((bar.close - bar.low) / range),
-                    Some(body / b_atr.max(1e-9)),
-                    Some(if body > 1e-9 {
-                        upper.max(lower) / body
-                    } else {
-                        0.0
-                    }),
-                )
-            })
-        })
-        .unwrap_or((None, None, None));
-    let mut setup = SetupFeatures {
-        a_move: event.a_move,
-        b_move: event.b_move,
-        a_bars: event.a_bars,
-        b_bars: event.b_bars,
-        retracement: event.retracement,
-        a_speed: if event.a_bars > 0 {
-            event.a_move / event.a_bars as f64
-        } else {
-            0.0
-        },
-        a_move_atr: if a_atr > 1e-9 {
-            event.a_move / a_atr
-        } else {
-            0.0
-        },
-        b_move_atr: if b_atr > 1e-9 {
-            event.b_move / b_atr
-        } else {
-            0.0
-        },
-        grade: event.grade.clone(),
-        level: event.level.clone(),
-        direction: event.direction.clone(),
-        a_strong_count: 0,
-        setup_quality: event.entry_score,
-        trend60_state: event_dim_string(event, "trend_state").unwrap_or_default(),
-        warning_close_location,
-        warning_body_atr,
-        warning_wick_ratio,
-        warning_volume_ratio: warning_volume,
-        normalized: false,
-        missing_mask: 0,
-    };
-    normalize_direction(&mut setup, Some(&mut trigger));
-
     Some(DatasetRow {
         event_id: event.id.to_string(),
         symbol: event.symbol.clone(),
-        direction: setup.direction,
-        setup_quality: setup.setup_quality,
-        a_move: setup.a_move,
-        b_move: setup.b_move,
-        a_move_atr: setup.a_move_atr,
-        b_move_atr: setup.b_move_atr,
-        a_speed: setup.a_speed,
-        retracement: setup.retracement,
-        warning_volume_ratio: setup.warning_volume_ratio,
-        trigger_close_overshoot_r: trigger.close_overshoot_r,
-        trigger_close_location: trigger.close_location,
-        trigger_body_atr: trigger.body_atr,
-        trigger_volume_ratio: trigger.volume_ratio,
-        trigger_wick_atr: trigger.wick_atr,
-        internal_swing_margin_r: trigger.internal_swing_margin_r,
-        chase_distance_r: trigger.chase_distance_r,
-        missing_mask: setup.missing_mask | trigger.missing_mask,
-        label_win: i32::from(event.outcome.as_deref() == Some("win")),
-        r_multiple: event.r_multiple,
-        is_1r_aux_win: None,
-        trigger_bar_ts: Some(trigger.trigger_bar_ts),
-        exit_ts: event.exit_ts.clone(),
-        schema_version: crate::v2::FEATURE_SCHEMA_VERSION.to_string(),
-        trend_gap_60: market_context.as_ref().and_then(|c| c.trend_gap_60),
-        trend_slope_60: market_context.as_ref().and_then(|c| c.trend_slope_60),
-        trend_strength_60: market_context.as_ref().and_then(|c| c.trend_strength_60),
-        trend_alignment_60: market_context.as_ref().and_then(|c| c.trend_alignment_60),
-        trend_10d: market_context.as_ref().and_then(|c| c.trend_10d),
-        trend_alignment_10d: market_context.as_ref().and_then(|c| c.trend_alignment_10d),
-        range_position_10d: market_context.as_ref().and_then(|c| c.range_position_10d),
-        mr_position_10d: market_context.as_ref().and_then(|c| c.mr_position_10d),
-        distance_ma10_dir: market_context.as_ref().and_then(|c| c.distance_ma10_dir),
-        trend_position_interaction: market_context
-            .as_ref()
-            .and_then(|c| c.trend_position_interaction),
-        context_as_of_ts: market_context.as_ref().map(|c| c.as_of_ts.clone()),
-        context_last_60m_ts: market_context
-            .as_ref()
-            .and_then(|c| c.latest_60m_close_ts.clone()),
-        context_last_daily_day: market_context
-            .as_ref()
-            .and_then(|c| c.latest_daily_trading_day.clone()),
-        crossed_rollover_10d: market_context
-            .as_ref()
-            .map(|c| c.crossed_rollover_10d)
-            .unwrap_or(false),
+        direction: event.direction.clone(),
+        setup_quality: event.entry_score,
+        a_move: event.a_move,
+        b_move: event.b_move,
+        a_move_atr: event.a_move / a,
+        b_move_atr: event.b_move / b,
+        a_speed: event.a_move / event.a_bars.max(1) as f64,
+        retracement: event.retracement,
+        warning_volume_ratio: crate::analyze::outcome::vol_ratio_at(prefix, w),
+        trigger_bar_ts: Some(prefix[w].dt.to_bar_ts()),
+        context_as_of_ts: Some(prefix[w].dt.to_bar_ts()),
+        schema_version: crate::v3::FEATURES.into(),
+        ..Default::default()
     })
 }
-
-fn predict(bundle: &InferenceBundle, row: &DatasetRow) -> Option<Prediction> {
-    // A context model must never silently turn unavailable context into
-    // scaled zero/mean values.  The caller can retain the V0 champion as the
-    // fallback when this returns None.
-    let context_features = [
-        "trend_gap_60",
-        "trend_slope_60",
-        "trend_strength_60",
-        "trend_alignment_60",
-        "trend_10d",
-        "trend_alignment_10d",
-        "range_position_10d",
-        "mr_position_10d",
-        "distance_ma10_dir",
-        "trend_position_interaction",
-    ];
-    if bundle
-        .feature_whitelist
-        .iter()
-        .any(|name| context_features.contains(&name.as_str()))
-    {
-        let complete = bundle.feature_whitelist.iter().all(|name| {
-            !context_features.contains(&name.as_str())
-                || crate::v2::model::get_feature(row, name).is_some()
-        });
-        if !complete {
-            return None;
-        }
-    }
-    if bundle.logistic.is_some() {
-        predict_logistic(bundle, row)
-    } else {
-        predict_gam(bundle, row)
-    }
+/// Qualification requires actual prospective evidence, not an arbitrary status string.
+pub fn eligible(metrics: &serde_json::Value) -> bool {
+    let p = &metrics["prospective"];
+    metrics["contract"] == crate::v3::CONTRACT
+        && metrics["policy"] == crate::v3::POLICY
+        && metrics["features"] == crate::v3::FEATURES
+        && p["origin"] == "prospective"
+        && p["trading_days"].as_u64().unwrap_or(0) >= 30
+        && p["independent_groups"].as_u64().unwrap_or(0) >= 200
+        && p["auc_ci_low"].as_f64().unwrap_or(0.) > 0.5
+        && p["brier_skill"].as_f64().unwrap_or(-1.) > 0.
+        && p["net_r_delta_1tick_ci_low"].as_f64().unwrap_or(-1.) > 0.
+        && p["net_r_delta_2tick"].as_f64().unwrap_or(-1.) >= 0.
+        && p["drawdown_not_worse"].as_bool().unwrap_or(false)
+        && p["actual_contracts_and_costs"].as_bool().unwrap_or(false)
 }
-
-fn sql_quote(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-async fn upsert_prediction(
+async fn models(
     db: &DatabaseConnection,
-    event_id: i64,
-    prediction: &Prediction,
-) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO v2_model_predictions (event_id, model_id, p_win, logit, feature_hash, predicted_at, prediction_mode) VALUES ({}, '{}', {}, {}, '{}', '{}', '{}') ON CONFLICT(event_id, model_id) DO UPDATE SET p_win=excluded.p_win, logit=excluded.logit, feature_hash=excluded.feature_hash, predicted_at=excluded.predicted_at, prediction_mode=excluded.prediction_mode",
-        event_id,
-        sql_quote(&prediction.model_id),
-        prediction.p_win,
-        prediction.logit,
-        sql_quote(&prediction.feature_hash),
-        sql_quote(&prediction.predicted_at),
-        sql_quote(&prediction.prediction_mode),
-    );
-    db.execute(Statement::from_string(DbBackend::Sqlite, sql))
-        .await
-        .context("写入 V2 预测失败")?;
-    Ok(())
+) -> Result<Vec<(String, String, LogisticModel, serde_json::Value)>> {
+    let rows=db.query_all(Statement::from_string(DbBackend::Sqlite,"SELECT model_id,status,coefficients,metrics,feature_whitelist FROM v2_model_registry WHERE name='logistic-v3' AND schema_version='3' AND status IN ('champion','challenger')".to_string())).await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let m: serde_json::Value = serde_json::from_str(&row.try_get::<String>("", "metrics")?)?;
+        let features: Vec<String> =
+            serde_json::from_str(&row.try_get::<String>("", "feature_whitelist")?)?;
+        if m["contract"] != crate::v3::CONTRACT
+            || m["policy"] != crate::v3::POLICY
+            || m["features"] != crate::v3::FEATURES
+            || features != crate::v3::whitelist()
+        {
+            continue;
+        }
+        let model: LogisticModel =
+            serde_json::from_str(&row.try_get::<String>("", "coefficients")?)?;
+        if model.feature_names != features
+            || model.coefficients.len() != features.len()
+            || model.scaler_means.len() != features.len()
+            || model.scaler_stds.len() != features.len()
+        {
+            continue;
+        }
+        out.push((
+            row.try_get("", "model_id")?,
+            row.try_get("", "status")?,
+            model,
+            m,
+        ));
+    }
+    Ok(out)
 }
-
-/// Score one newly-triggered event with every registered model.
+pub async fn freeze_event(
+    db: &DatabaseConnection,
+    event: &pattern_events::Model,
+    bars: &[Bar],
+    origin: &str,
+) -> Result<usize> {
+    let Some(mut row) = dataset_row_from_event(event, bars) else {
+        return Ok(0);
+    };
+    row.label_win = 0;
+    row.exit_ts = None;
+    row.r_multiple = None;
+    let generation = repo::get_setting(db, "signal_generation")
+        .await?
+        .unwrap_or_else(|| "unprepared".into());
+    let decision = row.trigger_bar_ts.clone().unwrap();
+    let hash = crate::v2::model::feature_hash(&row, &crate::v3::whitelist());
+    db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO signal_snapshots(event_id,generation,origin,decision_at,feature_hash,features_json,created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING",vec![event.id.into(),generation.clone().into(),origin.into(),decision.clone().into(),hash.clone().into(),serde_json::to_string(&row)?.into(),chrono::Utc::now().to_rfc3339().into()])).await?;
+    let frozen = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT feature_hash,features_json,origin FROM signal_snapshots WHERE event_id=?",
+            vec![event.id.into()],
+        ))
+        .await?
+        .unwrap();
+    let frozen_origin: String = frozen.try_get("", "origin")?;
+    let frozen_row: DatasetRow =
+        serde_json::from_str(&frozen.try_get::<String>("", "features_json")?)?;
+    let frozen_hash: String = frozen.try_get("", "feature_hash")?;
+    let mut n = 0;
+    for (id, _status, model, _metrics) in models(db).await? {
+        let probability = model.predict_row_p(&frozen_row);
+        if !probability.is_finite() {
+            continue;
+        }
+        let result=db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO prediction_history(event_id,model_id,generation,decision_at,feature_hash,p_win,predicted_at,origin,contract) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(event_id,model_id,feature_hash) DO NOTHING",vec![event.id.into(),id.into(),generation.clone().into(),decision.clone().into(),frozen_hash.clone().into(),probability.into(),chrono::Utc::now().to_rfc3339().into(),frozen_origin.clone().into(),crate::v3::CONTRACT.into()])).await?;
+        n += result.rows_affected() as usize;
+    }
+    Ok(n)
+}
+/// Trigger-time calls must not create a warning-time forecast after seeing its outcome.
 pub async fn predict_event(
     db: &DatabaseConnection,
     event: &pattern_events::Model,
     bars: &[Bar],
 ) -> Result<usize> {
-    let raw_rows = repo::raw_klines(db, &event.symbol).await?;
-    let rollover_rows = repo::symbol_rollovers(db, &event.symbol).await?;
-    let rollover_records = to_rollover_records(&rollover_rows);
-    let raw = raw_rows
-        .iter()
-        .map(crate::service::model_to_fetch)
-        .collect::<Vec<_>>();
-    let (_, bars60) = {
-        let m15 = aggregate(&raw, Timeframe::M15)
-            .iter()
-            .filter_map(|k| {
-                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
-                    dt,
-                    open: k.open,
-                    high: k.high,
-                    low: k.low,
-                    close: k.close,
-                    volume: k.volume,
-                    hold: k.hold,
-                    rollover: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        let m60 = aggregate(&raw, Timeframe::M60)
-            .iter()
-            .filter_map(|k| {
-                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
-                    dt,
-                    open: k.open,
-                    high: k.high,
-                    low: k.low,
-                    close: k.close,
-                    volume: k.volume,
-                    hold: k.hold,
-                    rollover: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        (m15, m60)
-    };
-    let daily = aggregate(&raw, Timeframe::Day)
-        .iter()
-        .filter_map(|k| {
-            DT::from_bar_ts(&k.datetime).map(|dt| Bar {
-                dt,
-                open: k.open,
-                high: k.high,
-                low: k.low,
-                close: k.close,
-                volume: k.volume,
-                hold: k.hold,
-                rollover: false,
-            })
-        })
-        .collect::<Vec<_>>();
-    let context = event.trigger_bar_ts.as_deref().and_then(|ts| {
-        extract_market_context(
-            &event.symbol,
-            ts,
-            &event.direction,
-            bars,
-            &bars60,
-            &daily,
-            &rollover_records,
-        )
-    });
-    let Some(row) = dataset_row_from_event_with_context(event, bars, context) else {
+    if event.state != "pending" || event.trigger_ts.is_some() {
         return Ok(0);
-    };
-    let bundles = load_bundles(db).await?;
-    let mut written = 0;
-    for bundle in &bundles {
-        if let Some(prediction) = predict(bundle, &row) {
-            upsert_prediction(db, event.id, &prediction).await?;
-            written += 1;
-        }
     }
-    Ok(written)
+    freeze_event(db, event, bars, "prospective").await
 }
-
-/// Return whether the event is missing a non-null prediction for any current
-/// champion model.  This is intentionally a lightweight check used by the
-/// live scan retry path; it must not trigger a historical full backfill.
-pub async fn needs_prediction(db: &DatabaseConnection, event_id: i64) -> Result<bool> {
-    let sql = format!(
-        "SELECT EXISTS(SELECT 1 FROM v2_model_registry r WHERE r.status='champion' AND NOT EXISTS (SELECT 1 FROM v2_model_predictions p WHERE p.event_id={} AND p.model_id=r.model_id AND p.p_win IS NOT NULL)) AS missing",
-        event_id
-    );
-    let row = db
-        .query_one(Statement::from_string(DbBackend::Sqlite, sql))
-        .await?;
-    Ok(row
-        .and_then(|r| r.try_get::<i64>("", "missing").ok())
-        .unwrap_or(0)
-        != 0)
+pub async fn needs_prediction(_db: &DatabaseConnection, _id: i64) -> Result<bool> {
+    Ok(false)
 }
-
-/// Read the same champion probability preferred by the signal card: logistic
-/// first when multiple scoring slots have champions, otherwise the newest row.
+pub async fn has_champion_model(db: &DatabaseConnection) -> Result<bool> {
+    Ok(models(db)
+        .await?
+        .iter()
+        .any(|(_, s, _, m)| s == "champion" && eligible(m)))
+}
 pub async fn champion_win_rate(
     db: &DatabaseConnection,
     event_id: i64,
 ) -> Result<Option<ChampionWinRate>> {
-    let sql = format!(
-        "SELECT p.model_id, p.p_win FROM v2_model_predictions p \
-         INNER JOIN v2_model_registry r ON r.model_id = p.model_id \
-         WHERE p.event_id = {} AND r.status = 'champion' AND p.p_win IS NOT NULL \
-         ORDER BY CASE WHEN p.model_id LIKE 'logistic-%' THEN 0 ELSE 1 END, \
-                  p.predicted_at DESC LIMIT 1",
-        event_id
-    );
-    let row = db
-        .query_one(Statement::from_string(DbBackend::Sqlite, sql))
-        .await?;
-    Ok(row.and_then(|row| {
-        Some(ChampionWinRate {
-            model_id: row.try_get("", "model_id").ok()?,
-            p_win: row.try_get("", "p_win").ok()?,
-        })
-    }))
-}
-
-pub async fn has_champion_model(db: &DatabaseConnection) -> Result<bool> {
-    let row = db
-        .query_one(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT EXISTS(SELECT 1 FROM v2_model_registry WHERE status = 'champion') AS present"
-                .to_string(),
-        ))
-        .await?;
-    Ok(row
-        .and_then(|row| row.try_get::<i64>("", "present").ok())
-        .unwrap_or(0)
-        != 0)
-}
-
-/// Backfill missing predictions for all persisted events that have triggered.
-/// It is idempotent and only scores event/model pairs that are not present yet.
-pub async fn backfill(db: &DatabaseConnection) -> Result<BackfillResult> {
-    let bundles = load_bundles(db).await?;
-    let events = repo::all_pattern_events(db).await?;
-    let existing_rows = db
-        .query_all(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT event_id, model_id, p_win FROM v2_model_predictions".to_string(),
-        ))
-        .await?;
-    let mut existing = HashSet::new();
-    for row in existing_rows {
-        if let (Ok(event_id), Ok(model_id), Ok(p_win)) = (
-            row.try_get::<i64>("", "event_id"),
-            row.try_get::<String>("", "model_id"),
-            row.try_get::<Option<f64>>("", "p_win"),
-        ) {
-            if p_win.is_some() {
-                existing.insert((event_id, model_id));
-            }
+    for (id, status, _, metrics) in models(db).await? {
+        if status != "champion" || !eligible(&metrics) {
+            continue;
         }
+        if let Some(row)=db.query_one(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT p_win FROM prediction_history WHERE event_id=? AND model_id=? AND origin='prospective' ORDER BY id DESC LIMIT 1",vec![event_id.into(),id.clone().into()])).await? {return Ok(Some(ChampionWinRate{model_id:id,p_win:row.try_get("","p_win")?}))}
     }
-
-    let mut by_symbol: HashMap<String, Vec<pattern_events::Model>> = HashMap::new();
-    let mut current_cohort_events = 0usize;
-    let mut legacy_cohort_events = 0usize;
-    for event in events {
-        if event.trigger_bar_ts.is_some() {
-            if is_current_event_cohort(&event) {
-                // Keep these counts visible to callers so application
-                // retrospective stats can report current and legacy cohorts
-                // separately instead of silently mixing them.
-                current_cohort_events += 1;
-            } else {
-                legacy_cohort_events += 1;
-            }
-            by_symbol
-                .entry(event.symbol.clone())
-                .or_default()
-                .push(event);
-        }
-    }
-
-    let mut result = BackfillResult {
-        models: bundles.len(),
-        current_cohort_events,
-        legacy_cohort_events,
-        ..Default::default()
-    };
-    for (symbol, events) in by_symbol {
-        let rows = repo::klines(db, &symbol, "15m", None, None).await?;
-        let bars = to_bars(&rows);
-        let rollover_rows = repo::symbol_rollovers(db, &symbol).await?;
-        let rollover_records = to_rollover_records(&rollover_rows);
-        let raw_rows = repo::raw_klines(db, &symbol).await?;
-        let raw = raw_rows
-            .iter()
-            .map(crate::service::model_to_fetch)
-            .collect::<Vec<_>>();
-        let bars60 = aggregate(&raw, Timeframe::M60)
-            .iter()
-            .filter_map(|k| {
-                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
-                    dt,
-                    open: k.open,
-                    high: k.high,
-                    low: k.low,
-                    close: k.close,
-                    volume: k.volume,
-                    hold: k.hold,
-                    rollover: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        let daily = aggregate(&raw, Timeframe::Day)
-            .iter()
-            .filter_map(|k| {
-                DT::from_bar_ts(&k.datetime).map(|dt| Bar {
-                    dt,
-                    open: k.open,
-                    high: k.high,
-                    low: k.low,
-                    close: k.close,
-                    volume: k.volume,
-                    hold: k.hold,
-                    rollover: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        for event in events {
-            result.events_seen += 1;
-            let context = event.trigger_bar_ts.as_deref().and_then(|ts| {
-                extract_market_context(
-                    &symbol,
-                    ts,
-                    &event.direction,
-                    &bars,
-                    &bars60,
-                    &daily,
-                    &rollover_records,
-                )
-            });
-            let Some(row) = dataset_row_from_event_with_context(&event, &bars, context) else {
-                continue;
-            };
-            let mut scored = false;
-            for bundle in &bundles {
-                if existing.contains(&(event.id, bundle.model_id.clone())) {
-                    continue;
-                }
-                if let Some(prediction) = predict(bundle, &row) {
-                    upsert_prediction(db, event.id, &prediction).await?;
-                    existing.insert((event.id, bundle.model_id.clone()));
-                    result.predictions_written += 1;
-                    scored = true;
-                }
-            }
-            if scored {
-                result.events_scored += 1;
-            }
-        }
-    }
-    Ok(result)
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    #[test]
+    fn old_or_incomplete_evidence_cannot_qualify() {
+        assert!(!eligible(
+            &serde_json::json!({"prospective":{"trading_days":9999,"independent_groups":9999}})
+        ))
+    }
     #[tokio::test]
-    async fn champion_win_rate_matches_logistic_first_card_preference() {
+    async fn old_champion_is_not_a_fallback() {
         let db = crate::storage::connect(std::path::Path::new(":memory:"))
             .await
             .unwrap();
-        db.execute_unprepared(
-            "INSERT INTO v2_model_registry \
-             (model_id,name,schema_version,feature_whitelist,train_window,dataset_hash,coefficients,spline_knots,metrics,created_at,status,scoring_slot) VALUES \
-             ('gam-new','gam-v1','v1','[]','all','h1','{}',NULL,'{}','2026-09-07 10:00:00','champion','aux'), \
-             ('logistic-old','logistic-v1','v1','[]','all','h2','{}',NULL,'{}','2026-09-07 09:00:00','champion','default')",
-        )
-        .await
-        .unwrap();
-        db.execute_unprepared(
-            "INSERT INTO v2_model_predictions \
-             (event_id,model_id,p_win,logit,feature_hash,predicted_at,prediction_mode) VALUES \
-             (42,'gam-new',0.81,1.4,'f1','2026-09-07T10:00:00Z','live'), \
-             (42,'logistic-old',0.64,0.6,'f2','2026-09-07T09:00:00Z','live')",
-        )
-        .await
-        .unwrap();
-
-        assert!(has_champion_model(&db).await.unwrap());
-        let rate = champion_win_rate(&db, 42).await.unwrap().unwrap();
-        assert_eq!(rate.model_id, "logistic-old");
-        assert_eq!(rate.p_win, 0.64);
-        assert!(champion_win_rate(&db, 7).await.unwrap().is_none());
+        assert!(!has_champion_model(&db).await.unwrap());
+        assert!(champion_win_rate(&db, 1).await.unwrap().is_none());
     }
 }

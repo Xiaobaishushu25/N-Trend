@@ -1,10 +1,10 @@
-use crate::v2::features::normalized::normalize_direction;
 use crate::v2::model::scaler::get_feature;
 use crate::v2::replay::ReplayEvent;
 use serde::{Deserialize, Serialize};
 
 /// One training row — Setup + Trigger raw features + label
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DatasetRow {
     pub event_id: String,
     pub symbol: String,
@@ -63,23 +63,7 @@ impl DatasetBuilder {
         }
     }
     pub fn default_whitelist() -> Vec<String> {
-        vec![
-            "a_move_atr",
-            "b_move_atr",
-            "a_speed",
-            "retracement",
-            "warning_volume_ratio",
-            "trigger_close_overshoot_r",
-            "trigger_close_location",
-            "trigger_body_atr",
-            "trigger_volume_ratio",
-            "trigger_wick_atr",
-            "internal_swing_margin_r",
-            "chase_distance_r",
-        ]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect()
+        crate::v3::whitelist()
     }
 
     pub fn context_whitelist() -> Vec<String> {
@@ -103,19 +87,23 @@ impl DatasetBuilder {
     pub fn build(&self, events: Vec<ReplayEvent>) -> Vec<DatasetRow> {
         let mut rows = Vec::new();
         for ev in events {
-            if ev.trigger_features.is_none() || ev.outcome.is_none() {
+            let Some(result) = ev.evaluation.as_ref() else {
+                continue;
+            };
+            let Some(net) = result.net_amount else {
+                continue;
+            };
+            if result.status != "closed" {
                 continue;
             }
-            let tf = ev.trigger_features.clone().unwrap();
-            let out = ev.outcome.clone().unwrap();
-            // clone for normalization
-            let mut sf = ev.setup_features.clone();
-            let mut tf2 = tf.clone();
-            normalize_direction(&mut sf, Some(&mut tf2));
-            let row = DatasetRow {
-                event_id: format!("{}|{}|{}", ev.symbol, ev.s0_ts, ev.s2_ts),
+            let sf = &ev.setup_features;
+            rows.push(DatasetRow {
+                event_id: format!(
+                    "{}|{}|{}|{}|{}",
+                    ev.symbol, ev.direction, ev.s0_ts, ev.s2_ts, ev.warning_ts
+                ),
                 symbol: ev.symbol.clone(),
-                direction: sf.direction.clone(),
+                direction: ev.direction.clone(),
                 setup_quality: sf.setup_quality,
                 a_move: sf.a_move,
                 b_move: sf.b_move,
@@ -124,68 +112,34 @@ impl DatasetBuilder {
                 a_speed: sf.a_speed,
                 retracement: sf.retracement,
                 warning_volume_ratio: sf.warning_volume_ratio,
-                trigger_close_overshoot_r: tf2.close_overshoot_r,
-                trigger_close_location: tf2.close_location,
-                trigger_body_atr: tf2.body_atr,
-                trigger_volume_ratio: tf2.volume_ratio,
-                trigger_wick_atr: tf2.wick_atr,
-                internal_swing_margin_r: tf2.internal_swing_margin_r,
-                chase_distance_r: tf2.chase_distance_r,
-                missing_mask: sf.missing_mask | tf2.missing_mask,
-                label_win: if out.outcome == "win" { 1 } else { 0 },
-                r_multiple: Some(out.r_multiple),
-                is_1r_aux_win: out.is_1r_aux_win,
-                trigger_bar_ts: ev.trigger_bar_ts.clone(),
-                exit_ts: Some(out.exit_ts.clone()),
-                schema_version: ev.schema_version.clone(),
-                trend_gap_60: ev.market_context.as_ref().and_then(|c| c.trend_gap_60),
-                trend_slope_60: ev.market_context.as_ref().and_then(|c| c.trend_slope_60),
-                trend_strength_60: ev.market_context.as_ref().and_then(|c| c.trend_strength_60),
-                trend_alignment_60: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.trend_alignment_60),
-                trend_10d: ev.market_context.as_ref().and_then(|c| c.trend_10d),
-                trend_alignment_10d: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.trend_alignment_10d),
-                range_position_10d: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.range_position_10d),
-                mr_position_10d: ev.market_context.as_ref().and_then(|c| c.mr_position_10d),
-                distance_ma10_dir: ev.market_context.as_ref().and_then(|c| c.distance_ma10_dir),
-                trend_position_interaction: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.trend_position_interaction),
-                context_as_of_ts: ev.market_context.as_ref().map(|c| c.as_of_ts.clone()),
-                context_last_60m_ts: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.latest_60m_close_ts.clone()),
-                context_last_daily_day: ev
-                    .market_context
-                    .as_ref()
-                    .and_then(|c| c.latest_daily_trading_day.clone()),
-                crossed_rollover_10d: ev
-                    .market_context
-                    .as_ref()
-                    .map(|c| c.crossed_rollover_10d)
-                    .unwrap_or(false),
-            };
-            // whitelist drop: if whitelist non-empty, we keep row but caller can filter columns on export
-            rows.push(row);
+                label_win: i32::from(net > 0.0),
+                r_multiple: result.net_r,
+                trigger_bar_ts: Some(ev.warning_ts.clone()),
+                exit_ts: result.exit_ts.clone(),
+                schema_version: crate::v3::FEATURES.into(),
+                missing_mask: if sf.a_move_atr <= 0.0 || sf.b_move_atr <= 0.0 {
+                    4
+                } else {
+                    sf.missing_mask
+                },
+                context_as_of_ts: Some(ev.warning_ts.clone()),
+                ..Default::default()
+            });
         }
-        // time sort for walk-forward stability
-        rows.sort_by(|a, b| a.trigger_bar_ts.cmp(&b.trigger_bar_ts));
+        rows.sort_by(|a, b| {
+            a.trigger_bar_ts
+                .cmp(&b.trigger_bar_ts)
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
         rows
     }
     /// blake3 hash over (features + labels + config)
     pub fn hash(&self, rows: &[DatasetRow]) -> DatasetHash {
         let mut hasher = blake3::Hasher::new();
+        hasher.update(crate::v3::CONTRACT.as_bytes());
+        hasher.update(crate::v3::POLICY.as_bytes());
         hasher.update(self.feature_whitelist.join(",").as_bytes());
+        hasher.update(&serde_json::to_vec(rows).expect("serializable dataset"));
         for r in rows {
             let feature_values = self
                 .feature_whitelist

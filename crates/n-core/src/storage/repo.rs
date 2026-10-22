@@ -27,6 +27,23 @@ pub async fn set_v2_model_status(
     if !matches!(status, "challenger" | "champion" | "archived") {
         return Err(anyhow!("invalid V2 model status: {status}"));
     }
+    if status == "champion" {
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT name,metrics FROM v2_model_registry WHERE model_id=?",
+                vec![model_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| anyhow!("unknown model"))?;
+        let metrics: serde_json::Value =
+            serde_json::from_str(&row.try_get::<String>("", "metrics")?)?;
+        anyhow::ensure!(
+            row.try_get::<String>("", "name")? == "logistic-v3"
+                && crate::v2::prediction::eligible(&metrics),
+            "model has not passed prospective validation"
+        );
+    }
     db.transaction::<_, (), anyhow::Error>(|txn| {
         let model_id = model_id.to_string();
         let status = status.to_string();
@@ -1526,30 +1543,6 @@ pub async fn add_signal_annotation(
 }
 
 /// 重建后按原时间戳回填批注，保留用户记录的创建时间。
-pub(crate) async fn insert_signal_annotation_with_ts(
-    db: &DatabaseConnection,
-    event_id: i64,
-    content: &str,
-    created_at: &str,
-) -> Result<signal_annotations::Model> {
-    let row = signal_annotations::ActiveModel {
-        id: sea_orm::NotSet,
-        event_id: Set(event_id),
-        content: Set(content.to_string()),
-        created_at: Set(created_at.to_string()),
-    };
-    let res = signal_annotations::Entity::insert(row)
-        .exec(db)
-        .await
-        .context("回填信号批注失败")?;
-    signal_annotations_for_event(db, event_id)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .find(|r| r.id == res.last_insert_id)
-                .ok_or_else(|| anyhow!("批注回填后读取失败"))
-        })?
-}
 
 pub async fn delete_signal_annotation(db: &DatabaseConnection, id: i64) -> Result<()> {
     let res = signal_annotations::Entity::delete_by_id(id)
@@ -1607,35 +1600,7 @@ pub async fn set_signal_decision(
 }
 
 /// 重建后按原时间戳回填开仓记录，保留用户记录的更新时间。
-pub(crate) async fn insert_signal_decision_with_ts(
-    db: &DatabaseConnection,
-    event_id: i64,
-    opened: bool,
-    updated_at: &str,
-) -> Result<signal_decisions::Model> {
-    let row = signal_decisions::ActiveModel {
-        event_id: Set(event_id),
-        opened: Set(opened),
-        updated_at: Set(updated_at.to_string()),
-    };
-    signal_decisions::Entity::insert(row)
-        .on_conflict(
-            OnConflict::columns([signal_decisions::Column::EventId])
-                .update_columns([
-                    signal_decisions::Column::Opened,
-                    signal_decisions::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(db)
-        .await
-        .context("回填信号开仓记录失败")?;
-    signal_decision(db, event_id)
-        .await?
-        .ok_or_else(|| anyhow!("开仓记录回填后读取失败"))
-}
 
-/// 重建事件时清空旧用户记录；上层先快照再重建，重建后按信号身份回填。
 pub async fn clear_signal_user_data(db: &DatabaseConnection) -> Result<()> {
     signal_annotations::Entity::delete_many()
         .exec(db)

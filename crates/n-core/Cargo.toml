@@ -29,10 +29,8 @@ n-protocol = { path = "../n-protocol" }
 name = "migrate"
 path = "src/bin/migrate.rs"
 
-[[bin]]
-name = "v2-dataset"
-path = "src/bin/v2_dataset.rs"
+
 
 [[bin]]
-name = "v2-train"
-path = "src/bin/v2_train.rs"
+name = "signal-research"
+path = "src/bin/signal_research.rs"

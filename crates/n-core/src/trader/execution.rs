@@ -7,11 +7,8 @@ use tokio::sync::{Mutex, RwLock};
 use super::client::CtpTraderClient;
 use super::model::*;
 use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
-use super::trailing::continuous_stop_price;
 use crate::analyze::model::Dir;
-use crate::analyze::outcome::{
-    NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS, TRAIL_START_R,
-};
+use crate::analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +112,8 @@ pub struct ManagedPosition {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
+    #[serde(default)]
+    pub signal_evidence: Option<serde_json::Value>,
     pub id: String,
     pub condition_order_id: String,
     pub symbol: String,
@@ -512,7 +511,11 @@ impl ExecutionEngine {
     }
 
     /// Sort references under the lock; clone only the requested page, never the archive.
-    pub async fn execution_orders_page(&self, page: usize, page_size: usize) -> ExecutionOrdersPage {
+    pub async fn execution_orders_page(
+        &self,
+        page: usize,
+        page_size: usize,
+    ) -> ExecutionOrdersPage {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
         let state = self.state.lock().await;
@@ -521,13 +524,29 @@ impl ExecutionEngine {
         orders.sort_by_cached_key(|order| {
             std::cmp::Reverse((
                 order.trading_day.clone(),
-                order.request.order_ref.as_deref().unwrap_or("").parse::<u64>().unwrap_or(0),
+                order
+                    .request
+                    .order_ref
+                    .as_deref()
+                    .unwrap_or("")
+                    .parse::<u64>()
+                    .unwrap_or(0),
                 order.request.order_ref.clone().unwrap_or_default(),
             ))
         });
         let offset = page.saturating_sub(1).saturating_mul(page_size);
-        let items = orders.into_iter().skip(offset).take(page_size).cloned().collect();
-        ExecutionOrdersPage { items, total, page, page_size }
+        let items = orders
+            .into_iter()
+            .skip(offset)
+            .take(page_size)
+            .cloned()
+            .collect();
+        ExecutionOrdersPage {
+            items,
+            total,
+            page,
+            page_size,
+        }
     }
 
     pub async fn comparison_summary(&self) -> serde_json::Value {
@@ -1199,6 +1218,7 @@ impl ExecutionEngine {
                 let mult = crate::precision::effective_multiplier(&pos.instrument_id, "");
                 let pnl_amount = points * mult * trade.volume as f64;
                 let rec = TradeRecord {
+                    signal_evidence: None,
                     id: key,
                     condition_order_id: cond.id.clone(),
                     symbol: pos.symbol.clone(),
@@ -1561,41 +1581,33 @@ impl ExecutionEngine {
             pos.max_mfe_r = pos.max_mfe_r.max(r);
             pos.max_mae_r = pos.max_mae_r.min(r);
             if !s.closes.contains_key(&cond.id) {
-                if pos.tier == PositionTier::Small && r >= 1.0 {
-                    Self::latch_exit(&mut s, &cond.id, "target_1r", q.last, true);
-                } else if pos.tier == PositionTier::Large && !pos.lot1_closed && r >= TRAIL_START_R
-                {
-                    Self::latch_exit(&mut s, &cond.id, "target_1r", q.last, false);
-                } else if pos.lot1_closed {
-                    pos.current_stop_price = continuous_stop_price(
-                        pos.fill_price,
-                        pos.risk,
-                        sign,
-                        pos.max_mfe_r,
-                        pos.current_stop_price,
+                let update = super::policy::on_price(
+                    pos.tier,
+                    pos.fill_price,
+                    pos.risk,
+                    sign,
+                    q.last,
+                    pos.target_price,
+                    pos.current_stop_price,
+                    pos.max_mfe_r,
+                    pos.lot1_closed,
+                );
+                pos.current_stop_price = update.stop;
+                if (update.stop - pos.fill_price) * sign > 0.0 {
+                    pos.trailing_grade = pos.trailing_grade.max(2)
+                }
+                if let Some(intent) = update.intent {
+                    Self::latch_exit(
+                        &mut s,
+                        &cond.id,
+                        intent.reason,
+                        if intent.reason == "trailing" || intent.reason == "breakeven" {
+                            update.stop
+                        } else {
+                            q.last
+                        },
+                        intent.all,
                     );
-                    if (pos.current_stop_price - pos.fill_price) * sign > 0.0 {
-                        pos.trailing_grade = pos.trailing_grade.max(2);
-                    }
-                    if (q.last - pos.current_stop_price) * sign <= 0.0 {
-                        Self::latch_exit(
-                            &mut s,
-                            &cond.id,
-                            if pos.trailing_grade > 1 {
-                                "trailing"
-                            } else {
-                                "breakeven"
-                            },
-                            pos.current_stop_price,
-                            true,
-                        );
-                    } else if (q.last - pos.target_price) * sign >= 0.0 {
-                        let target_r =
-                            (pos.target_price - pos.fill_price) * sign / pos.risk.max(1e-9);
-                        if target_r > 1.0 {
-                            Self::latch_exit(&mut s, &cond.id, "target_s1", q.last, true);
-                        }
-                    }
                 }
             } else if s.closes[&cond.id].reason == "target_1r"
                 && pos.tier == PositionTier::Large

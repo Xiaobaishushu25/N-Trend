@@ -17,6 +17,7 @@ pub mod storage;
 pub mod trader;
 
 pub mod v2;
+pub mod v3;
 pub use sea_orm;
 
 pub use derive::Timeframe;

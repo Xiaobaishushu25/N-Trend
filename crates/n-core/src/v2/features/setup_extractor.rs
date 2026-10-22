@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Setup raw features — frozen at Warning K close
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SetupFeatures {
     pub a_move: f64,
     pub b_move: f64,

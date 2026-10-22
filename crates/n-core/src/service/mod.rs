@@ -232,7 +232,7 @@ fn pattern_endpoint_prices(bars: &[Bar], candidate: &event::WarningCandidate) ->
     }
 }
 
-async fn insert_warning_event(
+pub(crate) async fn insert_warning_event(
     db: &DatabaseConnection,
     symbol: &str,
     bars: &[Bar],
@@ -257,6 +257,7 @@ async fn insert_warning_event(
         "pattern_version": crate::v2::PATTERN_LOGIC_VERSION,
         "execution_version": crate::v2::EXECUTION_VERSION,
         "feature_schema_version": crate::v2::FEATURE_SCHEMA_VERSION,
+        "prediction_contract": crate::v3::CONTRACT,
     })
     .to_string();
     let (s0_price, s1_price, s2_price) = pattern_endpoint_prices(bars, candidate);
@@ -308,9 +309,27 @@ async fn insert_warning_event(
         ..Default::default()
     };
     let id = repo::insert_pattern_event(db, row).await?;
-    repo::pattern_event_by_id(db, id)
+    let model = repo::pattern_event_by_id(db, id)
         .await?
-        .ok_or_else(|| anyhow!("写入事件 {id} 后读取失败"))
+        .ok_or_else(|| anyhow!("写入事件 {id} 后读取失败"))?;
+    let recent = chrono::NaiveDateTime::parse_from_str(&model.warning_ts, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .is_some_and(|t| (chrono::Local::now().naive_local() - t).num_seconds().abs() <= 120);
+    crate::v2::prediction::freeze_event(
+        db,
+        &model,
+        bars,
+        if recent
+            && repo::get_setting(db, "signal_origin").await?.as_deref()
+                != Some("historical_rebuild")
+        {
+            "prospective"
+        } else {
+            "historical_rebuild"
+        },
+    )
+    .await?;
+    Ok(model)
 }
 
 /// 相似预警抑制：同品种、同方向、预警K线相差不超过 5 根 15m 时，如果既有
@@ -423,6 +442,18 @@ fn event_outcome_str(e: &pattern_events::Model) -> String {
     if let Some(outcome) = e.outcome.as_deref() {
         return outcome.to_string();
     }
+    if matches!(
+        e.state.as_str(),
+        "ambiguous"
+            | "missing_data"
+            | "rollover"
+            | "unfilled"
+            | "invalidated"
+            | "filtered"
+            | "unpriced"
+    ) {
+        return e.state.clone();
+    }
     if e.state == "expired" {
         "no_trigger".to_string()
     } else {
@@ -489,14 +520,24 @@ fn parse_entry_dims(dims: &str) -> Option<[f64; 3]> {
     Some([a, b, w])
 }
 
-fn stat_row_from(e: &pattern_events::Model, tick: Option<f64>) -> Option<outcome::StatRow> {
-    let risk = e.risk;
+fn stat_row_from(e: &pattern_events::Model, _tick: Option<f64>) -> Option<outcome::StatRow> {
     let outcome = e
         .outcome
         .as_deref()
         .and_then(outcome::Outcome::parse)
         .or_else(|| {
-            if e.state == "expired" {
+            if matches!(
+                e.state.as_str(),
+                "ambiguous"
+                    | "missing_data"
+                    | "rollover"
+                    | "unfilled"
+                    | "invalidated"
+                    | "filtered"
+                    | "unpriced"
+            ) {
+                Some(outcome::Outcome::InsufficientData)
+            } else if e.state == "expired" {
                 Some(outcome::Outcome::NoTrigger)
             } else {
                 Some(outcome::Outcome::Open)
@@ -546,19 +587,16 @@ fn stat_row_from(e: &pattern_events::Model, tick: Option<f64>) -> Option<outcome
         b_bars: Some(e.b_bars as usize),
         retracement: Some(e.retracement),
         dims: parse_entry_dims(&e.entry_score_dims),
-        net_r: e
-            .r_multiple
-            .zip(tick)
-            .filter(|_| risk > 0.0)
-            .map(|(r, t)| r - 2.5 * t / risk),
+        net_r: serde_json::from_str::<serde_json::Value>(&e.entry_score_dims)
+            .ok()
+            .and_then(|v| v["evaluation"]["net_r"].as_f64()),
         rollover_crossed: e.outcome.as_deref() == Some("rollover"),
         gap_crossed_entry: false,
         gap_crossed_exit: false,
     })
 }
 
-fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeDetail {
-    let risk = e.risk;
+fn outcome_detail_from(e: &pattern_events::Model, _tick: Option<f64>) -> OutcomeDetail {
     OutcomeDetail {
         event_id: e.id,
         symbol: e.symbol.clone(),
@@ -618,11 +656,9 @@ fn outcome_detail_from(e: &pattern_events::Model, tick: Option<f64>) -> OutcomeD
         b_fast: None,
         b_weakening: None,
         b_weakening_ratio: None,
-        net_r: e
-            .r_multiple
-            .zip(tick)
-            .filter(|_| risk > 0.0)
-            .map(|(r, t)| r - 2.5 * t / risk),
+        net_r: serde_json::from_str::<serde_json::Value>(&e.entry_score_dims)
+            .ok()
+            .and_then(|v| v["evaluation"]["net_r"].as_f64()),
         rollover_crossed: e.outcome.as_deref() == Some("rollover"),
         gap_crossed_entry: false,
         gap_crossed_exit: false,
@@ -820,6 +856,7 @@ fn preclose_candidate_model(
         "pattern_version": crate::v2::PATTERN_LOGIC_VERSION,
         "execution_version": crate::v2::EXECUTION_VERSION,
         "feature_schema_version": crate::v2::FEATURE_SCHEMA_VERSION,
+        "prediction_contract": crate::v3::CONTRACT,
     })
     .to_string();
     preclose_candidates::Model {
@@ -911,315 +948,91 @@ fn event_dir(e: &pattern_events::Model) -> Dir {
     }
 }
 
-fn trail_r(grade: usize) -> f64 {
-    if grade == 1 {
-        1.0
-    } else {
-        outcome::TRAIL_STEP_R * grade as f64
-    }
-}
-
-fn trigger_k_adj(bars: &[Bar], dir: Dir, i: usize) -> f64 {
-    let atr20 = crate::analyze::indicators::atr(bars, ATR_PERIOD);
-    match crate::analyze::scoring::single_reversal_pattern(bars, &atr20, dir, i, i) {
-        Some(kind) if matches!(kind.as_str(), "strong" | "engulf") => 0.5,
-        Some(_) => 0.2,
-        None => -0.3,
-    }
-}
-
-fn append_hold_history(e: &mut pattern_events::Model, ts: &str, score: f64) {
-    let mut history: Vec<serde_json::Value> =
-        serde_json::from_str(&e.hold_score_history).unwrap_or_default();
-    if history
-        .last()
-        .and_then(|v| v.get("ts"))
-        .and_then(|v| v.as_str())
-        == Some(ts)
-    {
-        return;
-    }
-    history.push(serde_json::json!({ "ts": ts, "score": score }));
-    e.hold_score_history = serde_json::json!(history).to_string();
-}
-
-fn hold_score_for(
-    e: &pattern_events::Model,
-    bars: &[Bar],
-    dir: Dir,
-    tc: usize,
-    mfe_r: f64,
-    mae_r: f64,
-    held: usize,
-) -> f64 {
-    let volume_adj = match e.trigger_volume_ratio {
-        Some(v) if v >= outcome::VOL_CONFIRM_RATIO => 0.5,
-        Some(v) if v < 0.8 => -0.3,
-        _ => 0.0,
+fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> bool {
+    let before = serde_json::to_string(e).unwrap_or_default();
+    let mut ev = crate::v2::replay::ReplayEvent {
+        symbol: e.symbol.clone(),
+        direction: e.direction.clone(),
+        warning_ts: e.warning_ts.clone(),
+        entry: e.entry,
+        stop: e.stop,
+        target: e.target,
+        risk: e.risk,
+        tick_size: bars
+            .iter()
+            .find(|b| b.dt.to_bar_ts().starts_with(&e.warning_ts))
+            .map(|b| (e.entry - if e.direction == "up" { b.high } else { b.low }).abs())
+            .filter(|v| *v > 0.)
+            .unwrap_or(1.),
+        ..Default::default()
     };
-    let chase_adj = match e.overshoot_r {
-        Some(v) if v >= 0.6 => 0.5,
-        Some(v) if v < 0.1 => -0.5,
-        _ => 0.0,
-    };
-    let time_adj = if held >= outcome::NO_FOLLOW_BAR && mfe_r < outcome::NO_FOLLOW_MFE_R {
-        -0.6
-    } else if held >= 3 && mfe_r <= 0.0 {
-        -0.3
-    } else {
-        0.0
-    };
-    let pnl_adj = if mfe_r >= 1.0 { 0.5 } else { 0.0 } + if mae_r <= -0.8 { -0.5 } else { 0.0 };
-    let score =
-        e.entry_score + trigger_k_adj(bars, dir, tc) + volume_adj + chase_adj + time_adj + pnl_adj;
-    score.clamp(0.0, 5.0)
-}
-
-fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], w: usize) -> bool {
-    let mut changed = false;
-    let dir = event_dir(e);
-    let risk = e.risk;
-    if risk <= 0.0 || e.entry <= 0.0 {
-        return false;
+    ev.setup_features.setup_quality = e.entry_score;
+    // This adapter has only 15m bars. It is deliberately more conservative than the raw5m research runner.
+    let raw = bars
+        .iter()
+        .map(|b| Kline {
+            datetime: b.dt.to_bar_ts(),
+            open: b.open,
+            high: b.high,
+            low: b.low,
+            close: b.close,
+            volume: b.volume,
+            hold: b.hold,
+        })
+        .collect::<Vec<_>>();
+    let roll = bars
+        .iter()
+        .filter(|b| b.rollover)
+        .map(|b| rollover::RolloverRecord {
+            symbol: e.symbol.clone(),
+            ts: b.dt.to_bar_ts(),
+            from_contract: String::new(),
+            to_contract: String::new(),
+            confirmed: true,
+        })
+        .collect::<Vec<_>>();
+    let result = crate::v3::replay::evaluate_at_resolution(
+        &ev,
+        &raw,
+        &roll,
+        false,
+        1.,
+        &crate::trader::ExecutionConfig::default(),
+        15,
+    );
+    if let Some(ts) = &result.entry_ts {
+        e.trigger_ts = e.trigger_ts.clone().or_else(|| Some(ts.clone()));
+        e.trigger_bar_ts = Some(ts.clone());
+        e.trigger_price = result.fill;
     }
-
-    let crossed = |bar: &Bar| match dir {
-        Dir::Up => bar.high >= e.entry,
-        Dir::Down => bar.low <= e.entry,
-    };
-    let tc = if let Some(ts) = e.trigger_bar_ts.as_deref() {
-        bars.iter().position(|b| bar_ts(b) == ts)
-    } else {
-        bars.iter()
-            .enumerate()
-            .skip(w + 1)
-            .find(|(_, b)| crossed(b))
-            .map(|(i, _)| i)
-    };
-    let Some(tc) = tc else {
-        return false;
-    };
-
-    if e.trigger_bar_ts.is_none() {
-        e.trigger_bar_ts = Some(bar_ts(&bars[tc]));
-        if e.trigger_ts.is_none() {
-            e.trigger_ts = Some(bar_ts(&bars[tc]));
-        }
-        e.trigger_price = Some(e.entry);
-        changed = true;
+    e.exit_ts = result.exit_ts.clone();
+    e.exit_reason = result
+        .exit_reason
+        .clone()
+        .or_else(|| Some(result.status.clone()));
+    e.exit_price = result.final_price;
+    e.mfe_r = Some(result.mfe_r);
+    e.mae_r = Some(result.mae_r);
+    if result.status == "closed" {
+        // An unpriced gross result is never a net win/loss training label.
+        e.state = "unpriced".into();
+        e.r_multiple = None;
+        e.outcome = None;
+        let mut dims: serde_json::Value =
+            serde_json::from_str(&e.entry_score_dims).unwrap_or_else(|_| serde_json::json!({}));
+        dims["evaluation"] = serde_json::to_value(&result).unwrap();
+        dims["cost_version"] = serde_json::json!("unpriced");
+        e.entry_score_dims = dims.to_string();
+    } else if matches!(
+        result.status.as_str(),
+        "ambiguous" | "missing_data" | "rollover" | "invalidated" | "unfilled"
+    ) {
+        e.state = result.status;
+        e.outcome = None;
+        e.r_multiple = None;
     }
-
-    if e.trigger_volume_ratio.is_none() {
-        e.trigger_volume_ratio = outcome::vol_ratio_at(bars, tc);
-        changed = true;
-    }
-    if e.overshoot_r.is_none() {
-        let overshoot = match dir {
-            Dir::Up => (bars[tc].high - e.entry) / risk,
-            Dir::Down => (e.entry - bars[tc].low) / risk,
-        };
-        e.overshoot_r = Some(overshoot.max(0.0));
-        changed = true;
-    }
-    if e.trigger_score.is_none() {
-        let volume_adj = match e.trigger_volume_ratio {
-            Some(v) if v >= outcome::VOL_CONFIRM_RATIO => 0.5,
-            Some(v) if v < 0.8 => -0.3,
-            _ => 0.0,
-        };
-        let chase_adj = match e.overshoot_r {
-            Some(v) if v >= 0.6 => 0.5,
-            Some(v) if v < 0.1 => -0.5,
-            _ => 0.0,
-        };
-        e.trigger_score = Some(
-            (e.entry_score + trigger_k_adj(bars, dir, tc) + volume_adj + chase_adj).clamp(0.0, 5.0),
-        );
-        changed = true;
-    }
-
-    let mut fill = e.trigger_price.unwrap_or(e.entry);
-    if tc > 0 && !bars[tc - 1].rollover {
-        let prev_close = bars[tc - 1].close;
-        let cur_open = bars[tc].open;
-        let gap = match dir {
-            Dir::Up => prev_close < e.entry && cur_open > e.entry,
-            Dir::Down => prev_close > e.entry && cur_open < e.entry,
-        };
-        if gap {
-            fill = cur_open;
-        }
-    }
-    if e.trigger_price != Some(fill) {
-        e.trigger_price = Some(fill);
-        changed = true;
-    }
-
-    let base_tp = match dir {
-        Dir::Up => fill + risk,
-        Dir::Down => fill - risk,
-    };
-    let mut mfe = e.mfe_r.unwrap_or(0.0);
-    let mut mae = e.mae_r.unwrap_or(0.0);
-    let mut trail_grade: Option<usize> = None;
-    let mut exit: Option<(String, f64, String, f64, usize)> = None;
-    let mut last_idx = tc;
-
-    for i in tc..bars.len() {
-        let bar = &bars[i];
-        if bar.rollover {
-            exit = Some((
-                "rollover".to_string(),
-                bar.open,
-                bar_ts(bar),
-                0.0,
-                i - tc + 1,
-            ));
-            last_idx = i;
-            break;
-        }
-        let held = i - tc + 1;
-        let mfe_contrib = match dir {
-            Dir::Up => (bar.high - fill) / risk,
-            Dir::Down => (fill - bar.low) / risk,
-        };
-        let mae_contrib = match dir {
-            Dir::Up => (bar.low - fill) / risk,
-            Dir::Down => (fill - bar.high) / risk,
-        };
-        mfe = mfe.max(mfe_contrib);
-        mae = mae.min(mae_contrib);
-
-        let stop_hit = match dir {
-            Dir::Up => bar.low <= e.stop,
-            Dir::Down => bar.high >= e.stop,
-        };
-        if stop_hit {
-            let stop_gap = i > 0
-                && !bars[i - 1].rollover
-                && match dir {
-                    Dir::Up => bars[i - 1].close > e.stop && bar.open < e.stop,
-                    Dir::Down => bars[i - 1].close < e.stop && bar.open > e.stop,
-                };
-            let exit_price = if stop_gap { bar.open } else { e.stop };
-            let r = match dir {
-                Dir::Up => (exit_price - fill) / risk,
-                Dir::Down => (fill - exit_price) / risk,
-            };
-            exit = Some(("stop".to_string(), exit_price, bar_ts(bar), r, held));
-            last_idx = i;
-            break;
-        }
-
-        let reached_tp1 = match dir {
-            Dir::Up => bar.high >= base_tp,
-            Dir::Down => bar.low <= base_tp,
-        };
-        if trail_grade.is_none() && reached_tp1 {
-            trail_grade = Some(1);
-        }
-        if let Some(mut grade) = trail_grade {
-            loop {
-                let next_grade = grade + 1;
-                let next_r = trail_r(next_grade);
-                let next_price = match dir {
-                    Dir::Up => fill + next_r * risk,
-                    Dir::Down => fill - next_r * risk,
-                };
-                let next_hit = match dir {
-                    Dir::Up => bar.high >= next_price,
-                    Dir::Down => bar.low <= next_price,
-                };
-                if !next_hit {
-                    break;
-                }
-                grade = next_grade;
-            }
-            trail_grade = Some(grade);
-            let trail_price = match dir {
-                Dir::Up => fill + trail_r(grade) * risk,
-                Dir::Down => fill - trail_r(grade) * risk,
-            };
-            let fell_back = match dir {
-                Dir::Up => bar.low <= trail_price,
-                Dir::Down => bar.high >= trail_price,
-            };
-            if fell_back {
-                let r = match dir {
-                    Dir::Up => (trail_price - fill) / risk,
-                    Dir::Down => (fill - trail_price) / risk,
-                };
-                exit = Some(("target".to_string(), trail_price, bar_ts(bar), r, held));
-                last_idx = i;
-                break;
-            }
-        }
-
-        if i == tc + outcome::NO_FOLLOW_BAR && mfe < outcome::NO_FOLLOW_MFE_R {
-            let r = match dir {
-                Dir::Up => (bar.close - fill) / risk,
-                Dir::Down => (fill - bar.close) / risk,
-            };
-            exit = Some(("no_follow".to_string(), bar.close, bar_ts(bar), r, held));
-            last_idx = i;
-            break;
-        }
-        if held >= outcome::TIME_HORIZON_BARS {
-            let r = match dir {
-                Dir::Up => (bar.close - fill) / risk,
-                Dir::Down => (fill - bar.close) / risk,
-            };
-            exit = Some(("time_exit".to_string(), bar.close, bar_ts(bar), r, held));
-            last_idx = i;
-            break;
-        }
-        last_idx = i;
-    }
-
-    let current_ts = bar_ts(&bars[last_idx]);
-    if let Some((reason, price, ts, r, held)) = exit {
-        let outcome_str = if reason == "rollover" {
-            "rollover"
-        } else if r > 0.0 {
-            "win"
-        } else {
-            "loss"
-        };
-        e.state = "closed".to_string();
-        e.outcome = Some(outcome_str.to_string());
-        e.exit_reason = Some(reason);
-        e.exit_ts = Some(ts.clone());
-        e.exit_price = Some(price);
-        e.r_multiple = if outcome_str == "rollover" {
-            None
-        } else {
-            Some(r)
-        };
-        e.mfe_r = Some(mfe);
-        e.mae_r = Some(mae);
-        e.last_advance_ts = Some(ts);
-        e.hold_score = Some(hold_score_for(e, bars, dir, tc, mfe, mae, held));
-        append_hold_history(e, &current_ts, e.hold_score.unwrap_or(0.0));
-        return true;
-    }
-
-    if e.mfe_r != Some(mfe) || e.mae_r != Some(mae) {
-        e.mfe_r = Some(mfe);
-        e.mae_r = Some(mae);
-        changed = true;
-    }
-    let held = last_idx - tc + 1;
-    let score = hold_score_for(e, bars, dir, tc, mfe, mae, held);
-    if e.hold_score != Some(score) {
-        e.hold_score = Some(score);
-        changed = true;
-    }
-    if e.last_advance_ts.as_deref() != Some(current_ts.as_str()) {
-        e.last_advance_ts = Some(current_ts.clone());
-        changed = true;
-    }
-    append_hold_history(e, &current_ts, score);
-    changed
+    e.updated_at = now_ts();
+    serde_json::to_string(e).unwrap_or_default() != before
 }
 
 fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
@@ -3428,8 +3241,14 @@ impl Services {
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
+        let raw = repo::raw_klines(&self.db, symbol).await?;
+        let cutoff = raw.last().map(|r| r.ts.as_str()).unwrap_or("");
         let rows = repo::klines(&self.db, symbol, timeframe, None, None).await?;
-        let mut bars: Vec<Bar> = rows.iter().filter_map(model_to_bar).collect();
+        let mut bars: Vec<Bar> = rows
+            .iter()
+            .filter(|r| r.ts.as_str() <= cutoff)
+            .filter_map(model_to_bar)
+            .collect();
         let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
         mark_rollover_bars(&mut bars, &rollovers, timeframe);
         if bars.len() >= ATR_PERIOD + 2 {
@@ -3440,6 +3259,7 @@ impl Services {
         let fetch_bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let fallback: Vec<Bar> = aggregate(&fetch_bars, tf)
             .iter()
+            .filter(|r| r.datetime.as_str() <= cutoff)
             .filter_map(fetch_to_bar)
             .collect();
         if fallback.len() > bars.len() {
@@ -3462,8 +3282,17 @@ impl Services {
             let rows = repo::klines(&self.db, symbol, "5m", limit, None).await?;
             return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
+        let raw_cutoff = repo::raw_klines(&self.db, symbol)
+            .await?
+            .last()
+            .map(|r| r.ts.clone())
+            .unwrap_or_default();
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
-            let rows = repo::klines(&self.db, symbol, tf.as_str(), limit, None).await?;
+            let rows = repo::klines(&self.db, symbol, tf.as_str(), limit, None)
+                .await?
+                .into_iter()
+                .filter(|r| r.ts <= raw_cutoff)
+                .collect::<Vec<_>>();
             if !rows.is_empty() {
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
@@ -3471,7 +3300,11 @@ impl Services {
         let raw = repo::raw_klines(&self.db, symbol).await?;
         let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let derived = aggregate(&bars, tf);
-        let mut bars: Vec<Bar> = derived.iter().filter_map(fetch_to_bar).collect();
+        let mut bars: Vec<Bar> = derived
+            .iter()
+            .filter(|r| r.datetime <= raw_cutoff)
+            .filter_map(fetch_to_bar)
+            .collect();
         mark_rollover_bars(&mut bars, &rollovers, tf.as_str());
         let rows: Vec<KlineDto> = bars
             .iter()
@@ -3495,18 +3328,37 @@ impl Services {
         let primary_is_tq = config.data_source.primary_source == "tqsdk";
         if !primary_is_tq {
             let rows = self.get_klines(symbol, timeframe, limit).await?;
-            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线本地数据库查询完成");
+            tracing::info!(
+                trace_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                rows = rows.len(),
+                "K线本地数据库查询完成"
+            );
             return Ok(ChartKlineResponse {
                 rows,
-                status: "tqsdk".to_string(),
-                message: String::new(),
+                status: if config.data_source.primary_source == "offline" {
+                    "offline_snapshot"
+                } else {
+                    "tqsdk"
+                }
+                .to_string(),
+                message: if config.data_source.primary_source == "offline" {
+                    "冻结的本地研究快照".into()
+                } else {
+                    String::new()
+                },
                 partial_bar: None,
             });
         }
 
         // 健康检查有自己的冷却与连续成功策略，避免短暂抖动时反复切换。
         let tq_ready = self.data_source.tq_available_or_probe().await;
-        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), tq_ready, "K线天勤健康检查完成");
+        tracing::info!(
+            trace_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            tq_ready,
+            "K线天勤健康检查完成"
+        );
 
         if tq_ready {
             let had_fallback = self.chart_fallback_cache.lock().await.contains_key(symbol);
@@ -3517,7 +3369,11 @@ impl Services {
                 match self.recover_chart_gap(symbol).await {
                     Ok(()) => {
                         self.chart_fallback_cache.lock().await.remove(symbol);
-                        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), "K线历史回退缺口恢复完成");
+                        tracing::info!(
+                            trace_id,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "K线历史回退缺口恢复完成"
+                        );
                     }
                     Err(error) => {
                         recovery_pending = true;
@@ -3528,7 +3384,12 @@ impl Services {
             }
 
             let rows = self.get_klines(symbol, timeframe, limit).await?;
-            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线本地数据库查询完成");
+            tracing::info!(
+                trace_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                rows = rows.len(),
+                "K线本地数据库查询完成"
+            );
             let mut partial_bar = None;
             let now = chrono::Local::now();
             if crate::scheduler::is_symbol_trading_time(symbol, &now) {
@@ -3539,7 +3400,12 @@ impl Services {
                     }
                 }
             }
-            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), has_partial = partial_bar.is_some(), "K线未完成柱检查完成");
+            tracing::info!(
+                trace_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                has_partial = partial_bar.is_some(),
+                "K线未完成柱检查完成"
+            );
 
             return Ok(ChartKlineResponse {
                 rows,
@@ -3555,7 +3421,12 @@ impl Services {
 
         if !config.data_source.fallback_enabled {
             let rows = self.get_klines(symbol, timeframe, limit).await?;
-            tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = rows.len(), "K线数据源不可用，读取本地历史完成");
+            tracing::info!(
+                trace_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                rows = rows.len(),
+                "K线数据源不可用，读取本地历史完成"
+            );
             let mut partial_bar = None;
             let now = chrono::Local::now();
             if crate::scheduler::is_symbol_trading_time(symbol, &now) {
@@ -3576,7 +3447,11 @@ impl Services {
         }
 
         // 新浪桥接变慢时先展示正式库中的历史K线，避免图表被外部请求卡住。
-        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), "K线新浪临时回退开始");
+        tracing::info!(
+            trace_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "K线新浪临时回退开始"
+        );
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
             self.get_chart_klines_from_sina(symbol, timeframe, limit),
@@ -3584,15 +3459,32 @@ impl Services {
         .await
         {
             Ok(Ok(response)) => {
-                tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), rows = response.rows.len(), "K线新浪临时回退完成");
+                tracing::info!(
+                    trace_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    rows = response.rows.len(),
+                    "K线新浪临时回退完成"
+                );
                 Ok(response)
-            },
+            }
             Ok(Err(error)) => {
-                tracing::warn!(trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "新浪临时图表获取失败，回退本地历史K线: {error:#}");
+                tracing::warn!(
+                    trace_id,
+                    symbol,
+                    timeframe,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "新浪临时图表获取失败，回退本地历史K线: {error:#}"
+                );
                 self.local_chart_fallback(symbol, timeframe, limit).await
             }
             Err(_) => {
-                tracing::warn!(trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "新浪临时图表超过2秒，回退本地历史K线");
+                tracing::warn!(
+                    trace_id,
+                    symbol,
+                    timeframe,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "新浪临时图表超过2秒，回退本地历史K线"
+                );
                 self.local_chart_fallback(symbol, timeframe, limit).await
             }
         }
@@ -3605,7 +3497,10 @@ impl Services {
         limit: Option<usize>,
     ) -> Result<ChartKlineResponse> {
         let rows = self.get_klines(symbol, timeframe, limit).await?;
-        let latest = rows.last().map(|row| row.ts.as_str()).unwrap_or("无本地数据");
+        let latest = rows
+            .last()
+            .map(|row| row.ts.as_str())
+            .unwrap_or("无本地数据");
         Ok(ChartKlineResponse {
             message: format!("实时数据源响应缓慢，当前显示本地已入库历史K线（截至 {latest}）；请勿作为实时行情使用。"),
             rows,
@@ -3901,6 +3796,9 @@ impl Services {
     /// 优先使用天勤桥接内存极速探测（<=80ms），超时或无数据从内存缓存 live_5m_bars 回退，
     /// 若内存尚无则尝试读取最新行情快照就地构造，确保毫秒级响应不阻塞图表渲染。
     pub async fn get_or_probe_live_5m_bar(&self, symbol: &str) -> Option<KlineDto> {
+        if self.config().await.data_source.primary_source == "offline" {
+            return None;
+        }
         let now = chrono::Local::now();
         if !crate::scheduler::is_symbol_trading_time(symbol, &now) {
             return None;
@@ -4032,14 +3930,17 @@ impl Services {
         // Otherwise a delayed database refresh can turn the whole night opening move
         // into a tiny candle starting at the latest quote.
         if target_tf == crate::derive::Timeframe::M15 {
-            let end = NaiveDateTime::parse_from_str(&target_bucket_end, "%Y-%m-%d %H:%M:%S").ok()?;
+            let end =
+                NaiveDateTime::parse_from_str(&target_bucket_end, "%Y-%m-%d %H:%M:%S").ok()?;
             let live_end = NaiveDateTime::parse_from_str(&live_5m.ts, "%Y-%m-%d %H:%M:%S").ok()?;
             let first = end - ChronoDuration::minutes(10);
             let missing_slice = |rows: &[Kline]| {
                 (0..3).any(|i| {
                     let ts = first + ChronoDuration::minutes(i * 5);
                     ts <= live_end
-                        && !rows.iter().any(|row| row.datetime == ts.format("%Y-%m-%d %H:%M:%S").to_string())
+                        && !rows
+                            .iter()
+                            .any(|row| row.datetime == ts.format("%Y-%m-%d %H:%M:%S").to_string())
                 })
             };
             if missing_slice(&bars) && self.data_source.tq_is_available() {
@@ -4050,8 +3951,10 @@ impl Services {
                 )
                 .await
                 {
-                    let mut by_ts: std::collections::BTreeMap<String, Kline> =
-                        bars.into_iter().map(|bar| (bar.datetime.clone(), bar)).collect();
+                    let mut by_ts: std::collections::BTreeMap<String, Kline> = bars
+                        .into_iter()
+                        .map(|bar| (bar.datetime.clone(), bar))
+                        .collect();
                     for bar in raw.klines {
                         if bar.datetime <= live_5m.ts {
                             by_ts.insert(bar.datetime.clone(), bar);
@@ -4061,7 +3964,11 @@ impl Services {
                 }
             }
             if missing_slice(&bars) {
-                tracing::warn!(symbol, target_bucket_end, "15m 临时K线缺少同桶5m数据，暂不绘制不完整K线");
+                tracing::warn!(
+                    symbol,
+                    target_bucket_end,
+                    "15m 临时K线缺少同桶5m数据，暂不绘制不完整K线"
+                );
                 return None;
             }
         }
@@ -4654,138 +4561,28 @@ impl Services {
     /// 清空旧事件后按当前全部 15m K 线重建：前向识别预警并插入，
     /// 再把每个事件推进到现在的真实状态（触发/失效/已了结）。
     pub async fn rebuild_events(&self) -> Result<usize> {
-        let _scan_guard = self.scan_lock.lock().await;
-        let old_events = repo::all_pattern_events(&self.db).await?;
-        let old_keys: HashMap<i64, (String, String, String, String, String, String)> = old_events
-            .iter()
-            .map(|e| {
-                (
-                    e.id,
-                    (
-                        e.symbol.clone(),
-                        e.direction.clone(),
-                        e.s0_ts.clone(),
-                        e.s1_ts.clone(),
-                        e.s2_ts.clone(),
-                        e.warning_ts.clone(),
-                    ),
-                )
-            })
-            .collect();
-        let annotations = repo::all_signal_annotations(&self.db).await?;
-        let decisions = repo::all_signal_decisions(&self.db).await?;
-        repo::clear_pattern_events(&self.db).await?;
-        repo::clear_signal_user_data(&self.db).await?;
-        self.entry_notified.write().await.clear();
-        let symbols = repo::list_symbols(&self.db, true).await?;
-        let mut inserted = 0usize;
-        for sym in symbols {
-            let bars15 = self.bars_for(&sym.code, "15m").await?;
-            if bars15.len() < ATR_PERIOD + 2 {
-                continue;
-            }
+        let _guard = self.scan_lock.lock().await;
+        let mut inserted = 0;
+        for sym in repo::list_symbols(&self.db, true).await? {
+            self.pipeline.rebuild_derived(&sym.code).await?;
+            let bars = self.bars_for(&sym.code, "15m").await?;
             let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
-            let candidates = event::replay_warnings(&sym.code, &bars15, tick);
-            let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
-            for c in candidates {
-                let direction = if c.direction == Dir::Up { "up" } else { "down" };
-                let warning_ts = bar_ts(&bars15[c.warning_index]);
-                if repo::pattern_event_by_warning(&self.db, &sym.code, direction, &warning_ts)
+            for c in event::replay_warnings(&sym.code, &bars, tick) {
+                let dir = if c.direction == Dir::Up { "up" } else { "down" };
+                let warning = bar_ts(&bars[c.warning_index]);
+                if repo::pattern_event_by_warning(&self.db, &sym.code, dir, &warning)
                     .await?
-                    .is_some()
-                    || has_similar_warning(&bars15, &c, &events)?
+                    .is_none()
                 {
-                    continue;
-                }
-                let model = insert_warning_event(&self.db, &sym.code, &bars15, &c).await?;
-                events.push(model);
-                inserted += 1;
-            }
-
-            let events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
-            for mut e in events {
-                if advance_event_model(&mut e, &bars15) {
-                    repo::update_pattern_event(&self.db, e).await?;
+                    insert_warning_event(&self.db, &sym.code, &bars, &c).await?;
+                    inserted += 1;
                 }
             }
-        }
-        self.cleanup_duplicate_events().await?;
-        let new_events = repo::all_pattern_events(&self.db).await?;
-        let mut new_keys_by_structure: HashMap<(String, String, String, String, String), i64> =
-            HashMap::new();
-        let mut new_keys_by_warning: HashMap<(String, String, String), i64> = HashMap::new();
-        for e in &new_events {
-            new_keys_by_structure
-                .entry((
-                    e.symbol.clone(),
-                    e.direction.clone(),
-                    e.s0_ts.clone(),
-                    e.s1_ts.clone(),
-                    e.s2_ts.clone(),
-                ))
-                .or_insert(e.id);
-            new_keys_by_warning
-                .entry((e.symbol.clone(), e.direction.clone(), e.warning_ts.clone()))
-                .or_insert(e.id);
-        }
-        for ann in annotations {
-            let Some((symbol, direction, s0_ts, s1_ts, s2_ts, warning_ts)) =
-                old_keys.get(&ann.event_id)
-            else {
-                continue;
-            };
-            let structure_key = (
-                symbol.clone(),
-                direction.clone(),
-                s0_ts.clone(),
-                s1_ts.clone(),
-                s2_ts.clone(),
-            );
-            let new_id = new_keys_by_structure
-                .get(&structure_key)
-                .copied()
-                .or_else(|| {
-                    new_keys_by_warning
-                        .get(&(symbol.clone(), direction.clone(), warning_ts.clone()))
-                        .copied()
-                });
-            let Some(new_id) = new_id else {
-                continue;
-            };
-            repo::insert_signal_annotation_with_ts(&self.db, new_id, &ann.content, &ann.created_at)
-                .await?;
-        }
-        for decision in decisions {
-            let Some((symbol, direction, s0_ts, s1_ts, s2_ts, warning_ts)) =
-                old_keys.get(&decision.event_id)
-            else {
-                continue;
-            };
-            let structure_key = (
-                symbol.clone(),
-                direction.clone(),
-                s0_ts.clone(),
-                s1_ts.clone(),
-                s2_ts.clone(),
-            );
-            let new_id = new_keys_by_structure
-                .get(&structure_key)
-                .copied()
-                .or_else(|| {
-                    new_keys_by_warning
-                        .get(&(symbol.clone(), direction.clone(), warning_ts.clone()))
-                        .copied()
-                });
-            let Some(new_id) = new_id else {
-                continue;
-            };
-            repo::insert_signal_decision_with_ts(
-                &self.db,
-                new_id,
-                decision.opened,
-                &decision.updated_at,
-            )
-            .await?;
+            for mut old in repo::pattern_events_by_symbol(&self.db, &sym.code, None).await? {
+                if advance_event_model(&mut old, &bars) {
+                    repo::update_pattern_event(&self.db, old).await?;
+                }
+            }
         }
         Ok(inserted)
     }

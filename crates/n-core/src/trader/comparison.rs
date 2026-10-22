@@ -5,13 +5,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{Days, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 
-use super::execution::{ConditionOrder, ExecutionConfig, PositionTier};
+use super::execution::{ConditionOrder, ExecutionConfig};
 use super::model::ExecutionQuote;
 use super::overnight::check_pre_close_checkpoint;
-use super::trailing::continuous_stop_price;
 use crate::analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, TIME_HORIZON_BARS};
 
-pub const COMPARISON_VERSION: &str = "paired-quote-v2-continuous-08r";
+pub const COMPARISON_VERSION: &str = "paired-quote-v3-shared-policy";
 pub const COST_TICKS: f64 = 2.5;
 pub const FILTER_TICKS: u32 = 10;
 
@@ -198,41 +197,39 @@ impl VariantTrade {
         };
         if let Some(reason) = reason.map(str::to_owned) {
             self.exit(signal, q, now, self.remaining, &reason);
-        } else if signal.tier == PositionTier::Small && r >= 1.0 {
-            self.exit(signal, q, now, self.remaining, "target_1r");
-        } else if signal.tier == PositionTier::Large && !self.first_leg_closed && r >= 1.0 {
-            self.exit(signal, q, now, self.remaining.min(1), "target_1r");
-            self.first_leg_closed = true;
-            self.trailing_grade = 1;
-            self.stop = self.fill_price.unwrap();
-        } else if self.first_leg_closed {
-            self.stop = continuous_stop_price(
+        } else {
+            let update = super::policy::on_price(
+                signal.tier,
                 self.fill_price.unwrap(),
                 self.initial_risk.unwrap(),
                 sign,
-                self.max_mfe_r,
+                q.last,
+                self.target,
                 self.stop,
+                self.max_mfe_r,
+                self.first_leg_closed,
             );
+            self.stop = update.stop;
             if (self.stop - self.fill_price.unwrap()) * sign > 0.0 {
-                self.trailing_grade = self.trailing_grade.max(2);
+                self.trailing_grade = self.trailing_grade.max(2)
             }
-            if (q.last - self.stop) * sign <= 0.0 {
+            if let Some(intent) = update.intent {
                 self.exit(
                     signal,
                     q,
                     now,
-                    self.remaining,
-                    if self.trailing_grade > 1 {
-                        "trailing"
+                    if intent.all {
+                        self.remaining
                     } else {
-                        "breakeven"
+                        self.remaining.min(1)
                     },
+                    intent.reason,
                 );
-            } else if (q.last - self.target) * sign >= 0.0
-                && (self.target - self.fill_price.unwrap()) * sign
-                    > self.initial_risk.unwrap() + 1e-6
-            {
-                self.exit(signal, q, now, self.remaining, "target_s1");
+                if !intent.all {
+                    self.first_leg_closed = true;
+                    self.trailing_grade = 1;
+                    self.stop = self.fill_price.unwrap();
+                }
             }
         }
     }

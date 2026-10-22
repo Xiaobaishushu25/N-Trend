@@ -3,8 +3,7 @@ use crate::derive::rollover::RolloverRecord;
 use crate::derive::{aggregate, Timeframe};
 use crate::fetch::kline::Kline;
 use crate::v2::features::{
-    extract_market_context, extract_trigger_features, MarketContextSnapshot, SetupFeatures,
-    TriggerFeatures,
+    extract_market_context, MarketContextSnapshot, SetupFeatures, TriggerFeatures,
 };
 use crate::v2::{EXECUTION_VERSION, FEATURE_SCHEMA_VERSION, PATTERN_LOGIC_VERSION};
 use anyhow::Result;
@@ -28,7 +27,7 @@ impl Default for ReplayConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ReplayEvent {
     pub symbol: String,
     pub direction: String,
@@ -63,6 +62,8 @@ pub struct ReplayEvent {
     pub entry_price: Option<f64>,
     pub outcome: Option<ReplayOutcome>,
     pub market_context: Option<MarketContextSnapshot>,
+    #[serde(default)]
+    pub evaluation: Option<crate::v3::replay::Evaluation>,
     pub schema_version: String,
     pub pattern_version: String,
     pub execution_version: String,
@@ -95,9 +96,32 @@ impl ReplayEngine {
 
     /// Aggregate raw 5m klines to 15m/60m bars (reuses derive::aggregate)
     pub fn aggregate_bars(&self, raw5m: &[Kline]) -> (Vec<Bar>, Vec<Bar>) {
-        let bars15_k = aggregate(raw5m, Timeframe::M15);
-        let bars60_k = aggregate(raw5m, Timeframe::M60);
+        let last = raw5m.last().map(|b| b.datetime.as_str()).unwrap_or("");
+        let bars15_k = aggregate(raw5m, Timeframe::M15)
+            .into_iter()
+            .filter(|b| b.datetime.as_str() <= last)
+            .collect::<Vec<_>>();
+        let bars60_k = aggregate(raw5m, Timeframe::M60)
+            .into_iter()
+            .filter(|b| b.datetime.as_str() <= last)
+            .collect::<Vec<_>>();
         (kline_to_bar(&bars15_k), kline_to_bar(&bars60_k))
+    }
+
+    pub fn aggregate_with_rollovers(
+        &self,
+        raw: &[Kline],
+        rollovers: &[RolloverRecord],
+    ) -> (Vec<Bar>, Vec<Bar>) {
+        let (mut m15, mut m60) = self.aggregate_bars(raw);
+        for list in [&mut m15, &mut m60] {
+            for r in rollovers.iter().filter(|r| r.confirmed) {
+                if let Some(b) = list.iter_mut().find(|b| b.dt.to_bar_ts() >= r.ts) {
+                    b.rollover = true;
+                }
+            }
+        }
+        (m15, m60)
     }
 
     /// Replay history using the same forward warning extractor as live scans.
@@ -121,7 +145,7 @@ impl ReplayEngine {
         tick_size: f64,
         rollovers: &[RolloverRecord],
     ) -> Result<Vec<ReplayEvent>> {
-        let (bars15, bars60) = self.aggregate_bars(raw5m);
+        let (bars15, bars60) = self.aggregate_with_rollovers(raw5m, rollovers);
         let daily_bars = kline_to_bar(&aggregate(raw5m, Timeframe::Day));
         if bars15.len() < 30 {
             return Ok(vec![]);
@@ -238,251 +262,44 @@ impl ReplayEngine {
                 outcome: None,
                 schema_version: FEATURE_SCHEMA_VERSION.into(),
                 market_context: None,
+                evaluation: None,
                 pattern_version: PATTERN_LOGIC_VERSION.into(),
                 execution_version: EXECUTION_VERSION.into(),
             });
         }
-        // second pass: for each event, use the same entry-touch trigger and
-        // holding rules as the live event state machine.
-        for ev in events.iter_mut() {
-            let warn_idx_opt = bars15
-                .iter()
-                .position(|b| bar_ts_matches(&b.dt.to_bar_ts(), &ev.warning_ts));
-            let s2_idx_opt = bars15
-                .iter()
-                .position(|b| bar_ts_matches(&b.dt.to_bar_ts(), &ev.s2_ts));
-            let Some(start_idx) = warn_idx_opt.or(s2_idx_opt) else {
-                continue;
-            };
-            let is_long = ev.direction == "up";
-            let mut trigger_idx: Option<usize> = None;
-            let end = (start_idx + 1 + self.config.trigger_timeout_bars).min(bars15.len());
-            for j in start_idx + 1..end {
-                let b = &bars15[j];
-                let touched = if is_long {
-                    b.high >= ev.entry
-                } else {
-                    b.low <= ev.entry
-                };
-                if touched {
-                    trigger_idx = Some(j);
-                    break;
-                }
+        // Context is frozen at WARNING close, never at the future trigger close.
+        for ev in &mut events {
+            ev.market_context = extract_market_context(
+                symbol,
+                &ev.warning_ts,
+                &ev.direction,
+                &bars15,
+                &bars60,
+                &daily_bars,
+                rollovers,
+            );
+            let result = crate::v3::replay::evaluate(ev, raw5m, rollovers, false, 1.0);
+            ev.entry_ts = result.entry_ts.clone();
+            ev.entry_price = result.fill;
+            ev.trigger_bar_ts = result.entry_ts.clone();
+            // Gross display only. Supervised NET labels are built by the v3 cost runner.
+            if result.status == "closed" {
+                let r = result.gross_points / (result.risk * result.volume as f64).max(1e-9);
+                ev.outcome = Some(ReplayOutcome {
+                    outcome: if r > 0.0 { "win" } else { "loss" }.into(),
+                    exit_reason: result.exit_reason.clone().unwrap_or_default(),
+                    exit_ts: result.exit_ts.clone().unwrap(),
+                    exit_price: result.final_price.unwrap(),
+                    r_multiple: r,
+                    mfe_r: Some(result.mfe_r),
+                    mae_r: Some(result.mae_r),
+                    is_1r_aux_win: None,
+                });
             }
-            if let Some(ti) = trigger_idx {
-                let tb = &bars15[ti];
-                let risk = ev.risk.abs().max(1e-9);
-                let atr = crate::analyze::indicators::atr(&bars15, 20)
-                    .get(ti)
-                    .and_then(|x| *x);
-                let vol_ratio = crate::analyze::outcome::vol_ratio_at(&bars15, ti);
-                let tf = extract_trigger_features(tb, ev.entry, risk, atr, vol_ratio, None, None);
-                ev.trigger_features = Some(tf.clone());
-                ev.trigger_bar_ts = Some(tb.dt.to_bar_ts());
-                let mut fill = ev.entry;
-                if ti > 0 && !bars15[ti - 1].rollover {
-                    let prev_close = bars15[ti - 1].close;
-                    let cur_open = tb.open;
-                    let gap = if is_long {
-                        prev_close < ev.entry && cur_open > ev.entry
-                    } else {
-                        prev_close > ev.entry && cur_open < ev.entry
-                    };
-                    if gap {
-                        fill = cur_open;
-                    }
-                }
-                ev.entry_ts = Some(tb.dt.to_bar_ts());
-                ev.entry_price = Some(fill);
-                ev.market_context = extract_market_context(
-                    symbol,
-                    &tb.dt.to_bar_ts(),
-                    &ev.direction,
-                    &bars15,
-                    &bars60,
-                    &daily_bars,
-                    rollovers,
-                );
-
-                let mut exit: Option<(usize, f64, &str)> = None;
-                let base_tp = if is_long { fill + risk } else { fill - risk };
-                let look = (ti + crate::analyze::outcome::TIME_HORIZON_BARS).min(bars15.len());
-                let mut mfe = 0.0_f64;
-                let mut mae = 0.0_f64;
-                let mut trail_grade: Option<usize> = None;
-                for k in ti..look {
-                    let b = &bars15[k];
-                    if b.rollover {
-                        exit = None;
-                        break;
-                    }
-                    let mfe_contrib = if is_long {
-                        (b.high - fill) / risk
-                    } else {
-                        (fill - b.low) / risk
-                    };
-                    let mae_contrib = if is_long {
-                        (b.low - fill) / risk
-                    } else {
-                        (fill - b.high) / risk
-                    };
-                    mfe = mfe.max(mfe_contrib);
-                    mae = mae.min(mae_contrib);
-                    let hit_stop = if is_long {
-                        b.low <= ev.stop
-                    } else {
-                        b.high >= ev.stop
-                    };
-                    let reached_tp1 = if is_long {
-                        b.high >= base_tp
-                    } else {
-                        b.low <= base_tp
-                    };
-                    if hit_stop && reached_tp1 {
-                        match resolve_intrabar_exit(raw5m, &b.dt, ev.stop, base_tp, is_long) {
-                            IntrabarExit::Stop => {
-                                exit = Some((k, ev.stop, "stop"));
-                                break;
-                            }
-                            IntrabarExit::Ambiguous => break,
-                            IntrabarExit::Target => {}
-                        }
-                    } else if hit_stop {
-                        exit = Some((k, ev.stop, "stop"));
-                        break;
-                    }
-                    if trail_grade.is_none() && reached_tp1 {
-                        trail_grade = Some(1);
-                    }
-                    if let Some(mut grade) = trail_grade {
-                        loop {
-                            let next_grade = grade + 1;
-                            let next_price = if is_long {
-                                fill + trail_r(next_grade) * risk
-                            } else {
-                                fill - trail_r(next_grade) * risk
-                            };
-                            let next_hit = if is_long {
-                                b.high >= next_price
-                            } else {
-                                b.low <= next_price
-                            };
-                            if !next_hit {
-                                break;
-                            }
-                            grade = next_grade;
-                        }
-                        trail_grade = Some(grade);
-                        let trail_price = if is_long {
-                            fill + trail_r(grade) * risk
-                        } else {
-                            fill - trail_r(grade) * risk
-                        };
-                        let fell_back = if is_long {
-                            b.low <= trail_price
-                        } else {
-                            b.high >= trail_price
-                        };
-                        if fell_back {
-                            exit = Some((k, trail_price, "target"));
-                            break;
-                        }
-                    }
-                    if k - ti + 1 >= crate::analyze::outcome::NO_FOLLOW_BAR
-                        && mfe < crate::analyze::outcome::NO_FOLLOW_MFE_R
-                    {
-                        exit = Some((k, b.close, "no_follow"));
-                        break;
-                    }
-                    if k == ti + crate::analyze::outcome::TIME_HORIZON_BARS - 1 {
-                        exit = Some((k, b.close, "time_exit"));
-                        break;
-                    }
-                }
-                if let Some((ei, ep, reason)) = exit {
-                    let r_mult = if is_long {
-                        (ep - fill) / risk
-                    } else {
-                        (fill - ep) / risk
-                    };
-                    let outcome = if r_mult > 0.0 { "win" } else { "loss" };
-                    ev.outcome = Some(ReplayOutcome {
-                        outcome: outcome.into(),
-                        exit_reason: reason.into(),
-                        exit_ts: bars15[ei].dt.to_bar_ts(),
-                        exit_price: ep,
-                        r_multiple: r_mult,
-                        mfe_r: Some(mfe),
-                        mae_r: Some(mae),
-                        is_1r_aux_win: Some(mfe >= 1.0),
-                    });
-                }
-            }
+            ev.evaluation = Some(result);
         }
         Ok(events)
     }
-}
-
-fn trail_r(grade: usize) -> f64 {
-    if grade == 1 {
-        1.0
-    } else {
-        crate::analyze::outcome::TRAIL_STEP_R * grade as f64
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IntrabarExit {
-    Stop,
-    Target,
-    Ambiguous,
-}
-
-/// Resolve a same-15m-bar stop/target collision in chronological 5m order.
-/// A missing or intrinsically ambiguous 5m sequence is deliberately treated
-/// as unknown so DatasetBuilder excludes it from supervised training labels.
-fn resolve_intrabar_exit(
-    raw5m: &[Kline],
-    bucket: &crate::analyze::model::DT,
-    stop: f64,
-    target: f64,
-    is_long: bool,
-) -> IntrabarExit {
-    for k in raw5m {
-        let Some(dt) = crate::analyze::model::DT::from_bar_ts(&k.datetime) else {
-            continue;
-        };
-        if dt.year != bucket.year
-            || dt.month != bucket.month
-            || dt.day != bucket.day
-            || dt.hour != bucket.hour
-            || dt.minute / 15 != bucket.minute / 15
-        {
-            continue;
-        }
-        let hit_stop = if is_long {
-            k.low <= stop
-        } else {
-            k.high >= stop
-        };
-        let hit_target = if is_long {
-            k.high >= target
-        } else {
-            k.low <= target
-        };
-        match (hit_stop, hit_target) {
-            (true, true) => return IntrabarExit::Ambiguous,
-            (true, false) => return IntrabarExit::Stop,
-            (false, true) => return IntrabarExit::Target,
-            (false, false) => {}
-        }
-    }
-    IntrabarExit::Ambiguous
-}
-
-fn bar_ts_matches(bar_ts: &str, dto_ts: &str) -> bool {
-    // dto ts is "YYYY-MM-DD HH:MM" without seconds, bar_ts is "YYYY-MM-DD HH:MM:SS"
-    bar_ts == dto_ts || bar_ts.starts_with(dto_ts) || format!("{}:00", dto_ts) == bar_ts
 }
 
 fn kline_to_bar(klines: &[Kline]) -> Vec<Bar> {
@@ -516,48 +333,10 @@ fn kline_to_bar(klines: &[Kline]) -> Vec<Bar> {
 mod tests {
     use super::*;
     #[test]
-    fn empty_raw_returns_empty() {
-        let eng = ReplayEngine::default_engine();
-        let v = eng.replay_history("test", &[], 1.0).unwrap();
-        assert!(v.is_empty());
-    }
-
-    fn kline(ts: &str, high: f64, low: f64) -> Kline {
-        Kline {
-            datetime: ts.into(),
-            open: 100.0,
-            high,
-            low,
-            close: 100.0,
-            volume: 1.0,
-            hold: 0.0,
-        }
-    }
-
-    #[test]
-    fn same_15m_bar_is_resolved_by_5m_order() {
-        let bucket = crate::analyze::model::DT::from_bar_ts("2025-01-01 10:00:00").unwrap();
-        let raw = vec![
-            kline("2025-01-01 10:00:00", 101.0, 99.0),
-            kline("2025-01-01 10:05:00", 102.0, 100.5),
-        ];
-        assert_eq!(
-            resolve_intrabar_exit(&raw, &bucket, 99.5, 101.5, true),
-            IntrabarExit::Stop
-        );
-        assert_eq!(
-            resolve_intrabar_exit(&raw, &bucket, 98.5, 100.5, true),
-            IntrabarExit::Target
-        );
-    }
-
-    #[test]
-    fn same_5m_bar_is_ambiguous() {
-        let bucket = crate::analyze::model::DT::from_bar_ts("2025-01-01 10:00:00").unwrap();
-        let raw = vec![kline("2025-01-01 10:00:00", 102.0, 98.0)];
-        assert_eq!(
-            resolve_intrabar_exit(&raw, &bucket, 99.5, 101.5, true),
-            IntrabarExit::Ambiguous
-        );
+    fn empty_is_empty() {
+        assert!(ReplayEngine::default_engine()
+            .replay_history("RB", &[], 1.)
+            .unwrap()
+            .is_empty());
     }
 }

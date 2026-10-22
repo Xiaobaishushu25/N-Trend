@@ -77,6 +77,9 @@ impl HybridDataSource {
     /// 图表和其他按需读路径使用的健康状态：不可用时最多每10秒探测一次，
     /// 避免用户频繁切换图表造成健康接口请求风暴。
     pub async fn tq_available_or_probe(&self) -> bool {
+        if self.config.read().await.data_source.primary_source == "offline" {
+            return false;
+        }
         if self.tq_available.load(Ordering::Relaxed) {
             return true;
         }
@@ -92,6 +95,10 @@ impl HybridDataSource {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Vec<TradingCalendarDay>> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         let tq = self.tq_client.read().await.clone();
         tq.fetch_trading_calendar(start, end).await
     }
@@ -106,6 +113,10 @@ impl HybridDataSource {
         period: &str,
         count: usize,
     ) -> Result<Vec<Kline>> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         tracing::info!(
             target: "market_trace",
             layer = "hybrid_tq_only",
@@ -267,6 +278,10 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn fetch_quotes(&self, codes: &[String]) -> Result<HashMap<String, Quote>> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         if codes.is_empty() {
             return Ok(HashMap::new());
         }
@@ -300,6 +315,10 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn fetch_minute(&self, symbol: &str, period: &str, count: usize) -> Result<Vec<Kline>> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         let use_tq = self.should_use_tq().await;
         tracing::info!(
             target: "market_trace",
@@ -342,6 +361,10 @@ impl MarketDataSource for HybridDataSource {
         period: &str,
         count: usize,
     ) -> Result<RawKlineResponse> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         let use_tq = self.should_use_tq().await;
         tracing::info!(
             target: "market_trace",
@@ -382,6 +405,10 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn search_contracts(&self, keyword: &str) -> Result<Vec<FuturesSymbol>> {
+        anyhow::ensure!(
+            self.config.read().await.data_source.primary_source != "offline",
+            "research data source is offline"
+        );
         let fallback_enabled = self.config.read().await.data_source.fallback_enabled;
 
         if self.should_use_tq().await {
@@ -404,6 +431,9 @@ impl MarketDataSource for HybridDataSource {
     }
 
     async fn is_healthy(&self) -> bool {
+        if self.config.read().await.data_source.primary_source == "offline" {
+            return false;
+        }
         let primary_is_tq = self.config.read().await.data_source.primary_source == "tqsdk";
         if primary_is_tq {
             self.tq_available_or_probe().await

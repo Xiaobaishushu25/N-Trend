@@ -1,5 +1,6 @@
 use super::super::execution::ConditionState;
 use super::*;
+use crate::trader::PositionTier;
 use std::collections::HashMap;
 
 fn ts(s: &str) -> i64 {

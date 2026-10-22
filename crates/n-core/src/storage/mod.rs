@@ -115,7 +115,14 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
         let stmt = backend.build(&table);
         db.execute(stmt).await.context("创建数据表失败")?;
     }
-    for scope in ["symbols", "groups", "manual_levels", "signals", "settings", "notifications"] {
+    for scope in [
+        "symbols",
+        "groups",
+        "manual_levels",
+        "signals",
+        "settings",
+        "notifications",
+    ] {
         let _ = db.execute_unprepared(&format!(
             "INSERT OR IGNORE INTO sync_revisions (scope, revision, updated_at) VALUES ('{scope}', 1, datetime('now', 'localtime'))"
         )).await;
@@ -719,7 +726,6 @@ async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
     )
     .await
     .ok();
-    db.execute_unprepared("UPDATE v2_model_registry SET status='champion' WHERE status='archived' AND model_id=(SELECT model_id FROM v2_model_registry WHERE name='logistic-v1' ORDER BY created_at DESC LIMIT 1)").await.ok();
     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_registry_one_champion_per_slot ON v2_model_registry(scoring_slot) WHERE status='champion'").await.ok();
     db.execute_unprepared(
         "CREATE INDEX IF NOT EXISTS idx_v2_events_symbol_state ON v2_trade_events(symbol, state)",
@@ -732,6 +738,7 @@ async fn create_v2_tables(db: &DatabaseConnection) -> Result<()> {
     .await
     .context("创建 V2 索引失败")?;
     db.execute_unprepared("CREATE UNIQUE INDEX IF NOT EXISTS idx_v2_predictions_event_model ON v2_model_predictions(event_id, model_id)").await.context("创建 V2 预测唯一索引失败")?;
+    crate::v3::store::ensure(db).await?;
     // mark migrated to 4
     db.execute_unprepared(
         "INSERT OR IGNORE INTO settings(key, value) VALUES ('schema_migrated', '4')",
