@@ -38,8 +38,10 @@ pub(crate) fn prepare_local_trader_snapshot(snapshot: &mut Value) {
 
 #[tauri::command]
 pub fn report_frontend_stage(window: tauri::Window, stage: String, elapsed_ms: f64) {
-    if matches!(stage.as_str(), "entry_evaluated" | "app_mounted" | "route_ready")
-        && elapsed_ms.is_finite()
+    if matches!(stage.as_str(),
+        "entry_evaluated" | "app_mounted" | "route_ready" |
+        "document_response_started" | "document_waiting" | "document_downloaded" | "first_contentful_paint")
+        && elapsed_ms.is_finite() && elapsed_ms >= 0.0
     {
         tracing::info!(window = window.label(), stage, elapsed_ms, "前端启动阶段");
     }

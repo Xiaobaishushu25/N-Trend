@@ -30,8 +30,8 @@ OUT = ROOT / "reports" / "sr_dual_thrust_20261021"
 ZONE = timezone(timedelta(hours=8))
 START, END = date(2026, 9, 21), date(2026, 10, 20)
 DOWNLOAD_START, DOWNLOAD_END = "2026-09-14 00:00:00", "2026-10-21 00:00:00"
-HOLIDAYS = {date(2026, 9, 25)} | {date(2026, 10, d) for d in range(1, 8)}
-NO_NIGHTS = {date(2026, 9, 24), date(2026, 9, 30)}
+HOLIDAYS = {date(2026, 6, 19), date(2026, 9, 25)} | {date(2026, 10, d) for d in range(1, 8)}
+NO_NIGHTS = {date(2026, 6, 18), date(2026, 9, 24), date(2026, 9, 30)}
 STRATEGY_URL = "https://github.com/vnpy/vnpy_ctastrategy/blob/main/vnpy_ctastrategy/strategies/dual_thrust_strategy.py"
 CALENDAR_URL = "https://www.hongtaqh.com/wsyyt/ywgg/202609/20260921_12313.html"
 DATA_URL = "https://doc.shinnytech.com/edb/latest/md_server.html"

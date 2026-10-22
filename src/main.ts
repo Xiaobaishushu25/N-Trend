@@ -6,13 +6,29 @@ import router from './router'
 import './styles.css'
 import { reportPerformance } from './utils/performanceLog'
 
-function reportStartup(stage: string) {
+function reportStartup(stage: string, elapsedMs = performance.now()) {
   if (isTauri()) {
-    void invoke('report_frontend_stage', { stage, elapsedMs: performance.now() }).catch(() => {})
+    void invoke('report_frontend_stage', { stage, elapsedMs }).catch(() => {})
   }
 }
 
 reportStartup('entry_evaluated')
+const navigation = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined
+if (navigation) {
+  reportStartup('document_response_started', navigation.responseStart)
+  reportStartup('document_waiting', navigation.responseStart - navigation.requestStart)
+  reportStartup('document_downloaded', navigation.responseEnd - navigation.responseStart)
+}
+if (isTauri() && typeof PerformanceObserver !== 'undefined') {
+  const paints = new PerformanceObserver((list) => {
+    const firstPaint = list.getEntries().find((entry) => entry.name === 'first-contentful-paint')
+    if (firstPaint) {
+      reportStartup('first_contentful_paint', firstPaint.startTime)
+      paints.disconnect()
+    }
+  })
+  paints.observe({ type: 'paint', buffered: true })
+}
 function reportFrontendError(stage: string, message: string) {
   if (isTauri()) void invoke('report_frontend_error', { stage, message }).catch(() => {})
 }
