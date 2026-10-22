@@ -290,15 +290,7 @@ async function openChartForTicket(ticket: TradeReviewTicket) {
           style="width: 140px"
         />
 
-        <div class="lots-selector">
-          <span class="lots-label">单笔手数:</span>
-          <n-select
-            v-model:value="review.lots"
-            :options="lotOptions"
-            size="small"
-            style="width: 84px"
-          />
-        </div>
+        <div class="lots-selector"><span class="lots-label">按冻结策略手数统计；费用为研究估算</span></div>
       </div>
     </div>
 

@@ -90,7 +90,9 @@ export const useTradeReviewStore = defineStore('tradeReview', {
 
         // 判断交易阶段 (stage)
         let stage: 'open' | 'closed' | 'staged' | 'expired' = 'staged'
-        if (item.state === 'pending') {
+        if (['ambiguous', 'missing_data', 'rollover', 'unfilled', 'invalidated', 'filtered', 'unpriced'].includes(item.state)) {
+          stage = 'expired'
+        } else if (item.state === 'pending') {
           stage = 'staged'
         } else if (item.state === 'expired') {
           stage = 'expired'
@@ -113,10 +115,12 @@ export const useTradeReviewStore = defineStore('tradeReview', {
 
         // 计算盈亏
         const pnl = calcTradePnl(dir, actualEntry, actualExit, symbol, this.lots)
-        const pnlPoints = stage === 'closed' ? pnl.points : 0
-        const pnlAmount = stage === 'closed' ? pnl.amount : 0
-        const pnlPct = stage === 'closed' ? pnl.pct : 0
-        const isWin = stage === 'closed' ? pnl.isWin : false
+        let evaluation: { net_amount?: number | null; gross_points?: number; volume?: number } | null = null
+        try { evaluation = JSON.parse(item.entry_score_dims || '{}').evaluation ?? null } catch { /* absent evidence stays unknown */ }
+        const pnlPoints = stage === 'closed' ? (evaluation?.gross_points ?? pnl.points) : 0
+        const pnlAmount = stage === 'closed' ? (evaluation?.net_amount ?? pnl.amount) : 0
+        const pnlPct = stage === 'closed' ? (evaluation?.net_amount != null ? 100 * pnlAmount / Math.max(actualEntry * multiplier * (evaluation.volume ?? 1), 1e-9) : pnl.pct) : 0
+        const isWin = stage === 'closed' && pnlAmount > 0
 
         return {
           event_id: item.event_id,
@@ -145,7 +149,7 @@ export const useTradeReviewStore = defineStore('tradeReview', {
           mfe_r: item.mfe_r ?? null,
           mae_r: item.mae_r ?? null,
           multiplier,
-          lots: this.lots,
+          lots: evaluation?.volume ?? this.lots,
           pnl_points: pnlPoints,
           pnl_amount: pnlAmount,
           pnl_pct: pnlPct,
@@ -199,8 +203,8 @@ export const useTradeReviewStore = defineStore('tradeReview', {
     metrics(): ReviewMetrics {
       const settled = this.tickets.filter((t) => t.stage === 'closed')
       const totalSettled = settled.length
-      const wins = settled.filter((t) => t.pnl_points > 0)
-      const losses = settled.filter((t) => t.pnl_points < 0)
+      const wins = settled.filter((t) => t.pnl_amount > 0)
+      const losses = settled.filter((t) => t.pnl_amount < 0)
       const winCount = wins.length
       const lossCount = losses.length
       const winRate = totalSettled > 0 ? winCount / totalSettled : 0

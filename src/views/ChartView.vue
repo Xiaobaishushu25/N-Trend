@@ -4024,9 +4024,10 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div v-if="pwinFor(s.number) != null" class="pc-v2-pwin">
-                  <span>模型胜率</span>
+                  <span>净盈利概率</span>
                   <b>{{ (pwinFor(s.number)! * 100).toFixed(1) }}%</b>
                 </div>
+                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
 
                 <div class="pc-history">
                   <span class="pc-history-label">预警</span>
@@ -4208,9 +4209,10 @@ onBeforeUnmount(() => {
                 </div>
 
                 <div v-if="pwinFor(r.number) != null" class="pc-v2-pwin">
-                  <span>模型胜率</span>
+                  <span>净盈利概率</span>
                   <b>{{ (pwinFor(r.number)! * 100).toFixed(1) }}%</b>
                 </div>
+                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
 
                 <div class="pc-history">
                   <span class="pc-history-label">预警</span>

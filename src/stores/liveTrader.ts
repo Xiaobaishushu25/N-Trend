@@ -187,9 +187,10 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       return map
     },
-    resolveEventId(): (item?: { event_id?: number | null; condition_order_id?: string } | null) => number | null {
+    resolveEventId(): (item?: { event_id?: number | null; condition_order_id?: string; signal_evidence?: unknown } | null) => number | null {
       return (item) => {
         if (!item) return null
+        if (item.signal_evidence) return null
         if (item.event_id != null) return item.event_id
         return this.conditionMap[item.condition_order_id || '']?.event_id ?? null
       }

@@ -1163,6 +1163,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               </div>
 
               <!-- 底部博弈关键指标 -->
+              <pre v-if="rec.signal_evidence" style="white-space:pre-wrap;font-size:11px;max-height:180px;overflow:auto">原始信号依据（升级前归档）{{ JSON.stringify(rec.signal_evidence.signal, null, 2) }}</pre>
               <div class="hist-meta">
                 <span>合约乘数 {{ getSymbolMultiplier(rec.instrument_id) }} 元/点</span>
                 <span>持仓 {{ rec.bars_held }} 根K线</span>

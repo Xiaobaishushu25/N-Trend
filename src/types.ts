@@ -866,7 +866,7 @@ export interface BackupStatus {
 // ---- V2 ----
 export interface V2ModelRow { model_id: string; name: string; schema_version: string; feature_whitelist: string; train_window: string; dataset_hash: string; coefficients: string; spline_knots: string | null; metrics: string; created_at: string; }
 export interface V2PredictionRow { id: number; event_id: number; model_id: string; p_win: number | null; logit: number | null; feature_hash: string; predicted_at: string; }
-export interface V2ReportBundle { "logistic_report.md"?: string; "gam_report.md"?: string; "acceptance.md"?: string; [k: string]: string | undefined; }
+export interface V2ReportBundle { summary: Record<string, unknown> }
 
 // ---- Live Trader ----
 export interface CtpHealth {
@@ -1038,6 +1038,7 @@ export interface LiveManagedPosition {
 }
 
 export interface LiveTradeRecord {
+  signal_evidence?: { origin: string; event_id: number; archive_sha256: string; signal?: Record<string, unknown> | null } | null
   id: string
   condition_order_id: string
   symbol: string

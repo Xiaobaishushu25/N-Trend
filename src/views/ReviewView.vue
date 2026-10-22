@@ -586,7 +586,8 @@ onBeforeUnmount(() => {
       </n-space>
       <n-text v-if="error" type="error" style="display: block; margin-top: 8px">{{ error }}</n-text>
       <n-text depth="3" style="display: block; font-size: 12px; margin-top: 8px">
-        止盈口径：第一目标 1R；目标位R&gt;1 时第二目标=0.8×目标R（不低于1R），触及第二目标或从1R回落则止盈；目标位R≤1 时达到 1R 才止盈。同一结构跨扫描只保留首条；未触发不计胜率；同根K线双触按止损；不含手续费/滑点，另有净R估算（固定 2.5 tick/往返）。
+        形态评分用于描述结构。回放对齐当前实盘分批退出规则；路径不明、缺数据和未结束样本不计净胜负。研究费用为明确标注的代理假设，不能当作实际账户收益。
+
       </n-text>
     </n-card>
 
@@ -594,8 +595,8 @@ onBeforeUnmount(() => {
       <template #header>
         <div class="v2-header">
           <div>
-            <span class="v2-title">V2 概率模型</span>
-            <span class="v2-subtitle">根据信号特征估计单个信号的 P(win)，不是复盘总胜率</span>
+            <span class="v2-title">突破前概率模型</span>
+            <span class="v2-subtitle">预警确认时冻结；预测突破成交后按既定规则退出的净盈利概率</span>
           </div>
           <n-button
             v-if="review.v2Predictions.length || review.v2Report"
@@ -624,11 +625,11 @@ onBeforeUnmount(() => {
           />
           <n-button size="small" type="primary" :disabled="!review.v2SelectedModel" @click="review.loadV2Predictions()">加载预测</n-button>
           <n-tag v-if="review.v2Models.length" type="info" size="small">{{ review.v2Models.length }} 个模型</n-tag>
-          <n-tag v-else type="warning" size="small">暂无模型，请先运行 v2-train</n-tag>
+          <n-tag v-else type="warning" size="small">暂无经验证概率</n-tag>
         </n-space>
         <div v-if="showV2Details" class="v2-details">
           <n-text v-if="review.v2Report" depth="3" class="v2-report">
-            {{ (review.v2Report["logistic_report.md"] || review.v2Report["acceptance.md"] || "").slice(0, 4000) || "暂无报告" }}
+            {{ JSON.stringify(review.v2Report.summary ?? {}, null, 2).slice(0, 6000) }}
           </n-text>
           <n-data-table
             v-if="review.v2Predictions.length"
@@ -638,9 +639,9 @@ onBeforeUnmount(() => {
             size="small"
             striped
           />
-          <n-empty v-else description="暂无模型预测" />
+          <n-empty v-else description="暂无经验证概率；候选模型继续影子观察" />
           <n-text depth="3" class="v2-help">
-            Setup 阶段只使用警示K冻结的形态、A段、B段和回撤特征；Trigger K 收盘后才冻结触发特征，不使用未来数据。P(win) 是模型对单个信号的概率推理，模型报告仅用于训练/验收诊断。
+            仅使用预警确认时已知特征。历史重建与实时预测分别记录；候选模型未通过前瞻验证时，不用于日常决策。
           </n-text>
         </div>
       </n-space>
