@@ -39,7 +39,10 @@ pub async fn generate_database_snapshot(
     let raw_path_str = raw_temp_path.to_string_lossy().replace('\\', "/");
     let vacuum_sql = format!("VACUUM INTO '{raw_path_str}'");
 
-    tracing::info!("📦 开始执行 SQLite VACUUM INTO 生成数据库快照: {}", raw_path_str);
+    tracing::info!(
+        "📦 开始执行 SQLite VACUUM INTO 生成数据库快照: {}",
+        raw_path_str
+    );
     db.execute_unprepared(&vacuum_sql)
         .await
         .map_err(|e| anyhow!("VACUUM INTO 执行失败: {e}"))?;
@@ -47,7 +50,11 @@ pub async fn generate_database_snapshot(
     // 校验生成的快照一致性
     {
         tracing::info!("🔍 对生成的 SQLite 快照执行完整性校验 (PRAGMA integrity_check)...");
-        let snapshot_db = crate::storage::connect(&raw_temp_path).await?;
+        let snapshot_db = sea_orm::Database::connect(format!(
+            "sqlite://{}?mode=ro",
+            raw_temp_path.to_string_lossy().replace('\\', "/")
+        ))
+        .await?;
         let check_result = snapshot_db
             .query_one(Statement::from_string(
                 DbBackend::Sqlite,
