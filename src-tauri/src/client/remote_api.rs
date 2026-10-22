@@ -118,7 +118,10 @@ impl RemoteApiClient {
                         tracing::warn!(trace_id, attempt, elapsed_ms = attempt_started.elapsed().as_millis(), error = %e, "K线HTTP响应体读取失败");
                     }
                     if let Some(retry_rb) = retry_clone {
-                        tracing::warn!("⚠️ [RemoteAPI] 读取数据流中断，正在自动重试一次 ({}): {e}", url);
+                        tracing::warn!(
+                            "⚠️ [RemoteAPI] 读取数据流中断，正在自动重试一次 ({}): {e}",
+                            url
+                        );
                         return Box::pin(self.execute_with_retry(retry_rb, false, trace_id)).await;
                     }
                     tracing::error!("❌ [RemoteAPI] 读取响应流失败 ({}): {e}", url);
@@ -130,7 +133,14 @@ impl RemoteApiClient {
                 }
             };
             if let Some(trace_id) = trace_id {
-                tracing::info!(trace_id, attempt, body_read_ms = body_started.elapsed().as_millis(), total_ms = attempt_started.elapsed().as_millis(), bytes = bytes.len(), "K线HTTP响应体读取完成");
+                tracing::info!(
+                    trace_id,
+                    attempt,
+                    body_read_ms = body_started.elapsed().as_millis(),
+                    total_ms = attempt_started.elapsed().as_millis(),
+                    bytes = bytes.len(),
+                    "K线HTTP响应体读取完成"
+                );
             }
             let parse_started = std::time::Instant::now();
             let data = match serde_json::from_slice::<T>(&bytes) {
@@ -138,11 +148,18 @@ impl RemoteApiClient {
                 Err(e) => {
                     let text = String::from_utf8_lossy(&bytes);
                     let preview = if text.len() > 300 {
-                        format!("{}... (len: {})", text.chars().take(300).collect::<String>(), text.len())
+                        format!(
+                            "{}... (len: {})",
+                            text.chars().take(300).collect::<String>(),
+                            text.len()
+                        )
                     } else {
                         text.to_string()
                     };
-                    tracing::error!("❌ [RemoteAPI] 解析响应 JSON 失败 ({}): {e} | 内容: {preview}", url);
+                    tracing::error!(
+                        "❌ [RemoteAPI] 解析响应 JSON 失败 ({}): {e} | 内容: {preview}",
+                        url
+                    );
                     return Err(ApiErrorResponse::new(
                         "PARSE_ERROR",
                         format!("解析服务端响应失败: {e}"),
@@ -151,7 +168,13 @@ impl RemoteApiClient {
                 }
             };
             if let Some(trace_id) = trace_id {
-                tracing::info!(trace_id, attempt, parse_ms = parse_started.elapsed().as_millis(), total_ms = attempt_started.elapsed().as_millis(), "K线HTTP JSON解析完成");
+                tracing::info!(
+                    trace_id,
+                    attempt,
+                    parse_ms = parse_started.elapsed().as_millis(),
+                    total_ms = attempt_started.elapsed().as_millis(),
+                    "K线HTTP JSON解析完成"
+                );
             }
             Ok(data)
         } else {
@@ -839,11 +862,6 @@ impl RemoteApiClient {
         .await
     }
 
-    pub async fn backfill_v2_predictions(&self) -> Result<serde_json::Value, ApiErrorResponse> {
-        self.execute(self.request(Method::POST, "v2/predictions/backfill"))
-            .await
-    }
-
     pub async fn get_active_preclose_signals(&self) -> Result<Value, ApiErrorResponse> {
         self.execute(self.request(Method::GET, "signals/preclose"))
             .await
@@ -1053,9 +1071,20 @@ impl RemoteApiClient {
             .await
     }
 
-    pub async fn get_execution_orders(&self, page: usize, page_size: usize) -> Result<serde_json::Value, ApiErrorResponse> {
-        self.execute(self.request(Method::GET, &format!("trader/execution-orders?page={}&page_size={}", page.max(1), page_size.clamp(1, 100))))
-            .await
+    pub async fn get_execution_orders(
+        &self,
+        page: usize,
+        page_size: usize,
+    ) -> Result<serde_json::Value, ApiErrorResponse> {
+        self.execute(self.request(
+            Method::GET,
+            &format!(
+                "trader/execution-orders?page={}&page_size={}",
+                page.max(1),
+                page_size.clamp(1, 100)
+            ),
+        ))
+        .await
     }
 
     pub async fn get_trader_account(&self) -> Result<serde_json::Value, ApiErrorResponse> {

@@ -38,10 +38,17 @@ pub(crate) fn prepare_local_trader_snapshot(snapshot: &mut Value) {
 
 #[tauri::command]
 pub fn report_frontend_stage(window: tauri::Window, stage: String, elapsed_ms: f64) {
-    if matches!(stage.as_str(),
-        "entry_evaluated" | "app_mounted" | "route_ready" |
-        "document_response_started" | "document_waiting" | "document_downloaded" | "first_contentful_paint")
-        && elapsed_ms.is_finite() && elapsed_ms >= 0.0
+    if matches!(
+        stage.as_str(),
+        "entry_evaluated"
+            | "app_mounted"
+            | "route_ready"
+            | "document_response_started"
+            | "document_waiting"
+            | "document_downloaded"
+            | "first_contentful_paint"
+    ) && elapsed_ms.is_finite()
+        && elapsed_ms >= 0.0
     {
         tracing::info!(window = window.label(), stage, elapsed_ms, "前端启动阶段");
     }
@@ -56,12 +63,35 @@ pub fn report_frontend_perf(
     timeframe: Option<String>,
     rows: Option<usize>,
 ) {
-    if !matches!(stage.as_str(),
-        "layout_mounted" | "layout_events_ready" | "settings_loaded" | "settings_load_failed" | "symbols_loaded" | "symbols_load_failed" |
-        "route_navigation_started" | "route_navigation_finished" | "route_navigation_failed" |
-        "dashboard_mounted" | "dashboard_settings_ready" | "dashboard_events_ready" | "dashboard_load_started" | "dashboard_symbols_loaded" | "dashboard_rows_ready" | "dashboard_data_loaded" | "dashboard_load_finished" | "dashboard_load_failed" |
-        "chart_load_started" | "chart_load_finished" | "chart_load_failed" | "chart_load_superseded" |
-        "chart_created" | "chart_render_finished") || !elapsed_ms.is_finite() || elapsed_ms < 0.0 {
+    if !matches!(
+        stage.as_str(),
+        "layout_mounted"
+            | "layout_events_ready"
+            | "settings_loaded"
+            | "settings_load_failed"
+            | "symbols_loaded"
+            | "symbols_load_failed"
+            | "route_navigation_started"
+            | "route_navigation_finished"
+            | "route_navigation_failed"
+            | "dashboard_mounted"
+            | "dashboard_settings_ready"
+            | "dashboard_events_ready"
+            | "dashboard_load_started"
+            | "dashboard_symbols_loaded"
+            | "dashboard_rows_ready"
+            | "dashboard_data_loaded"
+            | "dashboard_load_finished"
+            | "dashboard_load_failed"
+            | "chart_load_started"
+            | "chart_load_finished"
+            | "chart_load_failed"
+            | "chart_load_superseded"
+            | "chart_created"
+            | "chart_render_finished"
+    ) || !elapsed_ms.is_finite()
+        || elapsed_ms < 0.0
+    {
         return;
     }
     let symbol = symbol.as_deref().unwrap_or("");
@@ -69,15 +99,30 @@ pub fn report_frontend_perf(
     if symbol.len() > 32 || timeframe.len() > 16 || !symbol.is_ascii() || !timeframe.is_ascii() {
         return;
     }
-    tracing::info!(window = window.label(), stage, elapsed_ms, symbol, timeframe, rows, "前端关键阶段");
+    tracing::info!(
+        window = window.label(),
+        stage,
+        elapsed_ms,
+        symbol,
+        timeframe,
+        rows,
+        "前端关键阶段"
+    );
 }
 
 #[tauri::command]
 pub fn report_frontend_error(window: tauri::Window, stage: String, message: String) {
-    if !matches!(stage.as_str(), "javascript_error" | "unhandled_rejection" | "router_error" | "vue_error") {
+    if !matches!(
+        stage.as_str(),
+        "javascript_error" | "unhandled_rejection" | "router_error" | "vue_error"
+    ) {
         return;
     }
-    let message: String = message.chars().filter(|c| !c.is_control()).take(500).collect();
+    let message: String = message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
+        .collect();
     tracing::error!(window = window.label(), stage, message, "前端执行异常");
 }
 
@@ -437,7 +482,11 @@ pub async fn get_chart_klines(
     limit: Option<usize>,
 ) -> Result<ChartKlineResponse, String> {
     let started = std::time::Instant::now();
-    let trace_id = format!("{}-{}", chrono::Utc::now().timestamp_millis(), CHART_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed));
+    let trace_id = format!(
+        "{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        CHART_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     tracing::info!(%trace_id, %symbol, %timeframe, ?limit, "K线客户端请求开始");
     // Automatically subscribe active symbol and timeframe in realtime client
     state
@@ -447,9 +496,10 @@ pub async fn get_chart_klines(
     tracing::info!(%trace_id, elapsed_ms = started.elapsed().as_millis(), "K线实时订阅完成");
 
     // 1. 如果有极新鲜的内存缓存（3秒内，如快速来回切换周期/品种），直接命中返回，实现 0ms 秒出图
-    if let Some(fresh) = state
-        .kline_cache
-        .get_fresh(&symbol, &timeframe, std::time::Duration::from_secs(3))
+    if let Some(fresh) =
+        state
+            .kline_cache
+            .get_fresh(&symbol, &timeframe, std::time::Duration::from_secs(3))
     {
         tracing::info!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = fresh.rows.len(), "K线命中3秒内存缓存");
         return Ok(fresh);
@@ -466,8 +516,16 @@ pub async fn get_chart_klines(
     let mut fetch_fut = Box::pin(async move {
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            fetch_state.api.get_chart_klines(&fetch_symbol, &fetch_timeframe, limit, None, &fetch_trace_id),
-        ).await {
+            fetch_state.api.get_chart_klines(
+                &fetch_symbol,
+                &fetch_timeframe,
+                limit,
+                None,
+                &fetch_trace_id,
+            ),
+        )
+        .await
+        {
             Ok(res) => res.map_err(|e| e.message),
             Err(_) => {
                 tracing::warn!(trace_id = %fetch_trace_id, symbol = %fetch_symbol, timeframe = %fetch_timeframe, "获取K线超时(30s)");
@@ -489,11 +547,14 @@ pub async fn get_chart_klines(
                     if let Ok(resp) = fetch_fut.await {
                         tracing::info!(trace_id = %bg_trace_id, rows = resp.rows.len(), "K线后台刷新完成");
                         bg_state.kline_cache.put(&sym, &tf, &resp);
-                        let _ = bg_app.emit("chart-klines-refreshed", serde_json::json!({
-                            "symbol": sym,
-                            "timeframe": tf,
-                            "response": resp,
-                        }));
+                        let _ = bg_app.emit(
+                            "chart-klines-refreshed",
+                            serde_json::json!({
+                                "symbol": sym,
+                                "timeframe": tf,
+                                "response": resp,
+                            }),
+                        );
                     } else {
                         tracing::warn!(trace_id = %bg_trace_id, "K线后台刷新失败");
                     }
@@ -850,15 +911,6 @@ pub async fn set_v2_model_status(
     state
         .api
         .set_v2_model_status(&model_id, &status)
-        .await
-        .map_err(|e| e.message)
-}
-
-#[tauri::command]
-pub async fn backfill_v2_predictions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    state
-        .api
-        .backfill_v2_predictions()
         .await
         .map_err(|e| e.message)
 }
@@ -1345,6 +1397,9 @@ pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if let Ok(snapshot) = state.api.get_trader_snapshot().await {
         return Ok(snapshot);
     }
@@ -1368,6 +1423,9 @@ pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Valu
 
 #[tauri::command]
 pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if let Ok(res) = state.api.get_trader_status().await {
         return Ok(res);
     }
@@ -1405,12 +1463,23 @@ pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value,
 }
 
 #[tauri::command]
-pub async fn get_execution_orders(state: State<'_, Arc<AppState>>, page: usize, page_size: usize) -> Result<Value, String> {
-    state.api.get_execution_orders(page, page_size).await.map_err(|e| e.message)
+pub async fn get_execution_orders(
+    state: State<'_, Arc<AppState>>,
+    page: usize,
+    page_size: usize,
+) -> Result<Value, String> {
+    state
+        .api
+        .get_execution_orders(page, page_size)
+        .await
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]
 pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if let Ok(res) = state.api.get_trader_account().await {
         return Ok(res);
     }
@@ -1445,6 +1514,9 @@ pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value
 
 #[tauri::command]
 pub async fn get_trader_positions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if let Ok(res) = state.api.get_trader_positions().await {
         return Ok(res);
     }
@@ -1515,6 +1587,9 @@ pub async fn update_trader_config(
 
 #[tauri::command]
 pub async fn emergency_cancel_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if state.realtime.get_state().await.status == ConnectionStatus::Connected {
         if let Ok(res) = state.api.emergency_cancel_all().await {
             return Ok(res);
@@ -1531,6 +1606,9 @@ pub async fn emergency_cancel_all(state: State<'_, Arc<AppState>>) -> Result<Val
 
 #[tauri::command]
 pub async fn emergency_close_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
+    if state.credentials.is_research() {
+        return Err("研究客户端禁止连接本地交易桥".into());
+    }
     if state.realtime.get_state().await.status == ConnectionStatus::Connected {
         if let Ok(res) = state.api.emergency_close_all().await {
             return Ok(res);

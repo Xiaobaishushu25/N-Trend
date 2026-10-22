@@ -28,6 +28,9 @@ zhihu_screenshot.png
 *.db
 ntrend.db
 data/
+data-dev/
+research-archives/
+research-runs/
 
 # Android release signing material (never commit)
 /release-signing/

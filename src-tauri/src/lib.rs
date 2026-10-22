@@ -111,7 +111,10 @@ pub fn run() {
                 env!("CARGO_PKG_VERSION"),
                 data_dir.display()
             );
-            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端日志初始化完成");
+            tracing::info!(
+                elapsed_ms = setup_t0.elapsed().as_millis(),
+                "客户端日志初始化完成"
+            );
 
             // 1. 初始化客户端模块
             let credentials = Arc::new(CredentialStore::new(&data_dir));
@@ -124,7 +127,10 @@ pub fn run() {
             );
             let backup_scheduler =
                 BackupScheduler::new(app.handle().clone(), api.clone(), &data_dir);
-            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端网络、缓存和后台调度器初始化完成");
+            tracing::info!(
+                elapsed_ms = setup_t0.elapsed().as_millis(),
+                "客户端网络、缓存和后台调度器初始化完成"
+            );
 
             // 2. 初始化全局客户端状态
             let state = Arc::new(AppState::new(
@@ -136,12 +142,18 @@ pub fn run() {
                 backup_scheduler,
             ));
             app.manage(state);
-            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端全局状态初始化完成");
+            tracing::info!(
+                elapsed_ms = setup_t0.elapsed().as_millis(),
+                "客户端全局状态初始化完成"
+            );
 
             // 3. 桌面端设置系统托盘
             #[cfg(desktop)]
             setup_tray(app)?;
-            tracing::info!(elapsed_ms = setup_t0.elapsed().as_millis(), "客户端托盘初始化完成");
+            tracing::info!(
+                elapsed_ms = setup_t0.elapsed().as_millis(),
+                "客户端托盘初始化完成"
+            );
 
             tracing::info!("✅ 主窗口就绪 总耗时 {}ms", setup_t0.elapsed().as_millis());
             tracing::info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -151,7 +163,11 @@ pub fn run() {
             #[cfg(desktop)]
             {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
-                    if (_window.label() == "main" || _window.label() == "live-trader" || _window.label() == "history-chart") && !QUITTING.load(Ordering::SeqCst) {
+                    if (_window.label() == "main"
+                        || _window.label() == "live-trader"
+                        || _window.label() == "history-chart")
+                        && !QUITTING.load(Ordering::SeqCst)
+                    {
                         let _ = _window
                             .app_handle()
                             .save_window_state(StateFlags::all() & !StateFlags::VISIBLE);
@@ -231,7 +247,6 @@ pub fn run() {
             commands::get_v2_dataset_report,
             commands::get_v2_predictions,
             commands::set_v2_model_status,
-            commands::backfill_v2_predictions,
             commands::get_active_preclose_signals,
             commands::get_active_preclose_candidates,
             commands::get_preclose_candidates,

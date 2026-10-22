@@ -19,8 +19,8 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use tower_http::compression::CompressionLayer;
+use tower_http::cors::CorsLayer;
 
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     let api_v1 = Router::new()
@@ -101,10 +101,6 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/v2/models", get(signals::get_v2_models))
         .route("/v2/models/status", post(signals::set_v2_model_status))
         .route("/v2/predictions", get(signals::get_v2_predictions))
-        .route(
-            "/v2/predictions/backfill",
-            post(signals::backfill_v2_predictions),
-        )
         .route("/v2/report", get(signals::get_v2_report))
         // 关键区域手动画线
         .route(
@@ -175,8 +171,14 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/integrity/repair", post(integrity::repair_integrity))
         // SimNow 自动化交易与持仓风控
         .route("/trader/status", get(trader::get_trader_status))
-        .route("/trader/snapshot", get(trader::get_trader_snapshot).layer(CompressionLayer::new()))
-        .route("/trader/execution-orders", get(trader::get_execution_orders).layer(CompressionLayer::new()))
+        .route(
+            "/trader/snapshot",
+            get(trader::get_trader_snapshot).layer(CompressionLayer::new()),
+        )
+        .route(
+            "/trader/execution-orders",
+            get(trader::get_execution_orders).layer(CompressionLayer::new()),
+        )
         .route("/trader/comparison", get(trader::get_strategy_comparison))
         .route("/trader/account", get(trader::get_trader_account))
         .route("/trader/positions", get(trader::get_trader_positions))
@@ -204,6 +206,10 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         .route("/healthz", get(meta::healthz))
         .nest("/api/v1", api_v1)
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.clone(),
+            research_boundary,
+        ))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(log_http_request))
@@ -246,4 +252,25 @@ async fn log_http_request(
     }
 
     resp
+}
+
+async fn research_boundary(
+    axum::extract::State(ctx): axum::extract::State<Arc<ServerContext>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !ctx.profile.allows(req.method(), req.uri().path()) {
+        return (axum::http::StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"code":"RESEARCH_DISABLED","message":"研究模式禁止交易、外部取数和运行配置变更"}))).into_response();
+    }
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        "x-ntrend-profile",
+        axum::http::HeaderValue::from_static(if ctx.profile.is_research() {
+            "research"
+        } else {
+            "production"
+        }),
+    );
+    response
 }

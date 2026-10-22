@@ -1,0 +1,18 @@
+{
+  "productName": "ntrend Research",
+  "identifier": "com.ntrend.app.research",
+  "app": {
+    "windows": [
+      {
+        "title": "N趋势 · 本地研究",
+        "width": 1360,
+        "height": 860,
+        "decorations": false
+      }
+    ]
+  },
+  "build": {
+    "beforeDevCommand": "npm run dev -- --host 127.0.0.1 --port 5174 --strictPort",
+    "devUrl": "http://127.0.0.1:5174"
+  }
+}

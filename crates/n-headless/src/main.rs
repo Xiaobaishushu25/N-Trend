@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod ctp_sidecar;
 mod lock;
+mod profile;
 mod realtime;
 mod runtime;
 mod secrets;
@@ -91,7 +92,9 @@ fn resolve_listen_addr() -> SocketAddr {
         }
     }
 
-    format!("{host}:{port}").parse().unwrap_or_else(|_| "0.0.0.0:8081".parse().unwrap())
+    format!("{host}:{port}")
+        .parse()
+        .unwrap_or_else(|_| "0.0.0.0:8081".parse().unwrap())
 }
 
 fn print_help() {
@@ -99,6 +102,7 @@ fn print_help() {
         r#"ntrend-server (n-headless) - ntrend 权威服务端
 用法:
   cargo run -p n-headless -- --data-dir ./data
+  cargo run -p n-headless -- --profile research --data-dir ./data-dev
   cargo run -p n-headless -- --data-dir /opt/ntrend/data --host 0.0.0.0 --port 8081
   cargo run -p n-headless -- --data-dir ./data --check-integrity
   cargo run -p n-headless -- --data-dir ./data --repair-integrity
@@ -113,9 +117,30 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let profile = profile::RuntimeProfile::parse(&std::env::args().collect::<Vec<_>>())?;
+    if profile.is_research() {
+        anyhow::ensure!(
+            !std::env::args().any(|a| a == "--repair-integrity"),
+            "research forbids network repair"
+        );
+        anyhow::ensure!(
+            std::env::args().any(|a| a == "--data-dir" || a.starts_with("--data-dir=")),
+            "research requires an explicit isolated --data-dir"
+        );
+    }
     let data_dir = resolve_data_dir();
+    if profile.is_research() {
+        anyhow::ensure!(
+            data_dir.join("manifest.json").exists(),
+            "research requires a verified prepared snapshot manifest"
+        );
+    }
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("ntrend.db");
+    anyhow::ensure!(
+        !data_dir.join("signal-v3-migration-in-progress").exists(),
+        "incomplete data migration; inspect the archive before restarting"
+    );
     let config_path = data_dir.join("config.json");
     let peek_level = peek_log_level(&config_path).unwrap_or_else(|| "info".to_string());
     init_logging(&data_dir, &peek_level)?;
@@ -130,13 +155,43 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let db = storage::connect(&db_path).await?;
+    if !profile.is_research()
+        && n_core::storage::repo::get_setting(&db, "signal_v3_prepared")
+            .await?
+            .as_deref()
+            != Some("1")
+    {
+        use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let count = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) AS n FROM pattern_events".to_string(),
+            ))
+            .await?
+            .unwrap()
+            .try_get::<i64>("", "n")?;
+        anyhow::ensure!(
+            count == 0,
+            "legacy signal database requires the offline v3 migration; nothing was deleted"
+        );
+        n_core::storage::repo::set_settings(
+            &db,
+            &std::collections::HashMap::from([
+                ("signal_generation".into(), uuid::Uuid::new_v4().to_string()),
+                ("signal_v3_prepared".into(), "1".into()),
+            ]),
+        )
+        .await?;
+    }
 
     // 命令行单次维护动作（兼容原有 CLI）
     if std::env::args().any(|a| a == "--check-integrity") {
         let symbols = n_core::storage::repo::list_symbols(&db, true).await?;
         println!("\n=== Raw 5m 数据完整性体检报告 ===\n");
         for s in &symbols {
-            let report = n_core::integrity::RawDataIntegrityChecker::inspect_symbol(&db, &s.code, 1000).await?;
+            let report =
+                n_core::integrity::RawDataIntegrityChecker::inspect_symbol(&db, &s.code, 1000)
+                    .await?;
             println!("{}", report.format_summary());
         }
         return Ok(());
@@ -158,8 +213,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = Config::load(&config_path, &db).await?;
-    let mut secrets = ServerSecrets::load_or_create(&data_dir)?;
+    let mut config = if profile.is_research() {
+        Config::default()
+    } else {
+        Config::load(&config_path, &db).await?
+    };
+    profile.config(&mut config);
+    let mut secrets = if profile.is_research() {
+        ServerSecrets::research(&data_dir)?
+    } else {
+        ServerSecrets::load_or_create(&data_dir)?
+    };
 
     // 自动兼容与同步密码（若 config 中有密码而 secrets 中为空，迁移至 secrets）
     let mut secrets_need_save = false;
@@ -185,12 +249,30 @@ async fn main() -> anyhow::Result<()> {
 
     let services = Arc::new(Services::new(db.clone(), config.clone(), config_path.clone()).await?);
 
+    if !profile.is_research()
+        && n_core::storage::repo::get_setting(&db, "signal_origin")
+            .await?
+            .as_deref()
+            == Some("historical_rebuild")
+    {
+        services.rebuild_events().await?;
+        n_core::storage::repo::set_settings(
+            &db,
+            &std::collections::HashMap::from([("signal_origin".into(), "live".into())]),
+        )
+        .await?;
+    }
+
     // CTP 生命周期独立于天勤的连通状态；后台拉起，不以柜台登录阻塞 HTTP 启动。
-    let ctp_sidecar = match ctp_sidecar::CtpSidecar::start(config.data_source.python_path.as_deref()) {
-        Ok(sidecar) => Some(sidecar),
-        Err(error) => {
-            tracing::warn!("CTP 自动启动不可用: {error:#}");
-            None
+    let ctp_sidecar = if profile.is_research() {
+        None
+    } else {
+        match ctp_sidecar::CtpSidecar::start(config.data_source.python_path.as_deref()) {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) => {
+                tracing::warn!("CTP 自动启动不可用: {error:#}");
+                None
+            }
         }
     };
 
@@ -200,14 +282,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 初始化全局上下文
-    let ctx = ServerContext::new(db, services, data_dir, secrets);
+    let ctx = ServerContext::with_profile(db, services, data_dir, secrets, profile);
 
     // 启动后台运行时任务（调度器、实时现价轮询、天勤闭合事件消费）
-    runtime::spawn_runtime_tasks(ctx.clone());
+    if !profile.is_research() {
+        runtime::spawn_runtime_tasks(ctx.clone());
+    }
 
     // 构建 Axum REST API 与 WebSocket 路由
     let router = api::build_router(ctx.clone());
-    let listen_addr = resolve_listen_addr();
+    let listen_addr = if profile.is_research() {
+        "127.0.0.1:18081".parse()?
+    } else {
+        resolve_listen_addr()
+    };
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     tracing::info!(

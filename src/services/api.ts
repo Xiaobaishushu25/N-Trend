@@ -193,7 +193,6 @@ export const api = {
   repairSymbolIntegrity: (symbol: string) => invoke<any>('repair_symbol_integrity', { symbol }),
   getV2Models: () => invoke<V2ModelRow[]>('get_v2_models'),
   getV2Predictions: (modelId?: string | null) => invoke<V2PredictionRow[]>('get_v2_predictions', { modelId: modelId || null }),
-  backfillV2Predictions: () => invoke<{ models: number; events_seen: number; events_scored: number; predictions_written: number }>('backfill_v2_predictions'),
   getV2Report: () => invoke<V2ReportBundle>('get_v2_dataset_report'),
 
   // ---- Multi-terminal & Server Architecture ----

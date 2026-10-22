@@ -83,6 +83,9 @@ impl RealtimeClient {
     }
 
     async fn run_local_trader_stream(&self) {
+        if self.credentials.is_research() {
+            return;
+        }
         let Ok(client) = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))
@@ -355,7 +358,10 @@ impl RealtimeClient {
             }
 
             let status = self.status.read().await.clone();
-            if !matches!(status, ConnectionStatus::Unauthorized | ConnectionStatus::VersionMismatch) {
+            if !matches!(
+                status,
+                ConnectionStatus::Unauthorized | ConnectionStatus::VersionMismatch
+            ) {
                 self.set_status(ConnectionStatus::Reconnecting).await;
             }
             if reconnect_requested {
@@ -420,7 +426,8 @@ impl RealtimeClient {
                     // Forward based on topic
                     match topic.as_str() {
                         "trader.updated" => {
-                            if let Some(snapshot) = self.trader_cache.write().await.replace(payload) {
+                            if let Some(snapshot) = self.trader_cache.write().await.replace(payload)
+                            {
                                 let _ = self.app.emit("trader-updated", &snapshot);
                             }
                         }
@@ -441,7 +448,9 @@ impl RealtimeClient {
                             }
                         }
                         "trader.heartbeat" => {
-                            if let Some(snapshot) = self.trader_cache.write().await.refresh_metadata(&payload) {
+                            if let Some(snapshot) =
+                                self.trader_cache.write().await.refresh_metadata(&payload)
+                            {
                                 let _ = self.app.emit("trader-updated", &snapshot);
                             }
                             let _ = self.app.emit("trader-heartbeat", ());
