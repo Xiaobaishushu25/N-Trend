@@ -88,9 +88,17 @@ impl OvernightSnapshot {
         let is_up = pos.direction == "up";
         // 多头以买一（Bid）平仓，空头以卖一（Ask）平仓；无买卖一价时降级为最新价（Last）
         let hypo_exit_price = if is_up {
-            if quote.bid > 0.0 { quote.bid } else { quote.last }
+            if quote.bid > 0.0 {
+                quote.bid
+            } else {
+                quote.last
+            }
         } else {
-            if quote.ask > 0.0 { quote.ask } else { quote.last }
+            if quote.ask > 0.0 {
+                quote.ask
+            } else {
+                quote.last
+            }
         };
 
         let sign = if is_up { 1.0 } else { -1.0 };
@@ -341,6 +349,7 @@ mod tests {
     #[test]
     fn test_snapshot_calculations() {
         let pos = ManagedPosition {
+            origin: Default::default(),
             id: "pos_123".into(),
             condition_order_id: "cond_123".into(),
             symbol: "RB".into(),
@@ -385,7 +394,8 @@ mod tests {
             timestamp: chrono::Utc::now().timestamp(),
         };
 
-        let mut snap = OvernightSnapshot::create(&pos, &quote, CheckpointType::DayClose, "2026-09-24");
+        let mut snap =
+            OvernightSnapshot::create(&pos, &quote, CheckpointType::DayClose, "2026-09-24");
         // 多头以 Bid 平仓: 3514 - 3500 = +14 点
         assert_eq!(snap.hypo_exit_price, 3514.0);
         assert_eq!(snap.hypo_pnl_pts, 14.0);

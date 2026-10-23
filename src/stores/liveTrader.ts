@@ -14,12 +14,22 @@ import type {
   LiveTradeRecord,
   LiveTradeStatistics,
   ExecutionOrder,
+  TraderInstanceCatalog,
+  SimnowLoginInput,
 } from '../types'
 
 export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison' | 'orders'
 
 export const useLiveTraderStore = defineStore('liveTrader', {
   state: () => ({
+    selectedInstanceId: 'default',
+    instanceCatalog: null as TraderInstanceCatalog | null,
+    instancesSupported: false,
+    instancesLoading: false,
+    instancesError: '',
+    instanceGeneration: 0,
+    instanceStreamId: '',
+    instanceRevision: 0,
     health: null as CtpHealth | null,
     config: null as ExecutionConfig | null,
     account: null as TraderAccount | null,
@@ -264,11 +274,94 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           this.config.mode = savedMode
         }
       }
+      await this.loadInstances()
       await this.refresh()
       this.loading = false
     },
 
+    async loadInstances() {
+      if (this.instancesLoading) return
+      if (typeof api.traderInstanceRequest !== 'function') {
+        this.instancesError = '当前客户端没有多账户接口，请更新并重新启动客户端。'
+        return
+      }
+      this.instancesLoading = true
+      this.instancesError = ''
+      try {
+        const catalog = await api.traderInstanceRequest<TraderInstanceCatalog>('list')
+        if (!catalog || !Array.isArray(catalog.instances)) throw new Error('服务端返回的账户列表格式不正确')
+        this.instanceCatalog = catalog
+        this.instancesSupported = true
+      } catch (e: any) {
+        const message = typeof e === 'string' ? e : e?.message || String(e)
+        if (/\b404\b/.test(message)) {
+          this.instancesError = '当前连接的服务端尚未提供多账户接口，需要更新服务端后使用。'
+        } else if (/trader_instance_request.*not found|unknown command/i.test(message)) {
+          this.instancesError = '当前客户端尚未加载多账户命令，请重新编译并启动客户端。'
+        } else {
+          this.instancesError = `多账户信息加载失败：${message}`
+        }
+        // Keep the selected instance and its routing on transient errors.
+      } finally {
+        this.instancesLoading = false
+      }
+    },
+    async selectInstance(id: string) {
+      if (id === this.selectedInstanceId) return
+      this.selectedInstanceId = id
+      this.instanceGeneration++
+      this.pushRevision++
+      this.refreshing = false
+      this.health = null; this.account = null; this.config = null
+      this.brokerPositions = []; this.managedPositions = []; this.conditions = []; this.history = []
+      this.statistics = null; this.strategyComparison = null; this.quotes = {}
+      this.executionOrdersSeq++; this.executionOrders = []; this.executionOrdersTotal = 0
+      this.executionOrdersPage = 1; this.executionOrdersError = ''; this.executionOrdersLoading = false
+      this.errorMsg = null; this.bridgeOnline = false; this.lastPushAt = 0
+      this.instanceStreamId = ''; this.instanceRevision = 0
+      await this.refresh()
+      if (this.activeTab === 'orders') await this.loadExecutionOrders()
+    },
+    async instanceAction(action: Record<string, unknown>) {
+      const id = this.selectedInstanceId
+      const result = await api.traderInstanceRequest('action', id, action)
+      if (id === this.selectedInstanceId) { await this.loadInstances(); await this.refresh() }
+      return result
+    },
+    async loginSimnow(id: string, credentials: SimnowLoginInput) {
+      const result = await api.traderInstanceRequest('login', id, credentials)
+      if (id === this.selectedInstanceId) {
+        this.health = null; this.account = null; this.bridgeOnline = false
+        this.brokerPositions = []; this.errorMsg = null
+        this.instanceGeneration++; this.pushRevision++
+        this.refreshing = false
+        await this.loadInstances()
+        await this.refresh()
+      }
+      return result
+    },
+    applyInstanceDelta(payload: { instance_id: string; delta: { stream_id: string; base_revision: number; revision: number; changes: Partial<LiveTraderSnapshot> } }) {
+      if (payload.instance_id !== this.selectedInstanceId) return
+      const delta = payload.delta
+      if (this.instanceStreamId !== delta.stream_id || delta.base_revision !== this.instanceRevision || delta.revision !== delta.base_revision + 1) {
+        void this.refresh()
+        return
+      }
+      const baseline: LiveTraderSnapshot = {
+        instance_id: this.selectedInstanceId, source: 'server', health: this.health, account: this.account,
+        broker_positions: this.brokerPositions, config: this.config || undefined,
+        managed_positions: this.managedPositions, conditions: this.conditions, history: this.history,
+        statistics: this.statistics, strategy_comparison: this.strategyComparison,
+        bridge_online: this.bridgeOnline, execution_error: this.errorMsg,
+        _stream_id: delta.stream_id, _revision: delta.revision,
+      }
+      this.applySnapshot({ ...baseline, ...delta.changes })
+      this.pushRevision++; this.lastPushAt = Date.now()
+    },
     applySnapshot(snapshot: LiveTraderSnapshot) {
+      if ((snapshot.instance_id || 'default') !== this.selectedInstanceId) return
+      if (snapshot._stream_id && snapshot._stream_id === this.instanceStreamId && (snapshot._revision ?? 0) < this.instanceRevision) return
+      if (snapshot._stream_id) { this.instanceStreamId = snapshot._stream_id; this.instanceRevision = snapshot._revision ?? 0 }
       if (snapshot.source && snapshot.source !== this.snapshotSource) {
         this.quotes = {}
         this.strategyComparison = null
@@ -299,7 +392,9 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.executionOrdersLoading = true
       this.executionOrdersError = ''
       try {
-        const result = await api.getExecutionOrders(requestedPage, this.executionOrdersPageSize)
+        const result = this.instancesSupported
+          ? await api.traderInstanceRequest<{ items: ExecutionOrder[]; total: number; page: number; page_size: number }>('orders', this.selectedInstanceId, { page: requestedPage, page_size: this.executionOrdersPageSize })
+          : await api.getExecutionOrders(requestedPage, this.executionOrdersPageSize)
         if (seq !== this.executionOrdersSeq) return
         this.executionOrders = result.items
         this.executionOrdersTotal = result.total
@@ -317,19 +412,23 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (this.refreshing) return
       this.refreshing = true
       const revision = this.pushRevision
+      const generation = this.instanceGeneration
       try {
-        const res: any = await api.getTraderSnapshot()
+        const res: any = this.instancesSupported
+          ? await api.traderInstanceRequest<LiveTraderSnapshot>('snapshot', this.selectedInstanceId)
+          : await api.getTraderSnapshot()
+        if (generation !== this.instanceGeneration) return
         if (revision !== this.pushRevision) return // A newer push supersedes this HTTP response.
         if (res?.success === false) throw new Error(res.error || '交易快照尚未就绪')
         const snapshot = res?.data !== undefined ? res.data : res
         if (snapshot) this.applySnapshot(snapshot)
       } catch (e: any) {
-        if (revision !== this.pushRevision) return
+        if (revision !== this.pushRevision || generation !== this.instanceGeneration) return
         this.errorMsg = typeof e === 'string' ? e : e?.message || '获取交易快照失败'
         this.bridgeOnline = false
         if (this.health) this.health = { ...this.health, ready: false, healthy: false }
       } finally {
-        this.refreshing = false
+        if (generation === this.instanceGeneration) this.refreshing = false
       }
     },
 
@@ -343,11 +442,19 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       try {
         await add(listen<LiveTraderSnapshot>('trader-updated', ({ payload }) => {
+          if (this.selectedInstanceId !== 'default') return
           this.pushRevision++
           this.lastPushAt = Date.now()
           this.applySnapshot(payload)
         }))
+        await add(listen<{ instance_id: string; delta: any }>('trader.instance.delta', ({ payload }) => this.applyInstanceDelta(payload)))
+        await add(listen<{ instance_id: string; heartbeat: { stream_id: string; revision: number } }>('trader.instance.heartbeat', ({ payload }) => {
+          if (payload.instance_id !== this.selectedInstanceId) return
+          if (payload.heartbeat.stream_id !== this.instanceStreamId || payload.heartbeat.revision !== this.instanceRevision) { void this.refresh(); return }
+          this.lastPushAt = Date.now()
+        }))
         await add(listen('trader-heartbeat', () => {
+          if (this.selectedInstanceId !== 'default') return
           this.lastPushAt = Date.now()
           if (!this.bridgeOnline || this.errorMsg || !this.account) {
             void this.refresh()
@@ -355,6 +462,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         }))
         await add(listen('trader-resync-needed', () => { void this.refresh() }))
         await add(listen<string>('connection-status-changed', ({ payload }) => {
+          if (payload === 'connected') void this.loadInstances()
           if (payload !== 'connected' && this.snapshotSource !== 'local') {
             this.lastPushAt = 0
             this.bridgeOnline = false
@@ -404,7 +512,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
     async confirmCondition(id: string) {
       try {
-        await api.confirmConditionOrder(id)
+        if (this.instancesSupported) await this.instanceAction({ action: 'confirm', condition_id: id })
+        else await api.confirmConditionOrder(id)
         notify.success('开仓任务已确认，等待柜台委托和成交回报')
         await this.refresh()
       } catch (e: any) {
@@ -414,7 +523,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
     async cancelCondition(id: string) {
       try {
-        await api.cancelConditionOrder(id)
+        if (this.instancesSupported) await this.instanceAction({ action: 'cancel', condition_id: id })
+        else await api.cancelConditionOrder(id)
         notify.success('条件单已撤销')
         await this.refresh()
       } catch (e: any) {
@@ -425,9 +535,12 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     async setEntryRiskFilter(ticks: number) {
       if (!this.config || this.updatingEntryFilter || ![0, 10].includes(ticks)) return
       this.updatingEntryFilter = true
+      const requestedInstance = this.selectedInstanceId
       const next = { ...this.config, min_entry_risk_ticks: ticks }
       try {
-        await api.updateTraderConfig(next)
+        if (this.instancesSupported) await this.instanceAction({ action: 'configure', config: next })
+        else await api.updateTraderConfig(next)
+        if (requestedInstance !== this.selectedInstanceId) return
         this.config = next
         notify.success(ticks ? '实际新开仓启用10 tick过滤；原规则继续影子观察' : '实际新开仓采用原规则；10 tick组继续影子观察')
       } catch (e: any) {
@@ -445,11 +558,14 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         default_small_volume: 1,
         daily_loss_limit_r: 3.0,
       }
+      const requestedInstance = this.selectedInstanceId
       const nextCfg = { ...current, mode }
-      this.config = nextCfg
-      localStorage.setItem('ntrend_trader_mode', mode)
       try {
-        await api.updateTraderConfig(nextCfg)
+        if (this.instancesSupported) await this.instanceAction({ action: 'configure', config: nextCfg })
+        else await api.updateTraderConfig(nextCfg)
+        if (requestedInstance !== this.selectedInstanceId) return
+        this.config = nextCfg
+        localStorage.setItem(this.instancesSupported ? `ntrend_trader_mode:${requestedInstance}` : 'ntrend_trader_mode', mode)
         const label = mode === 'FullAuto' ? '全自动执行' : mode === 'SemiAuto' ? '半自动确认' : '仅监控'
         notify.success(`已切换交易执行模式为: ${label}`)
       } catch (e: any) {
@@ -459,7 +575,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
     async emergencyCancelAll() {
       try {
-        await api.emergencyCancelAll()
+        if (this.instancesSupported) await this.instanceAction({ action: 'cancel_all' })
+        else await api.emergencyCancelAll()
         notify.warning('已向柜台发送全撤指令')
         await this.refresh()
       } catch (e: any) {
@@ -469,7 +586,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
     async emergencyCloseAll() {
       try {
-        await api.emergencyCloseAll()
+        if (this.instancesSupported) await this.instanceAction({ action: 'close_all' })
+        else await api.emergencyCloseAll()
         notify.error('已触发紧急一键全平！')
         await this.refresh()
       } catch (e: any) {

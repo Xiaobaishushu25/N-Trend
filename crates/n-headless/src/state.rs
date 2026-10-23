@@ -10,7 +10,6 @@ use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 pub struct ServerContext {
-    pub profile: crate::profile::RuntimeProfile,
     pub db: DatabaseConnection,
     pub services: Arc<Services>,
     pub data_dir: PathBuf,
@@ -25,21 +24,29 @@ pub struct ServerContext {
     pub last_scan: RwLock<Option<chrono::NaiveDateTime>>,
     pub scheduler_running: AtomicBool,
     pub execution_engine: Arc<n_core::trader::ExecutionEngine>,
+    pub instances: tokio::sync::OnceCell<Arc<n_core::trader::instances::InstanceManager>>,
+    pub ctp_sidecars: Mutex<std::collections::HashMap<String, crate::ctp_sidecar::CtpSidecar>>,
+    pub ctp_login_control: Mutex<()>,
     pub trader_snapshot: RwLock<serde_json::Value>,
 }
 
 impl ServerContext {
-    pub fn with_profile(
+    pub fn new(
         db: DatabaseConnection,
         services: Arc<Services>,
         data_dir: PathBuf,
         secrets: ServerSecrets,
-        profile: crate::profile::RuntimeProfile,
     ) -> Arc<Self> {
         let realtime_hub = Arc::new(RealtimeHub::new());
         let trader_client = n_core::trader::CtpTraderClient::for_port(8766);
-        let config_path = data_dir.join("trader_config.json");
-        let mut initial_config = if !profile.is_research() && config_path.exists() {
+        let instance_dir =
+            n_core::trader::instances::migrate_default(&data_dir).unwrap_or_else(|e| {
+                tracing::error!("交易状态迁移失败: {e:#}");
+                data_dir.join("trader_instances/default")
+            });
+        let config_path = instance_dir.join("trader_config.json");
+        let mut config_error = None;
+        let initial_config = if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
                 Ok(content) => {
                     match serde_json::from_str::<n_core::trader::ExecutionConfig>(&content) {
@@ -51,13 +58,13 @@ impl ServerContext {
                             cfg
                         }
                         Err(e) => {
-                            tracing::warn!("⚠️ 解析交易配置失败: {}, 将采用默认配置", e);
+                            config_error = Some(format!("解析交易配置失败，禁止交易: {e}"));
                             n_core::trader::ExecutionConfig::default()
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("⚠️ 读取交易配置失败: {}, 将采用默认配置", e);
+                    config_error = Some(format!("读取交易配置失败，禁止交易: {e}"));
                     n_core::trader::ExecutionConfig::default()
                 }
             }
@@ -65,20 +72,16 @@ impl ServerContext {
             n_core::trader::ExecutionConfig::default()
         };
 
-        if profile.is_research() {
-            initial_config.mode = n_core::trader::ExecutionMode::MonitorOnly;
-        }
-        let execution_engine = Arc::new(n_core::trader::ExecutionEngine::with_config_path(
+        let mut engine = n_core::trader::ExecutionEngine::with_config_path(
             trader_client,
             initial_config,
-            if profile.is_research() {
-                None
-            } else {
-                Some(config_path)
-            },
-        ));
+            Some(config_path),
+        );
+        if let Some(error) = config_error {
+            engine.disable_loading(error);
+        }
+        let execution_engine = Arc::new(engine);
         Arc::new(Self {
-            profile,
             db,
             services,
             data_dir,
@@ -90,8 +93,11 @@ impl ServerContext {
             trigger_email_scheduled: Mutex::new(HashSet::new()),
             last_refresh: RwLock::new(None),
             last_scan: RwLock::new(None),
-            scheduler_running: AtomicBool::new(!profile.is_research()),
+            scheduler_running: AtomicBool::new(true),
             execution_engine,
+            instances: tokio::sync::OnceCell::new(),
+            ctp_sidecars: Mutex::new(std::collections::HashMap::new()),
+            ctp_login_control: Mutex::new(()),
             trader_snapshot: RwLock::new(serde_json::Value::Null),
         })
     }

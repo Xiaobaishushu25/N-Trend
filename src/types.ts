@@ -878,6 +878,10 @@ export interface CtpHealth {
   message?: string
   sync_pending?: boolean
   sync_error?: string | null
+  login_error?: string | null
+  login_error_code?: number | null
+  settlement_confirmed?: boolean
+  user_id?: string
   account_updated_at?: number
   positions_updated_at?: number
   connected?: boolean
@@ -923,7 +927,52 @@ export interface LiveBrokerPosition {
   margin: number
 }
 
+export interface StrategyDefinition {
+  strategy_id: string
+  code_version: string
+  revision: string
+  exit_policy: string
+  sizing_policy: string
+  parameters: unknown
+}
+export interface TraderInstanceRow {
+  instance: { id: string; name: string; account_id: string; created_at: number }
+  account: { id: string; name: string; kind: 'ctp' | 'paper'; port?: number; broker_id?: string; user_id?: string; credential_ref?: string; config?: unknown }
+  strategy: StrategyDefinition
+  config: ExecutionConfig
+  paused: boolean
+  error?: string | null
+}
+export interface TraderInstanceCatalog {
+  default_instance_id: string
+  instances: TraderInstanceRow[]
+  modules: { strategies: { id: string; version: string }[]; exit_policies: string[]; sizing_policies: string[]; presets?: { label: string; definition: StrategyDefinition }[] }
+}
+export interface SimnowLoginInput {
+  user_id: string
+  password: string
+  td_front: string
+  app_id: string
+  auth_code: string
+}
+export interface CtpConnectionSettings {
+  configured: boolean
+  environment?: string
+  user_id?: string
+  broker_id?: string
+  td_front?: string
+  app_id?: string
+  password_saved?: boolean
+  auth_code_saved?: boolean
+}
 export interface LiveTraderSnapshot {
+  instance_id?: string
+  account_id?: string
+  account_kind?: 'ctp' | 'paper'
+  paused?: boolean
+  strategy?: StrategyDefinition
+  _stream_id?: string
+  _revision?: number
   strategy_comparison?: StrategyComparisonSummary | null
   source?: 'server' | 'local'
   health: CtpHealth | null

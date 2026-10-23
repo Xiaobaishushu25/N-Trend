@@ -29,6 +29,7 @@ zhihu_screenshot.png
 ntrend.db
 data/
 data-dev/
+**/ctp_credentials/
 research-archives/
 research-runs/
 

@@ -53,6 +53,9 @@ http.server.ThreadingHTTPServer(('127.0.0.1', a.port), Handler).serve_forever()
                     .expect("Python is required for fake bridge lifecycle tests"),
                 script,
                 port,
+                config: None,
+                flow_dir: None,
+                identity: None,
                 poll: Duration::from_millis(60),
                 probe_timeout: Duration::from_millis(150),
             },
@@ -186,4 +189,61 @@ async fn dropping_startup_guard_also_cleans_up_an_owned_child() {
 #[test]
 fn deployed_script_is_discoverable() {
     assert!(Path::new(&find_script().unwrap()).is_file());
+}
+
+#[tokio::test]
+async fn reconnect_restarts_only_the_owned_account_and_preserves_another_account() {
+    let first = Fixture::new();
+    let other = Fixture::new();
+    let supervisor = CtpSidecar::launch(first.launch.clone());
+    let other_supervisor = CtpSidecar::launch(other.launch.clone());
+    let old = first.running(1).await;
+    let untouched = other.running(1).await;
+    let (tx, rx) = oneshot::channel();
+    supervisor
+        .reconnect
+        .send((first.launch.clone(), tx))
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    assert_ne!(first.running(2).await, old);
+    assert_eq!(other.running(1).await, untouched);
+    assert_eq!(other.starts().len(), 1);
+    supervisor.stop().await;
+    other_supervisor.stop().await;
+    first.stopped().await;
+    other.stopped().await;
+}
+
+#[tokio::test]
+async fn reconnect_refuses_to_kill_an_external_bridge() {
+    let fixture = Fixture::new();
+    let mut external = Command::new(&fixture.launch.python)
+        .arg(&fixture.launch.script)
+        .args([
+            "--port",
+            &fixture.launch.port.to_string(),
+            "--parent-pid",
+            &std::process::id().to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = fixture.running(1).await;
+    let supervisor = CtpSidecar::launch(fixture.launch.clone());
+    let (tx, rx) = oneshot::channel();
+    supervisor
+        .reconnect
+        .send((fixture.launch.clone(), tx))
+        .await
+        .unwrap();
+    assert!(rx.await.unwrap().is_err());
+    assert_eq!(fixture.running(1).await, pid);
+    assert_eq!(fixture.starts().len(), 1);
+    supervisor.stop().await;
+    assert!(external.try_wait().unwrap().is_none());
+    external.kill().await.unwrap();
+    fixture.stopped().await;
 }

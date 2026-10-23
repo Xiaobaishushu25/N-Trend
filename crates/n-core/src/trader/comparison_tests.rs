@@ -14,6 +14,8 @@ fn ts(s: &str) -> i64 {
 }
 fn signal(id: &str, now: i64, risk: f64) -> ConditionOrder {
     ConditionOrder {
+        origin: Default::default(),
+        frozen: None,
         id: id.into(),
         event_id: Some(1),
         symbol: "PB0".into(),

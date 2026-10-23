@@ -1,0 +1,432 @@
+{
+  "id": "broad-search-shadow-20261023-v1",
+  "frozen_at_shanghai": "2026-10-23T00:26:32.690057+08:00",
+  "phase": "prospective_paper_comparison_only",
+  "qualified_for_trading": false,
+  "production_changed": false,
+  "independent_new_observations": 0,
+  "account_cap": null,
+  "quantity": 1,
+  "score_changes_size": false,
+  "primary_diagnostic": "one active opportunity per symbol; conservative occupancy for unknowns; no cross-symbol capital cap",
+  "primary_slip_ticks_per_fill": 1,
+  "stress_slip_ticks_per_fill": 2,
+  "change_warning_forecast_under_stress": false,
+  "exploration_stages": [
+    19,
+    10,
+    5
+  ],
+  "candidate_trials_seen": 34,
+  "not_independent_validation": true,
+  "engine_source_sha256": "db09f667af3583d61f362bc2f110066a0f88c47b79c8db16b50ceb8d077e1b23",
+  "runner_source_sha256": "6caf94989b46b74429f11d5b9acc1b5664472527d40eba7dba96b638e34d5b23",
+  "fee_profile_sha256": "867287e2ff85fd04033c626d5eec8d09ae516208adc40feb5158f248f6fa879b",
+  "trial_manifest_sha256": "5e92c2a2991a490932b3980361f060e894ae1354bd8dbc198c6d9532d43694e7",
+  "result_sha256": "c4911b1a0e5f35bfcec5378752a03934fb3b8f499bf95e85e588d5ccc0ad78d9",
+  "verification_sha256": "4c36c1520695a986aeb778bdda39d86fc62ab154ccfab1073400ee94180092d8",
+  "entry_gate": {
+    "min_net_reward_to_full_stop_loss": 1.0,
+    "warning_check": true,
+    "proposed_actual_fill_recheck": true,
+    "forecast_slip_ticks_per_side": 1,
+    "fee_bound": "open plus worse of close_today and close_yesterday; user SR total2 yuan"
+  },
+  "common_rules": {
+    "exit_target": "original_s1",
+    "min_planned_risk_ticks": 10,
+    "min_actual_risk_ticks": 10,
+    "pending_15m_buckets": 12,
+    "max_hold_15m_buckets": 60,
+    "default_no_follow_15m_bucket": 5,
+    "default_no_follow_mfe_r": 0.5,
+    "bar_paths": "O-H-L-C versus O-L-H-C require agreement, not all possible intrabar paths"
+  },
+  "frozen_candidates": [
+    {
+      "role": "primary_return_candidate",
+      "definition": {
+        "filter": "friction20",
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_friction20",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "win_rate_comparator",
+      "definition": {
+        "filter": "none",
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_confirm_no_follow_off",
+        "net_guard": true,
+        "no_follow": false,
+        "rules": {
+          "entry_mode": "close_confirm_next_open",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "left_tail_comparator",
+      "definition": {
+        "filter": "none",
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_flat_losers",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": 0.0,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    }
+  ],
+  "frozen_controls": [
+    {
+      "filter": "none",
+      "min_risk_ticks": 10,
+      "min_score": 2.5,
+      "name": "touch_s1_risk10",
+      "net_guard": false,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    },
+    {
+      "filter": "none",
+      "min_risk_ticks": 10,
+      "min_score": 2.5,
+      "name": "net_s1",
+      "net_guard": true,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    }
+  ],
+  "historical_snapshot": {
+    "score3_friction20": {
+      "slip1": {
+        "stats": {
+          "candidates": 236,
+          "quality": {
+            "closed": 232,
+            "rollover": 1,
+            "ambiguous": 2,
+            "unfinished": 1
+          },
+          "n": 232,
+          "wins": 92,
+          "losses": 140,
+          "flat": 0,
+          "win_rate": 0.39655172413793105,
+          "net_r": 48.13394915628966,
+          "mean_net_r": 0.2074739187771106,
+          "net_amount": 12853.208207500013,
+          "mean_win_net_r": 2.2165127190079748,
+          "mean_loss_net_r": -1.1127515785174573,
+          "profit_factor_r": 1.3089763512202757,
+          "profit_factor_cash": 1.3272165004207996,
+          "realized_exit_order_drawdown_r": 22.615652303854326,
+          "net_r_without_top5": 21.50208796748247
+        },
+        "distribution": {
+          "n": 232,
+          "median_net_r": -0.652533449586338,
+          "r_p05": -1.4731182795698636,
+          "r_p95": 3.8434686753628307,
+          "worst_r": -8.6,
+          "worst_amount": -1462.0,
+          "worst10pct_mean_r": -2.2193993777431626,
+          "worst10pct_mean_amount": -667.494491041667,
+          "net_amount_without_top5": 4109.772707500013,
+          "longest_realized_loss_run": 11,
+          "realized_exit_order_drawdown_amount": 7103.311814999999,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 4,
+        "mean_r_diagnostic_interval95": [
+          -0.14590364231015457,
+          0.4880262480380393
+        ]
+      },
+      "slip2": {
+        "stats": {
+          "candidates": 224,
+          "quality": {
+            "closed": 220,
+            "rollover": 1,
+            "ambiguous": 2,
+            "unfinished": 1
+          },
+          "n": 220,
+          "wins": 85,
+          "losses": 135,
+          "flat": 0,
+          "win_rate": 0.38636363636363635,
+          "net_r": 32.728608873437715,
+          "mean_net_r": 0.14876640397017143,
+          "net_amount": 9264.529022500014,
+          "mean_win_net_r": 2.1733394763105296,
+          "mean_loss_net_r": -1.1259647897256098,
+          "profit_factor_r": 1.215312363242124,
+          "profit_factor_cash": 1.2326105463183155,
+          "realized_exit_order_drawdown_r": 25.140058137455156,
+          "net_r_without_top5": 7.352483739053049
+        },
+        "distribution": {
+          "n": 220,
+          "median_net_r": -0.7064002143854171,
+          "r_p05": -1.4999999999999722,
+          "r_p95": 3.9159645942198815,
+          "worst_r": -8.233333333333333,
+          "worst_amount": -1482.0,
+          "worst10pct_mean_r": -2.274698498786803,
+          "worst10pct_mean_amount": -710.6213188636367,
+          "net_amount_without_top5": 624.5290225000135,
+          "longest_realized_loss_run": 11,
+          "realized_exit_order_drawdown_amount": 7356.893314999994,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 4,
+        "mean_r_diagnostic_interval95": [
+          -0.1564787142497957,
+          0.4266452507658544
+        ]
+      }
+    },
+    "score3_confirm_no_follow_off": {
+      "slip1": {
+        "stats": {
+          "candidates": 134,
+          "quality": {
+            "closed": 131,
+            "rollover": 2,
+            "unfinished": 1
+          },
+          "n": 131,
+          "wins": 62,
+          "losses": 69,
+          "flat": 0,
+          "win_rate": 0.4732824427480916,
+          "net_r": 36.939535803537176,
+          "mean_net_r": 0.28198118933997846,
+          "net_amount": 7725.921708750019,
+          "mean_win_net_r": 2.100709665987896,
+          "mean_loss_net_r": -1.3522386012711944,
+          "profit_factor_r": 1.3959032014411814,
+          "profit_factor_cash": 1.3357226778687818,
+          "realized_exit_order_drawdown_r": 19.13656119203966,
+          "net_r_without_top5": 13.456602561326385
+        },
+        "distribution": {
+          "n": 131,
+          "median_net_r": -1.0174520069808028,
+          "r_p05": -1.8690157027958871,
+          "r_p95": 3.7691614066726284,
+          "worst_r": -8.6,
+          "worst_amount": -1462.0,
+          "worst10pct_mean_r": -2.514377667975125,
+          "worst10pct_mean_amount": -708.1208225000004,
+          "net_amount_without_top5": 901.8657087500187,
+          "longest_realized_loss_run": 8,
+          "realized_exit_order_drawdown_amount": 4497.5550562499975,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 3,
+        "mean_r_diagnostic_interval95": [
+          -0.11878935262489093,
+          0.7657324181203299
+        ]
+      },
+      "slip2": {
+        "stats": {
+          "candidates": 110,
+          "quality": {
+            "closed": 107,
+            "rollover": 2,
+            "unfinished": 1
+          },
+          "n": 107,
+          "wins": 48,
+          "losses": 59,
+          "flat": 0,
+          "win_rate": 0.4485981308411215,
+          "net_r": 14.746284020703214,
+          "mean_net_r": 0.13781573851124498,
+          "net_amount": 3890.1692137500113,
+          "mean_win_net_r": 1.9897730875435327,
+          "mean_loss_net_r": -1.3688614268031585,
+          "profit_factor_r": 1.1825875230363951,
+          "profit_factor_cash": 1.1814898507986684,
+          "realized_exit_order_drawdown_r": 21.52312113653177,
+          "net_r_without_top5": -5.9657302878480785
+        },
+        "distribution": {
+          "n": 107,
+          "median_net_r": -1.0339582596391934,
+          "r_p05": -1.752475247524742,
+          "r_p95": 3.2919768403638976,
+          "worst_r": -8.233333333333333,
+          "worst_amount": -1482.0,
+          "worst10pct_mean_r": -2.6042910468446916,
+          "worst10pct_mean_amount": -787.863592272728,
+          "net_amount_without_top5": -2833.886786249989,
+          "longest_realized_loss_run": 6,
+          "realized_exit_order_drawdown_amount": 5435.419556250006,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 3,
+        "mean_r_diagnostic_interval95": [
+          -0.29543765388519727,
+          0.5890947216355553
+        ]
+      }
+    },
+    "score3_flat_losers": {
+      "slip1": {
+        "stats": {
+          "candidates": 237,
+          "quality": {
+            "closed": 233,
+            "rollover": 1,
+            "ambiguous": 3
+          },
+          "n": 233,
+          "wins": 62,
+          "losses": 171,
+          "flat": 0,
+          "win_rate": 0.26609442060085836,
+          "net_r": 28.48747412223093,
+          "mean_net_r": 0.1222638374344675,
+          "net_amount": 5417.402102500024,
+          "mean_win_net_r": 2.1526343990536967,
+          "mean_loss_net_r": -0.6138939100532063,
+          "profit_factor_r": 1.2713716705628184,
+          "profit_factor_cash": 1.2022688543547428,
+          "realized_exit_order_drawdown_r": 11.626650353167072,
+          "net_r_without_top5": 5.209035410541123
+        },
+        "distribution": {
+          "n": 233,
+          "median_net_r": -0.25908900961136827,
+          "r_p05": -1.092343208926511,
+          "r_p95": 3.1181227628264496,
+          "worst_r": -1.971140756874513,
+          "worst_amount": -677.1499999999978,
+          "worst10pct_mean_r": -1.2166574812269035,
+          "worst10pct_mean_amount": -469.44608812499973,
+          "net_amount_without_top5": -1124.2458974999763,
+          "longest_realized_loss_run": 13,
+          "realized_exit_order_drawdown_amount": 4045.6664649999957,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 4,
+        "mean_r_diagnostic_interval95": [
+          -0.019911455526105768,
+          0.27940274179106567
+        ]
+      },
+      "slip2": {
+        "stats": {
+          "candidates": 222,
+          "quality": {
+            "closed": 218,
+            "rollover": 1,
+            "ambiguous": 3
+          },
+          "n": 218,
+          "wins": 55,
+          "losses": 163,
+          "flat": 0,
+          "win_rate": 0.25229357798165136,
+          "net_r": 10.526723196074299,
+          "mean_net_r": 0.04828772108290963,
+          "net_amount": 135.866667500025,
+          "mean_win_net_r": 2.1037253836159087,
+          "mean_loss_net_r": -0.6452648644343599,
+          "profit_factor_r": 1.1000846744676052,
+          "profit_factor_cash": 1.0048473498947497,
+          "realized_exit_order_drawdown_r": 13.600444555790771,
+          "net_r_without_top5": -11.222219416356735
+        },
+        "distribution": {
+          "n": 218,
+          "median_net_r": -0.32897282779561865,
+          "r_p05": -1.1529456989247309,
+          "r_p95": 3.2857300362261888,
+          "worst_r": -1.9494584837545255,
+          "worst_amount": -697.1499999999978,
+          "worst10pct_mean_r": -1.23864609092315,
+          "worst10pct_mean_amount": -505.24582340909086,
+          "net_amount_without_top5": -6304.622832499975,
+          "longest_realized_loss_run": 13,
+          "realized_exit_order_drawdown_amount": 4184.667464999996,
+          "quantile_method": "empirical order statistic floor(p*(n-1)); no confidence bound"
+        },
+        "unknown": 4,
+        "mean_r_diagnostic_interval95": [
+          -0.10812490587158352,
+          0.2100929703778931
+        ]
+      }
+    }
+  },
+  "next_review": {
+    "min_new_priced_closed_per_candidate": 200,
+    "min_new_trading_dates": 60,
+    "new_only_after_protocol_freeze": true,
+    "all_historical_data_research_only": true,
+    "not_automatic_trading_qualification": true,
+    "checks": [
+      "net cash and net R positive in primary and 2tick stress",
+      "remove largest5 positive cash and R trades separately",
+      "report monthly and symbol concentration, leave-one-symbol-out, correlated exposures",
+      "tail10pct, gap losses, loss runs, realized and mark-to-market drawdown, capacity conflicts",
+      "actual contract, trading-day calendar and fee evidence; resolve unknowns or demonstrate bounds preserving conclusions",
+      "time-blocked new-data mean-net-R interval and sensitivity; interval spanning0 does not establish positive expectation"
+    ],
+    "no_automatic_selection_or_parameter_tuning": true
+  }
+}

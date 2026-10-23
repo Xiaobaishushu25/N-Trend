@@ -1397,9 +1397,6 @@ pub async fn open_log_directory(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if let Ok(snapshot) = state.api.get_trader_snapshot().await {
         return Ok(snapshot);
     }
@@ -1423,9 +1420,6 @@ pub async fn get_trader_snapshot(state: State<'_, Arc<AppState>>) -> Result<Valu
 
 #[tauri::command]
 pub async fn get_trader_status(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if let Ok(res) = state.api.get_trader_status().await {
         return Ok(res);
     }
@@ -1477,9 +1471,6 @@ pub async fn get_execution_orders(
 
 #[tauri::command]
 pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if let Ok(res) = state.api.get_trader_account().await {
         return Ok(res);
     }
@@ -1514,9 +1505,6 @@ pub async fn get_trader_account(state: State<'_, Arc<AppState>>) -> Result<Value
 
 #[tauri::command]
 pub async fn get_trader_positions(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if let Ok(res) = state.api.get_trader_positions().await {
         return Ok(res);
     }
@@ -1587,9 +1575,6 @@ pub async fn update_trader_config(
 
 #[tauri::command]
 pub async fn emergency_cancel_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if state.realtime.get_state().await.status == ConnectionStatus::Connected {
         if let Ok(res) = state.api.emergency_cancel_all().await {
             return Ok(res);
@@ -1606,9 +1591,6 @@ pub async fn emergency_cancel_all(state: State<'_, Arc<AppState>>) -> Result<Val
 
 #[tauri::command]
 pub async fn emergency_close_all(state: State<'_, Arc<AppState>>) -> Result<Value, String> {
-    if state.credentials.is_research() {
-        return Err("研究客户端禁止连接本地交易桥".into());
-    }
     if state.realtime.get_state().await.status == ConnectionStatus::Connected {
         if let Ok(res) = state.api.emergency_close_all().await {
             return Ok(res);
@@ -1648,4 +1630,22 @@ pub async fn get_trade_statistics(state: State<'_, Arc<AppState>>) -> Result<Val
         "small_trades_count": 0,
         "exit_reason_breakdown": {}
     }))
+}
+
+#[tauri::command]
+pub async fn trader_instance_request(
+    state: State<'_, Arc<AppState>>,
+    operation: String,
+    instance_id: Option<String>,
+    payload: Option<Value>,
+) -> Result<Value, String> {
+    state
+        .api
+        .trader_instance_request(
+            &operation,
+            instance_id.as_deref(),
+            payload.unwrap_or(Value::Null),
+        )
+        .await
+        .map_err(|e| e.message)
 }

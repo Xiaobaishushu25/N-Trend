@@ -16,13 +16,29 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
+    crate::instance_runtime::spawn(ctx);
 }
 
 pub async fn register_execution_signals(
     ctx: &Arc<ServerContext>,
     signals: &[n_core::storage::entities::pattern_events::Model],
 ) {
-    let registered = ctx.execution_engine.registered_signals().await;
+    // Deduplication is per instance, never global across accounts.
+    let not_before =
+        match n_core::storage::repo::get_setting(&ctx.db, "execution_signal_not_before").await {
+            Ok(Some(value)) => match value.parse::<i64>() {
+                Ok(ts) => ts,
+                Err(_) => {
+                    tracing::error!("执行预警时间界限无效，停止注册新入场");
+                    return;
+                }
+            },
+            Ok(None) => 0,
+            Err(error) => {
+                tracing::error!("无法读取执行预警时间界限: {error}");
+                return;
+            }
+        };
     let enabled = n_core::storage::repo::list_symbols(&ctx.db, true)
         .await
         .unwrap_or_default();
@@ -30,8 +46,9 @@ pub async fn register_execution_signals(
         .iter()
         .filter(|s| {
             s.entry_score >= 2.5
+                && n_core::trader::candidates::parse_time(&s.warning_ts)
+                    .is_ok_and(|ts| ts >= not_before)
                 && matches!(s.direction.as_str(), "up" | "down")
-                && !registered.contains(&s.id)
                 && enabled.iter().any(|e| e.code == s.symbol)
         })
         .collect::<Vec<_>>();
@@ -49,11 +66,20 @@ pub async fn register_execution_signals(
         return;
     };
     let mut bar_times = std::collections::HashMap::new();
+    let mut raw_bars = std::collections::HashMap::new();
     for code in &codes {
         if let Ok(bars) = ctx.services.bars_for(code, "15m").await {
             bar_times.insert(
                 code.clone(),
                 bars.iter().map(|b| b.dt.to_bar_ts()).collect::<Vec<_>>(),
+            );
+        }
+        if let Ok(rows) = n_core::storage::repo::raw_klines(&ctx.db, code).await {
+            raw_bars.insert(
+                code.clone(),
+                rows.iter()
+                    .map(n_core::service::model_to_fetch)
+                    .collect::<Vec<_>>(),
             );
         }
     }
@@ -85,33 +111,84 @@ pub async fn register_execution_signals(
         {
             continue;
         }
-        let direction = if signal.direction == "up" {
-            n_core::analyze::model::Dir::Up
+        let warning_context = raw_bars.get(&signal.symbol).and_then(|raw| {
+            n_core::trader::candidates::warning_context(raw, &signal.warning_ts)
+                .ok()
+                .flatten()
+        });
+        let engines = if let Some(manager) = ctx.instances.get() {
+            manager
+                .all()
+                .await
+                .into_iter()
+                .filter(|r| {
+                    r.definition.id == "default"
+                        || chrono::NaiveDateTime::parse_from_str(
+                            &signal.warning_ts,
+                            "%Y-%m-%d %H:%M:%S",
+                        )
+                        .ok()
+                        .and_then(|d| d.and_local_timezone(Local).single())
+                        .is_some_and(|d| d.timestamp() >= r.definition.created_at)
+                })
+                .map(|r| r.engine.clone())
+                .collect::<Vec<_>>()
         } else {
-            n_core::analyze::model::Dir::Down
+            vec![ctx.execution_engine.clone()]
         };
-        if let Err(e) = ctx
-            .execution_engine
-            .register_condition_with_evidence(
-                Some(signal.id),
-                &signal.symbol,
-                actual,
-                direction,
-                signal.entry,
-                signal.stop,
-                signal.target,
-                signal.entry_score,
-                &signal.warning_ts,
-                Some(serde_json::to_value(signal).unwrap_or_default()),
-            )
-            .await
-        {
-            tracing::warn!("预警 {} 注册交易任务失败: {e}", signal.id);
+        for engine in engines {
+            if engine.paused().await {
+                continue;
+            }
+            let mut payload = serde_json::to_value(signal).unwrap_or_default();
+            payload["source_evidence"] = payload.clone();
+            payload["instrument_id"] = serde_json::json!(actual);
+            payload["created_at_epoch"] = serde_json::json!(chrono::Utc::now().timestamp());
+            payload["tick_size"] = serde_json::json!(q.tick);
+            payload["multiplier"] = serde_json::json!(engine.broker_client().multiplier(actual));
+            payload["warning_context"] = serde_json::json!(warning_context);
+            if let Err(e) = engine
+                .dispatch(n_core::trader::strategy::StrategyEvent::Signal {
+                    source: n_core::trader::strategy::N_STRATEGY.into(),
+                    payload,
+                })
+                .await
+            {
+                tracing::warn!("预警 {} 注册交易任务失败: {e}", signal.id);
+            }
         }
     }
 }
 
 fn spawn_execution(ctx: Arc<ServerContext>) {
+    let worker = ctx.clone();
+    tokio::spawn(async move {
+        let Some(manager) = worker.instances.get() else {
+            return;
+        };
+        let Ok(r) = manager.get("default").await else {
+            return;
+        };
+        let Some(mut rx) = r.quote_rx.lock().await.take() else {
+            return;
+        };
+        while let Some(events) = rx.recv().await {
+            if worker
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            if r.quote_gap
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                let _ = r.engine.quote_gap().await;
+            }
+            if let Err(e) = r.engine.on_quote_batch(events).await {
+                tracing::warn!("默认实例行情推进失败: {e}");
+            }
+        }
+    });
     let quote_ctx = ctx.clone();
     tokio::spawn(async move {
         let mut cursor = 0;
@@ -124,7 +201,21 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             {
                 break;
             }
-            let codes = quote_ctx.execution_engine.requested_contracts().await;
+            let mut codes = quote_ctx.execution_engine.requested_contracts().await;
+            if let Some(manager) = quote_ctx.instances.get() {
+                for r in manager.all().await {
+                    codes.extend(r.engine.requested_contracts().await);
+                    codes.extend(
+                        r.engine
+                            .market_subscriptions()
+                            .await
+                            .into_iter()
+                            .map(|s| s.symbol),
+                    );
+                }
+            }
+            codes.sort();
+            codes.dedup();
             if codes.is_empty() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
@@ -139,13 +230,20 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                 Ok(batch) => {
                     if batch["gap"].as_bool().unwrap_or(false) {
                         let _ = quote_ctx.execution_engine.quote_gap().await;
+                        if let Some(manager) = quote_ctx.instances.get() {
+                            for r in manager.all().await {
+                                r.quote_gap
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                         stream_id.clear();
                         cursor = 0;
                         continue;
                     }
                     stream_id = batch["stream_id"].as_str().unwrap_or("").into();
                     cursor = batch["latest_event_id"].as_u64().unwrap_or(0);
-                    let events = batch["events"]
+                    let events: Vec<(String, n_core::trader::model::ExecutionQuote)> = batch
+                        ["events"]
                         .as_array()
                         .into_iter()
                         .flatten()
@@ -160,12 +258,27 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                             )
                         })
                         .collect();
-                    if let Err(e) = quote_ctx.execution_engine.on_quote_batch(events).await {
-                        tracing::warn!("执行行情与委托推进失败: {e}");
+                    if let Some(manager) = quote_ctx.instances.get() {
+                        for r in manager.all().await {
+                            if r.quote_tx.try_send(events.clone()).is_err() {
+                                r.quote_gap
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    if quote_ctx.instances.get().is_none() {
+                        if let Err(e) = quote_ctx.execution_engine.on_quote_batch(events).await {
+                            tracing::warn!("执行行情推进失败: {e}");
+                        }
                     }
                 }
                 Err(e) => {
                     quote_ctx.execution_engine.market_unavailable().await;
+                    if let Some(manager) = quote_ctx.instances.get() {
+                        for r in manager.all().await {
+                            r.engine.market_unavailable().await;
+                        }
+                    }
                     tracing::warn!("执行行情连接失败: {e}");
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
@@ -184,6 +297,16 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             {
                 break;
             }
+            if let Err(e) = ctx
+                .execution_engine
+                .dispatch(n_core::trader::strategy::StrategyEvent::Timer {
+                    timestamp: chrono::Utc::now().timestamp(),
+                })
+                .await
+            {
+                let _ = ctx.execution_engine.pause(true).await;
+                tracing::error!("默认实例策略处理失败: {e}");
+            }
             if let Err(e) = ctx.execution_engine.drive().await {
                 tracing::warn!("委托维护失败: {e}");
             }
@@ -197,8 +320,29 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             if let Ok(signals) = n_core::storage::repo::pending_execution_signals(&ctx.db).await {
                 register_execution_signals(&ctx, &signals).await;
             }
-            let symbols = ctx.execution_engine.active_symbols().await;
+            let declared = ctx.execution_engine.market_subscriptions().await;
+            let mut symbols = ctx.execution_engine.active_symbols().await;
+            symbols.extend(
+                declared
+                    .iter()
+                    .filter(|s| s.timeframe.as_deref() == Some("15m"))
+                    .map(|s| s.symbol.clone()),
+            );
+            symbols.sort();
+            symbols.dedup();
             for symbol in symbols {
+                if ctx.execution_engine.needs_completed_15m().await {
+                    if let Ok(raw) = n_core::storage::repo::raw_klines(&ctx.db, &symbol).await {
+                        let bars = raw
+                            .iter()
+                            .map(n_core::service::model_to_fetch)
+                            .collect::<Vec<_>>();
+                        if let Err(e) = ctx.execution_engine.on_completed_15m(&symbol, &bars).await
+                        {
+                            tracing::warn!("候选策略完整K线推进失败: {e}");
+                        }
+                    }
+                }
                 if let Ok(bars) = ctx.services.bars_for(&symbol, "15m").await {
                     let last = ctx.execution_engine.last_bar(&symbol).await;
                     let pending = if let Some(last) = last {
@@ -234,6 +378,25 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                     }
                 }
             }
+            for subscription in declared {
+                if let Some(tf) = subscription.timeframe.filter(|tf| tf != "15m") {
+                    if let Ok(bars) = ctx.services.bars_for(&subscription.symbol, &tf).await {
+                        if let Some(bar) = bars.last() {
+                            let _ = ctx
+                                .execution_engine
+                                .dispatch(n_core::trader::strategy::StrategyEvent::BarClosed {
+                                    symbol: subscription.symbol.clone(),
+                                    timeframe: tf,
+                                    timestamp: bar.dt.to_bar_ts(),
+                                    high: bar.high,
+                                    low: bar.low,
+                                    close: bar.close,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -262,8 +425,21 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                     }
                     snapshot["bridge_online"] = serde_json::json!(true);
                     snapshot["source"] = serde_json::json!("server");
+                    if let Some(manager) = bridge_ctx.instances.get() {
+                        manager.validate_snapshot("default", &snapshot).await?;
+                    }
                     if let Err(e) = bridge_ctx.execution_engine.reconcile(&snapshot).await {
                         tracing::error!("柜台状态恢复失败，执行任务未完成: {e}");
+                    }
+                    if let Err(e) = bridge_ctx
+                        .execution_engine
+                        .dispatch(n_core::trader::strategy::StrategyEvent::ExecutionUpdate(
+                            snapshot.clone(),
+                        ))
+                        .await
+                    {
+                        let _ = bridge_ctx.execution_engine.pause(true).await;
+                        tracing::error!("策略成交事件处理失败: {e}");
                     }
                     tx.send_replace(snapshot);
                     backoff = 1;
@@ -317,6 +493,15 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
             if snapshot.is_null() {
                 continue;
             }
+            snapshot["instance_id"] = serde_json::json!("default");
+            snapshot["account_id"] = serde_json::json!("default");
+            snapshot["account_kind"] = serde_json::json!("ctp");
+            if let Some(manager) = ctx.instances.get() {
+                if let Ok(r) = manager.get("default").await {
+                    *r.snapshot.write().await = snapshot.clone();
+                }
+                let _ = manager.sample_equity("default", &snapshot).await;
+            }
             snapshot["config"] =
                 serde_json::to_value(ctx.execution_engine.get_config().await).unwrap_or_default();
             snapshot["managed_positions"] =
@@ -336,6 +521,11 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                     .unwrap_or_default();
             snapshot["strategy_comparison"] = ctx.execution_engine.comparison_summary().await;
             let (snapshot, delta) = publisher.update(snapshot);
+            if let Some(manager) = ctx.instances.get() {
+                if let Ok(r) = manager.get("default").await {
+                    *r.published.write().await = snapshot.clone();
+                }
+            }
             // Keep the REST/bootstrap baseline fresh, including query timestamps.
             *ctx.trader_snapshot.write().await = snapshot.clone();
             if let Some(delta) = delta {

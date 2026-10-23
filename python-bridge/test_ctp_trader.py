@@ -71,6 +71,17 @@ def account():
 
 
 class QueryTests(unittest.TestCase):
+    def test_login_failure_is_published_with_code_and_without_credentials(self):
+        self.m.config.update(Password="fixture-password", AuthCode="fixture-auth")
+        info=types.SimpleNamespace(ErrorID=3,ErrorMsg="reject fixture-password fixture-auth")
+        self.m.OnRspUserLogin(None,info,1,True)
+        health=self.m.health_snapshot()
+        self.assertFalse(health["logged_in"])
+        self.assertEqual(health["login_error_code"],3)
+        self.assertNotIn("fixture-password",json.dumps(health))
+        self.assertNotIn("fixture-auth",json.dumps(self.m.update_events))
+        self.assertEqual(self.m.update_events[-1]["type"],"login_error")
+
     def setUp(self):
         self.m = bridge.CtpTraderManager({})
         self.m.api = FakeApi()
@@ -211,6 +222,27 @@ class QueryTests(unittest.TestCase):
         result = self.m.cancel_order("1001", "pb2611")
         self.assertTrue(result["success"])
         self.assertEqual(self.m.api.calls[0][0], "cancel")
+
+    def test_http_write_rejects_mismatched_account_identity_before_sending(self):
+        bridge.g_trader_mgr = self.m
+        self.m.config.update({"BrokerID": "broker-a", "UserID": "user-a"})
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), bridge.CtpHttpHandler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            request = urllib.request.Request(url + "/order/insert", data=b"{}", headers={
+                "X-Ntrend-Broker": "broker-a", "X-Ntrend-User": "wrong-user",
+                "Content-Type": "application/json"}, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=2)
+            self.assertEqual(caught.exception.code, 409)
+            caught.exception.close()
+            self.assertEqual(self.m.api.calls, [])
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_sse_initial_snapshot_and_event_update_without_counter_queries(self):
         bridge.g_trader_mgr = self.m

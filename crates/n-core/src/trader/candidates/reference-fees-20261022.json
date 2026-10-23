@@ -1,0 +1,387 @@
+{
+  "id": "published-main-contract-fees-20261022-with-user-SR-override",
+  "products": {
+    "C": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "c2701",
+      "open": {
+        "fixed_yuan_per_lot": 1.2,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 1.2,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 1.2,
+        "notional_rate": 0.0
+      }
+    },
+    "EB": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "eb2611",
+      "open": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      }
+    },
+    "EG": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "eg2611",
+      "open": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      }
+    },
+    "JD": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "jd2612",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.00015
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.00015
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.00015
+      }
+    },
+    "L": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "l2701",
+      "open": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      }
+    },
+    "PP": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "pp2701",
+      "open": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      }
+    },
+    "V": {
+      "exchange": "DCE",
+      "source": "DCE",
+      "observed_contract": "v2701",
+      "open": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 1.0,
+        "notional_rate": 0.0
+      }
+    },
+    "CF": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "CF701",
+      "open": {
+        "fixed_yuan_per_lot": 4.3,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 4.3,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      }
+    },
+    "CJ": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "CJ701",
+      "open": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 3.0,
+        "notional_rate": 0.0
+      }
+    },
+    "FG": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "FG701",
+      "open": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      }
+    },
+    "MA": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "MA701",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      }
+    },
+    "SA": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "SA701",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      }
+    },
+    "SF": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "SF701",
+      "open": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      }
+    },
+    "SH": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "SH701",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      }
+    },
+    "SM": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "SM701",
+      "open": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      }
+    },
+    "SR": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "SR701",
+      "published_schedule_before_override": {
+        "open": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        }
+      },
+      "roundtrip_fixed_yuan_per_lot": 2.0,
+      "user_override": "用户明确确认开平往返合计2元/手，所有已平仓糖信号按此口径；不是官方隔夜收费声明"
+    },
+    "UR": {
+      "exchange": "CZCE",
+      "source": "CZCE",
+      "observed_contract": "UR701",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      }
+    },
+    "BU": {
+      "exchange": "SHFE",
+      "source": "SHFE",
+      "observed_contract": "bu2611",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 5e-05
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 5e-05
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      },
+      "base_crosscheck": "SHFE_OFFICIAL"
+    },
+    "PB": {
+      "exchange": "SHFE",
+      "source": "SHFE",
+      "observed_contract": "pb2612",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 4e-05
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 4e-05
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      },
+      "base_crosscheck": "SHFE_OFFICIAL"
+    },
+    "RB": {
+      "exchange": "SHFE",
+      "source": "SHFE",
+      "observed_contract": "rb2701",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "base_crosscheck": "SHFE_OFFICIAL"
+    },
+    "SS": {
+      "exchange": "SHFE",
+      "source": "SHFE",
+      "observed_contract": "ss2612",
+      "open": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 2.0,
+        "notional_rate": 0.0
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      },
+      "base_crosscheck": "SHFE_OFFICIAL"
+    },
+    "SI": {
+      "exchange": "GFEX",
+      "source": "GFEX",
+      "observed_contract": "si2612",
+      "open": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_yesterday": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0001
+      },
+      "close_today": {
+        "fixed_yuan_per_lot": 0.0,
+        "notional_rate": 0.0
+      }
+    }
+  }
+}

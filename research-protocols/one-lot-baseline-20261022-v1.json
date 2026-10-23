@@ -1,0 +1,67 @@
+{
+  "id": "one-lot-baseline-20261022-v1",
+  "frozen_at_shanghai": "2026-10-22T22:25:24+08:00",
+  "historical_data_role": "already-used development diagnostics; not holdout or prospective",
+  "forward_observation_after": "2026-10-22T22:25:24+08:00",
+  "initial_capital_yuan": 50000,
+  "exchange_margin_multiplier": 1.1,
+  "policies": [
+    "original_s1",
+    "fixed_one_r"
+  ],
+  "quantity_per_signal": 1,
+  "min_score": 2.5,
+  "min_planned_risk_ticks": 10,
+  "no_follow_15m_bucket": 5,
+  "no_follow_mfe_r": 0.5,
+  "max_pending_15m_buckets": 12,
+  "max_holding_15m_buckets": 60,
+  "max_active_opportunities_per_symbol": 1,
+  "capacity_begins": "entry; unknown paths conservatively reserve from warning",
+  "priority": "earlier warning then event key; score never changes priority, size or exit",
+  "primary_adverse_slippage_ticks_per_side": 1,
+  "stress_adverse_slippage_ticks_per_side": 2,
+  "diagnostic_adverse_slippage_ticks_per_side": 0,
+  "score_observation_bands": [
+    2.5,
+    3,
+    3.5,
+    4
+  ],
+  "no_parameter_search": true,
+  "no_model_retraining": true,
+  "simultaneous_bar_orderings": [
+    "entry_first",
+    "exit_first_existing_positions"
+  ],
+  "funding_modes": [
+    "dynamic_known_component",
+    "static_50k_capacity_reference"
+  ],
+  "unknown_policy": "reserve margin, keep P&L unknown, final equity null, flag every later funding decision conditional",
+  "source_hashes": {
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\ablation-20261022-v2-input.json": "be5eaf3a10303e778d3528655c7800d281f31d7bd6a3cc1373945a5a3ae8afce",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\fee-reprice-20261022-v2\\summary.json": "f92cbcb6a811918e4eda3ca9692a924e6c7a38924e65d97cb2bd1ffd3f98b9a6",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\fee-reprice-20261022-v2\\evaluations.jsonl": "a8bc74b31f5f607bb178fe90178ca2b760ce6f855bacb08b521580c791e2ae8a",
+    "H:\\WorkSpace2\\Rust\\RustRover\\ntrend\\scripts\\run_one_lot_baseline.py": "04f971d0fa59325ebdcf80706366df87713eaa9cf0e1b5c8fb4a02c1b538c988",
+    "H:\\WorkSpace2\\Rust\\RustRover\\ntrend\\scripts\\validate_capital_capacity.py": "739701c664b1f1db614ac30933532ede87ef1c6ec399eeeeea7469d186fc6033",
+    "H:\\WorkSpace2\\Rust\\RustRover\\ntrend\\scripts\\validate_execution_research.py": "8fe1072c99f1d4fc63486deb4b0a3f8946bbc4aae34fa4ae49017b1ca0dd2022",
+    "H:\\WorkSpace2\\Rust\\RustRover\\ntrend\\scripts\\validate_score_sizing.py": "929fd1b31f981cb780f7c1c25c66a7778634eef56418bdb16ab0ec1589f2b57f",
+    "H:\\WorkSpace2\\Rust\\RustRover\\ntrend\\scripts\\report_signal_ablation.py": "a70df26a0024d65b247cc6d30dddc4be79c2168ec715c02636538d35a8ab78ec",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\final-20261022-v3\\signals.json": "1ded9d04d2ffd3bf580a39a1352645fadd65284df8ae1692e5c86aefcb857a7f"
+  },
+  "public_margin_snapshot_hashes": {
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\exchange-fees-20261022\\czce-mirror.html": "b97532d7e3c772b0befc9e0bccff039b046b49b053b8ed635fb6f20c4e513303",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\exchange-fees-20261022\\dce-mirror.html": "d6eeeadecea5300e7083b580313123bf36f186fa7761edb4de88cc347c3a09a2",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\exchange-fees-20261022\\gfex-mirror.html": "80766a7c2645b9abceb967ade16973c9cedaf3c5a492f651dd49008f0f01b3b1",
+    "G:\\待处理文件\\交易系统\\ntrend-worktree-backups\\signal-system-v3-20261022-212858\\research-runs\\exchange-fees-20261022\\shfe-mirror.html": "5e671aff53ecbed545c909237d857a430a4b347240978f1a4a8d60bbcafe5004"
+  },
+  "prospective_readiness_requirements": [
+    "Actually integrate and start an authenticated live observer; a frozen config alone is not collection.",
+    "Only newly observed warnings after protocol freeze; no historical backfill or known outcomes.",
+    "Capture actual contract, quote/order/fill timestamps, bid/ask, fees and trading-day margin.",
+    "At least 30 trading days and 200 nonoverlapping opportunity groups for first review; counts do not guarantee success.",
+    "Resolve unpriced exposures before reporting complete account equity; inspect costs, pressure, concentration and drawdown.",
+    "Revisions create a new protocol and cohort; do not overwrite this version or pick new score thresholds from this cohort."
+  ]
+}

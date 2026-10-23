@@ -1,0 +1,754 @@
+{
+  "id": "paper-candidates-spec-20261023-v1",
+  "timezone": "Asia/Shanghai",
+  "purpose": "implementation documentation and future paper testing",
+  "qualified_for_trading": false,
+  "production_changed": false,
+  "test_priority": [
+    "P2",
+    "P3",
+    "P1",
+    "LEGACY_NATIVE",
+    "P0"
+  ],
+  "candidates": {
+    "P0": {
+      "research_name": "score3_friction20",
+      "definition": {
+        "breadth_filter": "none",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_friction20",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": false,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    "P1": {
+      "research_name": "fric_weekend",
+      "definition": {
+        "breadth_filter": "none",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    "P2": {
+      "research_name": "fric_atr_weekend",
+      "definition": {
+        "breadth_filter": "risk_atr",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_atr_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    "P3": {
+      "research_name": "fric_atr_cap20_weekend",
+      "definition": {
+        "breadth_filter": "risk_atr",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_atr_cap20_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": 2.0
+        }
+      }
+    }
+  },
+  "common": {
+    "quantity": 1,
+    "score_changes_size": false,
+    "account_cap_yuan": null,
+    "min_planned_risk_ticks": 10,
+    "min_actual_risk_ticks": 10,
+    "forecast_slip_ticks_per_side": 1,
+    "execution_slip_ticks_per_side": [
+      1,
+      2
+    ],
+    "friction_warning_only": true,
+    "friction_limit_fraction_of_planned_risk": 0.2,
+    "net_reward_loss_min": 1,
+    "warning_and_proposed_fill_net_gate": true,
+    "max_chase_price": "max(0.20*planned_risk,2*tick_size)",
+    "pending_buckets": 12,
+    "holding_buckets": 60,
+    "no_follow_bucket": 5,
+    "no_follow_mfe_r_strictly_below": 0.5,
+    "score_min": 3,
+    "risk_atr_range_inclusive": [
+      0.75,
+      2.5
+    ],
+    "atr_context": "mean(last14 complete15m TR), current warning bucket required, midnight preserved",
+    "research_counting": "legacy midnight bucket function; first entry bucket=1",
+    "price_policy": "fixed original structure stop; original S1 unless P3 cap",
+    "one_r_breakeven": false,
+    "partial_exit": false,
+    "trailing_stop": false,
+    "slot": "one accepted entry opportunity per symbol per instance; no pending-warning reservation",
+    "retry_blocked_opportunities": false
+  },
+  "legacy": {
+    "mode": "snapshot actual instance definition and execution configuration before testing",
+    "default_score_min": 2.5,
+    "default_large_score_min": 3.5,
+    "default_large_volume": 2,
+    "default_small_volume": 1,
+    "first_exit_r": 1,
+    "first_large_exit_lots": 1,
+    "breakeven_only_after_confirmed_first_exit": true,
+    "trailing_activate_r": 1.6,
+    "trailing_distance_r": 0.8,
+    "not_equivalent_to_P0": true
+  },
+  "paper_execution_proposal": {
+    "version": "paper-tick-v1",
+    "matching_model": "top_of_book_next_quote",
+    "base_extra_slip_ticks": 0,
+    "stress_extra_slip_ticks": 1,
+    "max_quote_age_ms": 2000,
+    "latency_ms": 0,
+    "matching_requires_subsequent_quote": true,
+    "signal_trigger": "valid_last",
+    "buy_fill": "ask1 plus adverse extra slip",
+    "sell_fill": "bid1 minus adverse extra slip",
+    "forecast_gate_slip_ticks": 1,
+    "midpoint_or_last_fallback": false,
+    "fill_confirmation_required": true,
+    "same_event_exit_reentry": false,
+    "atr_and_counting_midnight_corrected": true,
+    "not_identical_to_research_v5": true
+  },
+  "holidays": [
+    {
+      "name": "中秋节",
+      "block_from": "2026-09-24 14:30:00",
+      "flat_at": "2026-09-24 14:45:00",
+      "last_close": "2026-09-24 15:00:00",
+      "reopen": "2026-09-28 09:00:00"
+    },
+    {
+      "name": "国庆节",
+      "block_from": "2026-09-30 14:30:00",
+      "flat_at": "2026-09-30 14:45:00",
+      "last_close": "2026-09-30 15:00:00",
+      "reopen": "2026-10-08 09:00:00"
+    }
+  ],
+  "fee_snapshot": {
+    "name": "published-main-contract-fees-20261022-with-user-SR-override",
+    "as_of": "2026-10-22",
+    "historical_schedule_verified": false,
+    "continuous_contract_mapping_verified": false,
+    "purpose": "offline sensitivity only; never production broker configuration",
+    "sources": {
+      "DCE": {
+        "title": "DCE交易所标准手续费镜像",
+        "url": "https://www.quantcont.com/shouxufei/jiaoyisuo/DCE",
+        "retrieved_date": "2026-10-22",
+        "verification": "公开第三方镜像，非交易所官网直接取数；非逐日历史费率",
+        "snapshot_sha256": "d6eeeadecea5300e7083b580313123bf36f186fa7761edb4de88cc347c3a09a2"
+      },
+      "CZCE": {
+        "title": "CZCE交易所标准手续费镜像",
+        "url": "https://quantcont.com/shouxufei/jiaoyisuo/CZCE",
+        "retrieved_date": "2026-10-22",
+        "verification": "公开第三方镜像，非交易所官网直接取数；非逐日历史费率",
+        "snapshot_sha256": "b97532d7e3c772b0befc9e0bccff039b046b49b053b8ed635fb6f20c4e513303"
+      },
+      "SHFE": {
+        "title": "SHFE交易所标准手续费镜像",
+        "url": "https://www.quantcont.com/shouxufei/jiaoyisuo/SHFE",
+        "retrieved_date": "2026-10-22",
+        "verification": "公开第三方镜像，非交易所官网直接取数；非逐日历史费率",
+        "snapshot_sha256": "5e671aff53ecbed545c909237d857a430a4b347240978f1a4a8d60bbcafe5004"
+      },
+      "GFEX": {
+        "title": "GFEX交易所标准手续费镜像",
+        "url": "https://www.quantcont.com/shouxufei/jiaoyisuo/GFEX",
+        "retrieved_date": "2026-10-22",
+        "verification": "公开第三方镜像，非交易所官网直接取数；非逐日历史费率",
+        "snapshot_sha256": "80766a7c2645b9abceb967ade16973c9cedaf3c5a492f651dd49008f0f01b3b1"
+      },
+      "SHFE_OFFICIAL": {
+        "title": "上期所2026-10-21结算参数",
+        "url": "https://www.shfe.com.cn/data/busiparamdata/future/Settlement20261021.dat",
+        "verification": "直接下载官方结算参数；对应镜像合约开/平昨基准费率一致，平今仍按镜像列",
+        "snapshot_sha256": "b08435ab740cb7716a7b33072e48b5553a35e8420a77765bb42c38d68f7555b4"
+      }
+    },
+    "products": {
+      "C": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "c2701",
+        "open": {
+          "fixed_yuan_per_lot": 1.2,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 1.2,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 1.2,
+          "notional_rate": 0.0
+        }
+      },
+      "EB": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "eb2611",
+        "open": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        }
+      },
+      "EG": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "eg2611",
+        "open": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        }
+      },
+      "JD": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "jd2612",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.00015
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.00015
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.00015
+        }
+      },
+      "L": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "l2701",
+        "open": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        }
+      },
+      "PP": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "pp2701",
+        "open": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        }
+      },
+      "V": {
+        "exchange": "DCE",
+        "source": "DCE",
+        "observed_contract": "v2701",
+        "open": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 1.0,
+          "notional_rate": 0.0
+        }
+      },
+      "CF": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "CF701",
+        "open": {
+          "fixed_yuan_per_lot": 4.3,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 4.3,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        }
+      },
+      "CJ": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "CJ701",
+        "open": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 3.0,
+          "notional_rate": 0.0
+        }
+      },
+      "FG": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "FG701",
+        "open": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        }
+      },
+      "MA": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "MA701",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        }
+      },
+      "SA": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "SA701",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        }
+      },
+      "SF": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "SF701",
+        "open": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        }
+      },
+      "SH": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "SH701",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        }
+      },
+      "SM": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "SM701",
+        "open": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        }
+      },
+      "SR": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "SR701",
+        "published_schedule_before_override": {
+          "open": {
+            "fixed_yuan_per_lot": 2.0,
+            "notional_rate": 0.0
+          },
+          "close_today": {
+            "fixed_yuan_per_lot": 0.0,
+            "notional_rate": 0.0
+          },
+          "close_yesterday": {
+            "fixed_yuan_per_lot": 2.0,
+            "notional_rate": 0.0
+          }
+        },
+        "roundtrip_fixed_yuan_per_lot": 2.0,
+        "user_override": "用户明确确认开平往返合计2元/手，所有已平仓糖信号按此口径；不是官方隔夜收费声明"
+      },
+      "UR": {
+        "exchange": "CZCE",
+        "source": "CZCE",
+        "observed_contract": "UR701",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        }
+      },
+      "BU": {
+        "exchange": "SHFE",
+        "source": "SHFE",
+        "observed_contract": "bu2611",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 5e-05
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 5e-05
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        },
+        "base_crosscheck": "SHFE_OFFICIAL"
+      },
+      "PB": {
+        "exchange": "SHFE",
+        "source": "SHFE",
+        "observed_contract": "pb2612",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 4e-05
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 4e-05
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        },
+        "base_crosscheck": "SHFE_OFFICIAL"
+      },
+      "RB": {
+        "exchange": "SHFE",
+        "source": "SHFE",
+        "observed_contract": "rb2701",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "base_crosscheck": "SHFE_OFFICIAL"
+      },
+      "SS": {
+        "exchange": "SHFE",
+        "source": "SHFE",
+        "observed_contract": "ss2612",
+        "open": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 2.0,
+          "notional_rate": 0.0
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        },
+        "base_crosscheck": "SHFE_OFFICIAL"
+      },
+      "SI": {
+        "exchange": "GFEX",
+        "source": "GFEX",
+        "observed_contract": "si2612",
+        "open": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_yesterday": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0001
+        },
+        "close_today": {
+          "fixed_yuan_per_lot": 0.0,
+          "notional_rate": 0.0
+        }
+      }
+    }
+  },
+  "historical_product_parameters": {
+    "PB": {
+      "tick_size": 5.0,
+      "multiplier": 5.0
+    },
+    "BU": {
+      "tick_size": 2.0,
+      "multiplier": 10.0
+    },
+    "CJ": {
+      "tick_size": 5.0,
+      "multiplier": 5.0
+    },
+    "CF": {
+      "tick_size": 5.0,
+      "multiplier": 5.0
+    },
+    "SS": {
+      "tick_size": 5.0,
+      "multiplier": 5.0
+    },
+    "SR": {
+      "tick_size": 1.0,
+      "multiplier": 10.0
+    },
+    "JD": {
+      "tick_size": 1.0,
+      "multiplier": 5.0
+    },
+    "SI": {
+      "tick_size": 5.0,
+      "multiplier": 5.0
+    },
+    "SF": {
+      "tick_size": 2.0,
+      "multiplier": 5.0
+    },
+    "SM": {
+      "tick_size": 2.0,
+      "multiplier": 5.0
+    },
+    "EG": {
+      "tick_size": 1.0,
+      "multiplier": 10.0
+    },
+    "PP": {
+      "tick_size": 1.0,
+      "multiplier": 5.0
+    },
+    "L": {
+      "tick_size": 1.0,
+      "multiplier": 5.0
+    },
+    "MA": {
+      "tick_size": 1.0,
+      "multiplier": 10.0
+    },
+    "V": {
+      "tick_size": 1.0,
+      "multiplier": 5.0
+    },
+    "UR": {
+      "tick_size": 1.0,
+      "multiplier": 20.0
+    },
+    "RB": {
+      "tick_size": 1.0,
+      "multiplier": 10.0
+    },
+    "FG": {
+      "tick_size": 1.0,
+      "multiplier": 20.0
+    },
+    "SA": {
+      "tick_size": 1.0,
+      "multiplier": 20.0
+    },
+    "C": {
+      "tick_size": 1.0,
+      "multiplier": 10.0
+    },
+    "EB": {
+      "tick_size": 1.0,
+      "multiplier": 5.0
+    },
+    "SH": {
+      "tick_size": 1.0,
+      "multiplier": 30.0
+    }
+  },
+  "review": {
+    "after_freeze_new_data_only": true,
+    "min_new_closed_per_candidate": 200,
+    "min_new_trading_days": 60,
+    "not_automatic_qualification": true,
+    "night_day_grouping": "night assigned to next exchange trading day; retain calendar-exit-date sensitivity; current archived calendar is inferred",
+    "checks": [
+      "positive net cash and R under1/2tick costs",
+      "best3 trading-day removal and worst3 and symmetric3 reported together",
+      "cash and R rankings kept separate across trades, trading days, natural dates and symbols",
+      "best3 positive symbol removal leaves positive totals; top3 share of positive product nets<=60pct in both slips",
+      "profit breadth with at least10 observations separated from tiny positive samples and products without trades",
+      "gap/calendar and actual contract evidence; actual fee evidence and unknown exposure bounds",
+      "new-data blocked uncertainty, no claim of positive expectation while interval spans0"
+    ],
+    "no_automatic_product_whitelist_or_score_sizing": true,
+    "no_automatic_parameter_selection": true
+  },
+  "source_sha256": {
+    "crates/n-core/src/analyze/model.rs": "03f697e739bb000857378dd7206521f3a25cc06427849a440f038adc64e108da",
+    "crates/n-core/src/derive/mod.rs": "cc912258ac198e9555a0db3a4a941c8ca9c68f31b30ccf41f59edc44262e2ec8",
+    "crates/n-core/src/analyze/indicators.rs": "ad08d4ae534a2d868921f733ce942fec0250f5f9b1226987065d1287c3fffcd4",
+    "crates/n-core/src/analyze/pattern.rs": "749cf7c4935dc13c64ad28b00db4ddbcf39c927376013288e20be221631326f5",
+    "crates/n-core/src/analyze/scoring.rs": "1c64a43a1b53a289a6c6106e0dec130ea2eacf53d29cb9f0ad9bcad4e574ee8f",
+    "crates/n-core/src/analyze/event.rs": "3ebc64e7b1591ec7dbe552410d935c5d38c910b5bc2e8f104ec5c6abdcd17e06",
+    "crates/n-core/src/analyze/mod.rs": "009b2b7dc36666a139d1b20e3dd53fa251ba451b6e7522c7f1379a0ad4be87dd",
+    "crates/n-core/src/v2/replay/engine.rs": "0f909bdbcfb107c2955d4c97732c811f4957ae716b7fb9750747a9a8e69bd7a0",
+    "crates/n-core/src/v3/ablation.rs": "407ee8614140093912a0f9b284244a1860b00215024b81e76c5621c4f3c8bd50",
+    "crates/n-core/src/bin/signal_search.rs": "6208723b05f5fdd6dafb9ebd6efae63be4b607dd234af89293fc4b2de18b8c69",
+    "crates/n-core/src/trader/policy.rs": "8469d705bc0cf661e60b2eceb30420e9d8a503d7ec35e4ff3d5c18097b3ce53b",
+    "crates/n-core/src/trader/trailing.rs": "c471ac1544071428fee565e92f44a6f5a36973f6da434d109e69a4e53e2471e3",
+    "crates/n-core/src/trader/strategy.rs": "a1b75ddfda7bed80063e656e44578ea432c5ecfb1e42a1c98e1fe10283d598f3",
+    "crates/n-core/src/precision.rs": "56e6d5d21eead23f12e9b17eed4d6c07aba3e79641ab5fe39754c178d51ae15c",
+    "scripts/reprice_signal_costs.py": "d594a342d2e9782cb73c80000d8b5e071b2fcf9380d96ed9f7151ed714b6f062",
+    "scripts/validate_execution_research.py": "8fe1072c99f1d4fc63486deb4b0a3f8946bbc4aae34fa4ae49017b1ca0dd2022",
+    "scripts/report_breadth_research.py": "4a48bb2ee5fe6f1273f161a393ab38cb98a5fd05410fcb65655614f5ebe4092a",
+    "scripts/exchange_fees_20261022.json": "867287e2ff85fd04033c626d5eec8d09ae516208adc40feb5158f248f6fa879b",
+    "research-protocols/breadth-shadow-20261023-v1.json": "f9b4ec70be0b68d939b71c384de23265d57c2f95d972a5008af45d6210283027",
+    "research-protocols/holiday-windows-2026-jul-oct-v1.json": "29425fb932fff4602fb0bd8c7766c85979b13daa2154636e44cd6329106b8532"
+  }
+}

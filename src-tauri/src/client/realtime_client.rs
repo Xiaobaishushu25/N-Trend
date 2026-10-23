@@ -83,9 +83,6 @@ impl RealtimeClient {
     }
 
     async fn run_local_trader_stream(&self) {
-        if self.credentials.is_research() {
-            return;
-        }
         let Ok(client) = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))

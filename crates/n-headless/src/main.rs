@@ -1,8 +1,10 @@
 mod api;
 mod auth;
+mod cli;
+mod ctp_login;
 mod ctp_sidecar;
+mod instance_runtime;
 mod lock;
-mod profile;
 mod realtime;
 mod runtime;
 mod secrets;
@@ -102,7 +104,6 @@ fn print_help() {
         r#"ntrend-server (n-headless) - ntrend 权威服务端
 用法:
   cargo run -p n-headless -- --data-dir ./data
-  cargo run -p n-headless -- --profile research --data-dir ./data-dev
   cargo run -p n-headless -- --data-dir /opt/ntrend/data --host 0.0.0.0 --port 8081
   cargo run -p n-headless -- --data-dir ./data --check-integrity
   cargo run -p n-headless -- --data-dir ./data --repair-integrity
@@ -112,29 +113,13 @@ fn print_help() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    cli::validate_args(std::env::args().skip(1))?;
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print_help();
         return Ok(());
     }
 
-    let profile = profile::RuntimeProfile::parse(&std::env::args().collect::<Vec<_>>())?;
-    if profile.is_research() {
-        anyhow::ensure!(
-            !std::env::args().any(|a| a == "--repair-integrity"),
-            "research forbids network repair"
-        );
-        anyhow::ensure!(
-            std::env::args().any(|a| a == "--data-dir" || a.starts_with("--data-dir=")),
-            "research requires an explicit isolated --data-dir"
-        );
-    }
     let data_dir = resolve_data_dir();
-    if profile.is_research() {
-        anyhow::ensure!(
-            data_dir.join("manifest.json").exists(),
-            "research requires a verified prepared snapshot manifest"
-        );
-    }
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("ntrend.db");
     anyhow::ensure!(
@@ -155,11 +140,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let db = storage::connect(&db_path).await?;
-    if !profile.is_research()
-        && n_core::storage::repo::get_setting(&db, "signal_v3_prepared")
-            .await?
-            .as_deref()
-            != Some("1")
+    if n_core::storage::repo::get_setting(&db, "signal_v3_prepared")
+        .await?
+        .as_deref()
+        != Some("1")
     {
         use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
         let count = db
@@ -213,17 +197,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = if profile.is_research() {
-        Config::default()
-    } else {
-        Config::load(&config_path, &db).await?
-    };
-    profile.config(&mut config);
-    let mut secrets = if profile.is_research() {
-        ServerSecrets::research(&data_dir)?
-    } else {
-        ServerSecrets::load_or_create(&data_dir)?
-    };
+    let mut config = Config::load(&config_path, &db).await?;
+    let mut secrets = ServerSecrets::load_or_create(&data_dir)?;
 
     // 自动兼容与同步密码（若 config 中有密码而 secrets 中为空，迁移至 secrets）
     let mut secrets_need_save = false;
@@ -249,11 +224,10 @@ async fn main() -> anyhow::Result<()> {
 
     let services = Arc::new(Services::new(db.clone(), config.clone(), config_path.clone()).await?);
 
-    if !profile.is_research()
-        && n_core::storage::repo::get_setting(&db, "signal_origin")
-            .await?
-            .as_deref()
-            == Some("historical_rebuild")
+    if n_core::storage::repo::get_setting(&db, "signal_origin")
+        .await?
+        .as_deref()
+        == Some("historical_rebuild")
     {
         services.rebuild_events().await?;
         n_core::storage::repo::set_settings(
@@ -263,39 +237,62 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     }
 
-    // CTP 生命周期独立于天勤的连通状态；后台拉起，不以柜台登录阻塞 HTTP 启动。
-    let ctp_sidecar = if profile.is_research() {
-        None
-    } else {
-        match ctp_sidecar::CtpSidecar::start(config.data_source.python_path.as_deref()) {
-            Ok(sidecar) => Some(sidecar),
-            Err(error) => {
-                tracing::warn!("CTP 自动启动不可用: {error:#}");
-                None
-            }
-        }
-    };
-
     // 启动天勤 Python Sidecar（若已配置自动拉起）
     if config.data_source.auto_spawn_bridge {
         let _ = n_core::process::SidecarManager::start(&config.data_source).await;
     }
 
     // 初始化全局上下文
-    let ctx = ServerContext::with_profile(db, services, data_dir, secrets, profile);
+    let ctx = ServerContext::new(db, services, data_dir, secrets);
+
+    n_core::trader::instances::migrate_default(&ctx.data_dir)?;
+    let instances = n_core::trader::instances::InstanceManager::open(
+        ctx.db.clone(),
+        ctx.data_dir.clone(),
+        ctx.execution_engine.clone(),
+        ctx.execution_engine.registry.clone(),
+    )
+    .await?;
+    ctx.instances
+        .set(instances)
+        .map_err(|_| anyhow::anyhow!("策略实例管理器已初始化"))?;
+
+    // CTP 生命周期独立于天勤的连通状态；后台拉起，不以柜台登录阻塞 HTTP 启动。
+    let default_account = ctx.instances.get().unwrap().account("default").await?;
+    let default_sidecar = match default_account.kind {
+        n_core::trader::instances::AccountKind::Ctp {
+            port,
+            broker_id,
+            user_id,
+            credential_ref: Some(reference),
+        } => ctp_sidecar::CtpSidecar::start_account(
+            config.data_source.python_path.as_deref(),
+            port,
+            ctx.data_dir
+                .join("ctp_credentials")
+                .join(format!("{reference}.json")),
+            ctx.data_dir.join("trader_instances/default/flow_ctp"),
+            broker_id,
+            user_id,
+        ),
+        _ => ctp_sidecar::CtpSidecar::start(config.data_source.python_path.as_deref()),
+    };
+    match default_sidecar {
+        Ok(sidecar) => {
+            ctx.ctp_sidecars
+                .lock()
+                .await
+                .insert("default".into(), sidecar);
+        }
+        Err(error) => tracing::warn!("CTP 自动启动不可用: {error:#}"),
+    }
 
     // 启动后台运行时任务（调度器、实时现价轮询、天勤闭合事件消费）
-    if !profile.is_research() {
-        runtime::spawn_runtime_tasks(ctx.clone());
-    }
+    runtime::spawn_runtime_tasks(ctx.clone());
 
     // 构建 Axum REST API 与 WebSocket 路由
     let router = api::build_router(ctx.clone());
-    let listen_addr = if profile.is_research() {
-        "127.0.0.1:18081".parse()?
-    } else {
-        resolve_listen_addr()
-    };
+    let listen_addr = resolve_listen_addr();
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
 
     tracing::info!(
@@ -303,14 +300,18 @@ async fn main() -> anyhow::Result<()> {
         listen_addr
     );
 
+    let shutdown_ctx = ctx.clone();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            shutdown_ctx
+                .is_shutting_down
+                .store(true, std::sync::atomic::Ordering::Release);
             tracing::info!("🛑 收到终止信号，正在优雅关闭服务...");
         })
         .await?;
 
-    if let Some(sidecar) = ctp_sidecar {
+    for (_, sidecar) in ctx.ctp_sidecars.lock().await.drain() {
         sidecar.stop().await;
     }
     n_core::process::SidecarManager::stop();

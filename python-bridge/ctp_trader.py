@@ -79,6 +79,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self.is_authenticated = False
         self.is_logged_in = False
         self.is_ready = False
+        self.login_error = None
+        self.login_error_code = None
         self.trading_day = ""
         self.front_id = 0
         self.session_id = 0
@@ -158,6 +160,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
     def OnFrontConnected(self):
         logger.info("[交易前置] 前置机连接成功，开始穿透式认证...")
         self.is_connected = True
+        self.login_error = None
+        self.login_error_code = None
+        self.emit_event("connecting", {})
         req = tdapi.CThostFtdcReqAuthenticateField()
         req.BrokerID = self.config.get("BrokerID", "9999")
         req.UserID = self.config.get("UserID", "")
@@ -181,8 +186,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
 
     def OnRspAuthenticate(self, pRspAuthenticateField, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:
-            logger.error(f"[穿透认证] 认证失败: {pRspInfo.ErrorMsg}")
             self.is_authenticated = False
+            self._set_login_error("认证失败", pRspInfo)
+            logger.error("[穿透认证] %s", self.login_error)
             # 柜台前置可能未初始化或不活跃，延迟 10 秒后自动重试穿透认证
             def retry_auth():
                 time.sleep(10)
@@ -198,6 +204,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             return
         logger.info("[穿透认证] 穿透式认证成功，开始用户登录...")
         self.is_authenticated = True
+        self.login_error = None
+        self.login_error_code = None
+        self.emit_event("authenticated", {})
         login_req = tdapi.CThostFtdcReqUserLoginField()
         login_req.BrokerID = self.config.get("BrokerID", "9999")
         login_req.UserID = self.config.get("UserID", "")
@@ -206,8 +215,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
 
     def OnRspUserLogin(self, pRspUserLogin, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:
-            logger.error(f"[用户登录] 登录失败: {pRspInfo.ErrorMsg}")
             self.is_logged_in = False
+            self._set_login_error("登录失败", pRspInfo)
+            logger.error("[用户登录] %s", self.login_error)
             # 延迟 10 秒后自动重试登录
             def retry_login():
                 time.sleep(10)
@@ -221,6 +231,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             threading.Thread(target=retry_login, daemon=True).start()
             return
         self.is_logged_in = True
+        self.login_error = None
+        self.login_error_code = None
+        self.emit_event("logged_in", {})
         day = str(pRspUserLogin.TradingDay)
         if self.trading_day and self.trading_day != day:
             with self.lock:
@@ -250,6 +263,16 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         settle_req.BrokerID = self.config.get("BrokerID", "9999")
         settle_req.InvestorID = self.config.get("UserID", "")
         self.api.ReqSettlementInfoConfirm(settle_req, self.get_req_id())
+
+    def _set_login_error(self, stage, info):
+        message = str(info.ErrorMsg)
+        for key in ("Password", "AuthCode"):
+            secret = self.config.get(key)
+            if secret:
+                message = message.replace(secret, "[已隐藏]")
+        self.login_error_code = int(info.ErrorID)
+        self.login_error = f"{stage} ({self.login_error_code}): {message[:256]}"
+        self.emit_event("login_error", {"message": self.login_error, "code": self.login_error_code})
 
     def OnRspSettlementInfoConfirm(self, pConfirm, pRspInfo, nRequestID, bIsLast):
         if pRspInfo and pRspInfo.ErrorID != 0:
@@ -462,6 +485,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 "pid": os.getpid(), "uptime": time.time() - SERVER_STARTED_AT,
                 "connected": self.is_connected, "authenticated": self.is_authenticated,
                 "logged_in": self.is_logged_in, "ready": self.is_ready,
+                "login_error": self.login_error, "login_error_code": self.login_error_code,
                 "settlement_confirmed": self._settlement_confirmed,
                 "trading_day": self.trading_day,
                 "broker_id": self.config.get("BrokerID"), "user_id": self.config.get("UserID"),
@@ -916,6 +940,12 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
         if not g_trader_mgr:
             return self._send_json(500, {"error": "Trader manager not initialized"})
 
+        expected_broker = self.headers.get("X-Ntrend-Broker")
+        expected_user = self.headers.get("X-Ntrend-User")
+        if ((expected_broker is not None and expected_broker != str(g_trader_mgr.config.get("BrokerID", "")))
+                or (expected_user is not None and expected_user != str(g_trader_mgr.config.get("UserID", "")))):
+            return self._send_json(409, {"success": False, "msg": "Account identity mismatch"})
+
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
         try:
@@ -1042,6 +1072,7 @@ def main():
     parser = argparse.ArgumentParser(description="SimNow CTP Local HTTP Bridge")
     parser.add_argument("--port", type=int, default=8766, help="HTTP service port (default: 8766)")
     parser.add_argument("--config", type=str, default="", help="Path to config JSON")
+    parser.add_argument("--flow-dir", type=str, default="", help="Isolated account flow and order journal directory")
     parser.add_argument("--parent-pid", type=int, default=0, help="Owning backend PID; exit when it exits")
     args = parser.parse_args()
     if args.parent_pid > 0:
@@ -1050,30 +1081,39 @@ def main():
     # Load configuration
     config = {
         "BrokerID": "9999",
-        "UserID": "278272",
-        "Password": "qwertyuiop123*",
+        "UserID": "",
+        "Password": "",
         "AppID": "simnow_client_test",
         "AuthCode": "0000000000000000",
         "TdFront": "tcp://182.254.243.31:30001",
         "MdFront": "tcp://182.254.243.31:30011",
     }
-    if args.config and os.path.exists(args.config):
+    config_path = args.config or os.path.join(os.path.dirname(os.path.abspath(__file__)), "simnow_config.json")
+    if config_path:
+        if not os.path.isfile(config_path):
+            raise RuntimeError("Configured account credentials file does not exist")
         try:
-            with open(args.config, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
                 config.update(loaded)
-                logger.info(f"Loaded config from {args.config}")
+                logger.info("Loaded server account configuration")
         except Exception as e:
-            logger.error(f"Failed to load config {args.config}: {e}")
+            raise RuntimeError("Failed to load configured account credentials") from e
+        required = ("BrokerID", "UserID", "Password", "AppID", "AuthCode", "TdFront")
+        if not all(loaded.get(key) for key in required):
+            raise RuntimeError("Configured account credentials are incomplete")
 
     # Create CTP Trader API
     global g_trader_mgr
     logger.info(f"Connecting to CTP Trader Front: {config['TdFront']} ...")
-    flow_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_ctp")
+    flow_dir = os.path.abspath(args.flow_dir) if args.flow_dir else os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_ctp")
     os.makedirs(flow_dir, exist_ok=True)
 
     trader_api = tdapi.CThostFtdcTraderApi.CreateFtdcTraderApi(flow_dir + os.sep)
-    config.setdefault("OrderJournalPath", os.path.join(flow_dir, "order_requests.json"))
+    if args.flow_dir:
+        config["OrderJournalPath"] = os.path.join(flow_dir, "order_requests.json")
+    else:
+        config.setdefault("OrderJournalPath", os.path.join(flow_dir, "order_requests.json"))
     g_trader_mgr = CtpTraderManager(config)
     g_trader_mgr.api = trader_api
     trader_api.RegisterSpi(g_trader_mgr)

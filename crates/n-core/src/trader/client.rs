@@ -7,6 +7,7 @@ use super::model::*;
 #[derive(Clone, Debug)]
 pub struct CtpTraderClient {
     base_url: String,
+    expected_identity: std::sync::Arc<std::sync::RwLock<Option<(String, String)>>>,
     http: Client,
 }
 
@@ -77,9 +78,25 @@ impl CtpTraderClient {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap_or_else(|_| Client::new());
-        Self { base_url, http }
+        Self {
+            base_url,
+            http,
+            expected_identity: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
+    pub fn expect_identity(&self, broker: &str, user: &str) {
+        *self.expected_identity.write().unwrap() = Some((broker.into(), user.into()));
+    }
+    fn mutation(&self, path: &str) -> reqwest::RequestBuilder {
+        let mut request = self.http.post(format!("{}{}", self.base_url, path));
+        if let Some((broker, user)) = &*self.expected_identity.read().unwrap() {
+            request = request
+                .header("X-Ntrend-Broker", broker)
+                .header("X-Ntrend-User", user);
+        }
+        request
+    }
     pub fn for_port(port: u16) -> Self {
         Self::new(format!("http://127.0.0.1:{port}"))
     }
@@ -99,6 +116,17 @@ impl CtpTraderClient {
             response,
             buffer: Vec::new(),
         })
+    }
+
+    pub async fn snapshot(&self) -> Result<serde_json::Value> {
+        Ok(self
+            .http
+            .get(format!("{}/snapshot", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     pub async fn health(&self) -> Result<TraderHealth> {
@@ -176,8 +204,7 @@ impl CtpTraderClient {
     pub async fn insert_order(&self, req: &OrderInsertRequest) -> Result<OrderInsertResponse> {
         let url = format!("{}/order/insert", self.base_url);
         let resp = self
-            .http
-            .post(&url)
+            .mutation("/order/insert")
             .json(req)
             .send()
             .await
@@ -199,8 +226,7 @@ impl CtpTraderClient {
             exchange_id: exchange_id.map(|s| s.to_string()),
         };
         let resp = self
-            .http
-            .post(&url)
+            .mutation("/order/cancel")
             .json(&req)
             .send()
             .await
@@ -210,8 +236,7 @@ impl CtpTraderClient {
     }
 
     pub async fn emergency_cancel_all(&self) -> Result<bool> {
-        let url = format!("{}/emergency/cancel_all", self.base_url);
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.mutation("/emergency/cancel_all").send().await?;
         let val = resp.json::<serde_json::Value>().await?;
         Ok(val
             .get("success")
@@ -220,8 +245,7 @@ impl CtpTraderClient {
     }
 
     pub async fn emergency_close_all(&self) -> Result<bool> {
-        let url = format!("{}/emergency/close_all", self.base_url);
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.mutation("/emergency/close_all").send().await?;
         let val = resp.json::<serde_json::Value>().await?;
         Ok(val
             .get("success")
@@ -230,8 +254,7 @@ impl CtpTraderClient {
     }
 
     pub async fn sync(&self) -> Result<bool> {
-        let url = format!("{}/sync", self.base_url);
-        let resp = self.http.post(&url).send().await?;
+        let resp = self.mutation("/sync").send().await?;
         let val = resp.json::<serde_json::Value>().await?;
         Ok(val
             .get("success")

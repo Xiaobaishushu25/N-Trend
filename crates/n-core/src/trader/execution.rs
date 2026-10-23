@@ -4,11 +4,17 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::sync::{Mutex, RwLock};
 
+use super::broker::BrokerClient;
 use super::client::CtpTraderClient;
 use super::model::*;
 use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
+use super::strategy::*;
 use crate::analyze::model::Dir;
-use crate::analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, PENDING_BARS, TIME_HORIZON_BARS};
+use crate::analyze::outcome::PENDING_BARS;
+use std::sync::Arc;
+
+#[path = "strategy_runtime.rs"]
+mod strategy_runtime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +54,10 @@ pub enum ConditionState {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionOrder {
+    #[serde(default)]
+    pub frozen: Option<FrozenPlan>,
+    #[serde(default, flatten)]
+    pub origin: TradeOrigin,
     pub id: String,
     pub event_id: Option<i64>,
     pub symbol: String,
@@ -72,6 +82,8 @@ pub struct ConditionOrder {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManagedPosition {
+    #[serde(default, flatten)]
+    pub origin: TradeOrigin,
     pub id: String,
     pub condition_order_id: String,
     pub symbol: String,
@@ -112,6 +124,8 @@ pub struct ManagedPosition {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeRecord {
+    #[serde(default, flatten)]
+    pub origin: TradeOrigin,
     #[serde(default)]
     pub signal_evidence: Option<serde_json::Value>,
     pub id: String,
@@ -228,6 +242,8 @@ pub enum OrderPhase {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionOrder {
+    #[serde(default, flatten)]
+    pub origin: TradeOrigin,
     pub request: OrderInsertRequest,
     pub condition_id: String,
     pub reason: Option<String>,
@@ -311,6 +327,13 @@ struct CloseTask {
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ExecutionState {
+    definition: StrategyDefinition,
+    active_config: Option<ExecutionConfig>,
+    strategy_states: HashMap<String, serde_json::Value>,
+    strategy_bars: HashMap<String, String>,
+    quote_gaps: Vec<i64>,
+    paused: bool,
+    strategy_error: Option<String>,
     conditions: HashMap<String, ConditionOrder>,
     positions: HashMap<String, ManagedPosition>,
     history: Vec<TradeRecord>,
@@ -329,9 +352,16 @@ struct ExecutionState {
     #[serde(default)]
     recorded_checkpoints: HashSet<String>,
     entry_funding_waits: HashMap<String, EntryFundingWait>,
+    quote_sequences: HashMap<String, u64>,
+    entry_trigger_sequences: HashMap<String, u64>,
+    symbol_slots: HashMap<String, String>,
+    symbol_release_after: HashMap<String, u64>,
+    entry_decisions: HashMap<String, serde_json::Value>,
     comparison: super::comparison::ComparisonBook,
     #[serde(skip)]
     entry_funds: Option<EntryFunds>,
+    #[serde(skip)]
+    account_snapshot: Option<TraderAccount>,
     #[serde(skip)]
     broker_ready: bool,
     #[serde(skip)]
@@ -351,7 +381,9 @@ struct ExecutionState {
 }
 
 pub struct ExecutionEngine {
-    client: CtpTraderClient,
+    client: BrokerClient,
+    pub registry: Arc<StrategyRegistry>,
+    identity: RwLock<(String, String)>,
     config: RwLock<ExecutionConfig>,
     config_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
@@ -376,7 +408,7 @@ impl ExecutionEngine {
     }
 
     pub fn with_config_path(
-        client: CtpTraderClient,
+        client: impl Into<BrokerClient>,
         config: ExecutionConfig,
         config_path: Option<PathBuf>,
     ) -> Self {
@@ -424,8 +456,10 @@ impl ExecutionEngine {
             state.persistence_error = lock_error;
         }
         Self {
-            client,
-            config: RwLock::new(config),
+            client: client.into(),
+            registry: Arc::new(StrategyRegistry::default()),
+            identity: RwLock::new(("default".into(), "default".into())),
+            config: RwLock::new(state.active_config.clone().unwrap_or(config)),
             config_path,
             state_path,
             state: Mutex::new(state),
@@ -463,11 +497,7 @@ impl ExecutionEngine {
         self.config.read().await.clone()
     }
     pub async fn update_config(&self, cfg: ExecutionConfig) -> Result<()> {
-        if let Some(path) = &self.config_path {
-            atomic_json(path, &cfg)?;
-        }
-        *self.config.write().await = cfg;
-        Ok(())
+        self.configure_strategy(self.definition().await, cfg).await
     }
     pub async fn list_conditions(&self) -> Vec<ConditionOrder> {
         self.state
@@ -563,6 +593,7 @@ impl ExecutionEngine {
         let s = self.state.lock().await;
         s.persistence_error
             .clone()
+            .or_else(|| s.strategy_error.clone())
             .or_else(|| s.error.clone())
             .or_else(|| s.market_error.clone())
     }
@@ -831,93 +862,42 @@ impl ExecutionEngine {
         warning_ts: &str,
         evidence: Option<serde_json::Value>,
     ) -> Result<String> {
-        let long = dir == Dir::Up;
-        anyhow::ensure!(
-            entry.is_finite()
-                && stop.is_finite()
-                && target.is_finite()
-                && entry > 0.0
-                && stop > 0.0
-                && (if long { stop < entry } else { stop > entry }),
-            "入场/止损价格不合法"
-        );
-        let risk = (entry - stop).abs();
-        anyhow::ensure!(risk > 0.0, "止损空间必须大于0");
-        anyhow::ensure!(score.is_finite() && score >= 2.5, "评分低于执行门槛");
-        anyhow::ensure!(
-            is_actual_futures_contract(instrument_id),
-            "必须使用实际交易合约"
-        );
+        let payload = serde_json::json!({"id":event_id,"signal_id":format!("{}:{}:{}",symbol,if dir==Dir::Up {"up"}else{"down"},warning_ts),
+            "symbol":symbol,"instrument_id":instrument_id,"direction":if dir==Dir::Up {"up"}else{"down"},
+            "entry":entry,"stop":stop,"target":target,"entry_score":score,"warning_ts":warning_ts,"source_evidence":evidence});
         let cfg = self.get_config().await;
-        let mut s = self.state.lock().await;
-        let direction = if long { "up" } else { "down" };
-        // This key survives process restarts and repeated scans of the same signal.
-        if let Some(ord) = s.conditions.values().find(|o| {
-            o.symbol == symbol
-                && o.direction == direction
-                && (if event_id.is_some() {
-                    o.event_id == event_id
-                } else {
-                    o.warning_bar_ts == warning_ts
-                })
-        }) {
-            return Ok(ord.id.clone());
-        }
-        let tier = if score >= 3.5 {
-            PositionTier::Large
-        } else {
-            PositionTier::Small
+        let state = self.state.lock().await;
+        let definition = state.definition.clone();
+        let context = StrategyContext {
+            instance_id: "default",
+            positions: &[],
+            orders: &[],
+            conditions: &[],
+            account: None,
+            quotes: &state.quotes,
+            config: &cfg,
+            allow_entries: !state.paused,
         };
-        let target_space = if long { target - entry } else { entry - target };
-        // 目标空间过小判定：若目标空间小于等于止损空间（即 RR <= 1.0，含 S1 倒挂或触碰 entry 的情形）
-        // 此时不以原形态 S1 目标点位作为止盈，而是将止盈预设在 1:1 盈亏比（1.0R）上
-        let (effective_target, is_preset_1r) = if target_space <= risk {
-            let one_r_target = if long { entry + risk } else { entry - risk };
-            (one_r_target, true)
-        } else {
-            (target, false)
-        };
-        let id = uuid::Uuid::new_v4().to_string();
-        s.conditions.insert(
-            id.clone(),
-            ConditionOrder {
-                id: id.clone(),
-                event_id,
-                symbol: symbol.into(),
-                instrument_id: instrument_id.into(),
-                direction: direction.into(),
-                tier,
-                entry_price: entry,
-                stop_price: stop,
-                target_price: effective_target,
-                risk,
-                score,
-                volume: if tier == PositionTier::Large {
-                    cfg.default_large_volume.max(1)
-                } else {
-                    cfg.default_small_volume.max(1)
-                },
-                warning_bar_ts: warning_ts.into(),
-                trigger_ts: None,
-                bars_waited: 0,
-                max_wait_bars: PENDING_BARS,
-                state: ConditionState::Pending,
-                created_at: chrono::Utc::now().timestamp(),
-                note: if is_preset_1r {
-                    format!("目标空间<1R(S1:{:.1})，止盈预设1:1", target)
-                } else {
-                    "等待实际合约触价".into()
-                },
+        let actions = self.registry.strategy(&definition)?.on_event(
+            &StrategyEvent::Signal {
+                source: N_STRATEGY.into(),
+                payload,
             },
-        );
-        let condition = s.conditions[&id].clone();
-        s.comparison
-            .register(&condition, &cfg, condition.created_at);
-        if let Some(evidence) = evidence {
-            s.comparison.attach_evidence(&id, evidence);
-        }
-        self.save(&mut s)?;
-        Ok(id)
+            &context,
+            &mut serde_json::Value::Null,
+        )?;
+        drop(state);
+        let plan = actions
+            .into_iter()
+            .find_map(|a| {
+                if let TradeIntent::Open(p) = a {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow::anyhow!("策略未产生入场计划"))?;
+        self.register_plan(plan, definition, cfg).await
     }
 
     pub async fn cancel_condition(&self, id: &str) -> Result<bool> {
@@ -946,6 +926,7 @@ impl ExecutionEngine {
             .get(id)
             .is_some_and(|o| o.state == ConditionState::WaitingConfirm)
             || s.aborted_entries.contains(id)
+            || s.paused
         {
             return Ok(false);
         }
@@ -983,6 +964,7 @@ impl ExecutionEngine {
         s: &mut ExecutionState,
         snapshot: &serde_json::Value,
     ) -> Result<()> {
+        s.account_snapshot = serde_json::from_value(snapshot["account"].clone()).ok();
         let h = &snapshot["health"];
         s.broker_connected = h["logged_in"].as_bool().unwrap_or(false)
             && h["settlement_confirmed"]
@@ -1144,6 +1126,7 @@ impl ExecutionEngine {
                     .positions
                     .entry(cond.id.clone())
                     .or_insert_with(|| ManagedPosition {
+                        origin: cond.origin.clone(),
                         id: cond.id.clone(),
                         condition_order_id: cond.id.clone(),
                         symbol: cond.symbol.clone(),
@@ -1185,12 +1168,32 @@ impl ExecutionEngine {
                     + trade.price * trade.volume as f64)
                     / qty as f64;
                 pos.volume = qty;
-                pos.risk = (pos.fill_price - cond.stop_price).abs().max(1e-9);
+                pos.risk = if cond.stop_price > 0.0 {
+                    (pos.fill_price - cond.stop_price).abs().max(1e-9)
+                } else {
+                    cond.risk
+                };
                 pos.is_closed = false;
                 let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
                 let target_space = (cond.target_price - cond.entry_price) * sign;
-                if target_space <= cond.risk + 1e-6 {
+                if cond
+                    .frozen
+                    .as_ref()
+                    .is_none_or(|f| f.definition.exit_policy == "n_exit_v1")
+                    && target_space <= cond.risk + 1e-6
+                {
                     pos.target_price = pos.fill_price + sign * pos.risk;
+                }
+                if let Some(frozen) = &cond.frozen {
+                    if let Some(target) = self
+                        .registry
+                        .exit(&frozen.definition.exit_policy)
+                        .ok()
+                        .and_then(|policy| policy.target_on_fill(pos, &frozen.plan))
+                        .filter(|price| price.is_finite() && *price > 0.0)
+                    {
+                        pos.target_price = target;
+                    }
                 }
                 // Stop exits include fills racing an entry cancellation. A partial
                 // profit-taking task still closes only its requested first lot.
@@ -1198,8 +1201,9 @@ impl ExecutionEngine {
                     if task.all {
                         task.target += trade.volume;
                     }
-                } else if (cond.direction == "up" && trade.price <= cond.stop_price)
-                    || (cond.direction == "down" && trade.price >= cond.stop_price)
+                } else if cond.stop_price > 0.0
+                    && ((cond.direction == "up" && trade.price <= cond.stop_price)
+                        || (cond.direction == "down" && trade.price >= cond.stop_price))
                 {
                     Self::latch_exit(s, &cond.id, "stop", cond.stop_price, true);
                 }
@@ -1215,10 +1219,17 @@ impl ExecutionEngine {
                 pos.exit_price = Some(trade.price);
                 pos.exit_reason = order.reason.clone();
                 let r = points / pos.risk.max(1e-9);
-                let mult = crate::precision::effective_multiplier(&pos.instrument_id, "");
+                let mult = self.client.multiplier(&pos.instrument_id);
                 let pnl_amount = points * mult * trade.volume as f64;
                 let rec = TradeRecord {
-                    signal_evidence: None,
+                    origin: cond.origin.clone(),
+                    signal_evidence: cond
+                        .frozen
+                        .as_ref()
+                        .filter(|f| {
+                            f.definition.strategy_id != N_STRATEGY && !f.plan.evidence.is_null()
+                        })
+                        .map(|f| f.plan.evidence.clone()),
                     id: key,
                     condition_order_id: cond.id.clone(),
                     symbol: pos.symbol.clone(),
@@ -1408,7 +1419,11 @@ impl ExecutionEngine {
                         .filter(|ts| ts.as_str() > o.warning_bar_ts.as_str())
                         .count(),
                 );
-                if o.bars_waited > o.max_wait_bars {
+                if o.frozen
+                    .as_ref()
+                    .is_none_or(|f| f.definition.strategy_id == N_STRATEGY)
+                    && o.bars_waited > o.max_wait_bars
+                {
                     o.state = ConditionState::Expired;
                     expired.push(o.id.clone());
                 }
@@ -1458,14 +1473,19 @@ impl ExecutionEngine {
     pub async fn market_unavailable(&self) {
         let mut s = self.state.lock().await;
         if s.market_error.is_none() {
+            s.quote_gaps.push(chrono::Utc::now().timestamp());
             s.comparison.mark_quote_gap();
         }
         s.quotes.clear();
         s.market_error = Some("执行行情连接中断，暂停新报单并保留未完成任务".into());
+        if let Err(e) = self.save(&mut s) {
+            tracing::error!("行情缺口状态保存失败: {e}");
+        }
     }
 
     pub async fn quote_gap(&self) -> Result<()> {
         let mut s = self.state.lock().await;
+        s.quote_gaps.push(chrono::Utc::now().timestamp());
         s.comparison.mark_quote_gap();
         let ids = s
             .orders
@@ -1492,18 +1512,68 @@ impl ExecutionEngine {
     }
 
     pub async fn on_quotes(&self, quotes: HashMap<String, ExecutionQuote>) -> Result<()> {
+        for quote in quotes.values().filter(|q| q.valid()) {
+            if let Err(e) = self.dispatch(StrategyEvent::Quote(quote.clone())).await {
+                self.pause(true).await?;
+                tracing::error!("策略处理失败，继续保护已有持仓: {e}");
+            }
+        }
         let mode = self.get_config().await.mode;
         let mut s = self.state.lock().await;
+        let observed = quotes
+            .values()
+            .filter(|q| q.valid())
+            .map(|q| q.instrument_id.to_uppercase())
+            .collect::<HashSet<_>>();
+        for instrument in &observed {
+            *s.quote_sequences.entry(instrument.clone()).or_default() += 1;
+        }
+        Self::release_symbol_slots(&mut s, &observed);
         if quotes.values().any(|q| q.valid()) {
             s.market_error = None;
+        }
+        for q in quotes.values() {
+            s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
         }
         s.quotes.extend(quotes);
         let state = &mut *s;
         state
             .comparison
             .advance(&state.quotes, chrono::Utc::now().timestamp());
-        let entries = s.conditions.values().cloned().collect::<Vec<_>>();
+        let mut entries = s.conditions.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            (&a.warning_bar_ts, &a.origin.signal_id, &a.id).cmp(&(
+                &b.warning_bar_ts,
+                &b.origin.signal_id,
+                &b.id,
+            ))
+        });
         for cond in entries {
+            let strategy = cond
+                .frozen
+                .as_ref()
+                .and_then(|f| self.registry.strategy(&f.definition).ok());
+            let constraints = strategy
+                .as_ref()
+                .map(|p| p.entry_constraints())
+                .unwrap_or_default();
+            if cond.frozen.as_ref().is_some_and(|f| {
+                f.plan
+                    .expires_at
+                    .is_some_and(|t| chrono::Utc::now().timestamp() > t)
+            }) {
+                s.aborted_entries.insert(cond.id.clone());
+                if let Some(c) = s.conditions.get_mut(&cond.id).filter(|c| {
+                    matches!(
+                        c.state,
+                        ConditionState::Pending
+                            | ConditionState::WaitingConfirm
+                            | ConditionState::Triggered
+                    )
+                }) {
+                    c.state = ConditionState::Expired;
+                }
+            }
             let Some(q) = s
                 .quotes
                 .get(&cond.instrument_id.to_uppercase())
@@ -1512,16 +1582,84 @@ impl ExecutionEngine {
             else {
                 continue;
             };
+            let mode = cond
+                .frozen
+                .as_ref()
+                .map(|f| f.execution.mode)
+                .unwrap_or(mode);
+            let new_quote = observed.contains(&cond.instrument_id.to_uppercase());
+            if constraints.terminal_rejections
+                && new_quote
+                && !s.positions.get(&cond.id).is_some_and(|p| !p.is_closed)
+                && matches!(
+                    cond.state,
+                    ConditionState::Pending
+                        | ConditionState::WaitingConfirm
+                        | ConditionState::Triggered
+                )
+                && cond.stop_price > 0.0
+                && (q.last - cond.stop_price) * if cond.direction == "up" { 1.0 } else { -1.0 }
+                    <= 0.0
+            {
+                Self::reject_strategy_entry(&mut s, &cond.id, "invalidated");
+                continue;
+            }
             if cond.state == ConditionState::Pending
+                && (!constraints.next_quote || new_quote)
+                && !s.paused
+                && cond.frozen.as_ref().is_none_or(|f| {
+                    f.plan
+                        .expires_at
+                        .is_none_or(|t| chrono::Utc::now().timestamp() <= t)
+                })
                 && !s.aborted_entries.contains(&cond.id)
                 && s.entry_symbols_ready.contains(&cond.symbol)
             {
-                let hit = if cond.direction == "up" {
+                let hit = if cond
+                    .frozen
+                    .as_ref()
+                    .is_some_and(|f| matches!(f.plan.trigger, EntryTrigger::Immediate))
+                {
+                    true
+                } else if cond.direction == "up" {
                     q.last >= cond.entry_price
                 } else {
                     q.last <= cond.entry_price
                 };
                 if hit {
+                    if constraints.one_per_symbol {
+                        let frozen = cond.frozen.as_ref().unwrap();
+                        let proposed = if cond.direction == "up" { q.ask } else { q.bid };
+                        match strategy.as_ref().unwrap().check_entry(
+                            &frozen.plan,
+                            &q,
+                            proposed,
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            EntryDecision::Wait(reason) => {
+                                Self::set_entry_note(&mut s, &cond.id, reason);
+                                continue;
+                            }
+                            EntryDecision::Reject(reason) => {
+                                Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                continue;
+                            }
+                            EntryDecision::Allow => {}
+                        }
+                        if Self::symbol_slot_blocked(&s, &cond) {
+                            Self::reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
+                            continue;
+                        }
+                        s.symbol_slots.insert(cond.symbol.clone(), cond.id.clone());
+                    }
+                    if constraints.next_quote {
+                        let seq = s
+                            .quote_sequences
+                            .get(&cond.instrument_id.to_uppercase())
+                            .copied()
+                            .unwrap_or(0);
+                        s.entry_trigger_sequences.insert(cond.id.clone(), seq);
+                    }
                     let o = s.conditions.get_mut(&cond.id).unwrap();
                     if o.trigger_ts.is_none() {
                         o.trigger_ts =
@@ -1548,11 +1686,12 @@ impl ExecutionEngine {
                 .orders
                 .values()
                 .any(|o| o.condition_id == cond.id && o.reason.is_none());
-            let stop_hit = if cond.direction == "up" {
-                q.last <= cond.stop_price
-            } else {
-                q.last >= cond.stop_price
-            };
+            let stop_hit = cond.stop_price > 0.0
+                && if cond.direction == "up" {
+                    q.last <= cond.stop_price
+                } else {
+                    q.last >= cond.stop_price
+                };
             let exposed = s.positions.get(&cond.id).is_some_and(|p| p.volume > 0)
                 || s.orders.values().any(|o| {
                     o.condition_id == cond.id
@@ -1581,35 +1720,83 @@ impl ExecutionEngine {
             pos.max_mfe_r = pos.max_mfe_r.max(r);
             pos.max_mae_r = pos.max_mae_r.min(r);
             if !s.closes.contains_key(&cond.id) {
-                let update = super::policy::on_price(
-                    pos.tier,
-                    pos.fill_price,
-                    pos.risk,
-                    sign,
-                    q.last,
-                    pos.target_price,
-                    pos.current_stop_price,
-                    pos.max_mfe_r,
-                    pos.lot1_closed,
-                );
+                let parameters = cond
+                    .frozen
+                    .as_ref()
+                    .map(|f| &f.definition.parameters)
+                    .unwrap_or(&serde_json::Value::Null);
+                let policy_id = cond
+                    .frozen
+                    .as_ref()
+                    .map(|f| f.definition.exit_policy.as_str())
+                    .unwrap_or("n_exit_v1");
+                let policy = self
+                    .registry
+                    .exit(policy_id)
+                    .or_else(|_| self.registry.exit("protect_only_v1"))?;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    policy.on_quote(&pos, &q, parameters)
+                }));
+                let mut update = match result {
+                    Ok(u) => u,
+                    Err(_) => {
+                        s.paused = true;
+                        s.strategy_error = Some("退出模块异常，使用已保存的保护价".into());
+                        self.registry
+                            .exit("protect_only_v1")?
+                            .on_quote(&pos, &q, parameters)
+                    }
+                };
+                if !update.stop.is_finite()
+                    || update.stop < 0.0
+                    || update
+                        .close
+                        .as_ref()
+                        .is_some_and(|(_, v)| v.is_some_and(|v| v <= 0 || v > pos.volume))
+                {
+                    s.paused = true;
+                    s.strategy_error = Some("退出模块返回无效保护价或平仓数量".into());
+                    update = self
+                        .registry
+                        .exit("protect_only_v1")?
+                        .on_quote(&pos, &q, parameters);
+                }
+                if pos.current_stop_price > 0.0 {
+                    update.stop = if sign > 0.0 {
+                        update.stop.max(pos.current_stop_price)
+                    } else if update.stop <= 0.0 {
+                        pos.current_stop_price
+                    } else {
+                        update.stop.min(pos.current_stop_price)
+                    };
+                }
                 pos.current_stop_price = update.stop;
                 if (update.stop - pos.fill_price) * sign > 0.0 {
                     pos.trailing_grade = pos.trailing_grade.max(2)
                 }
-                if let Some(intent) = update.intent {
+                if let Some((reason, volume)) = update.close {
                     Self::latch_exit(
                         &mut s,
                         &cond.id,
-                        intent.reason,
-                        if intent.reason == "trailing" || intent.reason == "breakeven" {
+                        &reason,
+                        if reason == "trailing" || reason == "breakeven" {
                             update.stop
                         } else {
                             q.last
                         },
-                        intent.all,
+                        volume.is_none(),
                     );
+                    if let Some(volume) = volume {
+                        if let Some(task) = s.closes.get_mut(&cond.id) {
+                            task.target = task.target.max(task.filled + volume.min(pos.volume));
+                        }
+                    }
                 }
-            } else if s.closes[&cond.id].reason == "target_1r"
+            } else if cond
+                .frozen
+                .as_ref()
+                .is_none_or(|f| f.definition.exit_policy == "n_exit_v1")
+                && s.closes[&cond.id].reason == "target_1r"
                 && pos.tier == PositionTier::Large
                 && s.closes[&cond.id].filled >= s.closes[&cond.id].target
             {
@@ -1658,29 +1845,70 @@ impl ExecutionEngine {
         if state.comparison.advance(&state.quotes, now) {
             self.save(&mut s)?;
         }
+        let expired = s
+            .conditions
+            .values()
+            .filter(|c| {
+                c.frozen
+                    .as_ref()
+                    .is_some_and(|f| f.plan.expires_at.is_some_and(|t| now > t))
+                    && !s.aborted_entries.contains(&c.id)
+            })
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            for id in expired {
+                s.aborted_entries.insert(id.clone());
+                if let Some(c) = s.conditions.get_mut(&id).filter(|c| {
+                    matches!(
+                        c.state,
+                        ConditionState::Pending
+                            | ConditionState::WaitingConfirm
+                            | ConditionState::Triggered
+                    )
+                }) {
+                    c.state = ConditionState::Expired;
+                }
+            }
+            self.save(&mut s)?;
+        }
         self.check_overnight_checkpoints(&mut s);
         self.update_overnight_next_open(&mut s);
-        if cfg.mode == ExecutionMode::MonitorOnly {
-            return Ok(());
-        }
         if !s.broker_connected || s.persistence_error.is_some() || now - s.last_action_at < 2 {
             return Ok(());
         }
         // 解除长时间处于 CancelPending 且已重试多次的死锁报单，防止阻塞驱动循环与其它品种交易
         let mut unblocked_any = false;
+        let strict_orders = s
+            .orders
+            .iter()
+            .filter_map(|(id, o)| {
+                s.conditions
+                    .get(&o.condition_id)
+                    .and_then(|c| c.frozen.as_ref())
+                    .and_then(|f| self.registry.strategy(&f.definition).ok())
+                    .is_some_and(|p| p.entry_constraints().terminal_rejections)
+                    .then_some(id.clone())
+            })
+            .collect::<HashSet<_>>();
         for (r, o) in s.orders.iter_mut() {
             if o.phase == OrderPhase::CancelPending
                 && o.cancel_attempts >= 3
                 && now - o.action_at >= 15
             {
                 tracing::warn!(
-                    "⚠️ 报单 {} ({}) 处于 CancelPending 且已重试 {} 次超时未获柜台终态回报，将其标记为 Rejected 避免阻塞其它品种交易",
+                    "⚠️ 报单 {} ({}) 撤单已重试 {} 次仍未获得柜台终态回报",
                     r,
                     o.request.instrument_id,
                     o.cancel_attempts
                 );
-                o.phase = OrderPhase::Rejected;
-                o.note = "撤单多次未获回报，标记终止".to_string();
+                if strict_orders.contains(r) {
+                    o.phase = OrderPhase::Unknown;
+                    o.note = "撤单未确认，保留未知敞口与品种槽位，禁止替换报单".into();
+                } else {
+                    o.phase = OrderPhase::Rejected;
+                    o.note = "撤单多次未获回报，标记终止".to_string();
+                }
                 unblocked_any = true;
             }
         }
@@ -1753,9 +1981,39 @@ impl ExecutionEngine {
         }
         let mut entry_state_changed = Self::refresh_entry_funding_waits(&mut s);
         let mut conditions = s.conditions.values().cloned().collect::<Vec<_>>();
-        conditions.sort_by_key(|o| (!s.closes.contains_key(&o.id), o.created_at, o.id.clone()));
+        conditions.sort_by_key(|o| {
+            (
+                !s.closes.contains_key(&o.id),
+                o.warning_bar_ts.clone(),
+                o.origin.signal_id.clone(),
+                o.id.clone(),
+            )
+        });
         let mut candidate = None;
         for cond in conditions {
+            let cfg = cond.frozen.as_ref().map(|f| &f.execution).unwrap_or(&cfg);
+            let strategy = cond
+                .frozen
+                .as_ref()
+                .and_then(|f| self.registry.strategy(&f.definition).ok());
+            let constraints = strategy
+                .as_ref()
+                .map(|p| p.entry_constraints())
+                .unwrap_or_default();
+            if constraints.terminal_rejections
+                && !s.closes.contains_key(&cond.id)
+                && s.orders.values().any(|o| {
+                    o.condition_id == cond.id
+                        && o.reason.is_none()
+                        && o.phase == OrderPhase::Rejected
+                        && o.filled == 0
+                        && o.reported_filled == 0
+                })
+            {
+                Self::reject_strategy_entry(&mut s, &cond.id, "broker_rejected");
+                entry_state_changed = true;
+                continue;
+            }
             let blocked = s.orders.values().any(|o| {
                 o.condition_id == cond.id
                     && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
@@ -1787,13 +2045,36 @@ impl ExecutionEngine {
                     task.attempts,
                 )
             } else {
-                if cfg.mode == ExecutionMode::MonitorOnly
+                if s.paused
+                    || cond.frozen.as_ref().is_some_and(|f| {
+                        self.registry.validate(&f.definition).is_err()
+                            || f.plan.expires_at.is_some_and(|t| now > t)
+                    })
+                    || cfg.mode == ExecutionMode::MonitorOnly
                     || !s.entry_symbols_ready.contains(&cond.symbol)
                     || !s.authorized_entries.contains(&cond.id)
                     || s.aborted_entries.contains(&cond.id)
                 // 暂时停用日内亏损熔断限制（后续如需重新启用，解开下方注释即可）：
                 // || (cfg.daily_loss_limit_r > 0.0 && s.loss_r >= cfg.daily_loss_limit_r)
                 {
+                    continue;
+                }
+                if constraints.next_quote {
+                    let sequence = s
+                        .quote_sequences
+                        .get(&cond.instrument_id.to_uppercase())
+                        .copied()
+                        .unwrap_or(0);
+                    if s.entry_trigger_sequences
+                        .get(&cond.id)
+                        .is_none_or(|trigger| sequence <= *trigger)
+                    {
+                        continue;
+                    }
+                }
+                if constraints.one_per_symbol && Self::symbol_slot_blocked(&s, &cond) {
+                    Self::reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
+                    entry_state_changed = true;
                     continue;
                 }
                 let risk_ticks = cond.risk / q.tick;
@@ -1839,6 +2120,11 @@ impl ExecutionEngine {
                     market_price < cond.entry_price - max_entry_slippage - 1e-6
                 };
                 if overshot {
+                    if constraints.terminal_rejections {
+                        Self::reject_strategy_entry(&mut s, &cond.id, "unfilled");
+                        entry_state_changed = true;
+                        continue;
+                    }
                     let limit_desc = if buy { "上限" } else { "下限" };
                     let max_p = if buy {
                         cond.entry_price + max_entry_slippage
@@ -1859,6 +2145,29 @@ impl ExecutionEngine {
             let Some(price) = q.order_price(buy, reference, ticks, max_ticks) else {
                 continue;
             };
+            if reason.is_none() {
+                if let (Some(strategy), Some(frozen)) = (&strategy, &cond.frozen) {
+                    let decision = strategy.check_entry(&frozen.plan, &q, price, now);
+                    match decision {
+                        EntryDecision::Allow => {
+                            if constraints.terminal_rejections {
+                                s.entry_decisions.insert(cond.id.clone(),serde_json::json!({"stage":"proposed_fill","reason":"allowed",
+                                    "at":now,"proposed":price,"quote":q,"signal_id":cond.origin.signal_id,"version":cond.origin.strategy_version}));
+                                entry_state_changed = true;
+                            }
+                        }
+                        EntryDecision::Wait(reason) => {
+                            entry_state_changed |= Self::set_entry_note(&mut s, &cond.id, reason);
+                            continue;
+                        }
+                        EntryDecision::Reject(reason) => {
+                            Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                            entry_state_changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
             s.last_ref = (s.last_ref + 1).max(chrono::Utc::now().timestamp() as u64 * 100);
             let r = s.last_ref.to_string();
             let req = OrderInsertRequest {
@@ -1896,9 +2205,11 @@ impl ExecutionEngine {
         } else {
             None
         };
+        let origin = s.conditions[&id].origin.clone();
         s.orders.insert(
             r.clone(),
             ExecutionOrder {
+                origin,
                 request: req.clone(),
                 condition_id: id.clone(),
                 reason: reason.clone(),
@@ -1975,6 +2286,20 @@ impl ExecutionEngine {
         if !is_new_bar {
             return Ok(());
         } // Execution uses actual-contract quote events, never historical OHLC touches.
+        if let Err(e) = self
+            .dispatch(StrategyEvent::BarClosed {
+                symbol: symbol.into(),
+                timeframe: "15m".into(),
+                timestamp: bar_ts.into(),
+                high: _high,
+                low: _low,
+                close: _close,
+            })
+            .await
+        {
+            self.pause(true).await?;
+            tracing::error!("策略K线处理失败: {e}");
+        }
         let mut s = self.state.lock().await;
         if s.last_bars
             .get(symbol)
@@ -2019,16 +2344,37 @@ impl ExecutionEngine {
         for id in ids {
             let p = s.positions.get_mut(&id).unwrap();
             p.bars_held += 1;
-            let reason = if p.bars_held >= TIME_HORIZON_BARS {
-                Some("time_exit")
-            } else if p.bars_held == NO_FOLLOW_BAR && p.max_mfe_r < NO_FOLLOW_MFE_R {
-                Some("no_follow")
-            } else {
-                None
+            let parameters = s
+                .conditions
+                .get(&id)
+                .and_then(|c| c.frozen.as_ref())
+                .map(|f| f.definition.parameters.clone())
+                .unwrap_or(serde_json::Value::Null);
+            let frozen = s
+                .conditions
+                .get(&id)
+                .and_then(|c| c.frozen.as_ref())
+                .map(|f| f.definition.exit_policy.clone())
+                .unwrap_or_else(|| "n_exit_v1".into());
+            let p = s.positions.get_mut(&id).unwrap();
+            let position = p.clone();
+            let reference = position.fill_price;
+            let result = self.registry.exit(&frozen).map(|policy| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    policy.on_bar(&position, &parameters)
+                }))
+            });
+            let reason = match result {
+                Ok(Ok(reason)) => reason,
+                Ok(Err(_)) => {
+                    s.paused = true;
+                    s.strategy_error = Some("退出模块K线处理异常，保留已有保护价".into());
+                    None
+                }
+                Err(_) => None,
             };
-            let reference = p.fill_price;
             if let Some(reason) = reason {
-                Self::latch_exit(&mut s, &id, reason, reference, true);
+                Self::latch_exit(&mut s, &id, &reason, reference, true);
             }
         }
         self.save(&mut s)
@@ -2038,3 +2384,11 @@ impl ExecutionEngine {
 #[cfg(test)]
 #[path = "execution_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "instance_tests.rs"]
+mod instance_tests;
+
+#[cfg(test)]
+#[path = "candidate_execution_tests.rs"]
+mod candidate_execution_tests;

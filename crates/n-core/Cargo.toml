@@ -34,3 +34,15 @@ path = "src/bin/migrate.rs"
 [[bin]]
 name = "signal-research"
 path = "src/bin/signal_research.rs"
+
+[[bin]]
+name = "signal-ablation"
+path = "src/bin/signal_ablation.rs"
+
+[[bin]]
+name = "signal-optimize"
+path = "src/bin/signal_optimize.rs"
+
+[[bin]]
+name = "signal-search"
+path = "src/bin/signal_search.rs"

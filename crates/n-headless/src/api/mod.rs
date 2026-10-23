@@ -2,6 +2,7 @@ pub mod actions;
 pub mod admin;
 pub mod annotations;
 pub mod devices;
+pub mod instances;
 pub mod integrity;
 pub mod klines;
 pub mod manual_levels;
@@ -170,6 +171,19 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
         .route("/integrity", get(integrity::check_integrity))
         .route("/integrity/repair", post(integrity::repair_integrity))
         // SimNow 自动化交易与持仓风控
+        .route(
+            "/trader/instances",
+            get(instances::list).post(instances::create),
+        )
+        .route("/trader/instances/comparison", get(instances::comparison))
+        .route("/trader/instances/:id/snapshot", get(instances::snapshot))
+        .route("/trader/instances/:id/orders", get(instances::orders))
+        .route("/trader/instances/:id/actions", post(instances::action))
+        .route(
+            "/trader/instances/:id/connection",
+            get(instances::connection_settings),
+        )
+        .route("/trader/instances/:id/login", post(instances::login))
         .route("/trader/status", get(trader::get_trader_status))
         .route(
             "/trader/snapshot",
@@ -206,10 +220,6 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         .route("/healthz", get(meta::healthz))
         .nest("/api/v1", api_v1)
-        .layer(axum::middleware::from_fn_with_state(
-            ctx.clone(),
-            research_boundary,
-        ))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(log_http_request))
@@ -252,25 +262,4 @@ async fn log_http_request(
     }
 
     resp
-}
-
-async fn research_boundary(
-    axum::extract::State(ctx): axum::extract::State<Arc<ServerContext>>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if !ctx.profile.allows(req.method(), req.uri().path()) {
-        return (axum::http::StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"code":"RESEARCH_DISABLED","message":"研究模式禁止交易、外部取数和运行配置变更"}))).into_response();
-    }
-    let mut response = next.run(req).await;
-    response.headers_mut().insert(
-        "x-ntrend-profile",
-        axum::http::HeaderValue::from_static(if ctx.profile.is_research() {
-            "research"
-        } else {
-            "production"
-        }),
-    );
-    response
 }

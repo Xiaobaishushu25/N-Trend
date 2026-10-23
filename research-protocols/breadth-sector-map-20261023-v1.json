@@ -1,0 +1,15 @@
+{
+  "id": "breadth-sector-map-20261023-v1",
+  "purpose": "Fixed broad exposure proxy, not fitted correlations or a product profitability whitelist",
+  "groups": {
+    "energy_chemical": ["BU0", "EB0", "EG0", "FG0", "L0", "MA0", "PP0", "SA0", "SH0", "UR0", "V0"],
+    "agriculture_soft": ["C0", "CF0", "CJ0", "JD0", "SR0"],
+    "metals_ferroalloys": ["PB0", "RB0", "SF0", "SI0", "SM0", "SS0"]
+  },
+  "admission": "Keep one opportunity per symbol; additionally at most one concurrent opportunity in each sector and direction. Opposite directions share symbol limit but not sector-direction slot.",
+  "ties": "Entry interval end, warning timestamp, then event_key ascending. Reverse event_key sensitivity also reported. No sorting by future PnL or retrospective preferred symbols.",
+  "unknown_exposure": "Same conservative maximum-horizon reservation as existing capacity research",
+  "capital_cap": null,
+  "not_a_broker_replay": true,
+  "qualified_for_trading": false
+}

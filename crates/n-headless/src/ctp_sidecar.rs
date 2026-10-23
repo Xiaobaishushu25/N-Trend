@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const SERVICE: &str = "ntrend-ctp-trader";
@@ -14,6 +14,7 @@ const SERVICE: &str = "ntrend-ctp-trader";
 pub struct CtpSidecar {
     stop: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+    reconnect: mpsc::Sender<(Launch, oneshot::Sender<Result<()>>)>,
 }
 
 #[derive(Clone)]
@@ -21,6 +22,9 @@ struct Launch {
     python: PathBuf,
     script: PathBuf,
     port: u16,
+    config: Option<PathBuf>,
+    flow_dir: Option<PathBuf>,
+    identity: Option<(String, String)>,
     poll: Duration,
     probe_timeout: Duration,
 }
@@ -33,16 +37,82 @@ impl CtpSidecar {
             python,
             script,
             port: 8766,
+            config: None,
+            flow_dir: None,
+            identity: None,
             poll: Duration::from_secs(5),
             probe_timeout: Duration::from_secs(1),
         }))
     }
 
+    pub fn start_account(
+        custom_python: Option<&str>,
+        port: u16,
+        config: PathBuf,
+        flow_dir: PathBuf,
+        broker: String,
+        user: String,
+    ) -> Result<Self> {
+        Ok(Self::launch(Self::account_launch(
+            custom_python,
+            port,
+            config,
+            flow_dir,
+            broker,
+            user,
+        )?))
+    }
+
+    fn account_launch(
+        custom_python: Option<&str>,
+        port: u16,
+        config: PathBuf,
+        flow_dir: PathBuf,
+        broker: String,
+        user: String,
+    ) -> Result<Launch> {
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+        anyhow::ensure!(
+            value["BrokerID"].as_str() == Some(&broker) && value["UserID"].as_str() == Some(&user),
+            "CTP凭据身份不匹配"
+        );
+        Ok(Launch {
+            python: find_python(custom_python)?,
+            script: find_script()?,
+            port,
+            config: Some(config),
+            flow_dir: Some(flow_dir),
+            identity: Some((broker, user)),
+            poll: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(1),
+        })
+    }
+
+    pub async fn reconnect_account(
+        &self,
+        custom_python: Option<&str>,
+        port: u16,
+        config: PathBuf,
+        flow_dir: PathBuf,
+        broker: String,
+        user: String,
+    ) -> Result<()> {
+        let launch = Self::account_launch(custom_python, port, config, flow_dir, broker, user)?;
+        let (tx, rx) = oneshot::channel();
+        self.reconnect
+            .send((launch, tx))
+            .await
+            .context("CTP连接管理任务已停止")?;
+        rx.await.context("CTP重连任务已停止")?
+    }
+
     fn launch(launch: Launch) -> Self {
         let (stop, receiver) = oneshot::channel();
+        let (reconnect, requests) = mpsc::channel(4);
         Self {
             stop: Some(stop),
-            task: Some(tokio::spawn(supervise(launch, receiver))),
+            reconnect,
+            task: Some(tokio::spawn(supervise(launch, receiver, requests))),
         }
     }
 
@@ -82,6 +152,11 @@ enum Listener {
 
 async fn listener(launch: &Launch, client: &CtpTraderClient) -> Listener {
     if let Ok(Ok(health)) = tokio::time::timeout(launch.probe_timeout, client.health()).await {
+        if launch.identity.as_ref().is_some_and(|(b, u)| {
+            health.broker_id.as_ref() != Some(b) || health.user_id.as_ref() != Some(u)
+        }) {
+            return Listener::Occupied;
+        }
         if health.service == SERVICE {
             if let Some(pid) = health.pid.filter(|pid| *pid > 0) {
                 return Listener::Bridge {
@@ -101,7 +176,11 @@ async fn listener(launch: &Launch, client: &CtpTraderClient) -> Listener {
     }
 }
 
-async fn supervise(launch: Launch, mut stop: oneshot::Receiver<()>) {
+async fn supervise(
+    mut launch: Launch,
+    mut stop: oneshot::Receiver<()>,
+    mut requests: mpsc::Receiver<(Launch, oneshot::Sender<Result<()>>)>,
+) {
     let client = CtpTraderClient::for_port(launch.port);
     let mut child: Option<Child> = None;
     let mut last = None;
@@ -111,6 +190,25 @@ async fn supervise(launch: Launch, mut stop: oneshot::Receiver<()>) {
         tokio::select! {
             biased;
             _ = &mut stop => break,
+            Some((next, reply)) = requests.recv() => {
+                let state = listener(&launch, &client).await;
+                let owned_pid = child.as_ref().and_then(Child::id);
+                let refused = next.port != launch.port || match state {
+                    Listener::Bridge { pid, .. } => owned_pid != Some(pid),
+                    Listener::Occupied => true,
+                    Listener::Free => false,
+                };
+                if refused {
+                    let _ = reply.send(Err(anyhow::anyhow!("该端口由外部或未确认的桥接占用，请先停止外部桥接后重试；其他账户不受影响")));
+                    continue;
+                }
+                if let Some(mut owned) = child.take() { stop_owned(&mut owned).await; }
+                launch = next;
+                last = None;
+                interval.reset_immediately();
+                let _ = reply.send(Ok(()));
+                continue;
+            },
             _ = interval.tick() => {},
         }
         if let Some(owned) = child.as_mut() {
@@ -156,6 +254,12 @@ async fn supervise(launch: Launch, mut stop: oneshot::Receiver<()>) {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            if let Some(config) = &launch.config {
+                command.arg("--config").arg(config);
+            }
+            if let Some(flow) = &launch.flow_dir {
+                command.arg("--flow-dir").arg(flow);
+            }
             #[cfg(windows)]
             command.creation_flags(0x08000000);
             match command.spawn() {

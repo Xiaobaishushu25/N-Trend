@@ -1,0 +1,33 @@
+{
+  "id": "net-space-s1-20261022-v1",
+  "frozen_at_shanghai": "2026-10-22T22:49:54+08:00",
+  "role": "Candidate frozen after historical development diagnostics, not validated for production",
+  "account_cap": null,
+  "volume": 1,
+  "primary_policy": "original_s1",
+  "min_score": 2.5,
+  "min_planned_risk_ticks": 10,
+  "no_follow_15m_bucket": 5,
+  "max_hold_15m_buckets": 60,
+  "entry_gate": {
+    "min_net_reward_to_full_stop_loss": 1.0,
+    "warning_check": true,
+    "actual_proposed_fill_recheck": true,
+    "assumed_slip_ticks_per_side": 1,
+    "close_fee_bound": "worse of close_today and close_yesterday",
+    "sugar_user_total_roundtrip_yuan": 2.0
+  },
+  "score_changes_size": false,
+  "primary_slip_ticks": 1,
+  "stress_slip_ticks": 2,
+  "change_warning_forecast_under_stress": false,
+  "primary_diagnostic": "one active opportunity per symbol, no account capital cap",
+  "secondary_diagnostic": "independent signals",
+  "comparison_policy": "same net-space guard, no_follow disabled; no automatic winner promotion",
+  "rejected_protection_variant": "move stop to entry at 1R: weak under stress; keep original S1 exit for main candidate",
+  "fee_profile_sha256": "867287e2ff85fd04033c626d5eec8d09ae516208adc40feb5158f248f6fa879b",
+  "trial_manifest_sha256": "ce679d33193ed381dc701c93739c57a9195e4dabbc56845327ff02998d7a9e81",
+  "qualified_for_trading": false,
+  "production_changed": false,
+  "independent_new_observations": 0
+}

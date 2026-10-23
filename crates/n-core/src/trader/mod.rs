@@ -1,9 +1,13 @@
+pub mod broker;
+pub mod candidates;
 pub mod client;
 pub mod comparison;
 pub mod execution;
+pub mod instances;
 pub mod model;
 pub mod overnight;
 pub mod policy;
+pub mod strategy;
 mod trailing;
 
 pub use client::CtpTraderClient;

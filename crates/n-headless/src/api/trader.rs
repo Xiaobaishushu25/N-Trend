@@ -70,9 +70,11 @@ pub async fn get_execution_orders(
     _device: crate::auth::AuthDevice,
     Query(query): Query<ExecutionOrdersQuery>,
 ) -> impl IntoResponse {
-    Json(ctx.execution_engine.execution_orders_page(
-        query.page.unwrap_or(1), query.page_size.unwrap_or(20),
-    ).await)
+    Json(
+        ctx.execution_engine
+            .execution_orders_page(query.page.unwrap_or(1), query.page_size.unwrap_or(20))
+            .await,
+    )
 }
 
 pub async fn get_trader_account(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
@@ -141,16 +143,22 @@ pub async fn update_trader_config(
     }
 }
 
-pub async fn emergency_cancel_all(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
-    let client = CtpTraderClient::for_port(8766);
+pub async fn emergency_cancel_all(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
+    let n_core::trader::broker::BrokerClient::Ctp(client) = ctx.execution_engine.broker_client()
+    else {
+        return Json(ApiResponse::err("默认账户不是CTP账户"));
+    };
     match client.emergency_cancel_all().await {
         Ok(res) => Json(ApiResponse::ok(res)),
         Err(e) => Json(ApiResponse::err(format!("一键全撤失败: {}", e))),
     }
 }
 
-pub async fn emergency_close_all(State(_ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
-    let client = CtpTraderClient::for_port(8766);
+pub async fn emergency_close_all(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
+    let n_core::trader::broker::BrokerClient::Ctp(client) = ctx.execution_engine.broker_client()
+    else {
+        return Json(ApiResponse::err("默认账户不是CTP账户"));
+    };
     match client.emergency_close_all().await {
         Ok(res) => Json(ApiResponse::ok(res)),
         Err(e) => Json(ApiResponse::err(format!("一键全平失败: {}", e))),

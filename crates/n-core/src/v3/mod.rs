@@ -1,5 +1,6 @@
 //! Warning-time, net-profit contract. Legacy trigger-close models are ineligible.
 pub mod replay;
+pub mod ablation;
 pub mod research;
 pub mod store;
 pub const CONTRACT: &str = "warning-breakout-net-v3";

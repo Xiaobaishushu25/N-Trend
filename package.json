@@ -8,9 +8,7 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "icon": "tauri icon src-tauri/icons/icon-manifest.json",
-    "dev:research": "tauri dev --config src-tauri/tauri.research.conf.json",
-    "server:research": "cargo run -p n-headless -- --profile research --data-dir ./data-dev"
+    "icon": "tauri icon src-tauri/icons/icon-manifest.json"
   },
   "dependencies": {
     "@imengyu/vue3-context-menu": "^1.5.6",

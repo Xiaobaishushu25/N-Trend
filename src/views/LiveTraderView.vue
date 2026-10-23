@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import TraderInstancesPanel from '../components/TraderInstancesPanel.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { isTauri } from '@tauri-apps/api/core'
@@ -56,6 +57,9 @@ import {
 import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from '../types'
 
 const trader = useLiveTraderStore()
+const selectedInstance = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
+const executionLabel = computed(() => selectedInstance.value?.account.kind === 'paper' ? '模拟' : '实盘')
+const isNStrategy = computed(() => !selectedInstance.value || selectedInstance.value.strategy.strategy_id === 'n_pattern')
 watch(() => trader.activeTab, (tab) => {
   if (tab === 'orders') void trader.loadExecutionOrders(1)
 })
@@ -326,13 +330,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 <template>
   <div class="live-trader-page">
+    <TraderInstancesPanel />
     <!-- 1. 顶部控制栏与柜台状态（浅色高对比度） -->
     <header class="trader-header" @mousedown="onHeaderMouseDown">
       <div class="header-top-row">
         <div class="header-title-box">
           <div class="title-with-badge">
             <n-icon :component="Bolt" size="22" color="#eab308" />
-            <h1 class="header-title">实盘量化执行终端</h1>
+            <h1 class="header-title">{{ executionLabel }}量化执行终端</h1>
             <n-tooltip trigger="hover">
               <template #trigger>
                 <n-tag
@@ -429,17 +434,17 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 一键全撤
               </n-button>
             </template>
-            确定要向 SimNow 柜台撤回所有在途挂单吗？
+            确定要撤回当前所选账户的全部在途委托吗？
           </n-popconfirm>
 
           <n-popconfirm @positive-click="trader.emergencyCloseAll">
             <template #trigger>
               <n-button size="small" secondary type="error">
                 <template #icon><n-icon :component="AlertTriangle" /></template>
-                紧急全平
+                {{ trader.instancesSupported ? '平本实例持仓' : '紧急全平' }}
               </n-button>
             </template>
-            确定要市价对手价平掉当前所有活跃持仓吗？此操作不可逆！
+            {{ trader.instancesSupported ? '确定要平掉当前实例的全部托管持仓吗？' : '确定要平掉当前账户的全部活跃持仓吗？' }}
           </n-popconfirm>
 
           <n-button size="small" secondary :loading="trader.refreshing" @click="trader.refresh">
@@ -453,7 +458,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
       <div class="account-strip">
         <div class="acc-col">
           <span class="acc-label">投资者账号</span>
-          <span class="acc-val font-num">{{ trader.account?.account_id || trader.health?.account_id || '278272' }}</span>
+          <span class="acc-val font-num">{{ trader.account?.account_id || trader.health?.account_id || '—' }}</span>
         </div>
         <div class="acc-divider" />
         <div class="acc-col">
@@ -504,13 +509,13 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
       <div class="kpi-and-diff-row">
         <div class="live-kpi-bar">
           <div class="kpi-box">
-            <span class="kpi-name">实盘成交单数</span>
+            <span class="kpi-name">{{ executionLabel }}成交单数</span>
             <span class="kpi-num font-num">{{ trader.statistics?.total_trades || 0 }} <span class="unit">笔</span></span>
             <span class="kpi-sub">大仓 {{ trader.statistics?.large_trades_count || 0 }} / 小仓 {{ trader.statistics?.small_trades_count || 0 }}</span>
           </div>
           <div class="kpi-divider" />
           <div class="kpi-box">
-            <span class="kpi-name">实盘真实胜率</span>
+            <span class="kpi-name">{{ executionLabel }}真实胜率</span>
             <span
               class="kpi-num font-num"
               :class="(trader.statistics?.win_rate_pct || 0) >= 50 ? 'is-up' : 'is-down'"
@@ -523,7 +528,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </div>
           <div class="kpi-divider" />
           <div class="kpi-box">
-            <span class="kpi-name">实盘平仓盈亏</span>
+            <span class="kpi-name">{{ executionLabel }}平仓盈亏</span>
             <span
               class="kpi-num font-num"
               :class="trader.totalRealizedPnlAmount >= 0 ? 'is-up' : 'is-down'"
@@ -536,7 +541,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </div>
           <div class="kpi-divider" />
           <div class="kpi-box">
-            <span class="kpi-name">实盘累计 R 倍数</span>
+            <span class="kpi-name">{{ executionLabel }}累计 R 倍数</span>
             <span
               class="kpi-num font-num"
               :class="(trader.statistics?.total_r || 0) >= 0 ? 'is-up' : 'is-down'"
@@ -547,7 +552,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </div>
           <div class="kpi-divider" />
           <div class="kpi-box">
-            <span class="kpi-name">实盘盈亏比</span>
+            <span class="kpi-name">{{ executionLabel }}盈亏比</span>
             <span class="kpi-num font-num">
               {{ (trader.statistics?.profit_factor || 0).toFixed(2) }}
             </span>
@@ -556,10 +561,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         </div>
 
         <!-- 理论复盘 vs 实盘对比卡条 -->
-        <div class="comparison-card">
+        <div v-if="isNStrategy" class="comparison-card">
           <div class="cmp-title">
             <n-icon :component="LayersSubtract" size="15" color="#0284c7" />
-            <span>实盘表现 vs 理论复盘</span>
+            <span>{{ executionLabel }}表现 vs 理论复盘</span>
           </div>
           <div class="cmp-content">
             <div class="cmp-item">
@@ -569,13 +574,13 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               </span>
             </div>
             <div class="cmp-item">
-              <span class="cmp-label">实盘真实胜率:</span>
+              <span class="cmp-label">{{ executionLabel }}真实胜率:</span>
               <span class="cmp-val font-num" :class="(trader.statistics?.win_rate_pct || 0) >= 50 ? 'is-up' : 'is-down'">
                 {{ (trader.statistics?.win_rate_pct || 0).toFixed(1) }}%
               </span>
             </div>
             <div class="cmp-item">
-              <span class="cmp-label">实盘偏差:</span>
+              <span class="cmp-label">{{ executionLabel }}偏差:</span>
               <span
                 v-if="winRateDiff !== null"
                 class="cmp-val font-num"
@@ -587,7 +592,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             </div>
           </div>
           <div class="cmp-tip">
-            * 理论复盘按历史信号理想打点推演；实盘则反映 SimNow 真实撮合排队、跳价与两手分批保本规则。
+            理论复盘按历史信号推演。实盘统计使用柜台成交；模拟统计使用明确的盘口成交假设，不能代替实际成交效果。
           </div>
         </div>
       </div>
@@ -677,7 +682,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
       <!-- A. 在手持仓标签页（展示 SimNow 柜台真实持仓如 pb2612 与托管策略持仓） -->
       <section v-if="trader.activeTab === 'positions'" class="tab-pane">
         <div v-if="!trader.combinedPositions.length" class="empty-holder">
-          <n-empty description="当前 SimNow 柜台与策略没有在手持仓（已空仓等待新信号突破）" />
+          <n-empty description="当前账户与策略没有在手持仓" />
         </div>
 
         <div v-else class="cards-grid">
@@ -708,7 +713,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                   {{ pos.managed.tier === 'large' ? '策略托管: 大仓分批' : '策略托管: 小仓1:1' }}
                 </n-tag>
                 <n-tag v-else size="small" type="default">
-                  SimNow 柜台直持仓
+                  账户直接持仓
                 </n-tag>
 
                 <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->

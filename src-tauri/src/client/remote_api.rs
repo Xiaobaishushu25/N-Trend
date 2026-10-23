@@ -1061,6 +1061,90 @@ impl RemoteApiClient {
 
     // ── Trader ──
 
+    pub async fn trader_instance_request(
+        &self,
+        operation: &str,
+        instance_id: Option<&str>,
+        payload: Value,
+    ) -> Result<Value, ApiErrorResponse> {
+        if matches!(operation, "login" | "action") && instance_id.is_none() {
+            return Err(ApiErrorResponse::new(
+                "INVALID_INSTANCE",
+                "交易操作必须指定策略实例",
+                "",
+            ));
+        }
+        let id = instance_id.unwrap_or("default");
+        if id.is_empty()
+            || id.len() > 80
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(ApiErrorResponse::new(
+                "INVALID_INSTANCE",
+                "实例编号无效",
+                "",
+            ));
+        }
+        let (method, path) = match operation {
+            "list" => (Method::GET, "trader/instances".into()),
+            "create" => (Method::POST, "trader/instances".into()),
+            "snapshot" => (Method::GET, format!("trader/instances/{id}/snapshot")),
+            "connection" => (Method::GET, format!("trader/instances/{id}/connection")),
+            "login" => (Method::POST, format!("trader/instances/{id}/login")),
+            "orders" => (
+                Method::GET,
+                format!(
+                    "trader/instances/{id}/orders?page={}&page_size={}",
+                    payload["page"].as_u64().unwrap_or(1),
+                    payload["page_size"].as_u64().unwrap_or(20)
+                ),
+            ),
+            "action" => (Method::POST, format!("trader/instances/{id}/actions")),
+            "comparison" => (
+                Method::GET,
+                format!(
+                    "trader/instances/comparison?from={}&to={}",
+                    payload["from"]
+                        .as_i64()
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp() - 30 * 86400),
+                    payload["to"]
+                        .as_i64()
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+                ),
+            ),
+            _ => {
+                return Err(ApiErrorResponse::new(
+                    "INVALID_OPERATION",
+                    "实例操作无效",
+                    "",
+                ))
+            }
+        };
+        let request = self.request(method.clone(), &path);
+        // Creation is not retried automatically: the client may have missed a successful response.
+        let response: Value = self
+            .execute_with_retry(
+                if method == Method::POST {
+                    request.json(&payload)
+                } else {
+                    request
+                },
+                method == Method::GET,
+                None,
+            )
+            .await?;
+        if response["success"] == false {
+            return Err(ApiErrorResponse::new(
+                "INSTANCE_ERROR",
+                response["error"].as_str().unwrap_or("实例操作失败"),
+                "",
+            ));
+        }
+        Ok(response.get("data").cloned().unwrap_or(response))
+    }
+
     pub async fn get_trader_status(&self) -> Result<serde_json::Value, ApiErrorResponse> {
         self.execute(self.request(Method::GET, "trader/status"))
             .await

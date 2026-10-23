@@ -15,22 +15,6 @@ pub struct ServerSecrets {
 }
 
 impl ServerSecrets {
-    /// Never load production secrets or the production admin-key environment in research.
-    pub fn research(data_dir: &Path) -> Result<Self> {
-        let path = data_dir.join("research-pairing-key.txt");
-        let admin_key = if path.exists() {
-            std::fs::read_to_string(&path)?
-        } else {
-            let key = uuid::Uuid::new_v4().simple().to_string();
-            std::fs::write(&path, &key)?;
-            key
-        };
-        Ok(Self {
-            admin_key: admin_key.trim().to_string(),
-            ..Self::default()
-        })
-    }
-
     pub fn load_or_create(data_dir: &Path) -> Result<Self> {
         let path = data_dir.join("secrets.json");
         let mut secrets = if path.exists() {

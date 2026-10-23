@@ -1,0 +1,208 @@
+{
+  "id": "holiday-profit-shadow-20261023-v1",
+  "frozen_at_shanghai": "2026-10-23T00:58:11.651849+08:00",
+  "supersedes_for_next_paper_comparison": "broad-search-shadow-20261023-v1",
+  "reason": "User requires avoiding multi-day holiday exposure and auditing profit distribution; keep three branches as explicit comparators",
+  "scope": "offline and prospective paper comparison only",
+  "qualified_for_trading": false,
+  "production_changed": false,
+  "new_independent_observations": 0,
+  "quantity": 1,
+  "account_cap": null,
+  "score_changes_size": false,
+  "holiday_policy": "fixed14:30 block entries,14:45 flatten before published multi-day holidays only; no weekend/lunch flatten; missing cutoff quote remains unknown",
+  "holiday_schedule": {
+    "coverage_end": "2026-10-31 23:59:59",
+    "coverage_start": "2026-07-01 00:00:00",
+    "cross_exchange_scope_note": "Shared mainland holiday dates applied to all22 products; source citations directly verify SHFE, other exchange-specific exceptional schedules are not independently certified by this file",
+    "id": "holiday-windows-2026-jul-oct-v1",
+    "policy": "Fixed once for this research: stop entries14:30, flatten at14:45, no profit-conditioned exceptions. 5m bars have end labels; entry block applies conservatively to interval ending14:30. No parameter sweep.",
+    "production_changed": false,
+    "qualified_for_trading": false,
+    "scope": "Published Mid-Autumn and National Day market closures within coverage; ordinary weekends, overnight and lunch remain separate diagnostics",
+    "sources": [
+      {
+        "retrieved_shanghai_date": "2026-10-23",
+        "title": "上海期货交易所2026年休市安排",
+        "url": "https://www.shfe.com.cn/services/calenderandholidays/holiday/"
+      },
+      {
+        "published": "2026-09-21",
+        "retrieved_shanghai_date": "2026-10-23",
+        "title": "关于2026年中秋节、国庆节期间有关工作安排的通知",
+        "url": "https://www.shfe.com.cn/publicnotice/notice/202609/t20260921_833503.html?updatetime=short"
+      }
+    ],
+    "timezone": "Asia/Shanghai",
+    "windows": [
+      {
+        "block_from": "2026-09-24 14:30:00",
+        "flat_at": "2026-09-24 14:45:00",
+        "last_close": "2026-09-24 15:00:00",
+        "name": "中秋节",
+        "reopen": "2026-09-28 09:00:00"
+      },
+      {
+        "block_from": "2026-09-30 14:30:00",
+        "flat_at": "2026-09-30 14:45:00",
+        "last_close": "2026-09-30 15:00:00",
+        "name": "国庆节",
+        "reopen": "2026-10-08 09:00:00"
+      }
+    ]
+  },
+  "holiday_schedule_sha256": "29425fb932fff4602fb0bd8c7766c85979b13daa2154636e44cd6329106b8532",
+  "engine_source_sha256": "8b1ceafed04a2d89ab6edc21ad7a2587496da33488157f99ddce4414c75621d8",
+  "runner_source_sha256": "7130fd3b6448d9608034650725c51e9d354983b77be9ddba2dbfdbc1ee0e43d5",
+  "fee_profile_sha256": "867287e2ff85fd04033c626d5eec8d09ae516208adc40feb5158f248f6fa879b",
+  "manifest_sha256": "cef01cb8787cae56a533af5f26e5420e0bcf22934cfc49ddaa2534bdd44bdbe8",
+  "result_sha256": "1cd6e5660305ac4ce23375c9298d98584028cc220e3b3e9703cd32009736e8ec",
+  "verification_sha256": "ef83dca403e50491c868273f19daf6f96905ed19129acebb9e4eca20162b967a",
+  "fixed_candidates": [
+    {
+      "role": "simple_mechanism_control",
+      "definition": {
+        "filter": "none",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 2.5,
+        "name": "net_s1_holiday_flat",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "primary_return_and_distribution_candidate",
+      "definition": {
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_friction20_holiday_flat",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "higher_win_rate_comparator",
+      "definition": {
+        "filter": "none",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "score3_confirm_no_follow_off_holiday_flat",
+        "net_guard": true,
+        "no_follow": false,
+        "rules": {
+          "entry_mode": "close_confirm_next_open",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    }
+  ],
+  "original_comparators": [
+    {
+      "filter": "none",
+      "holiday_flat": false,
+      "min_risk_ticks": 10,
+      "min_score": 2.5,
+      "name": "net_s1",
+      "net_guard": true,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    },
+    {
+      "filter": "friction20",
+      "holiday_flat": false,
+      "min_risk_ticks": 10,
+      "min_score": 3.0,
+      "name": "score3_friction20",
+      "net_guard": true,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    },
+    {
+      "filter": "none",
+      "holiday_flat": false,
+      "min_risk_ticks": 10,
+      "min_score": 3.0,
+      "name": "score3_confirm_no_follow_off",
+      "net_guard": true,
+      "no_follow": false,
+      "rules": {
+        "entry_mode": "close_confirm_next_open",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    }
+  ],
+  "primary_slip_ticks_per_fill": 1,
+  "stress_slip_ticks_per_fill": 2,
+  "no_search_of_holiday_cutoff_times": true,
+  "no_automatic_winner_promotion": true,
+  "future_review": {
+    "new_observations_only_after_freeze": true,
+    "min_new_closed_per_candidate": 200,
+    "min_new_trading_dates": 60,
+    "not_automatic_trading_qualification": true,
+    "focus": [
+      "both cash and R, execution cost stress",
+      "positive-profit concentration versus share of net, ranked separately in cash and R",
+      "top5/top10 and best3exit-date removal as sensitivity, not arbitrary optimization targets",
+      "holiday carry prohibited; new post-reopen entry cannot inherit prior gap",
+      "ordinary session gap, joint same-date and correlated-sector contribution",
+      "month and symbol concentration, tail losses and unknown exposure bounds",
+      "actual contract mapping, published future holiday calendar and actual fee evidence",
+      "independent chronological evidence and block uncertainty before positive-expectation claims"
+    ]
+  }
+}

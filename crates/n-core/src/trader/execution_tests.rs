@@ -12,7 +12,10 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn historical_orders_are_paged_newest_first_without_changing_archive() {
-    let engine = ExecutionEngine::new(CtpTraderClient::new("http://127.0.0.1:1".into()), ExecutionConfig::default());
+    let engine = ExecutionEngine::new(
+        CtpTraderClient::new("http://127.0.0.1:1".into()),
+        ExecutionConfig::default(),
+    );
     {
         let mut state = engine.state.lock().await;
         for reference in 1..=4031 {
@@ -34,8 +37,19 @@ async fn historical_orders_are_paged_newest_first_without_changing_archive() {
     assert_eq!(first.items[19].request.order_ref.as_deref(), Some("4012"));
     assert_eq!(second.items[0].request.order_ref.as_deref(), Some("4011"));
     assert_eq!(engine.execution_orders_page(202, 20).await.items.len(), 11);
-    assert!(engine.execution_orders_page(usize::MAX, 100).await.items.is_empty());
-    assert_eq!(engine.execution_orders_page(0, usize::MAX).await.items.len(), 100);
+    assert!(engine
+        .execution_orders_page(usize::MAX, 100)
+        .await
+        .items
+        .is_empty());
+    assert_eq!(
+        engine
+            .execution_orders_page(0, usize::MAX)
+            .await
+            .items
+            .len(),
+        100
+    );
     assert_eq!(engine.execution_orders_page(0, 0).await.page_size, 1);
     assert_eq!(engine.state.lock().await.orders.len(), 4031);
 }
@@ -644,6 +658,7 @@ async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions()
         s.orders.insert(
             "ref_stuck".to_string(),
             ExecutionOrder {
+                origin: Default::default(),
                 request: OrderInsertRequest {
                     instrument_id: "inst_a".to_string(),
                     exchange_id: Some("DCE".to_string()),
@@ -759,7 +774,7 @@ async fn rejection_without_numeric_shortfall_waits_for_margin_release_not_floati
 }
 
 #[tokio::test]
-async fn narrow_stop_filter_is_configurable_and_old_conditions_cannot_bypass_it() {
+async fn narrow_stop_filter_changes_only_new_signals_and_freezes_old_conditions() {
     let counter = Counter::new();
     let engine = counter.engine(ExecutionMode::FullAuto, 2);
     let mut cfg = engine.get_config().await;
@@ -777,9 +792,34 @@ async fn narrow_stop_filter_is_configurable_and_old_conditions_cannot_bypass_it(
     engine.update_config(cfg).await.unwrap();
     age(&engine).await;
     quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+    let old = engine
+        .list_conditions()
+        .await
+        .into_iter()
+        .find(|c| c.id == id)
+        .unwrap();
+    assert_eq!(
+        old.frozen.as_ref().unwrap().execution.min_entry_risk_ticks,
+        10
+    );
+    let new = engine
+        .register_condition(
+            Some(124),
+            "PB0",
+            "pb2611",
+            Dir::Up,
+            1000.0,
+            995.0,
+            1200.0,
+            3.6,
+            "2026-10-16 10:15:00",
+        )
+        .await
+        .unwrap();
+    quote(&engine, 1000.0).await;
     assert_eq!(counter.inserts().len(), 1);
-    assert_eq!(counter.inserts()[0]["volume"], 2);
-    assert_eq!(engine.list_conditions().await[0].id, id);
+    assert_ne!(new, id);
 }
 
 #[test]

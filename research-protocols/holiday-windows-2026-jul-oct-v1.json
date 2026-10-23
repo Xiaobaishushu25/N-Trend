@@ -1,0 +1,19 @@
+{
+  "id": "holiday-windows-2026-jul-oct-v1",
+  "timezone": "Asia/Shanghai",
+  "coverage_start": "2026-07-01 00:00:00",
+  "coverage_end": "2026-10-31 23:59:59",
+  "scope": "Published Mid-Autumn and National Day market closures within coverage; ordinary weekends, overnight and lunch remain separate diagnostics",
+  "sources": [
+    {"title": "上海期货交易所2026年休市安排", "url": "https://www.shfe.com.cn/services/calenderandholidays/holiday/", "retrieved_shanghai_date": "2026-10-23"},
+    {"title": "关于2026年中秋节、国庆节期间有关工作安排的通知", "url": "https://www.shfe.com.cn/publicnotice/notice/202609/t20260921_833503.html?updatetime=short", "published": "2026-09-21", "retrieved_shanghai_date": "2026-10-23"}
+  ],
+  "cross_exchange_scope_note": "Shared mainland holiday dates applied to all22 products; source citations directly verify SHFE, other exchange-specific exceptional schedules are not independently certified by this file",
+  "policy": "Fixed once for this research: stop entries14:30, flatten at14:45, no profit-conditioned exceptions. 5m bars have end labels; entry block applies conservatively to interval ending14:30. No parameter sweep.",
+  "windows": [
+    {"name": "中秋节", "block_from": "2026-09-24 14:30:00", "flat_at": "2026-09-24 14:45:00", "last_close": "2026-09-24 15:00:00", "reopen": "2026-09-28 09:00:00"},
+    {"name": "国庆节", "block_from": "2026-09-30 14:30:00", "flat_at": "2026-09-30 14:45:00", "last_close": "2026-09-30 15:00:00", "reopen": "2026-10-08 09:00:00"}
+  ],
+  "qualified_for_trading": false,
+  "production_changed": false
+}

@@ -9,6 +9,7 @@ class PrepareTests(unittest.TestCase):
    root=Path(temp); source=root/"source.db"
    with closing(sqlite3.connect(source)) as db:
     db.executescript("CREATE TABLE klines(symbol,timeframe,ts,source,close); INSERT INTO klines VALUES('RB','5m','2026-01-01','raw',1); INSERT INTO klines VALUES('RB','15m','2026-01-01','derived',1); CREATE TABLE pattern_events(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO pattern_events DEFAULT VALUES; CREATE TABLE settings(key PRIMARY KEY,value); CREATE TABLE signal_annotations(id,event_id,content); INSERT INTO signal_annotations VALUES(1,1,'note'); CREATE TABLE trades(id,amount); INSERT INTO trades VALUES(1,10);")
+    db.executescript("CREATE TABLE devices(id); INSERT INTO devices VALUES('existing-device'); CREATE TABLE server_settings(key,value); INSERT INTO server_settings VALUES('deployment','existing'); INSERT INTO settings VALUES('email.enabled','true'); INSERT INTO settings VALUES('account_token','existing-token');")
     db.commit()
    result=m.prepare(source,root/"archive",root/"work")
    self.assertEqual(result['before']['signal_annotations'],1)
@@ -16,6 +17,10 @@ class PrepareTests(unittest.TestCase):
    with closing(sqlite3.connect(root/"work/ntrend.db")) as db:
     self.assertEqual(db.execute('SELECT count(*) FROM signal_annotations').fetchone()[0],0)
     self.assertEqual(db.execute('SELECT amount FROM trades').fetchone()[0],10)
+    self.assertEqual(db.execute('SELECT id FROM devices').fetchone()[0],'existing-device')
+    self.assertEqual(db.execute('SELECT value FROM server_settings').fetchone()[0],'existing')
+    self.assertEqual(dict(db.execute('SELECT key,value FROM settings'))['email.enabled'],'true')
+    self.assertEqual(dict(db.execute('SELECT key,value FROM settings'))['account_token'],'existing-token')
     self.assertEqual(db.execute('SELECT count(*) FROM klines').fetchone()[0],1)
     db.execute('INSERT INTO pattern_events DEFAULT VALUES');self.assertEqual(db.execute('SELECT id FROM pattern_events').fetchone()[0],2)
    with self.assertRaises(ValueError): m.prepare(source,root/"archive2",root/"work")

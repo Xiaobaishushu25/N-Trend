@@ -40,7 +40,6 @@ onBeforeUnmount(() => {
     <n-dialog-provider>
       <n-notification-provider>
         <n-message-provider>
-          <div v-if="appStore.serverUrl.includes(':18081')" style="position:fixed;top:0;left:40%;z-index:99999;background:#724c0a;color:#fff;padding:3px 12px;font-size:12px;pointer-events:none">本地研究 · 离线数据 · 禁止交易</div>
           <AppLayout />
         </n-message-provider>
       </n-notification-provider>

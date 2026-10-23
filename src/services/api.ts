@@ -217,6 +217,7 @@ export const api = {
   openBackupDirectory: () => invoke<void>('open_backup_directory'),
 
   // ---- Live Trader ----
+  traderInstanceRequest: <T = any>(operation: string, instanceId?: string, payload?: unknown) => invoke<T>('trader_instance_request', { operation, instanceId, payload }),
   getTraderStatus: () => invoke<{ health: CtpHealth; config: ExecutionConfig }>('get_trader_status'),
   getTraderSnapshot: () => invoke<import('../types').LiveTraderSnapshot>('get_trader_snapshot'),
   getExecutionOrders: (page = 1, pageSize = 20) =>

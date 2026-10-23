@@ -1,4 +1,4 @@
-"""Create a verified immutable archive and a clean, isolated research database.
+"""Archive and prepare a database for the offline signal V3 upgrade.
 Never opens the source with the application migration layer. Standard library only.
 """
 from contextlib import closing
@@ -26,10 +26,10 @@ def summary(db):
 def request(base,token,path):
     req=urllib.request.Request(base.rstrip("/")+"/api/v1"+path,headers={"Authorization":"Bearer "+token})
     return urllib.request.urlopen(req,timeout=120)
-def prepare(source, archive_dir, data_dir, origin="local-explicit-snapshot", expected_sha=None, compressed=False, research=True):
+def prepare(source, archive_dir, data_dir, origin="local-explicit-snapshot", expected_sha=None, compressed=False):
     archive_dir=Path(archive_dir).resolve(); data_dir=Path(data_dir).resolve(); source=Path(source).resolve()
     if archive_dir==data_dir or archive_dir in data_dir.parents or data_dir in archive_dir.parents: raise ValueError("archive and work directories must be disjoint")
-    if (data_dir/"ntrend.db").exists() or (data_dir/"manifest.json").exists(): raise ValueError("destination exists; choose a new research generation")
+    if (data_dir/"ntrend.db").exists() or (data_dir/"manifest.json").exists(): raise ValueError("destination exists; choose a new staging directory")
     archive_dir.mkdir(parents=True,exist_ok=False); data_dir.mkdir(parents=True,exist_ok=True)
     snapshot=archive_dir/"source.sqlite"
     if expected_sha and digest(source)!=expected_sha.lower(): raise ValueError("download checksum mismatch")
@@ -54,11 +54,6 @@ def prepare(source, archive_dir, data_dir, origin="local-explicit-snapshot", exp
             for table in DERIVED:
                 if table in tables: db.execute('DELETE FROM "'+table+'"')
             db.execute("DELETE FROM klines WHERE source='derived'")
-            if research:
-                # Avoid restoring production identities/configuration in local research.
-                for table in ("devices","idempotency_requests","server_settings"):
-                    if table in tables: db.execute('DELETE FROM "'+table+'"')
-                db.execute("DELETE FROM settings WHERE key LIKE 'email.%' OR key LIKE '%password%' OR key LIKE '%token%'")
             db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('signal_generation',?)",(manifest["generation"],))
             db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('signal_origin','historical_rebuild')")
             db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('signal_v3_prepared','1')")
@@ -88,7 +83,7 @@ def main():
                 if not expected: raise ValueError("server did not provide snapshot checksum")
                 downloaded.write_bytes(response.read())
             result=prepare(downloaded,args.archive_dir,args.data_dir,origin="server-consistent-snapshot",expected_sha=expected,compressed=True)
-            # Read-only exports preserve execution evidence without loading it into the research engine.
+            # Read-only exports preserve execution evidence alongside the database archive.
             for name,path in [("trade-history","/trader/history"),("execution-snapshot","/trader/snapshot")]:
                 try:
                     with request(base,token,path) as response: value=json.load(response)

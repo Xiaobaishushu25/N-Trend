@@ -1,0 +1,222 @@
+{
+  "id": "breadth-shadow-20261023-v1",
+  "frozen_at_shanghai": "2026-10-23T01:41:19.942555+08:00",
+  "scope": "offline research and future paper comparison",
+  "supersedes_for_future_paper_comparison": "holiday-profit-shadow-20261023-v1",
+  "qualified_for_trading": false,
+  "production_changed": false,
+  "new_independent_observations": 0,
+  "development_objectives_met": false,
+  "quantity": 1,
+  "account_cap": null,
+  "score_changes_size": false,
+  "admission": "one opportunity per symbol; sector-direction admission only a separately reported sensitivity and not selected",
+  "study_candidate_count": 32,
+  "study_case_count": 96,
+  "exploration_stages": [
+    21,
+    7,
+    4
+  ],
+  "all_historical_data_repeatedly_seen": true,
+  "no_adjustment_for_multiple_comparisons": true,
+  "fee_profile_sha256": "867287e2ff85fd04033c626d5eec8d09ae516208adc40feb5158f248f6fa879b",
+  "holiday_schedule_sha256": "29425fb932fff4602fb0bd8c7766c85979b13daa2154636e44cd6329106b8532",
+  "engine_source_sha256": "407ee8614140093912a0f9b284244a1860b00215024b81e76c5621c4f3c8bd50",
+  "runner_source_sha256": "6208723b05f5fdd6dafb9ebd6efae63be4b607dd234af89293fc4b2de18b8c69",
+  "manifest_sha256": "0bb3e0a6f6d3464bf7f4c1ceb95f2ee0aef90086e25f45c4e9e77aa42fd1a065",
+  "result_sha256": "0b0c3131df3c69500b6ba6f5daf46d322b496a76f1738ae877710fce94c15e30",
+  "verification_sha256": "fdacca6a8d8b0ed6ad2fcc5134d094d96afb273e48ab76c588ffff71a1fce5a9",
+  "context_verification_sha256": "c6903790ce5a387eb33ce60d1b18bfb923695f7c1a2282389c2ac3546ac7faba",
+  "sector_protocol_sha256": "0c8014e24f0709ff2179b3bf2ecee9e8bbf853c1d2e6d8233f9c96a53158cbd6",
+  "frozen_candidates": [
+    {
+      "role": "simpler_weekend_only_comparator",
+      "definition": {
+        "breadth_filter": "none",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "return_tail_comparator",
+      "definition": {
+        "breadth_filter": "risk_atr",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_atr_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": null
+        }
+      }
+    },
+    {
+      "role": "primary_profit_breadth_candidate",
+      "definition": {
+        "breadth_filter": "risk_atr",
+        "filter": "friction20",
+        "holiday_flat": true,
+        "min_risk_ticks": 10,
+        "min_score": 3.0,
+        "name": "fric_atr_cap20_weekend",
+        "net_guard": true,
+        "no_follow": true,
+        "rules": {
+          "entry_mode": "touch",
+          "exit_before_break_below_r": null,
+          "fast_fail_bucket": null,
+          "flat_before_long_break": false,
+          "flat_before_weekend": true,
+          "max_holding_buckets": null,
+          "min_actual_risk_ticks": 10.0,
+          "pending_buckets": null,
+          "skip_prebreak_entries": false,
+          "target_cap_r": 2.0
+        }
+      }
+    }
+  ],
+  "controls": [
+    {
+      "breadth_filter": "none",
+      "filter": "none",
+      "holiday_flat": true,
+      "min_risk_ticks": 10,
+      "min_score": 2.5,
+      "name": "net_s1",
+      "net_guard": true,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "flat_before_weekend": false,
+        "max_holding_buckets": null,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    },
+    {
+      "breadth_filter": "none",
+      "filter": "friction20",
+      "holiday_flat": true,
+      "min_risk_ticks": 10,
+      "min_score": 3.0,
+      "name": "score3_friction20",
+      "net_guard": true,
+      "no_follow": true,
+      "rules": {
+        "entry_mode": "touch",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "flat_before_weekend": false,
+        "max_holding_buckets": null,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    },
+    {
+      "breadth_filter": "none",
+      "filter": "none",
+      "holiday_flat": true,
+      "min_risk_ticks": 10,
+      "min_score": 3.0,
+      "name": "score3_confirm_no_follow_off",
+      "net_guard": true,
+      "no_follow": false,
+      "rules": {
+        "entry_mode": "close_confirm_next_open",
+        "exit_before_break_below_r": null,
+        "fast_fail_bucket": null,
+        "flat_before_long_break": false,
+        "flat_before_weekend": false,
+        "max_holding_buckets": null,
+        "min_actual_risk_ticks": 10.0,
+        "pending_buckets": null,
+        "skip_prebreak_entries": false,
+        "target_cap_r": null
+      }
+    }
+  ],
+  "common": {
+    "min_planned_and_actual_stop_ticks": 10,
+    "forecast_slip_ticks_per_side": 1,
+    "primary_execution_slip_ticks": 1,
+    "stress_execution_slip_ticks": 2,
+    "entry_net_reward_to_full_stop_loss_min": 1,
+    "warning_and_proposed_fill_gate": true,
+    "hold_limit_completed15m_buckets": 60,
+    "no_follow_completed15m_bucket": 5,
+    "no_follow_mfe_r": 0.5,
+    "ATR": "simple mean of last14 completed15m true ranges, midnight preserved",
+    "risk_atr_range": [
+      0.75,
+      2.5
+    ],
+    "holiday_rule": "fixed14:30 block entries,14:45 flatten before published multi-day holidays only; no weekend/lunch flatten; missing cutoff quote remains unknown",
+    "weekend_rule": "flat within10minutes of last Friday-night session close, Friday15 for no-night symbols; no future prices",
+    "offline_session_correction": {
+      "reason": "existing shared default falls through to23:00 but frozen archive has no night bars; published product contracts specify day hours, night requires separate notice; shared production calendar unchanged",
+      "symbols": [
+        "SF0",
+        "SM0"
+      ]
+    },
+    "production_calendar_unchanged": true
+  },
+  "current_failure": "top3 positive product contribution remains above60pct in primary and stress; uncertainty, unknown exposure and independent validation unresolved",
+  "future_review": {
+    "after_freeze_new_data_only": true,
+    "min_new_closed_per_candidate": 200,
+    "min_new_trading_days": 60,
+    "not_automatic_qualification": true,
+    "night_day_grouping": "night assigned to next exchange trading day; retain calendar-exit-date sensitivity; current archived calendar is inferred",
+    "checks": [
+      "positive net cash and R under1/2tick costs",
+      "best3 trading-day removal and worst3 and symmetric3 reported together",
+      "cash and R rankings kept separate across trades, trading days, natural dates and symbols",
+      "best3 positive symbol removal leaves positive totals; top3 share of positive product nets<=60pct in both slips",
+      "profit breadth with at least10 observations separated from tiny positive samples and products without trades",
+      "gap/calendar and actual contract evidence; actual fee evidence and unknown exposure bounds",
+      "new-data blocked uncertainty, no claim of positive expectation while interval spans0"
+    ],
+    "no_automatic_product_whitelist_or_score_sizing": true,
+    "no_automatic_parameter_selection": true
+  }
+}
