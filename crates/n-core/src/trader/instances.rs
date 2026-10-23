@@ -467,10 +467,34 @@ impl InstanceManager {
         }
         Ok(())
     }
+    pub async fn rename(&self, id: &str, new_name: String) -> Result<()> {
+        let trimmed = new_name.trim();
+        ensure!(!trimmed.is_empty() && trimmed.len() <= 160, "实例名称无效");
+        let mut c = self.catalog.lock().await;
+        let mut next = c.clone();
+        let inst = next.instances.get_mut(id).context("实例不存在")?;
+        inst.name = trimmed.to_string();
+        self.validate_catalog(&next)?;
+        self.persist(&next).await?;
+        *c = next;
+        Ok(())
+    }
     pub async fn list(&self) -> Value {
         let mut rows = vec![];
+        let (instances, accounts) = {
+            let c = self.catalog.lock().await;
+            (c.instances.clone(), c.accounts.clone())
+        };
         for r in self.all().await {
-            rows.push(json!({"instance":r.definition,"account":self.account(&r.definition.id).await.unwrap_or_else(|_| r.account.clone()),"strategy":r.engine.definition().await,"config":r.engine.get_config().await,"paused":r.engine.paused().await,"error":r.error.read().await.clone().or(r.runtime_error.read().await.clone()).or(r.engine.execution_error().await)}));
+            let def = instances
+                .get(&r.definition.id)
+                .cloned()
+                .unwrap_or_else(|| r.definition.clone());
+            let acc = accounts
+                .get(&def.account_id)
+                .cloned()
+                .unwrap_or_else(|| r.account.clone());
+            rows.push(json!({"instance":def,"account":acc,"strategy":r.engine.definition().await,"config":r.engine.get_config().await,"paused":r.engine.paused().await,"error":r.error.read().await.clone().or(r.runtime_error.read().await.clone()).or(r.engine.execution_error().await)}));
         }
         json!({"default_instance_id":DEFAULT_INSTANCE,"instances":rows,"modules":self.registry.catalog()})
     }
@@ -650,7 +674,12 @@ impl InstanceManager {
         ensure!(from <= to, "对比区间无效");
         let mut rows = vec![];
         let mut paired: BTreeMap<String, BTreeMap<(String, String), f64>> = BTreeMap::new();
+        let instances = self.catalog.lock().await.instances.clone();
         for r in self.all().await {
+            let def = instances
+                .get(&r.definition.id)
+                .cloned()
+                .unwrap_or_else(|| r.definition.clone());
             let samples=self.db.query_all(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT timestamp,equity,margin,fees,quality,trading_day FROM trader_equity WHERE instance_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp",[r.definition.id.clone().into(),from.into(),to.into()])).await?;
             let mut curve = vec![];
             let mut peak: f64 = 0.0;
@@ -734,7 +763,7 @@ impl InstanceManager {
             let fees_confirmed = !samples.is_empty() && !quality.contains(&"fees_unconfirmed");
             quality.sort();
             quality.dedup();
-            rows.push(json!({"instance":r.definition,"account":r.account,"from":from,"to":to,"effective_from":curve.first().map(|p|p["timestamp"].clone()),"effective_to":curve.last().map(|p|p["timestamp"].clone()),"sample_count":samples.len(),"equity_curve":curve,
+            rows.push(json!({"instance":def,"account":r.account,"from":from,"to":to,"effective_from":curve.first().map(|p|p["timestamp"].clone()),"effective_to":curve.last().map(|p|p["timestamp"].clone()),"sample_count":samples.len(),"equity_curve":curve,
                 "return_pct":first.zip(last).filter(|(a,_)|*a>0.0).map(|(a,b)|(b/a-1.0)*100.0),"net_profit":first.zip(last).map(|(a,b)|b-a),"max_drawdown_pct":if samples.is_empty(){None}else{Some(drawdown*100.0)},"trades":grouped.len(),"win_rate_pct":if grouped.is_empty(){None}else{Some(wins as f64/grouped.len() as f64*100.0)},"profit_factor":if losses<0.0 {Some(profits/(-losses))}else{None},"max_margin":margin_peak,"fees_confirmed":fees_confirmed,"observed_fees":if fees_confirmed {Some(fees_by_day.values().map(|(a,b)|(b-a).max(0.0)).sum::<f64>())}else{None},"quality_flags":quality,"cash_flow_adjusted":false}));
         }
         let ids = paired.keys().cloned().collect::<Vec<_>>();

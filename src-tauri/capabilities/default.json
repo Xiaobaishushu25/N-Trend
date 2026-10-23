@@ -7,8 +7,11 @@
     "review",
     "notifications",
     "trade-review",
+    "trade-review*",
     "live-trader",
-    "history-chart"
+    "live-trader*",
+    "history-chart",
+    "history-chart*"
   ],
   "permissions": [
     "core:default",

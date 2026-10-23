@@ -140,6 +140,9 @@ pub enum Action {
     Pause,
     Resume,
     Delete,
+    Rename {
+        name: String,
+    },
     Configure {
         config: ExecutionConfig,
     },
@@ -181,6 +184,7 @@ pub async fn action(
                     r.engine.pause(false).await?;
                 }
                 Action::Delete => m.remove(&id).await?,
+                Action::Rename { name } => m.rename(&id, name).await?,
                 Action::ConfigureStrategy { config, strategy } => {
                     r.engine.configure_strategy(strategy, config).await?
                 }

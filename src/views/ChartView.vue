@@ -492,13 +492,13 @@ function onReviewKeydown(e: KeyboardEvent) {
   chartRef.value?.stepCandles(e.key === 'ArrowLeft' ? -1 : 1)
 }
 
-/** 形态状态优先级：等待触发 > 已触发 > 已了结 > 已失效 */
-function patternStateRank(state: string): number {
-  if (state === 'pending') return 0
-  if (state === 'triggered') return 1
-  if (state === 'closed') return 2
-  if (state === 'expired') return 3
-  return 4
+/** 按识别时间倒序，同一识别时间按触发时间、编号倒序；缺少识别时间时回退到触发时间。 */
+function compareSignalTime(a: PatternDto, b: PatternDto): number {
+  const timeA = a.warning_ts || a.trigger_ts || ''
+  const timeB = b.warning_ts || b.trigger_ts || ''
+  return timeB.localeCompare(timeA)
+    || (b.trigger_ts || '').localeCompare(a.trigger_ts || '')
+    || b.number - a.number
 }
 
 /** 把新事件表记录转换成图表组件使用的旧形态结构 */
@@ -587,41 +587,25 @@ function toChartSignalFromOutcome(row: OutcomeDetail): PatternDto {
   }
 }
 
-/**
- * 最近一次扫描识别出的该品种仍在途N形态（策略基于 15m，与图表显示级别无关）。
- * 已了结、已失效、未知状态由信号源统一过滤，不进入右侧列表。
- * 排序规则：先按状态（等待触发 > 已触发），
- * 同一状态内按评分从高到低，评分相同按编号小的优先。
- */
+/** 当前品种仍在途的形态，按识别、触发时间从新到旧展示。 */
 const signals = computed<PatternDto[]>(() => {
   return scansStore.latestSignals
-    .filter((s) => s.symbol === symbol.value)
+    .filter((s) => s.symbol === symbol.value && (s.state === 'pending' || s.state === 'triggered'))
     .map(toChartSignal)
-    .sort((a, b) => {
-      const rankA = patternStateRank(a.state)
-      const rankB = patternStateRank(b.state)
-      if (rankA !== rankB) return rankA - rankB
-      if (b.score !== a.score) return b.score - a.score
-      return a.number - b.number
-    })
+    .sort(compareSignalTime)
 })
 
 const recentSignals = ref<PatternDto[]>([])
 const recentLoading = ref(false)
 let recentSeq = 0
 
-/** 该品种最近的历史形态：排除仍在途的当前信号，按预警时间倒序保留 5 个。 */
+/** 该品种最近 5 个历史信号：排除仍在途的信号，按识别、触发时间倒序。 */
 const recentHistorySignals = computed<PatternDto[]>(() => {
   const activeNumbers = new Set(signals.value.map((s) => s.number))
   return recentSignals.value
-    .filter((s) => !activeNumbers.has(s.number))
+    .filter((s) => s.state !== 'pending' && s.state !== 'triggered' && !activeNumbers.has(s.number))
     .slice()
-    .sort((a, b) => {
-      const ta = a.warning_ts ?? ''
-      const tb = b.warning_ts ?? ''
-      if (ta !== tb) return tb.localeCompare(ta)
-      return b.number - a.number
-    })
+    .sort(compareSignalTime)
     .slice(0, 5)
 })
 
@@ -637,12 +621,7 @@ async function loadRecentPatterns() {
   try {
     const rows = await api.getRecentOutcomes(20, { symbol: sym })
     if (seq !== recentSeq) return
-    recentSignals.value = rows.map(toChartSignalFromOutcome).sort((a, b) => {
-      const ta = a.warning_ts ?? ''
-      const tb = b.warning_ts ?? ''
-      if (ta !== tb) return tb.localeCompare(ta)
-      return b.number - a.number
-    })
+    recentSignals.value = rows.map(toChartSignalFromOutcome).sort(compareSignalTime)
   } catch {
     if (seq === recentSeq) recentSignals.value = []
   } finally {
@@ -1563,6 +1542,8 @@ function sigLabel(state: string) {
       return '已了结'
     case 'expired':
       return '已失效'
+    case 'filtered':
+      return '已过滤'
     default:
       return state
   }
@@ -3889,9 +3870,191 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else class="patterns-card">
-          <div class="patterns-title">全部信号（{{ signals.length + activeManualLevels.length }}）</div>
+          <div class="patterns-title">活跃信号（{{ signals.length }}）</div>
           <n-scrollbar style="flex: 1">
-            <div v-if="activeManualLevels.length || signals.length" class="patterns-list">
+            <div v-if="signals.length" class="patterns-list">
+              <div
+                v-for="s in signals"
+                :key="s.number"
+                class="pattern-card"
+                :class="[
+                  s.direction === 'up' ? 'is-up' : 'is-down',
+                  { 'is-active': s.active, 'is-hidden': isHidden(s.number) },
+                ]"
+                :title="isHidden(s.number) ? '点击在K线图上显示该形态' : '点击在K线图上隐藏该形态'"
+                @click="togglePattern(s.number)"
+              >
+                <div class="pc-head">
+                  <div class="pc-badges">
+                    <span class="pc-num">#{{ s.number }}</span>
+                    <span class="pc-dir">{{ dirText(s.direction) }} {{ levelSuffix(s.level) }}</span>
+                    <span class="pc-grade">{{ s.grade }}</span>
+                    <span class="pc-warning">{{ warningKindText(s.warning_kind) }}</span>
+                    <span v-if="s.trend_state" class="pc-trend" :class="trendClass(s.trend_state)" :title="s.trend_state || ''">{{ trendText(s.trend_state) }}<em v-if="s.trend_bonus"> {{ trendBonusText(s) }}</em></span>
+                  </div>
+                  <n-icon
+                  :component="isHidden(s.number) ? EyeOff : Eye"
+                  size="17"
+                  :color="isHidden(s.number) ? '#cbd5e1' : '#94a3b8'"
+                  style="margin-top: 2px"
+                />
+                <div class="pc-score">
+                    <span class="pc-score-num">{{ s.score.toFixed(2) }}</span>
+                    <span class="pc-score-label">评分</span>
+                  </div>
+                </div>
+
+                <div class="pc-state" :class="stateType(s.state)">
+                  <span class="dot"></span>{{ sigLabel(s.state) }}
+                </div>
+
+                <div v-if="pwinFor(s.number) != null" class="pc-v2-pwin">
+                  <span>净盈利概率</span>
+                  <b>{{ (pwinFor(s.number)! * 100).toFixed(1) }}%</b>
+                </div>
+                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">预警</span>
+                  <span>{{ s.warning_ts ? fmtRecentTime(s.warning_ts) : '—' }}</span>
+                  <span v-if="s.trigger_ts" class="pc-history-label"> / 触发</span>
+                  <span v-if="s.trigger_ts">{{ fmtRecentTime(s.trigger_ts) }}</span>
+                </div>
+
+                <div v-if="s.trigger_ts" class="pc-vol" :class="volStatusClass(s)">
+                  <span>触发量能</span>
+                  <b v-if="s.vol_ratio != null">{{ s.vol_ratio.toFixed(2) }}×</b>
+                  <em>{{ volStatusText(s) }}</em>
+                </div>
+
+                <div v-if="s.trigger_ts" class="pc-vol pc-overshoot" :class="overshootStatusClass(s)">
+                  <span>追价深度</span>
+                  <b v-if="s.trigger_overshoot_r != null">{{ s.trigger_overshoot_r.toFixed(2) }}R</b>
+                  <em>{{ overshootStatusText(s) }}</em>
+                </div>
+
+                <div class="pc-prices">
+                  <div class="pc-price">
+                    <span>入场</span>
+                    <b>{{ s.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>止损</span>
+                    <b>{{ s.stop.toFixed(1) }}</b>
+                    <em class="pc-delta is-stop">{{ fmtDelta(s.stop - s.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>目标</span>
+                    <b>{{ s.target.toFixed(1) }}</b>
+                    <em class="pc-delta is-target">{{ fmtDelta(s.target - s.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>RR</span>
+                    <b>{{ s.rr.toFixed(2) }}</b>
+                  </div>
+                </div>
+
+                <div class="pc-legs">
+                  <span>a段 {{ s.a_bars }}根 / {{ s.a_move.toFixed(1) }}点</span>
+                  <span>b段 {{ s.b_bars }}根 / {{ s.b_move.toFixed(1) }}点</span>
+                  <span>回撤 {{ (s.retracement * 100).toFixed(1) }}%</span>
+                </div>
+
+                <div class="pc-note">{{ s.note }}</div>
+                <SignalNotes :event-id="s.number" />
+              </div>
+            </div>
+            <div v-else class="patterns-empty">当前品种暂无活跃信号</div>
+
+            <div class="patterns-title recent-title">最近5个信号（{{ recentHistorySignals.length }}）</div>
+            <div v-if="recentLoading" class="patterns-empty">正在加载历史形态...</div>
+            <div v-else-if="recentHistorySignals.length" class="patterns-list recent-list">
+              <div
+                v-for="r in recentHistorySignals"
+                :key="`recent-${r.number}`"
+                class="pattern-card is-recent"
+                :class="[
+                  r.direction === 'up' ? 'is-up' : 'is-down',
+                  { 'is-hidden': !isRecentShown(r.number) },
+                ]"
+                :title="
+                  isRecentShown(r.number)
+                    ? '点击在K线图上隐藏该形态'
+                    : '点击在K线图上显示该形态'
+                "
+                @click="toggleRecentPattern(r.number)"
+              >
+                <div class="pc-head">
+                  <div class="pc-badges">
+                    <span class="pc-num">#{{ r.number }}</span>
+                    <span class="pc-dir">{{ dirText(r.direction) }} {{ levelSuffix(r.level) }}</span>
+                    <span class="pc-grade">{{ r.grade }}</span>
+                    <span class="pc-warning">{{ warningKindText(r.warning_kind) }}</span>
+                    <span v-if="r.trend_state" class="pc-trend" :class="trendClass(r.trend_state)" :title="r.trend_state || ''">{{ trendText(r.trend_state) }}<em v-if="r.trend_bonus"> {{ trendBonusText(r) }}</em></span>
+                  </div>
+                  <n-icon
+                    :component="isRecentShown(r.number) ? Eye : EyeOff"
+                    size="17"
+                    :color="isRecentShown(r.number) ? '#1677ff' : '#94a3b8'"
+                    style="margin-top: 2px"
+                  />
+                  <div class="pc-score">
+                    <span class="pc-score-num">{{ r.score.toFixed(2) }}</span>
+                    <span class="pc-score-label">评分</span>
+                  </div>
+                </div>
+
+                <div class="pc-state" :class="stateType(r.state)">
+                  <span class="dot"></span>{{ sigLabel(r.state) }}
+                  <span v-if="r.trigger_ts" class="pc-state-time">{{ fmtRecentTime(r.trigger_ts) }}</span>
+                </div>
+
+                <div v-if="pwinFor(r.number) != null" class="pc-v2-pwin">
+                  <span>净盈利概率</span>
+                  <b>{{ (pwinFor(r.number)! * 100).toFixed(1) }}%</b>
+                </div>
+                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
+
+                <div class="pc-history">
+                  <span class="pc-history-label">预警</span>
+                  <span>{{ r.warning_ts ? fmtRecentTime(r.warning_ts) : '—' }}</span>
+                  <span v-if="r.trigger_ts" class="pc-history-label"> / 触发</span>
+                  <span v-if="r.trigger_ts">{{ fmtRecentTime(r.trigger_ts) }}</span>
+                </div>
+
+                <div class="pc-prices">
+                  <div class="pc-price">
+                    <span>入场</span>
+                    <b>{{ r.entry.toFixed(1) }}</b>
+                  </div>
+                  <div class="pc-price">
+                    <span>止损</span>
+                    <b>{{ r.stop.toFixed(1) }}</b>
+                    <em class="pc-delta is-stop">{{ fmtDelta(r.stop - r.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>目标</span>
+                    <b>{{ r.target.toFixed(1) }}</b>
+                    <em class="pc-delta is-target">{{ fmtDelta(r.target - r.entry) }}点</em>
+                  </div>
+                  <div class="pc-price">
+                    <span>RR</span>
+                    <b>{{ r.rr.toFixed(2) }}</b>
+                  </div>
+                </div>
+
+                <div class="pc-legs">
+                  <span>a段 {{ r.a_bars }}根 / {{ r.a_move.toFixed(1) }}点</span>
+                  <span>b段 {{ r.b_bars }}根 / {{ r.b_move.toFixed(1) }}点</span>
+                  <span>回撤 {{ (r.retracement * 100).toFixed(1) }}%</span>
+                </div>
+                <SignalNotes :event-id="r.number" />
+              </div>
+            </div>
+            <div v-else class="patterns-empty">该品种暂无历史形态</div>
+
+            <div v-if="manualLevels.length" class="patterns-title recent-title">关键区域（{{ manualLevels.length }}）</div>
+            <div v-if="manualLevels.length" class="patterns-list">
               <div
                 v-for="level in activeManualLevels"
                 :key="`manual-${level.id}`"
@@ -3989,102 +4152,6 @@ onBeforeUnmount(() => {
               </div>
 
               <div
-                v-for="s in signals"
-                :key="s.number"
-                class="pattern-card"
-                :class="[
-                  s.direction === 'up' ? 'is-up' : 'is-down',
-                  { 'is-active': s.active, 'is-hidden': isHidden(s.number) },
-                ]"
-                :title="isHidden(s.number) ? '点击在K线图上显示该形态' : '点击在K线图上隐藏该形态'"
-                @click="togglePattern(s.number)"
-              >
-                <div class="pc-head">
-                  <div class="pc-badges">
-                    <span class="pc-num">#{{ s.number }}</span>
-                    <span class="pc-dir">{{ dirText(s.direction) }} {{ levelSuffix(s.level) }}</span>
-                    <span class="pc-grade">{{ s.grade }}</span>
-                    <span class="pc-warning">{{ warningKindText(s.warning_kind) }}</span>
-                    <span v-if="s.trend_state" class="pc-trend" :class="trendClass(s.trend_state)" :title="s.trend_state || ''">{{ trendText(s.trend_state) }}<em v-if="s.trend_bonus"> {{ trendBonusText(s) }}</em></span>
-                  </div>
-                  <n-icon
-                  :component="isHidden(s.number) ? EyeOff : Eye"
-                  size="17"
-                  :color="isHidden(s.number) ? '#cbd5e1' : '#94a3b8'"
-                  style="margin-top: 2px"
-                />
-                <div class="pc-score">
-                    <span class="pc-score-num">{{ s.score.toFixed(2) }}</span>
-                    <span class="pc-score-label">评分</span>
-                  </div>
-                </div>
-
-                <div class="pc-state" :class="stateType(s.state)">
-                  <span class="dot"></span>{{ sigLabel(s.state) }}
-                </div>
-
-                <div v-if="pwinFor(s.number) != null" class="pc-v2-pwin">
-                  <span>净盈利概率</span>
-                  <b>{{ (pwinFor(s.number)! * 100).toFixed(1) }}%</b>
-                </div>
-                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
-
-                <div class="pc-history">
-                  <span class="pc-history-label">预警</span>
-                  <span>{{ s.warning_ts ? fmtRecentTime(s.warning_ts) : '—' }}</span>
-                  <span v-if="s.trigger_ts" class="pc-history-label"> / 触发</span>
-                  <span v-if="s.trigger_ts">{{ fmtRecentTime(s.trigger_ts) }}</span>
-                </div>
-
-                <div v-if="s.trigger_ts" class="pc-vol" :class="volStatusClass(s)">
-                  <span>触发量能</span>
-                  <b v-if="s.vol_ratio != null">{{ s.vol_ratio.toFixed(2) }}×</b>
-                  <em>{{ volStatusText(s) }}</em>
-                </div>
-
-                <div v-if="s.trigger_ts" class="pc-vol pc-overshoot" :class="overshootStatusClass(s)">
-                  <span>追价深度</span>
-                  <b v-if="s.trigger_overshoot_r != null">{{ s.trigger_overshoot_r.toFixed(2) }}R</b>
-                  <em>{{ overshootStatusText(s) }}</em>
-                </div>
-
-                <div class="pc-prices">
-                  <div class="pc-price">
-                    <span>入场</span>
-                    <b>{{ s.entry.toFixed(1) }}</b>
-                  </div>
-                  <div class="pc-price">
-                    <span>止损</span>
-                    <b>{{ s.stop.toFixed(1) }}</b>
-                    <em class="pc-delta is-stop">{{ fmtDelta(s.stop - s.entry) }}点</em>
-                  </div>
-                  <div class="pc-price">
-                    <span>目标</span>
-                    <b>{{ s.target.toFixed(1) }}</b>
-                    <em class="pc-delta is-target">{{ fmtDelta(s.target - s.entry) }}点</em>
-                  </div>
-                  <div class="pc-price">
-                    <span>RR</span>
-                    <b>{{ s.rr.toFixed(2) }}</b>
-                  </div>
-                </div>
-
-                <div class="pc-legs">
-                  <span>a段 {{ s.a_bars }}根 / {{ s.a_move.toFixed(1) }}点</span>
-                  <span>b段 {{ s.b_bars }}根 / {{ s.b_move.toFixed(1) }}点</span>
-                  <span>回撤 {{ (s.retracement * 100).toFixed(1) }}%</span>
-                </div>
-
-                <div class="pc-note">{{ s.note }}</div>
-                <SignalNotes :event-id="s.number" />
-              </div>
-            </div>
-            <div v-else class="patterns-empty">当前品种暂无识别出的信号</div>
-
-            <div class="patterns-title recent-title">最近形态（{{ recentHistorySignals.length + recentManualLevels.length }}）</div>
-            <div v-if="recentLoading" class="patterns-empty">正在加载历史形态...</div>
-            <div v-else-if="recentManualLevels.length || recentHistorySignals.length" class="patterns-list recent-list">
-              <div
                 v-for="level in recentManualLevels"
                 :key="`recent-manual-${level.id}`"
                 class="pattern-card manual-pattern-card is-recent"
@@ -4168,89 +4235,7 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div
-                v-for="r in recentHistorySignals"
-                :key="`recent-${r.number}`"
-                class="pattern-card is-recent"
-                :class="[
-                  r.direction === 'up' ? 'is-up' : 'is-down',
-                  { 'is-hidden': !isRecentShown(r.number) },
-                ]"
-                :title="
-                  isRecentShown(r.number)
-                    ? '点击在K线图上隐藏该形态'
-                    : '点击在K线图上显示该形态'
-                "
-                @click="toggleRecentPattern(r.number)"
-              >
-                <div class="pc-head">
-                  <div class="pc-badges">
-                    <span class="pc-num">#{{ r.number }}</span>
-                    <span class="pc-dir">{{ dirText(r.direction) }} {{ levelSuffix(r.level) }}</span>
-                    <span class="pc-grade">{{ r.grade }}</span>
-                    <span class="pc-warning">{{ warningKindText(r.warning_kind) }}</span>
-                    <span v-if="r.trend_state" class="pc-trend" :class="trendClass(r.trend_state)" :title="r.trend_state || ''">{{ trendText(r.trend_state) }}<em v-if="r.trend_bonus"> {{ trendBonusText(r) }}</em></span>
-                  </div>
-                  <n-icon
-                    :component="isRecentShown(r.number) ? Eye : EyeOff"
-                    size="17"
-                    :color="isRecentShown(r.number) ? '#1677ff' : '#94a3b8'"
-                    style="margin-top: 2px"
-                  />
-                  <div class="pc-score">
-                    <span class="pc-score-num">{{ r.score.toFixed(2) }}</span>
-                    <span class="pc-score-label">评分</span>
-                  </div>
-                </div>
-
-                <div class="pc-state" :class="stateType(r.state)">
-                  <span class="dot"></span>{{ sigLabel(r.state) }}
-                  <span v-if="r.trigger_ts" class="pc-state-time">{{ fmtRecentTime(r.trigger_ts) }}</span>
-                </div>
-
-                <div v-if="pwinFor(r.number) != null" class="pc-v2-pwin">
-                  <span>净盈利概率</span>
-                  <b>{{ (pwinFor(r.number)! * 100).toFixed(1) }}%</b>
-                </div>
-                <div v-else class="pc-v2-pwin"><span>暂无经验证概率</span></div>
-
-                <div class="pc-history">
-                  <span class="pc-history-label">预警</span>
-                  <span>{{ r.warning_ts ? fmtRecentTime(r.warning_ts) : '—' }}</span>
-                  <span v-if="r.trigger_ts" class="pc-history-label"> / 触发</span>
-                  <span v-if="r.trigger_ts">{{ fmtRecentTime(r.trigger_ts) }}</span>
-                </div>
-
-                <div class="pc-prices">
-                  <div class="pc-price">
-                    <span>入场</span>
-                    <b>{{ r.entry.toFixed(1) }}</b>
-                  </div>
-                  <div class="pc-price">
-                    <span>止损</span>
-                    <b>{{ r.stop.toFixed(1) }}</b>
-                    <em class="pc-delta is-stop">{{ fmtDelta(r.stop - r.entry) }}点</em>
-                  </div>
-                  <div class="pc-price">
-                    <span>目标</span>
-                    <b>{{ r.target.toFixed(1) }}</b>
-                    <em class="pc-delta is-target">{{ fmtDelta(r.target - r.entry) }}点</em>
-                  </div>
-                  <div class="pc-price">
-                    <span>RR</span>
-                    <b>{{ r.rr.toFixed(2) }}</b>
-                  </div>
-                </div>
-
-                <div class="pc-legs">
-                  <span>a段 {{ r.a_bars }}根 / {{ r.a_move.toFixed(1) }}点</span>
-                  <span>b段 {{ r.b_bars }}根 / {{ r.b_move.toFixed(1) }}点</span>
-                  <span>回撤 {{ (r.retracement * 100).toFixed(1) }}%</span>
-                </div>
-                <SignalNotes :event-id="r.number" />
-              </div>
             </div>
-            <div v-else class="patterns-empty">该品种暂无历史形态</div>
           </n-scrollbar>
         </div>
 

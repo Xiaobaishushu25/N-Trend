@@ -164,8 +164,8 @@ pub fn run() {
             {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
                     if (_window.label() == "main"
-                        || _window.label() == "live-trader"
-                        || _window.label() == "history-chart")
+                        || _window.label().starts_with("live-trader")
+                        || _window.label().starts_with("history-chart"))
                         && !QUITTING.load(Ordering::SeqCst)
                     {
                         let _ = _window

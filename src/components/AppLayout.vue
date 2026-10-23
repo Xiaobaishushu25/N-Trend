@@ -96,7 +96,9 @@ const windowTitle = computed(() => {
       : route.name === 'trade-review'
         ? '量化复盘工作台'
         : route.name === 'live-trader'
-          ? '实盘量化执行终端'
+          ? (typeof route.query.instance_id === 'string' && route.query.instance_id.trim()
+            ? `实盘量化执行终端 · ${route.query.instance_id.trim()}`
+            : '实盘量化执行终端')
           : route.name === 'notifications'
             ? '历史通知'
             : ''
@@ -714,7 +716,7 @@ onBeforeUnmount(() => {
             size="small"
             title="实盘量化执行终端 (SimNow)"
             class="live-trader-button"
-            @click="openLiveTraderWindow"
+            @click="() => openLiveTraderWindow()"
           >
             <template #icon>
               <n-icon :component="Bolt" size="18" color="#f5c23f" />

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import TraderInstancesPanel from '../components/TraderInstancesPanel.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import { openLiveTraderWindow } from '../utils/openLiveTraderWindow'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { emit } from '@tauri-apps/api/event'
@@ -43,7 +44,6 @@ import {
 } from '@vicons/tabler'
 import { useLiveTraderStore } from '../stores/liveTrader'
 import StrategyComparisonPanel from '../components/StrategyComparisonPanel.vue'
-import { useTradeReviewStore } from '../stores/tradeReview'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import {
@@ -59,11 +59,9 @@ import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from
 const trader = useLiveTraderStore()
 const selectedInstance = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
 const executionLabel = computed(() => selectedInstance.value?.account.kind === 'paper' ? '模拟' : '实盘')
-const isNStrategy = computed(() => !selectedInstance.value || selectedInstance.value.strategy.strategy_id === 'n_pattern')
 watch(() => trader.activeTab, (tab) => {
   if (tab === 'orders') void trader.loadExecutionOrders(1)
 })
-const review = useTradeReviewStore()
 
 function onHeaderMouseDown(e: MouseEvent) {
   if (!isTauri() || e.button !== 0) return
@@ -154,27 +152,26 @@ function getInstrumentName(inst: string): string {
   return inst.toUpperCase()
 }
 
-const theoreticalWinRate = ref<number | null>(null)
 
-async function loadTheoreticalWinRate() {
-  try {
-    const stats = await api.getReviewStats('overall', 'all')
-    if (stats?.overall?.win_rate != null) {
-      theoreticalWinRate.value = stats.overall.win_rate * 100
-    }
-  } catch (e) {
-    console.warn('获取理论复盘胜率失败:', e)
-  }
-}
 
 onMounted(async () => {
+  window.addEventListener('open-live-trader-window', onPopoutCustomEvent)
+  const queryInstanceId = typeof route.query.instance_id === 'string' && route.query.instance_id.trim()
+    ? route.query.instance_id.trim()
+    : null
+  if (queryInstanceId) {
+    trader.selectedInstanceId = queryInstanceId
+  }
   await trader.startRealtime()
   await trader.loadAll()
+  if (queryInstanceId) {
+    await trader.selectInstance(queryInstanceId)
+  }
   if (trader.activeTab === 'orders') void trader.loadExecutionOrders(1)
-  void loadTheoreticalWinRate()
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('open-live-trader-window', onPopoutCustomEvent)
   trader.stopRealtime()
 })
 
@@ -227,14 +224,7 @@ function exitReasonBadge(reason: string) {
   }
 }
 
-/** 理论复盘胜率 vs 实盘胜率差额 */
-const winRateDiff = computed(() => {
-  if (!trader.statistics || trader.statistics.total_trades === 0) return null
-  const liveRate = trader.statistics.win_rate_pct
-  const reviewRate = theoreticalWinRate.value ?? (review.rawOutcomes.length ? review.metrics.winRate * 100 : null)
-  if (reviewRate == null) return null
-  return liveRate - reviewRate
-})
+
 
 function getTradeRecordPnl(rec: LiveTradeRecord): number {
   if (rec.realized_pnl_amount != null && !Number.isNaN(rec.realized_pnl_amount) && rec.realized_pnl_amount !== 0) {
@@ -244,6 +234,34 @@ function getTradeRecordPnl(rec: LiveTradeRecord): number {
 }
 
 const router = useRouter()
+const route = useRoute()
+
+function handleOpenInstanceWindow(instanceId?: string, name?: string) {
+  const targetId = instanceId || trader.selectedInstanceId
+  const targetName = name || selectedInstance.value?.instance.name || targetId
+  void openLiveTraderWindow(targetId, targetName)
+}
+
+function onPopoutCustomEvent(e: Event) {
+  const detail = (e as CustomEvent).detail
+  if (detail?.instanceId) {
+    handleOpenInstanceWindow(detail.instanceId, detail.name)
+  }
+}
+
+watch(() => route.query.instance_id, async (newId) => {
+  if (typeof newId === 'string' && newId.trim() && newId.trim() !== trader.selectedInstanceId) {
+    await trader.selectInstance(newId.trim())
+  }
+})
+
+watch(selectedInstance, (inst) => {
+  if (inst && isTauri()) {
+    const accId = inst.account.user_id || inst.account.name || inst.account.id
+    const winTitle = `实盘量化执行终端 · ${inst.instance.name} (${accId})`
+    void getCurrentWindow().setTitle(winTitle)
+  }
+}, { immediate: true })
 
 /**
  * 活跃信号（当前在手持仓 / 活跃条件单）：
@@ -330,48 +348,23 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 <template>
   <div class="live-trader-page">
-    <TraderInstancesPanel />
-    <!-- 1. 顶部控制栏与柜台状态（浅色高对比度） -->
+    <TraderInstancesPanel @open-window="handleOpenInstanceWindow" />
+    <!-- 1. 顶部控制栏与柜台状态（高密度专业布局） -->
     <header class="trader-header" @mousedown="onHeaderMouseDown">
       <div class="header-top-row">
-        <div class="header-title-box">
-          <div class="title-with-badge">
-            <n-icon :component="Bolt" size="22" color="#eab308" />
-            <h1 class="header-title">{{ executionLabel }}量化执行终端</h1>
-            <n-tooltip trigger="hover">
-              <template #trigger>
-                <n-tag
-                  :type="trader.isReady ? 'success' : trader.health?.sync_pending ? 'warning' : 'error'"
-                  size="small"
-                  round
-                  class="status-tag"
-                >
-                  {{ trader.isReady ? 'CTP 柜台就绪' : trader.health?.sync_pending ? 'CTP 数据同步中' : 'CTP 未就绪' }}
-                </n-tag>
-              </template>
-              <span>
-                {{
-                  trader.isReady
-                    ? 'CTP 柜台已就绪，行情与报单通道正常'
-                    : trader.health?.sync_pending
-                      ? '正在从柜台同步最新资金、持仓与委托流...'
-                      : !trader.health?.connected
-                        ? 'CTP 柜台未连接（当前处于非交易时段或周末休市，期货柜台服务关闭；当前呈现的数据为最后一次成功同步的历史镜像）'
-                        : !trader.health?.logged_in
-                          ? 'CTP 柜台网络已连通，等待认证登录'
-                          : 'CTP 柜台未就绪'
-                }}
-              </span>
-            </n-tooltip>
-          </div>
-          <span class="header-subtitle">
-            {{ trader.bridgeOnline ? '交易数据已连接' : '交易数据连接中断' }} · 柜台资金更新：{{ formatAccountUpdateTime(trader.account?.updated_at) }}
-            <span v-if="trader.errorMsg" class="error-inline">
-              · <span class="error-msg-text">{{ trader.errorMsg }}</span>
-              <n-button text size="tiny" type="error" class="retry-btn" :loading="trader.refreshing" @click="trader.refresh">
-                重试
-              </n-button>
-            </span>
+        <div class="header-status-box">
+          <span class="live-status-pill" :class="trader.bridgeOnline ? 'is-online' : 'is-offline'">
+            <span class="status-indicator-dot" />
+            {{ trader.bridgeOnline ? '数据通信正常' : '数据通信中断' }}
+          </span>
+          <span class="header-subtitle font-num">
+            柜台更新: {{ formatAccountUpdateTime(trader.account?.updated_at) }}
+          </span>
+          <span v-if="trader.errorMsg" class="error-inline">
+            · <span class="error-msg-text">{{ trader.errorMsg }}</span>
+            <n-button text size="tiny" type="error" class="retry-btn" :loading="trader.refreshing" @click="trader.refresh">
+              重试
+            </n-button>
           </span>
         </div>
 
@@ -505,95 +498,57 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         </div>
       </div>
 
-      <!-- 3. 实盘真实 KPI 看板 & 理论复盘比对条 -->
-      <div class="kpi-and-diff-row">
-        <div class="live-kpi-bar">
-          <div class="kpi-box">
-            <span class="kpi-name">{{ executionLabel }}成交单数</span>
-            <span class="kpi-num font-num">{{ trader.statistics?.total_trades || 0 }} <span class="unit">笔</span></span>
-            <span class="kpi-sub">大仓 {{ trader.statistics?.large_trades_count || 0 }} / 小仓 {{ trader.statistics?.small_trades_count || 0 }}</span>
-          </div>
-          <div class="kpi-divider" />
-          <div class="kpi-box">
-            <span class="kpi-name">{{ executionLabel }}真实胜率</span>
-            <span
-              class="kpi-num font-num"
-              :class="(trader.statistics?.win_rate_pct || 0) >= 50 ? 'is-up' : 'is-down'"
-            >
-              {{ (trader.statistics?.win_rate_pct || 0).toFixed(1) }}%
-            </span>
-            <span class="kpi-sub">
-              {{ trader.statistics?.win_trades || 0 }}胜 / {{ trader.statistics?.loss_trades || 0 }}负
-            </span>
-          </div>
-          <div class="kpi-divider" />
-          <div class="kpi-box">
-            <span class="kpi-name">{{ executionLabel }}平仓盈亏</span>
-            <span
-              class="kpi-num font-num"
-              :class="trader.totalRealizedPnlAmount >= 0 ? 'is-up' : 'is-down'"
-            >
-              {{ formatPnlAmount(trader.totalRealizedPnlAmount, { decimals: 2 }) }}
-            </span>
-            <span class="kpi-sub">
-              累计 {{ formatPnlPoints(trader.totalRealizedPnlPoints) }}
-            </span>
-          </div>
-          <div class="kpi-divider" />
-          <div class="kpi-box">
-            <span class="kpi-name">{{ executionLabel }}累计 R 倍数</span>
-            <span
-              class="kpi-num font-num"
-              :class="(trader.statistics?.total_r || 0) >= 0 ? 'is-up' : 'is-down'"
-            >
-              {{ formatRMultiple(trader.statistics?.total_r || 0) }}
-            </span>
-            <span class="kpi-sub">单笔期望 {{ (trader.statistics?.avg_r || 0).toFixed(2) }}R</span>
-          </div>
-          <div class="kpi-divider" />
-          <div class="kpi-box">
-            <span class="kpi-name">{{ executionLabel }}盈亏比</span>
-            <span class="kpi-num font-num">
-              {{ (trader.statistics?.profit_factor || 0).toFixed(2) }}
-            </span>
-            <span class="kpi-sub">获利金额/亏损金额</span>
-          </div>
+      <!-- 3. 实盘真实 KPI 看板 -->
+      <div class="live-kpi-bar">
+        <div class="kpi-box">
+          <span class="kpi-name">{{ executionLabel }}成交单数</span>
+          <span class="kpi-num font-num">{{ trader.statistics?.total_trades || 0 }} <span class="unit">笔</span></span>
+          <span class="kpi-sub">大仓 {{ trader.statistics?.large_trades_count || 0 }} / 小仓 {{ trader.statistics?.small_trades_count || 0 }}</span>
         </div>
-
-        <!-- 理论复盘 vs 实盘对比卡条 -->
-        <div v-if="isNStrategy" class="comparison-card">
-          <div class="cmp-title">
-            <n-icon :component="LayersSubtract" size="15" color="#0284c7" />
-            <span>{{ executionLabel }}表现 vs 理论复盘</span>
-          </div>
-          <div class="cmp-content">
-            <div class="cmp-item">
-              <span class="cmp-label">理论胜率 (复盘):</span>
-              <span class="cmp-val font-num">
-                {{ theoreticalWinRate !== null ? theoreticalWinRate.toFixed(1) + '%' : (review.metrics.winRate ? (review.metrics.winRate * 100).toFixed(1) + '%' : '—') }}
-              </span>
-            </div>
-            <div class="cmp-item">
-              <span class="cmp-label">{{ executionLabel }}真实胜率:</span>
-              <span class="cmp-val font-num" :class="(trader.statistics?.win_rate_pct || 0) >= 50 ? 'is-up' : 'is-down'">
-                {{ (trader.statistics?.win_rate_pct || 0).toFixed(1) }}%
-              </span>
-            </div>
-            <div class="cmp-item">
-              <span class="cmp-label">{{ executionLabel }}偏差:</span>
-              <span
-                v-if="winRateDiff !== null"
-                class="cmp-val font-num"
-                :class="winRateDiff >= 0 ? 'is-up' : 'is-down'"
-              >
-                {{ winRateDiff >= 0 ? '+' : '' }}{{ winRateDiff.toFixed(1) }}%
-              </span>
-              <span v-else class="cmp-val font-num">—</span>
-            </div>
-          </div>
-          <div class="cmp-tip">
-            理论复盘按历史信号推演。实盘统计使用柜台成交；模拟统计使用明确的盘口成交假设，不能代替实际成交效果。
-          </div>
+        <div class="kpi-divider" />
+        <div class="kpi-box">
+          <span class="kpi-name">{{ executionLabel }}真实胜率</span>
+          <span
+            class="kpi-num font-num"
+            :class="(trader.statistics?.win_rate_pct || 0) >= 50 ? 'is-up' : 'is-down'"
+          >
+            {{ (trader.statistics?.win_rate_pct || 0).toFixed(1) }}%
+          </span>
+          <span class="kpi-sub">
+            {{ trader.statistics?.win_trades || 0 }}胜 / {{ trader.statistics?.loss_trades || 0 }}负
+          </span>
+        </div>
+        <div class="kpi-divider" />
+        <div class="kpi-box">
+          <span class="kpi-name">{{ executionLabel }}平仓盈亏</span>
+          <span
+            class="kpi-num font-num"
+            :class="trader.totalRealizedPnlAmount >= 0 ? 'is-up' : 'is-down'"
+          >
+            {{ formatPnlAmount(trader.totalRealizedPnlAmount, { decimals: 2 }) }}
+          </span>
+          <span class="kpi-sub">
+            累计 {{ formatPnlPoints(trader.totalRealizedPnlPoints) }}
+          </span>
+        </div>
+        <div class="kpi-divider" />
+        <div class="kpi-box">
+          <span class="kpi-name">{{ executionLabel }}累计 R 倍数</span>
+          <span
+            class="kpi-num font-num"
+            :class="(trader.statistics?.total_r || 0) >= 0 ? 'is-up' : 'is-down'"
+          >
+            {{ formatRMultiple(trader.statistics?.total_r || 0) }}
+          </span>
+          <span class="kpi-sub">单笔期望 {{ (trader.statistics?.avg_r || 0).toFixed(2) }}R</span>
+        </div>
+        <div class="kpi-divider" />
+        <div class="kpi-box">
+          <span class="kpi-name">{{ executionLabel }}盈亏比</span>
+          <span class="kpi-num font-num">
+            {{ (trader.statistics?.profit_factor || 0).toFixed(2) }}
+          </span>
+          <span class="kpi-sub">获利金额/亏损金额</span>
         </div>
       </div>
     </header>
@@ -1230,6 +1185,37 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   margin-bottom: 8px;
 }
 
+.header-status-box {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.live-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.live-status-pill.is-online {
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+.live-status-pill.is-offline {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+.status-indicator-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
 .header-title-box {
   display: flex;
   flex-direction: column;
@@ -1396,14 +1382,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   margin: 0 12px;
 }
 
-/* KPI & 比对行 */
-.kpi-and-diff-row {
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-  gap: 12px;
-  align-items: stretch;
-}
-
+/* 实盘 KPI 看板 */
 .live-kpi-bar {
   min-width: 0;
   display: grid;
@@ -1413,7 +1392,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 8px;
-  padding: 8px 14px;
+  padding: 8px 16px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
@@ -1453,54 +1432,6 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   display: none;
 }
 
-.comparison-card {
-  min-width: 0;
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  border-radius: 8px;
-  padding: 6px 12px;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-}
-
-.cmp-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  font-weight: 600;
-  color: #15803d;
-}
-
-.cmp-content {
-  display: flex;
-  justify-content: space-between;
-  margin: 2px 0;
-}
-
-.cmp-item {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.cmp-label {
-  font-size: 10px;
-  color: #64748b;
-}
-
-.cmp-val {
-  font-size: 12px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.cmp-tip {
-  font-size: 10px;
-  color: #64748b;
-}
-
 /* 工具栏 Tabs */
 .main-tabs-toolbar {
   display: flex;
@@ -1530,11 +1461,6 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   box-sizing: border-box;
 }
 
-@media (max-width: 1100px) {
-  .kpi-and-diff-row {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
 
 @media (max-width: 640px) {
   .live-kpi-bar {

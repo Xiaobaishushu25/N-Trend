@@ -851,6 +851,7 @@ pub fn definition(id: &str, parameters: Parameters) -> StrategyDefinition {
         .into(),
         sizing_policy: ONE_LOT.into(),
         parameters: serde_json::to_value(parameters).unwrap(),
+        name: None,
     }
 }
 pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {

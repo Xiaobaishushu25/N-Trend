@@ -934,6 +934,7 @@ export interface StrategyDefinition {
   exit_policy: string
   sizing_policy: string
   parameters: unknown
+  name?: string
 }
 export interface TraderInstanceRow {
   instance: { id: string; name: string; account_id: string; created_at: number }

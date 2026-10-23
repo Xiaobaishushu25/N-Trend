@@ -663,3 +663,34 @@ async fn damaged_paper_account_is_disabled_without_blocking_other_accounts_or_ov
     ));
     assert_eq!(std::fs::read(path).unwrap(), b"damaged");
 }
+
+#[tokio::test]
+async fn instance_rename_updates_catalog_and_persists() {
+    let root = directory();
+    let db = crate::storage::connect(&root.join("test.db"))
+        .await
+        .unwrap();
+    let dir = migrate_default(&root).unwrap();
+    let e = Arc::new(ExecutionEngine::with_config_path(
+        CtpTraderClient::for_port(1),
+        config(),
+        Some(dir.join("trader_config.json")),
+    ));
+    let m = InstanceManager::open(db.clone(), root.clone(), e.clone(), registry())
+        .await
+        .unwrap();
+    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "现有 N 字形策略");
+    m.rename("default", "螺纹实盘1号".into()).await.unwrap();
+    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "螺纹实盘1号");
+    drop(m);
+    drop(e);
+    let e = Arc::new(ExecutionEngine::with_config_path(
+        CtpTraderClient::for_port(1),
+        config(),
+        Some(dir.join("trader_config.json")),
+    ));
+    let m = InstanceManager::open(db, root, e, registry())
+        .await
+        .unwrap();
+    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "螺纹实盘1号");
+}

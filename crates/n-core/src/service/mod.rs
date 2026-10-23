@@ -1025,7 +1025,7 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
         e.entry_score_dims = dims.to_string();
     } else if matches!(
         result.status.as_str(),
-        "ambiguous" | "missing_data" | "rollover" | "invalidated" | "unfilled"
+        "ambiguous" | "missing_data" | "rollover" | "invalidated" | "unfilled" | "filtered"
     ) {
         e.state = result.status;
         e.outcome = None;
@@ -5638,6 +5638,39 @@ mod tests {
             summary.contains("MA0 做多 精细N | A | 等待触发 | 形态: 长影线 | 评分 2.30 | 未达阈值")
         );
         assert!(summary.contains("入场: 2577.0 | 止损: 2564.0 | 目标: 2584.0 | R/R: 0.54"));
+    }
+
+    #[test]
+    fn filtered_breakout_does_not_leave_a_triggered_signal_without_time() {
+        let bars = vec![
+            bar_model("2026-08-11 09:45:00", 2572.0, 2576.0, 2566.0, 2570.0),
+            bar_model("2026-08-11 10:00:00", 2577.0, 2580.0, 2575.0, 2579.0),
+        ];
+        for state in ["pending", "triggered"] {
+            for (score, risk) in [(2.3, 13.0), (3.8, 3.0)] {
+                let mut e = pattern_event(1, score, state);
+                e.risk = risk;
+                assert!(advance_event_model(&mut e, &bars));
+                assert_eq!(e.state, "filtered", "initial state={state}, score={score}, risk={risk}");
+                assert_eq!(e.exit_reason.as_deref(), Some("filtered"));
+                assert!(e.trigger_ts.is_none());
+                assert!(e.trigger_bar_ts.is_none());
+                assert!(e.outcome.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn eligible_breakout_keeps_trigger_state_and_time_together() {
+        let bars = vec![
+            bar_model("2026-08-11 09:45:00", 2572.0, 2576.0, 2566.0, 2570.0),
+            bar_model("2026-08-11 10:00:00", 2577.0, 2580.0, 2575.0, 2579.0),
+        ];
+        let mut e = pattern_event(1, 3.8, "pending");
+        assert!(advance_event_model(&mut e, &bars));
+        assert_eq!(e.state, "triggered");
+        assert_eq!(e.trigger_ts.as_deref(), Some("2026-08-11 10:00:00"));
+        assert_eq!(e.trigger_bar_ts, e.trigger_ts);
     }
 
     #[test]
