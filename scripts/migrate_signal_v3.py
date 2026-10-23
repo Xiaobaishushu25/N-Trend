@@ -43,7 +43,9 @@ def assert_managed_continuity(state, snapshot, now=None):
             raise ValueError('position and condition disagree')
         expected[(pos['instrument_id'].upper(),'buy' if pos['direction']=='up' else 'sell')]+=qty
     actual=collections.Counter()
-    for pos in snapshot.get('positions',[]):
+    broker_positions=snapshot.get('broker_positions',snapshot.get('positions'))
+    if not isinstance(broker_positions,list):raise ValueError('broker snapshot lacks an explicit positions list')
+    for pos in broker_positions:
         if pos.get('position',0)>0:actual[(pos['instrument_id'].upper(),pos['direction'])]+=pos['position']
     if actual!=expected:raise ValueError('broker and managed positions disagree')
     for cond in state.get('conditions',{}).values():

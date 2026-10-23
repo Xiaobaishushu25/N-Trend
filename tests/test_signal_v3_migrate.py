@@ -10,13 +10,15 @@ class QuiescentTests(unittest.TestCase):
   c={'id':'c','event_id':1,'symbol':'PB0','instrument_id':'pb2611','direction':'up','state':'filled','entry_price':1000.,'stop_price':980.,'target_price':1100.,'risk':20.,'volume':2,'score':4.,'created_at':1,'warning_bar_ts':'2026-10-22 09:15:00'}
   p={'id':'c','condition_order_id':'c','instrument_id':'pb2611','direction':'up','volume':1,'is_closed':False,'fill_price':1001.,'risk':21.,'initial_stop_price':980.,'current_stop_price':1001.,'target_price':1100.,'lot1_closed':True,'trailing_grade':1}
   state={'account':'9999:fixture','conditions':{'c':c},'positions':{'c':p},'orders':{'1':{'phase':'Terminal','filled':2,'reported_filled':2}},'history':[{'id':'first-leg','event_id':1,'realized_pnl_amount':105.}],'closes':{'historical':{'filled':1,'target':1}},'comparison':{'original':'preserved'},'seen_trades':['known-fill'],'last_ref':12345}
-  snap={'health':{'ready':True,'positions_updated_at':time.time(),'broker_id':'9999','user_id':'fixture'},'positions':[{'instrument_id':'pb2611','direction':'buy','position':1}]}
+  snap={'health':{'ready':True,'positions_updated_at':time.time(),'broker_id':'9999','user_id':'fixture'},'broker_positions':[{'instrument_id':'pb2611','direction':'buy','position':1}]}
   return state,snap
  def test_continuity_requires_fresh_matching_reconciled_counter(self):
   state,snapshot=self.continuity_fixture();assert_managed_continuity(state,snapshot)
   bad=copy.deepcopy(snapshot);bad['health']['positions_updated_at']-=31
   with self.assertRaises(ValueError):assert_managed_continuity(state,bad)
-  bad=copy.deepcopy(snapshot);bad['positions'][0]['position']=2
+  bad=copy.deepcopy(snapshot);bad['broker_positions'][0]['position']=2
+  with self.assertRaises(ValueError):assert_managed_continuity(state,bad)
+  bad=copy.deepcopy(snapshot);del bad['broker_positions']
   with self.assertRaises(ValueError):assert_managed_continuity(state,bad)
   bad=copy.deepcopy(snapshot);bad['health']['user_id']='other'
   with self.assertRaises(ValueError):assert_managed_continuity(state,bad)
