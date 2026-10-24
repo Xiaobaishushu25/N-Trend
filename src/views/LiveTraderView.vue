@@ -192,15 +192,176 @@ function dirLabel(direction: string): string {
 }
 
 function conditionLabel(state: string): string {
-  return ({ Pending: '等待突破', WaitingConfirm: '等待确认开仓', Triggered: '已触发，尚未提交',
+  const map: Record<string, string> = {
+    pending: '等待突破',
+    waiting_confirm: '等待确认开仓',
+    triggered: '已触发，尚未提交',
+    unknown: '提交结果待核实',
+    working: '委托中，尚未成交',
+    part_filled: '部分成交',
+    closing: '自动平仓处理中',
+    filled: '已成交',
+    rejected: '提交失败，等待重试',
+    canceled: '已取消后续开仓',
+    closed: '已平仓',
+    expired: '已过期',
+    invalidated: '已失效',
+  }
+  const key = (state || '').toLowerCase()
+  return map[key] || ({
+    Pending: '等待突破', WaitingConfirm: '等待确认开仓', Triggered: '已触发，尚未提交',
     Unknown: '提交结果待核实', Working: '委托中，尚未成交', PartFilled: '部分成交',
     Closing: '自动平仓处理中', Filled: '已成交', Rejected: '提交失败，等待重试',
-    Canceled: '已取消后续开仓', Closed: '已平仓', Expired: '已过期', Invalidated: '已失效' } as Record<string, string>)[state] || state
+    Canceled: '已取消后续开仓', Closed: '已平仓', Expired: '已过期', Invalidated: '已失效'
+  } as Record<string, string>)[state] || state
+}
+
+function formatOrderActionTime(ts?: number | null): string {
+  if (!ts) return ''
+  const ms = ts > 1e11 ? ts : ts * 1000
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function formatOffset(offset?: string): string {
+  if (!offset) return ''
+  switch (offset) {
+    case 'open':
+      return '开仓'
+    case 'close':
+      return '平仓'
+    case 'close_today':
+      return '平今'
+    case 'close_yesterday':
+      return '平昨'
+    case 'auto':
+      return '平仓'
+    default:
+      return ''
+  }
 }
 
 function orderLabel(phase: string): string {
   return ({ Unknown: '等待柜台确认', Working: '柜台委托中', CancelPending: '等待撤单确认',
     Terminal: '委托已结束', Rejected: '提交失败' } as Record<string, string>)[phase] || phase
+}
+
+function isWarningNote(note?: string | null): boolean {
+  if (!note) return false
+  return /筛选|暂缓|小于|滑点|资金不足|风控|拦截|过滤|超入场|不可用|熔断|已越过止损/i.test(note)
+}
+
+function getNoteCategory(note?: string | null): string {
+  if (!note) return '说明'
+  if (/入场筛选|小于.*tick/i.test(note)) return '入场筛选'
+  if (/资金不足|资金/i.test(note)) return '资金风控'
+  if (/滑点/i.test(note)) return '滑点保护'
+  if (/平仓|退出/i.test(note)) return '平仓说明'
+  if (/超时|过期/i.test(note)) return '状态提醒'
+  if (/越过止损|拦截|风控/i.test(note)) return '风控拦截'
+  return '说明'
+}
+
+function formatNoteText(note?: string | null): string {
+  if (!note) return ''
+  return note.replace(/^(说明[:：]|入场筛选[:：])\s*/, '').trim()
+}
+
+function isConditionClosing(state?: string | null): boolean {
+  if (!state) return false
+  const s = state.toLowerCase()
+  return s === 'closing' || s === 'closed'
+}
+
+function getNoteTooltip(note?: string | null): string {
+  if (!note) return ''
+  const trimmed = note.trim()
+
+  // 1. 退出任务已锁定: [reason]
+  if (/退出任务已锁定/i.test(trimmed)) {
+    const reasonMatch = trimmed.match(/退出任务已锁定[:：]\s*(\w+)/i)
+    const reason = reasonMatch ? reasonMatch[1].toLowerCase() : ''
+
+    const reasonMap: Record<string, string> = {
+      market_gap: '【行情跳号/跳空风控】行情推送序列出现断层或跳空，超出系统容忍阈值。为防止数据中断期间产生不可控的极端穿透滑点，系统启动最高优先级风控，锁定任务并立即平仓保护本金。',
+      stop: '【触及硬止损】盘中价格击穿建仓时设定的初始止损保护线，按纪律坚决全平止损，严格控制单笔最大风险。',
+      target_1r: '【+1.0R第1止盈位】浮盈达到1倍初始风险目标。若是1手则全平落袋；若是多手则平第1手止盈，并将剩余持仓止损线自动移至开仓成本线保本。',
+      breakeven: '【保本平仓离场】在第1手止盈落袋后，行情未能进一步走高而是回落至开仓成本价，系统自动平掉剩余持仓，保住已获利润，做到零回撤。',
+      trailing: '【追踪移动止盈】浮盈大幅扩大后，动态保护线随最高点持续跟进；当价格自高位回撤触及移动止损线时平仓，锁住大部分趋势波段利润。',
+      target_s1: '【结构阻力位止盈】行情冲刺触及前高/前低或战略结构位 S1，完成既定目标，全平获利了结。',
+      no_follow: '【动能衰竭离场】开仓后持有满5根K线但最大浮盈依然小于0.5R，显示突破缺乏跟进动能、走势停滞，主动平仓微利或微损离场，释放资金槽位。',
+      time_exit: '【时间窗口离场】持仓达到策略设定的时间周期上限（60根K线），强制退出，防范陷入无序震荡。',
+      pre_close: '【日盘收盘避险】临近日盘收盘，主动平仓离场，规避休市期间外部市场异动带来的跳空风险。',
+      pre_weekend: '【周末休市避险】周五夜盘收盘前主动清仓，规避周末长休市期间宏观消息面引发的周一大幅跳空风险。',
+      pre_holiday: '【长假避险平仓】节假日前主动清仓，彻底防范长假期间外盘剧烈波动风险。',
+    }
+
+    if (reason && reasonMap[reason]) {
+      return reasonMap[reason]
+    }
+    return `【平仓任务锁定】系统检测到持仓触发退出条件（${reason || '策略触发'}），已切断加仓通道并原子锁定平仓任务，正在向柜台提交平仓委托。`
+  }
+
+  // 2. 入场与风控筛选说明
+  if (/止损距离.*小于.*tick/i.test(trimmed)) {
+    return '【入场空间筛选】当前信号计算出的止损保护距离小于策略设定的最小保护阈值（如10 tick）。过窄的止损极易被盘口随机噪音频繁扫损，盈亏比与胜率性价比低，系统主动过滤该开仓信号以减少磨损。'
+  }
+  if (/资金不足/i.test(trimmed)) {
+    return '【资金风控拦截】当前账户可用资金低于该合约开仓1手所需保证金与安全缓冲金，暂缓报单以保障账户免于透支与强平风险。'
+  }
+  if (/超入场滑点限制/i.test(trimmed)) {
+    return '【滑点保护拦截】盘口瞬时突破幅度过大，对价已超出策略允许的追单容差上限，系统主动放弃追高/追空，避免在不利高位追价接盘。'
+  }
+  if (/越过止损/i.test(trimmed)) {
+    return '【极速反向拦截】条件单触发瞬间盘口剧烈跳空，价格在发出报单前已跌破/涨破止损保护线，紧急终止本次入场，避免开仓即深套。'
+  }
+  if (/仅监控/i.test(trimmed)) {
+    return '【监控模式】当前策略处于仅监控模式（MonitorOnly），仅记录信号触发与行情轨迹，不向柜台发送真实交易委托。'
+  }
+  if (/已确认.*等待有效盘口/i.test(trimmed)) {
+    return '【等待盘口挂单】开仓已获得确认，系统正在等待买卖盘口出现符合滑点和深度要求的有效对价时自动报单。'
+  }
+  if (/已取消后续开仓/i.test(trimmed)) {
+    return '【取消开仓确认】已向柜台撤销未成交的开仓报单，正在等待柜台回报完成状态结算。'
+  }
+  if (/撤单未确认/i.test(trimmed)) {
+    return '【撤单防并发保护】撤单请求已发给柜台但尚未收到确认回报，为防重复开仓引发敞口超额，系统暂时锁定该品种槽位。'
+  }
+  if (/提交结果未知/i.test(trimmed)) {
+    return '【提交异常核实】向柜台报单后返回异常或超时，禁止盲目重报以避免双倍持仓，系统正在核实委托状态。'
+  }
+
+  return trimmed
+}
+
+function formatCondTs(ts?: string | null): string {
+  if (!ts) return ''
+  const match = ts.match(/^\d{4}-(\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)/)
+  if (match) return match[1]
+  return ts
+}
+
+function conditionBadgeType(state?: string | null): 'default' | 'primary' | 'info' | 'success' | 'warning' | 'error' {
+  const s = (state || '').toLowerCase()
+  switch (s) {
+    case 'waiting_confirm':
+    case 'waitingconfirm':
+      return 'warning'
+    case 'triggered':
+      return 'info'
+    case 'working':
+    case 'part_filled':
+      return 'primary'
+    case 'filled':
+      return 'success'
+    case 'closing':
+      return 'warning'
+    case 'rejected':
+      return 'error'
+    default:
+      return 'default'
+  }
 }
 
 function exitReasonBadge(reason: string) {
@@ -407,14 +568,6 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             >
               {{ (trader.config?.mode || 'SemiAuto') === 'FullAuto' ? '⚡ 自动报单中' : (trader.config?.mode || 'SemiAuto') === 'SemiAuto' ? '🛡️ 待人工核准' : '👁️ 仅生成信号' }}
             </n-tag>
-            <n-tooltip v-if="(trader.config?.min_entry_risk_ticks ?? 0) > 0">
-              <template #trigger>
-                <n-tag size="small" round type="info">
-                  入场止损 ≥ {{ trader.config?.min_entry_risk_ticks }} tick
-                </n-tag>
-              </template>
-              过滤止损距离过窄的新开仓信号；资金不足时等待资金恢复。已有持仓的止损和平仓继续执行。
-            </n-tooltip>
           </div>
 
           <n-divider vertical style="height: 22px; margin: 0 4px" />
@@ -835,7 +988,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             v-for="cond in trader.activeConditions"
             :key="cond.id"
             class="cond-card"
-            :class="cond.state === 'WaitingConfirm' ? 'pulse-confirm' : ''"
+            :class="[
+              cond.direction === 'up' ? 'border-up' : 'border-down',
+              cond.state === 'WaitingConfirm' || cond.state === 'waiting_confirm' ? 'pulse-confirm' : '',
+            ]"
           >
             <div class="cond-head">
               <div class="head-left">
@@ -865,12 +1021,6 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                   <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
                 </n-tag>
                 <span class="score-badge">评分 {{ cond.score.toFixed(2) }}</span>
-                <span v-if="cond.warning_bar_ts" class="warning-ts-tag font-num">
-                  预警: {{ cond.warning_bar_ts }}
-                </span>
-                <span v-if="cond.trigger_ts" class="trigger-ts-tag font-num">
-                  触发: {{ cond.trigger_ts }}
-                </span>
               </div>
 
               <div class="head-right">
@@ -879,7 +1029,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 </span>
                 <n-tag
                   size="small"
-                  :type="cond.state === 'WaitingConfirm' ? 'warning' : cond.state === 'Triggered' ? 'info' : 'default'"
+                  :type="conditionBadgeType(cond.state)"
                 >
                   {{ conditionLabel(cond.state) }}
                 </n-tag>
@@ -887,50 +1037,106 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             </div>
 
             <div class="cond-body">
-              <div class="cond-price-row">
-                <div class="cond-price-item">
-                  <span class="lbl">突破买点 (Entry)</span>
-                  <span class="val font-num highlight-entry">{{ fmtPrice(cond.entry_price) }}</span>
+              <div class="cond-metrics-panel">
+                <!-- 左半部：核心点位与风险 -->
+                <div class="metrics-group-price">
+                  <div class="metric-item">
+                    <span class="lbl">突破买点 (Entry)</span>
+                    <span class="val font-num highlight-entry">{{ fmtPrice(cond.entry_price) }}</span>
+                  </div>
+                  <div class="metric-item">
+                    <span class="lbl">初始止损 (Stop)</span>
+                    <span class="val font-num highlight-stop-val">{{ fmtPrice(cond.stop_price) }}</span>
+                  </div>
+                  <div class="metric-item">
+                    <span class="lbl">目标止盈 (Target)</span>
+                    <span class="val font-num text-success">{{ fmtPrice(cond.target_price) }}</span>
+                  </div>
+                  <div class="metric-item">
+                    <span class="lbl">计划风险 (1.0R)</span>
+                    <span class="val font-num">{{ cond.risk.toFixed(1) }} 点</span>
+                  </div>
                 </div>
-                <div class="cond-price-item">
-                  <span class="lbl">初始止损 (Stop)</span>
-                  <span class="val font-num highlight-stop-val">{{ fmtPrice(cond.stop_price) }}</span>
-                </div>
-                <div class="cond-price-item">
-                  <span class="lbl">目标止盈 (Target)</span>
-                  <span class="val font-num text-success">{{ fmtPrice(cond.target_price) }}</span>
-                </div>
-                <div class="cond-price-item">
-                  <span class="lbl">计划风险 (1.0R)</span>
-                  <span class="val font-num">{{ cond.risk.toFixed(1) }} 点</span>
-                </div>
-              </div>
 
-              <div v-if="cond.note" class="cond-note">
-                说明: {{ cond.note }}
+                <div class="metrics-divider" />
+
+                <!-- 右半部：时间线与触价进度 -->
+                <div class="metrics-group-time">
+                  <div class="metric-item">
+                    <span class="lbl">预警 K 线时间</span>
+                    <span class="val font-num font-time" :title="`预警时间: ${cond.warning_bar_ts || '—'}`">
+                      {{ formatCondTs(cond.warning_bar_ts) || '—' }}
+                    </span>
+                  </div>
+                  <div class="metric-item">
+                    <span class="lbl">行情触价触发</span>
+                    <span
+                      class="val font-num font-time"
+                      :class="cond.trigger_ts ? 'text-triggered' : 'text-muted'"
+                      :title="`触价时间: ${cond.trigger_ts || '等待突破触价'}`"
+                    >
+                      {{ formatCondTs(cond.trigger_ts) || '等待突破触价' }}
+                    </span>
+                  </div>
+                </div>
               </div>
             </div>
 
-            <div class="cond-actions">
-              <n-button
-                v-if="cond.state === 'WaitingConfirm'"
-                type="primary"
-                size="small"
-                @click="trader.confirmCondition(cond.id)"
-              >
-                <template #icon><n-icon :component="CircleCheck" /></template>
-                立即确认开仓
-              </n-button>
-              <n-button
-                size="small"
-                secondary
-                type="error"
-                :disabled="cond.state === 'Closing'"
-                @click="trader.cancelCondition(cond.id)"
-              >
-                <template #icon><n-icon :component="CircleX" /></template>
-                取消剩余开仓
-              </n-button>
+            <div class="cond-footer">
+              <n-tooltip v-if="cond.note" trigger="hover" placement="top" :style="{ maxWidth: '420px' }">
+                <template #trigger>
+                  <div class="cond-note-banner" :class="isWarningNote(cond.note) ? 'is-warning' : 'is-info'">
+                    <n-icon :component="isWarningNote(cond.note) ? AlertTriangle : InfoCircle" class="note-icon" />
+                    <div class="note-content">
+                      <span class="note-tag">{{ getNoteCategory(cond.note) }}</span>
+                      <span class="note-text">{{ formatNoteText(cond.note) }}</span>
+                    </div>
+                  </div>
+                </template>
+                <div class="note-tooltip-box">
+                  <div class="note-tooltip-header">
+                    <span class="note-tooltip-badge" :class="isWarningNote(cond.note) ? 'is-warning' : 'is-info'">
+                      {{ getNoteCategory(cond.note) }}
+                    </span>
+                    <span class="note-tooltip-title">{{ formatNoteText(cond.note) }}</span>
+                  </div>
+                  <div class="note-tooltip-body">{{ getNoteTooltip(cond.note) }}</div>
+                </div>
+              </n-tooltip>
+              <div v-else class="cond-footer-spacer" />
+
+              <div class="cond-actions">
+                <n-button
+                  v-if="cond.state === 'WaitingConfirm' || cond.state === 'waiting_confirm'"
+                  type="primary"
+                  size="small"
+                  @click="trader.confirmCondition(cond.id)"
+                >
+                  <template #icon><n-icon :component="CircleCheck" /></template>
+                  立即确认开仓
+                </n-button>
+                <n-tooltip trigger="hover" placement="top" :style="{ maxWidth: '320px' }">
+                  <template #trigger>
+                    <span class="cond-btn-wrapper">
+                      <n-button
+                        size="small"
+                        secondary
+                        :type="isConditionClosing(cond.state) ? 'default' : 'error'"
+                        :disabled="isConditionClosing(cond.state)"
+                        @click="trader.cancelCondition(cond.id)"
+                      >
+                        <template #icon>
+                          <n-icon :component="isConditionClosing(cond.state) ? ShieldCheck : CircleX" />
+                        </template>
+                        {{ isConditionClosing(cond.state) ? '平仓执行中' : '取消剩余开仓' }}
+                      </n-button>
+                    </span>
+                  </template>
+                  {{ isConditionClosing(cond.state)
+                    ? '持仓已进入自动平仓阶段，开仓已全部完成，无需取消开仓。系统正按退出策略执行清仓委托。'
+                    : '撤销该条件单未成交的剩余开仓委托，已成交持仓将继续受平仓策略保护。' }}
+                </n-tooltip>
+              </div>
             </div>
           </div>
         </div>
@@ -952,15 +1158,32 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           <div class="history-list">
             <div v-for="order in trader.executionOrders" :key="`${order.trading_day}-${order.request.order_ref}`" class="cond-card">
               <div class="cond-head">
-                <span>{{ order.request.instrument_id }} · {{ order.request.direction === 'buy' ? '买入' : '卖出' }}</span>
+                <div class="head-left">
+                  <span class="inst-name">{{ getInstrumentName(order.request.instrument_id) }}</span>
+                  <span class="inst-code font-num">({{ order.request.instrument_id }})</span>
+                  <n-tag
+                    :type="order.request.direction === 'buy' ? 'error' : 'success'"
+                    size="small"
+                    round
+                  >
+                    {{ order.request.direction === 'buy' ? '买入' : '卖出' }}{{ formatOffset(order.request.offset) }}
+                  </n-tag>
+                  <span v-if="order.action_at" class="order-time font-num">
+                    {{ formatOrderActionTime(order.action_at) }}
+                  </span>
+                </div>
                 <n-tag size="small">
                   {{ orderLabel(order.phase) }}
                 </n-tag>
               </div>
               <div class="cond-body">
-                委托 {{ order.request.volume }} 手 @ {{ fmtPrice(order.request.price) }} · 柜台成交 {{ order.filled }} 手
-                <div>交易日 {{ order.trading_day }} · 报单号 {{ order.request.order_ref }}</div>
-                <div class="cond-note">{{ order.note }}</div>
+                <div>委托 {{ order.request.volume }} 手 @ {{ fmtPrice(order.request.price) }} · 柜台成交 {{ order.filled }} 手</div>
+                <div class="order-meta font-num">
+                  <span v-if="order.action_at">时间 {{ formatOrderActionTime(order.action_at) }} · </span>
+                  <span>交易日 {{ order.trading_day }}</span>
+                  <span> · 报单号 {{ order.request.order_ref }}</span>
+                </div>
+                <div v-if="order.note" class="cond-note">{{ order.note }}</div>
               </div>
             </div>
           </div>
@@ -1529,19 +1752,23 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 .head-left {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
 }
 
 .inst-name {
   font-size: 16px;
   font-weight: 700;
   color: #0f172a;
+  white-space: nowrap;
 }
 
 .inst-code {
   font-size: 13px;
   color: #64748b;
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .lot1-tag {
@@ -1657,8 +1884,13 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   padding: 14px 18px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: all 0.2s ease;
+}
+
+.cond-card:hover {
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.06);
 }
 
 .pulse-confirm {
@@ -1670,6 +1902,8 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
 }
 
 .score-badge {
@@ -1679,31 +1913,71 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   padding: 2px 6px;
   border-radius: 4px;
   font-weight: 600;
+  white-space: nowrap;
+  line-height: 1.5;
 }
 
-.cond-price-row {
+.cond-metrics-panel {
   display: flex;
-  gap: 24px;
+  align-items: center;
+  justify-content: space-between;
   background: #f8fafc;
-  padding: 8px 14px;
+  padding: 10px 16px;
   border-radius: 6px;
   border: 1px solid #f1f5f9;
+  gap: 20px;
+  flex-wrap: wrap;
 }
 
-.cond-price-item {
+.metrics-group-price {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  flex: 1;
+  min-width: 320px;
+}
+
+.metrics-divider {
+  width: 1px;
+  height: 28px;
+  background: #e2e8f0;
+  flex-shrink: 0;
+}
+
+.metrics-group-time {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex-shrink: 0;
+}
+
+.metric-item {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.cond-price-item .lbl {
+.metric-item .lbl {
   font-size: 11px;
   color: #64748b;
+  font-weight: 500;
 }
 
-.cond-price-item .val {
+.metric-item .val {
   font-size: 14px;
   font-weight: 700;
+  color: #0f172a;
+  white-space: nowrap;
+}
+
+.font-time {
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  color: #334155;
+}
+
+.text-triggered {
+  color: #0284c7 !important;
 }
 
 .highlight-entry {
@@ -1714,15 +1988,161 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   color: #16a34a;
 }
 
+.cond-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+  min-height: 32px;
+}
+
+.cond-footer-spacer {
+  flex: 1;
+}
+
 .cond-note {
   font-size: 12px;
   color: #64748b;
 }
 
+.cond-note-banner {
+  flex: 1;
+  margin-top: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  min-width: 0;
+  transition: all 0.2s ease;
+  cursor: help;
+}
+
+.cond-note-banner:hover {
+  filter: brightness(0.97);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+
+.note-tooltip-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 0;
+  line-height: 1.5;
+}
+
+.note-tooltip-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  padding-bottom: 4px;
+}
+
+.note-tooltip-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+
+.note-tooltip-badge.is-warning {
+  background-color: rgba(234, 179, 8, 0.25);
+  color: #fde047;
+}
+
+.note-tooltip-badge.is-info {
+  background-color: rgba(56, 189, 248, 0.25);
+  color: #7dd3fc;
+}
+
+.note-tooltip-title {
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.note-tooltip-body {
+  font-size: 12px;
+  color: #cbd5e1;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.cond-btn-wrapper {
+  display: inline-flex;
+  align-items: center;
+}
+
+.cond-note-banner.is-warning {
+  background-color: #fefce8;
+  border: 1px solid #fef08a;
+  color: #854d0e;
+}
+
+.cond-note-banner.is-info {
+  background-color: #f0f9ff;
+  border: 1px solid #bae6fd;
+  color: #0369a1;
+}
+
+.note-icon {
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.note-content {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.note-tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.2px;
+}
+
+.cond-note-banner.is-warning .note-tag {
+  background-color: #fde047;
+  color: #713f12;
+}
+
+.cond-note-banner.is-info .note-tag {
+  background-color: #bae6fd;
+  color: #0369a1;
+}
+
+.note-text {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.order-meta {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.order-time {
+  font-size: 12px;
+  color: #64748b;
+  margin-left: 4px;
+}
+
 .cond-actions {
   display: flex;
   gap: 10px;
+  align-items: center;
   justify-content: flex-end;
+  flex-shrink: 0;
 }
 
 /* 流水卡片 */
@@ -1882,18 +2302,40 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   transform: translateY(-1px);
 }
 
-.warning-ts-tag {
+.warning-ts-tag,
+.trigger-ts-tag {
+  display: inline-flex;
+  align-items: center;
   font-size: 11px;
-  color: #64748b;
+  color: #475569;
   background: #f1f5f9;
-  padding: 2px 6px;
+  border: 1px solid #e2e8f0;
+  padding: 2px 7px;
   border-radius: 4px;
+  white-space: nowrap;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.trigger-ts-tag {
+  color: #0284c7;
+  background: #f0f9ff;
+  border-color: #bae6fd;
+  font-weight: 500;
+}
+
+.head-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .wait-progress {
   font-size: 12px;
   color: #64748b;
-  margin-right: 8px;
+  white-space: nowrap;
 }
 
 /* 计划与实际执行比对栏 (持仓卡片) */

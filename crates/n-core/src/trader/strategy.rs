@@ -27,8 +27,6 @@ pub struct StrategyDefinition {
     pub sizing_policy: String,
     #[serde(default)]
     pub parameters: Value,
-    #[serde(default)]
-    pub name: Option<String>,
 }
 impl Default for StrategyDefinition {
     fn default() -> Self {
@@ -39,7 +37,6 @@ impl Default for StrategyDefinition {
             exit_policy: "n_exit_v1".into(),
             sizing_policy: "n_score_v1".into(),
             parameters: Value::Null,
-            name: None,
         }
     }
 }

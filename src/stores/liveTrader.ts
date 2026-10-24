@@ -3,6 +3,7 @@ import { api, onQuotesUpdated } from '../services/api'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
+import { isMarketTradingWindow } from '../utils/tradingHours'
 import type {
   CtpHealth,
   LiveTraderSnapshot,
@@ -65,6 +66,9 @@ export const useLiveTraderStore = defineStore('liveTrader', {
   }),
 
   getters: {
+    isTradingWindow(): boolean {
+      return isMarketTradingWindow(new Date(this.now))
+    },
     isReady(): boolean {
       return Boolean(this.health?.ready)
     },
@@ -158,12 +162,29 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       return list
     },
     activeConditions(): LiveConditionOrder[] {
-      return this.conditions.filter(
-        (c) => ['Pending', 'WaitingConfirm', 'Triggered', 'Unknown', 'Working', 'PartFilled', 'Closing', 'Rejected'].includes(c.state),
-      )
+      const activeStates = new Set([
+        'pending', 'waiting_confirm', 'triggered', 'unknown', 'working', 'part_filled', 'closing', 'rejected',
+        'Pending', 'WaitingConfirm', 'Triggered', 'Unknown', 'Working', 'PartFilled', 'Closing', 'Rejected',
+      ])
+      const list = this.conditions.filter((c) => activeStates.has(c.state))
+      return list.sort((a, b) => {
+        const timeA = a.trigger_ts || a.warning_bar_ts || a.created_at || 0
+        const timeB = b.trigger_ts || b.warning_bar_ts || b.created_at || 0
+        if (timeA && timeB) {
+          if (typeof timeB === 'string' && typeof timeA === 'string') {
+            const cmp = timeB.localeCompare(timeA)
+            if (cmp !== 0) return cmp
+          } else {
+            const numA = typeof timeA === 'number' ? timeA : Number(new Date(timeA)) || 0
+            const numB = typeof timeB === 'number' ? timeB : Number(new Date(timeB)) || 0
+            if (numB !== numA) return numB - numA
+          }
+        }
+        return 0
+      })
     },
     waitingConfirmConditions(): LiveConditionOrder[] {
-      return this.conditions.filter((c) => c.state === 'WaitingConfirm')
+      return this.conditions.filter((c) => c.state === 'waiting_confirm' || c.state === 'WaitingConfirm')
     },
     filteredHistory(): LiveTradeRecord[] {
       const list = this.filterReason
@@ -456,7 +477,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         await add(listen('trader-heartbeat', () => {
           if (this.selectedInstanceId !== 'default') return
           this.lastPushAt = Date.now()
-          if (!this.bridgeOnline || this.errorMsg || !this.account) {
+          if ((!this.bridgeOnline || this.errorMsg || !this.account) && isMarketTradingWindow(new Date(this.now))) {
             void this.refresh()
           }
         }))
@@ -491,9 +512,10 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         this.now = Date.now()
         // Healthy streams send a heartbeat every 15 s. Only recover via HTTP when stale.
         // When there is an error or the trader data is not yet synchronized, retry more actively (5s).
+        const isTrading = isMarketTradingWindow(new Date(this.now))
         const hasError = Boolean(this.errorMsg) || !this.bridgeOnline || !this.account
-        const staleTimeout = hasError ? 5000 : 45000
-        const minInterval = hasError ? 5000 : 15000
+        const staleTimeout = !isTrading ? 60000 : hasError ? 5000 : 45000
+        const minInterval = !isTrading ? 60000 : hasError ? 5000 : 15000
         if (this.now - this.lastPushAt > staleTimeout && this.now - this.lastRecoveryAt > minInterval) {
           this.lastRecoveryAt = this.now
           void this.refresh()

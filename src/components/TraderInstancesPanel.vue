@@ -14,7 +14,6 @@ const busy = ref(false)
 const error = ref('')
 const name = ref('')
 const renameInstanceName = ref('')
-const strategyName = ref('')
 const kind = ref<'paper' | 'ctp' | 'simnow'>('paper')
 const simnow = ref(emptySimnowLogin())
 const savedCredentials = ref(false)
@@ -38,59 +37,6 @@ const isCandidate = computed(() => strategy.value?.strategy_id === 'n_p2' || str
 const compareOpen = ref(false)
 const compareBusy = ref(false)
 const compare = ref<any>(null)
-
-interface CustomPreset {
-  id: string
-  name: string
-  strategy: StrategyDefinition
-  config: ExecutionConfig
-  created_at: number
-}
-const customPresets = ref<CustomPreset[]>([])
-function loadCustomPresets() {
-  if (typeof window === 'undefined' || !window.localStorage) return
-  try {
-    const raw = window.localStorage.getItem('ntrend_custom_presets_v1')
-    if (raw) customPresets.value = JSON.parse(raw)
-  } catch {}
-}
-function saveAsCustomPreset() {
-  if (!strategy.value || !config.value) return
-  const label = strategyName.value.trim() || `${moduleLabel(strategy.value.strategy_id)} 组合`
-  const newPreset: CustomPreset = {
-    id: `custom-${Date.now()}`,
-    name: label,
-    strategy: { ...strategy.value, name: label, parameters: JSON.parse(parameters.value) },
-    config: { ...config.value },
-    created_at: Date.now(),
-  }
-  const idx = customPresets.value.findIndex(p => p.name === label)
-  if (idx >= 0) {
-    customPresets.value[idx] = newPreset
-  } else {
-    customPresets.value.push(newPreset)
-  }
-  if (typeof window !== 'undefined' && window.localStorage) {
-    window.localStorage.setItem('ntrend_custom_presets_v1', JSON.stringify(customPresets.value))
-  }
-  strategyName.value = label
-  notice.value = `已将策略方案【${label}】保存为自定义预设。`
-}
-function deleteCustomPreset(id: string, e?: Event) {
-  e?.stopPropagation()
-  customPresets.value = customPresets.value.filter(p => p.id !== id)
-  if (typeof window !== 'undefined' && window.localStorage) {
-    window.localStorage.setItem('ntrend_custom_presets_v1', JSON.stringify(customPresets.value))
-  }
-}
-function applyCustomPreset(p: CustomPreset) {
-  strategy.value = JSON.parse(JSON.stringify(p.strategy))
-  strategyName.value = p.name
-  parameters.value = JSON.stringify(strategy.value?.parameters ?? {}, null, 2)
-  if (config.value) {
-    Object.assign(config.value, p.config)
-  }
-}
 function openRename() {
   if (!selected.value) return
   renameInstanceName.value = selected.value.instance.name
@@ -140,14 +86,12 @@ function applyPreset(id: string) {
   const preset = presets.value.find(p => p.definition.strategy_id === id)
   if (!preset) {
     if (id === 'n_pattern' && strategy.value) {
-      strategy.value = { ...strategy.value, strategy_id: id, code_version: '1', exit_policy: 'n_exit_v1', sizing_policy: 'n_score_v1', parameters: null, name: undefined }
-      strategyName.value = '现有 N 字形'
+      strategy.value = { ...strategy.value, strategy_id: id, code_version: '1', exit_policy: 'n_exit_v1', sizing_policy: 'n_score_v1', parameters: null }
       parameters.value = 'null'
     }
     return
   }
   strategy.value = JSON.parse(JSON.stringify(preset.definition)) as StrategyDefinition
-  strategyName.value = preset.label || moduleLabel(id)
   parameters.value = JSON.stringify(strategy.value.parameters, null, 2)
   if (config.value) Object.assign(config.value, { min_entry_risk_ticks: 10, default_large_volume: 1, default_small_volume: 1, slippage_ticks: 0 })
 }
@@ -190,10 +134,8 @@ function openConfigure() {
   strategy.value = { ...selected.value.strategy }
   parameters.value = JSON.stringify(selected.value.strategy.parameters ?? {}, null, 2)
   renameInstanceName.value = selected.value.instance.name
-  strategyName.value = selected.value.strategy.name || ''
   error.value = ''
   dialog.value = 'configure'
-  loadCustomPresets()
 }
 async function create() {
   if (busy.value) return
@@ -234,13 +176,12 @@ async function save() {
     }
     const next = {
       ...strategy.value,
-      name: strategyName.value.trim() || undefined,
       parameters: JSON.parse(parameters.value),
     }
     // One operation commits module selection and execution parameters together.
     await trader.instanceAction({ action: 'configure_strategy', strategy: next, config: config.value })
     dialog.value = null
-    notice.value = '策略配置与命名已保存。'
+    notice.value = '配置已保存。'
   } catch (e) { error.value = String(e) } finally { busy.value = false }
 }
 async function togglePause() {
@@ -331,16 +272,6 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
           <span class="badge-kind" :class="selected?.account.kind">
             {{ accountLabel(selected?.account) }}
           </span>
-
-          <!-- 策略方案标识与提示 (点击可打开配置与命名) -->
-          <div
-            class="strategy-pill"
-            :title="`策略方案：${selected?.strategy.name || moduleLabel(selected?.strategy.strategy_id || '')}\n信号模块：${moduleLabel(selected?.strategy.strategy_id || '')} · 退出：${moduleLabel(selected?.strategy.exit_policy || '')} · 仓位：${moduleLabel(selected?.strategy.sizing_policy || '')}\n版本：#${(selected?.strategy.revision || 'v1').slice(0, 7)}。\n点击可配置参数或自定义策略命名。`"
-            @click="openConfigure"
-          >
-            <span class="strat-title">{{ selected?.strategy.name || moduleLabel(selected?.strategy.strategy_id || '') }}</span>
-            <span class="strat-rev">#{{ (selected?.strategy.revision || 'v1').slice(0, 7) }}</span>
-          </div>
 
           <!-- 实例运行 / 暂停状态快速切换 -->
           <button
@@ -667,59 +598,28 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
 
             <!-- 配置策略参数 -->
             <template v-else-if="config && strategy">
-              <!-- 实例名称与策略方案命名 -->
-              <div class="form-grid-names">
-                <div class="form-row">
-                  <label class="form-label">
-                    实例名称
-                    <span class="label-tip">席位显示名称</span>
-                  </label>
-                  <input
-                    v-model="renameInstanceName"
-                    class="form-input"
-                    required
-                    maxlength="160"
-                    placeholder="例如：螺纹实盘1号"
-                  >
-                </div>
-
-                <div class="form-row">
-                  <label class="form-label">
-                    策略方案名称
-                    <span class="label-tip">为当前组合命名</span>
-                  </label>
-                  <div class="input-with-action">
-                    <input
-                      v-model="strategyName"
-                      class="form-input"
-                      maxlength="80"
-                      placeholder="例如：N字突破激进组合、P3趋势跟踪"
-                    >
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-outline"
-                      title="将当前组合模块与参数另存为我的自定义预设，可在其他账户直接加载"
-                      @click="saveAsCustomPreset"
-                    >
-                      另存为预设
-                    </button>
-                  </div>
-                </div>
+              <!-- 实例名称 -->
+              <div class="form-row">
+                <label class="form-label">
+                  实例名称
+                  <span class="label-tip">席位与盯盘显示名称</span>
+                </label>
+                <input
+                  v-model="renameInstanceName"
+                  class="form-input"
+                  required
+                  maxlength="160"
+                  placeholder="例如：螺纹实盘1号"
+                >
               </div>
 
-              <!-- 预设选择与自定义预设 -->
+              <!-- 快速套用策略模板 -->
               <div class="preset-load-row">
-                <span class="ctrl-label">快速加载预设:</span>
+                <span class="ctrl-label">快速套用策略模板:</span>
                 <div class="preset-buttons">
                   <button v-for="p in presets" :key="p.definition.strategy_id" type="button" class="btn btn-xs btn-outline" @click="applyPreset(p.definition.strategy_id)">
                     {{ p.label }}
                   </button>
-                  <span v-for="cp in customPresets" :key="cp.id" class="custom-preset-tag">
-                    <button type="button" class="btn btn-xs btn-custom-preset" :title="`加载自定义预设：${cp.name}`" @click="applyCustomPreset(cp)">
-                      ★ {{ cp.name }}
-                    </button>
-                    <button type="button" class="btn-del-preset" title="删除此自定义预设" @click="deleteCustomPreset(cp.id, $event)">✕</button>
-                  </span>
                 </div>
               </div>
 
@@ -1086,96 +986,11 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
   stroke: currentColor;
 }
 
-/* 策略胶囊 */
-.strategy-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 3px 8px;
-  font-size: 11px;
-  color: #475569;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-.strategy-pill:hover {
-  border-color: #2563eb;
-  background: #eff6ff;
-}
-.strat-title {
-  font-weight: 600;
-  color: #0f172a;
-}
-.strat-rev {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  color: #64748b;
-}
-
-/* 配置弹窗内的名称行 */
-.form-grid-names {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin-bottom: 12px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid #f1f5f9;
-}
-@media (max-width: 640px) {
-  .form-grid-names {
-    grid-template-columns: 1fr;
-  }
-}
-
-.input-with-action {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-.input-with-action .form-input {
-  flex: 1;
-}
-
 .label-tip {
   font-size: 11px;
   color: #94a3b8;
   font-weight: 400;
   margin-left: 6px;
-}
-
-/* 自定义预设按钮组 */
-.custom-preset-tag {
-  display: inline-flex;
-  align-items: center;
-  border: 1px solid #bfdbfe;
-  border-radius: 4px;
-  background: #eff6ff;
-  overflow: hidden;
-}
-.btn-custom-preset {
-  border: none;
-  background: transparent;
-  padding: 2px 6px;
-  font-size: 11px;
-  color: #1d4ed8;
-  font-weight: 600;
-  cursor: pointer;
-}
-.btn-custom-preset:hover {
-  background: #dbeafe;
-}
-.btn-del-preset {
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  font-size: 10px;
-  padding: 2px 5px;
-  cursor: pointer;
-}
-.btn-del-preset:hover {
-  color: #ef4444;
-  background: #fee2e2;
 }
 
 /* 连接与认证状态组（独立右上角） */

@@ -27,6 +27,7 @@ function setup(listenOverride) {
       }) }
       if (name === '../services/api') return { api, onQuotesUpdated: async () => () => {} }
       if (name === '../utils/notify') return { notify: { success() {}, error() {} } }
+      if (name === '../utils/tradingHours') return { isMarketTradingWindow: () => true }
       if (name === '../utils/multipliers') return {
         DEFAULT_MULTIPLIERS: { PB: 5 }, getSymbolPrefix: (s) => s.match(/^[a-z]+/i)?.[0].toUpperCase(),
       }
@@ -322,4 +323,44 @@ test('a missing native command identifies the client update instead of hiding th
   await store.loadInstances()
   assert.match(store.instancesError, /重新编译并启动客户端/)
   assert.equal(store.instancesLoading, false)
+})
+
+test('activeConditions and waitingConfirmConditions support both snake_case and PascalCase states', () => {
+  const { store } = setup()
+  store.conditions = [
+    { id: '1', state: 'pending' },
+    { id: '2', state: 'waiting_confirm' },
+    { id: '3', state: 'triggered' },
+    { id: '4', state: 'working' },
+    { id: '5', state: 'part_filled' },
+    { id: '6', state: 'closing' },
+    { id: '7', state: 'rejected' },
+    { id: '8', state: 'unknown' },
+    { id: '9', state: 'closed' },
+    { id: '10', state: 'expired' },
+    { id: '11', state: 'canceled' },
+    { id: '12', state: 'invalidated' },
+    { id: '13', state: 'filled' },
+    { id: '14', state: 'WaitingConfirm' },
+    { id: '15', state: 'Pending' },
+  ]
+
+  assert.equal(store.activeConditions.length, 10)
+  const activeIds = store.activeConditions.map(c => c.id)
+  assert.deepEqual(activeIds, ['1', '2', '3', '4', '5', '6', '7', '8', '14', '15'])
+
+  assert.equal(store.waitingConfirmConditions.length, 2)
+  const waitingIds = store.waitingConfirmConditions.map(c => c.id)
+  assert.deepEqual(waitingIds, ['2', '14'])
+})
+
+test('activeConditions sorts by trigger_ts/warning_bar_ts/created_at descending', () => {
+  const { store } = setup()
+  store.conditions = [
+    { id: 'older', state: 'pending', warning_bar_ts: '2026-10-23 20:00:00' },
+    { id: 'newest', state: 'pending', trigger_ts: '2026-10-23 21:45:00' },
+    { id: 'middle', state: 'pending', warning_bar_ts: '2026-10-23 21:00:00' },
+  ]
+  const activeIds = store.activeConditions.map(c => c.id)
+  assert.deepEqual(activeIds, ['newest', 'middle', 'older'])
 })

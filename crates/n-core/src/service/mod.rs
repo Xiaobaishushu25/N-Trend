@@ -948,6 +948,54 @@ fn event_dir(e: &pattern_events::Model) -> Dir {
     }
 }
 
+fn populate_trigger_features(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
+    let mut changed = false;
+    if e.trigger_volume_ratio.is_some() && e.overshoot_r.is_some() {
+        return false;
+    }
+    let target_ts = e
+        .trigger_bar_ts
+        .as_deref()
+        .or(e.trigger_ts.as_deref());
+    let Some(target_ts) = target_ts else {
+        return false;
+    };
+    let prefix = if target_ts.len() >= 16 {
+        &target_ts[..16]
+    } else {
+        target_ts
+    };
+    let tc = bars
+        .iter()
+        .position(|b| bar_ts(b).starts_with(prefix) || target_ts.starts_with(&bar_ts(b)))
+        .or_else(|| {
+            bars.iter().position(|b| {
+                bar_ts(b).as_str() >= target_ts && bar_ts(b).as_str() > e.warning_ts.as_str()
+            })
+        });
+    if let Some(tc) = tc {
+        if e.trigger_bar_ts.is_none() {
+            e.trigger_bar_ts = Some(bar_ts(&bars[tc]));
+            changed = true;
+        }
+        if e.trigger_volume_ratio.is_none() {
+            if let Some(vr) = outcome::vol_ratio_at(bars, tc) {
+                e.trigger_volume_ratio = Some(vr);
+                changed = true;
+            }
+        }
+        if e.overshoot_r.is_none() && e.risk > 0.0 {
+            let overshoot = match event_dir(e) {
+                Dir::Up => (bars[tc].high - e.entry) / e.risk,
+                Dir::Down => (e.entry - bars[tc].low) / e.risk,
+            };
+            e.overshoot_r = Some(overshoot.max(0.0));
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> bool {
     let before = serde_json::to_string(e).unwrap_or_default();
     let mut ev = crate::v2::replay::ReplayEvent {
@@ -1005,6 +1053,7 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
         e.trigger_bar_ts = Some(ts.clone());
         e.trigger_price = result.fill;
     }
+    populate_trigger_features(e, bars);
     e.exit_ts = result.exit_ts.clone();
     e.exit_reason = result
         .exit_reason
@@ -1089,6 +1138,8 @@ fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
             changed = advance_triggered(e, bars, w) || changed;
         }
     } else if e.state == "triggered" && advance_triggered(e, bars, w) {
+        changed = true;
+    } else if populate_trigger_features(e, bars) {
         changed = true;
     }
 
@@ -5671,6 +5722,37 @@ mod tests {
         assert_eq!(e.state, "triggered");
         assert_eq!(e.trigger_ts.as_deref(), Some("2026-08-11 10:00:00"));
         assert_eq!(e.trigger_bar_ts, e.trigger_ts);
+        assert!((e.overshoot_r.unwrap() - 3.0 / 13.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trigger_features_populate_volume_ratio_and_overshoot() {
+        let mut bars = Vec::new();
+        for i in 0..20 {
+            let mut b = bar_model(
+                &format!("2026-08-11 {:02}:{:02}:00", 9 + i / 4, (i % 4) * 15),
+                2570.0,
+                2575.0,
+                2565.0,
+                2570.0,
+            );
+            b.volume = 1000.0;
+            bars.push(b);
+        }
+        let mut warn_b = bar_model("2026-08-11 14:00:00", 2572.0, 2576.0, 2566.0, 2570.0);
+        warn_b.volume = 1000.0;
+        bars.push(warn_b);
+        let mut trig_b = bar_model("2026-08-11 14:15:00", 2577.0, 2580.0, 2575.0, 2579.0);
+        trig_b.volume = 2500.0;
+        bars.push(trig_b);
+
+        let mut e = pattern_event(1, 3.8, "pending");
+        e.warning_ts = "2026-08-11 14:00:00".to_string();
+        assert!(advance_event_model(&mut e, &bars));
+        assert_eq!(e.state, "triggered");
+        assert_eq!(e.trigger_bar_ts.as_deref(), Some("2026-08-11 14:15:00"));
+        assert_eq!(e.trigger_volume_ratio, Some(2.5));
+        assert!((e.overshoot_r.unwrap() - 3.0 / 13.0).abs() < 1e-6);
     }
 
     #[test]

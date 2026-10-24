@@ -934,7 +934,6 @@ export interface StrategyDefinition {
   exit_policy: string
   sizing_policy: string
   parameters: unknown
-  name?: string
 }
 export interface TraderInstanceRow {
   instance: { id: string; name: string; account_id: string; created_at: number }
@@ -1050,7 +1049,33 @@ export interface LiveConditionOrder {
   trigger_ts?: string | null
   bars_waited?: number
   max_wait_bars?: number
-  state: 'Pending' | 'WaitingConfirm' | 'Triggered' | 'Filled' | 'Canceled' | 'Rejected' | 'Unknown' | 'Working' | 'PartFilled' | 'Closing' | 'Closed' | 'Expired' | 'Invalidated'
+  state:
+    | 'pending'
+    | 'waiting_confirm'
+    | 'triggered'
+    | 'filled'
+    | 'canceled'
+    | 'rejected'
+    | 'unknown'
+    | 'working'
+    | 'part_filled'
+    | 'closing'
+    | 'closed'
+    | 'expired'
+    | 'invalidated'
+    | 'Pending'
+    | 'WaitingConfirm'
+    | 'Triggered'
+    | 'Filled'
+    | 'Canceled'
+    | 'Rejected'
+    | 'Unknown'
+    | 'Working'
+    | 'PartFilled'
+    | 'Closing'
+    | 'Closed'
+    | 'Expired'
+    | 'Invalidated'
   created_at: number
   note: string
 }
