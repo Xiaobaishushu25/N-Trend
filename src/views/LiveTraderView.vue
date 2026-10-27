@@ -202,6 +202,7 @@ function conditionLabel(state: string): string {
     closing: '自动平仓处理中',
     filled: '已成交',
     rejected: '提交失败，等待重试',
+    filtered: '已过滤，不开仓',
     canceled: '已取消后续开仓',
     closed: '已平仓',
     expired: '已过期',
@@ -359,6 +360,8 @@ function conditionBadgeType(state?: string | null): 'default' | 'primary' | 'inf
       return 'warning'
     case 'rejected':
       return 'error'
+    case 'filtered':
+      return 'warning'
     default:
       return 'default'
   }
@@ -737,7 +740,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             type="warning"
             style="margin-left: 6px"
           />
-          <span v-else style="margin-left: 4px">({{ trader.activeConditions.length }})</span>
+          <span v-else style="margin-left: 4px">({{ trader.conditionPool.length }})</span>
         </n-button>
 
         <n-button
@@ -979,13 +982,37 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
       <!-- B. 活跃条件单标签页 -->
       <section v-else-if="trader.activeTab === 'conditions'" class="tab-pane">
-        <div v-if="!trader.activeConditions.length" class="empty-holder">
-          <n-empty description="当前暂存池无等待突破的条件单" />
+        <div v-if="!trader.conditionPool.length" class="empty-holder cond-empty-container">
+          <n-empty description="当前实例暂无条件单或准入过滤记录">
+            <template #extra>
+              <div class="empty-hint-box">
+                <div class="empty-hint-text">
+                  <span class="empty-hint-main">收到信号后，将逐条列出等待状态或未开仓原因</span>
+                  <span class="empty-hint-sub">
+                    被准入规则拦截的信号会标记为“已过滤，不开仓”
+                  </span>
+                </div>
+                <n-button
+                  size="small"
+                  secondary
+                  type="primary"
+                  @click="trader.activeTab = 'comparison'"
+                >
+                  <template #icon><n-icon :component="LayersSubtract" /></template>
+                  查看策略前瞻对比
+                </n-button>
+              </div>
+            </template>
+          </n-empty>
         </div>
 
         <div v-else class="cards-grid">
+          <div v-if="trader.filteredConditions.length" class="condition-pool-summary">
+            活跃条件单 {{ trader.activeConditions.length }} 条 · 准入过滤 {{ trader.filteredConditions.length }} 条
+            <span>过滤记录仅供查看，不会报单</span>
+          </div>
           <div
-            v-for="cond in trader.activeConditions"
+            v-for="cond in trader.conditionPool"
             :key="cond.id"
             class="cond-card"
             :class="[
@@ -1004,7 +1031,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 >
                   {{ dirLabel(cond.direction) }}
                 </n-tag>
-                <n-tag size="small" :type="cond.tier === 'large' ? 'warning' : 'default'">
+                <n-tag v-if="!cond.display_only" size="small" :type="cond.tier === 'large' ? 'warning' : 'default'">
                   {{ cond.tier === 'large' ? '大仓' : '小仓' }}（计划 {{ cond.volume }} 手）
                 </n-tag>
                 <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->
@@ -1020,11 +1047,11 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                   Event #{{ cond.event_id }}
                   <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
                 </n-tag>
-                <span class="score-badge">评分 {{ cond.score.toFixed(2) }}</span>
+                <span class="score-badge">评分 {{ Number.isFinite(cond.score) ? cond.score.toFixed(2) : '—' }}</span>
               </div>
 
               <div class="head-right">
-                <span class="wait-progress font-num">
+                <span v-if="!cond.display_only" class="wait-progress font-num">
                   已等待 {{ cond.bars_waited ?? 0 }} / {{ cond.max_wait_bars ?? 12 }} 根K线
                 </span>
                 <n-tag
@@ -1054,7 +1081,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                   </div>
                   <div class="metric-item">
                     <span class="lbl">计划风险 (1.0R)</span>
-                    <span class="val font-num">{{ cond.risk.toFixed(1) }} 点</span>
+                    <span class="val font-num">{{ fmtPrice(cond.risk) }} 点</span>
                   </div>
                 </div>
 
@@ -1068,7 +1095,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                       {{ formatCondTs(cond.warning_bar_ts) || '—' }}
                     </span>
                   </div>
-                  <div class="metric-item">
+                  <div v-if="!cond.display_only" class="metric-item">
                     <span class="lbl">行情触价触发</span>
                     <span
                       class="val font-num font-time"
@@ -1105,7 +1132,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               </n-tooltip>
               <div v-else class="cond-footer-spacer" />
 
-              <div class="cond-actions">
+              <div v-if="!cond.display_only" class="cond-actions">
                 <n-button
                   v-if="cond.state === 'WaitingConfirm' || cond.state === 'waiting_confirm'"
                   type="primary"
@@ -1716,6 +1743,51 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   background: #ffffff;
   border-radius: 8px;
   border: 1px solid #e2e8f0;
+}
+
+.cond-empty-container {
+  padding: 40px 16px;
+}
+
+.condition-pool-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  color: #475569;
+  font-size: 13px;
+}
+
+.condition-pool-summary span {
+  color: #94a3b8;
+}
+
+.empty-hint-box {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.empty-hint-text {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  max-width: 520px;
+  text-align: center;
+}
+
+.empty-hint-main {
+  font-size: 13px;
+  font-weight: 500;
+  color: #475569;
+}
+
+.empty-hint-sub {
+  font-size: 12px;
+  color: #94a3b8;
+  line-height: 1.5;
 }
 
 .cards-grid {

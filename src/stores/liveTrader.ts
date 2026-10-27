@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { isMarketTradingWindow } from '../utils/tradingHours'
+import { filteredConditionRows } from '../utils/conditionPool'
 import type {
   CtpHealth,
   LiveTraderSnapshot,
@@ -17,6 +18,9 @@ import type {
   ExecutionOrder,
   TraderInstanceCatalog,
   SimnowLoginInput,
+  StrategyDefinition,
+  StrategyDiagnostics,
+  ConditionPoolRow,
 } from '../types'
 
 export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison' | 'orders'
@@ -47,6 +51,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     executionOrdersSeq: 0,
     statistics: null as LiveTradeStatistics | null,
     strategyComparison: null as LiveTraderSnapshot['strategy_comparison'],
+    currentStrategy: null as StrategyDefinition | null,
+    strategyDiagnostics: null as StrategyDiagnostics | null,
     updatingEntryFilter: false,
     loading: false,
     refreshing: false,
@@ -181,6 +187,18 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           }
         }
         return 0
+      })
+    },
+    filteredConditions(): ConditionPoolRow[] {
+      return filteredConditionRows(this.strategyDiagnostics, this.currentStrategy?.revision)
+    },
+    conditionPool(): ConditionPoolRow[] {
+      const time = (row: ConditionPoolRow) => row.trigger_ts || row.warning_bar_ts || row.created_at || 0
+      return [...this.activeConditions, ...this.filteredConditions].sort((a, b) => {
+        const ta = time(a), tb = time(b)
+        if (typeof ta === 'string' && typeof tb === 'string') return tb.localeCompare(ta)
+        const epoch = (t: string | number) => typeof t === 'number' ? t * 1000 : Date.parse(t) || 0
+        return epoch(tb) - epoch(ta)
       })
     },
     waitingConfirmConditions(): LiveConditionOrder[] {
@@ -336,6 +354,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.health = null; this.account = null; this.config = null
       this.brokerPositions = []; this.managedPositions = []; this.conditions = []; this.history = []
       this.statistics = null; this.strategyComparison = null; this.quotes = {}
+      this.currentStrategy = null; this.strategyDiagnostics = null
       this.executionOrdersSeq++; this.executionOrders = []; this.executionOrdersTotal = 0
       this.executionOrdersPage = 1; this.executionOrdersError = ''; this.executionOrdersLoading = false
       this.errorMsg = null; this.bridgeOnline = false; this.lastPushAt = 0
@@ -373,6 +392,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         broker_positions: this.brokerPositions, config: this.config || undefined,
         managed_positions: this.managedPositions, conditions: this.conditions, history: this.history,
         statistics: this.statistics, strategy_comparison: this.strategyComparison,
+        strategy: this.currentStrategy || undefined, strategy_diagnostics: this.strategyDiagnostics,
         bridge_online: this.bridgeOnline, execution_error: this.errorMsg,
         _stream_id: delta.stream_id, _revision: delta.revision,
       }
@@ -386,6 +406,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.source && snapshot.source !== this.snapshotSource) {
         this.quotes = {}
         this.strategyComparison = null
+        this.currentStrategy = null; this.strategyDiagnostics = null
         this.executionOrdersSeq++
         this.executionOrders = []
         this.executionOrdersTotal = 0
@@ -404,6 +425,10 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.history) this.history = snapshot.history
       if (snapshot.statistics !== undefined) this.statistics = snapshot.statistics
       if (snapshot.strategy_comparison !== undefined) this.strategyComparison = snapshot.strategy_comparison
+      if (snapshot.source !== 'local') {
+        this.currentStrategy = snapshot.strategy || null
+        this.strategyDiagnostics = snapshot.strategy_diagnostics || null
+      }
       this.errorMsg = snapshot.execution_error || snapshot.health?.sync_error || null
     },
 

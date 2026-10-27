@@ -6,6 +6,10 @@ const ts = require('typescript')
 
 // Exercise the actual store with mocked native IPC; no Tauri or trading connection.
 function setup(listenOverride) {
+  const poolModule = { exports: {} }
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/utils/conditionPool.ts', 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText, poolModule)
   const events = new Map()
   const api = { getTraderSnapshot: async () => snapshot() }
   const context = {
@@ -28,6 +32,7 @@ function setup(listenOverride) {
       if (name === '../services/api') return { api, onQuotesUpdated: async () => () => {} }
       if (name === '../utils/notify') return { notify: { success() {}, error() {} } }
       if (name === '../utils/tradingHours') return { isMarketTradingWindow: () => true }
+      if (name === '../utils/conditionPool') return poolModule.exports
       if (name === '../utils/multipliers') return {
         DEFAULT_MULTIPLIERS: { PB: 5 }, getSymbolPrefix: (s) => s.match(/^[a-z]+/i)?.[0].toUpperCase(),
       }
@@ -363,4 +368,128 @@ test('activeConditions sorts by trigger_ts/warning_bar_ts/created_at descending'
   ]
   const activeIds = store.activeConditions.map(c => c.id)
   assert.deepEqual(activeIds, ['newest', 'middle', 'older'])
+})
+
+function candidateAudit(reason = 'risk_ticks_below_min') {
+  return { states: { p2: { decisions: {
+    'PB0|up|s0|s1|s2|2026-10-26 10:15:00': { reason, values: {
+      warning: { id: 123 },
+      snapshot: { symbol: 'PB0', instrument: 'pb2611', direction: 'long',
+        warning_ts: '2026-10-26 10:15:00', available_at: 1792980900,
+        entry: 1000, stop: 991, target: 1100, risk: 9, tick: 1, score: 3.5 },
+    } },
+    accepted: { reason: 'accepted_warning', values: {} },
+  } }, p3: { decisions: { other: { reason: 'score_below_min', values: {} } } } } }
+}
+
+test('P2 pool lists filtered signals with concrete reasons without creating executable conditions', () => {
+  const { store } = setup()
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit(), conditions: [] })
+  assert.equal(store.conditionPool.length, 1)
+  assert.equal(store.conditions.length, 0)
+  assert.equal(store.activeConditions.length, 0)
+  assert.equal(store.waitingConfirmConditions.length, 0)
+  const row = store.conditionPool[0]
+  assert.equal(row.instrument_id, 'pb2611')
+  assert.equal(row.direction, 'up')
+  assert.equal(row.event_id, 123)
+  assert.equal(row.entry_price, 1000)
+  assert.equal(row.volume, 0)
+  assert.equal(row.display_only, true)
+  assert.equal(row.state, 'filtered')
+  assert.match(row.note, /止损距离 9.00 tick.*10 tick.*不会开仓/)
+})
+
+test('filtered audit survives account deltas, clears on instance switch and excludes old strategy revisions', async () => {
+  const { store, api } = setup()
+  store.instancesSupported = true
+  store.selectedInstanceId = 'p2-account'
+  store.applySnapshot({ ...snapshot(), instance_id: 'p2-account', _stream_id: 'stream', _revision: 1,
+    strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit() })
+  store.applyInstanceDelta({ instance_id: 'p2-account', delta: {
+    stream_id: 'stream', base_revision: 1, revision: 2, changes: { account: { balance: 2000 } },
+  } })
+  assert.equal(store.conditionPool.length, 1)
+  assert.equal(store.account.balance, 2000)
+  store.applyInstanceDelta({ instance_id: 'p2-account', delta: {
+    stream_id: 'stream', base_revision: 2, revision: 3, changes: { strategy: { revision: 'p3' } },
+  } })
+  assert.equal(store.conditionPool.length, 1)
+  assert.match(store.conditionPool[0].id, /filtered:p3:/)
+  api.traderInstanceRequest = async () => { throw Error('offline') }
+  await store.selectInstance('other-account')
+  assert.equal(store.conditionPool.length, 0)
+  assert.equal(store.strategyDiagnostics, null)
+  store.applySnapshot({ ...snapshot(), instance_id: 'other-account', strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit() })
+  assert.equal(store.conditionPool.length, 1)
+  store.applySnapshot({ ...snapshot(), instance_id: 'other-account', source: 'local' })
+  assert.equal(store.conditionPool.length, 0)
+})
+
+test('legacy invalid-input audits retain per-signal identity and show unavailable data safely', () => {
+  const { store } = setup()
+  const diagnostics = { states: { p2: { decisions: {
+    'PB0|down|s0|s1|s2|2026-10-26 10:00:00': {
+      reason: 'invalid_input:fee_unavailable', values: { entry: 1000, stop: 1020, target: 900, score: 3.8 },
+    },
+  } } } }
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: diagnostics,
+    conditions: [{ id: 'real', state: 'pending', warning_bar_ts: '2026-10-26 10:15:00', created_at: 1 }] })
+  assert.equal(store.conditionPool.length, 2)
+  assert.equal(store.conditionPool[0].id, 'real')
+  const row = store.conditionPool[1]
+  assert.equal(row.symbol, 'PB0')
+  assert.equal(row.direction, 'down')
+  assert.equal(row.warning_bar_ts, '2026-10-26 10:00:00')
+  assert.equal(row.entry_price, 1000)
+  assert.ok(Number.isNaN(row.risk))
+  assert.match(row.note, /缺少该合约的费用参数/)
+})
+
+test('all P2/P3 pre-entry filters have readable reasons', () => {
+  const { store } = setup()
+  for (const reason of ['score_below_min', 'risk_ticks_below_min', 'friction_above20', 'atr_unavailable',
+    'atr_out_of_range', 'filtered_net_rr_plan', 'filtered_holiday_window', 'filtered_weekend_window', 'calendar_uncovered']) {
+    store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit(reason) })
+    assert.equal(store.conditionPool.length, 1)
+    assert.ok(!store.conditionPool[0].note.includes(reason), reason)
+    assert.match(store.conditionPool[0].note, /准入过滤.*本信号不会开仓/)
+  }
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: null })
+  assert.equal(store.conditionPool.length, 0)
+})
+
+test('actual condition-pool template shows blocked reasons and omits execution controls', async () => {
+  const Vue = require('vue')
+  const { compile } = require('@vue/compiler-dom')
+  const { renderToString } = require('@vue/server-renderer')
+  const { store } = setup()
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit() })
+  store.activeTab = 'conditions'
+  const source = fs.readFileSync('src/views/LiveTraderView.vue', 'utf8')
+  const template = source.match(/<section v-else-if="trader.activeTab === 'conditions'"[\s\S]*?<\/section>/)[0]
+    .replace('v-else-if', 'v-if')
+  const render = new Function('Vue', compile(template).code)(Vue)
+  const identity = value => value
+  const context = { trader: store, getInstrumentName: identity, dirLabel: identity,
+    conditionBadgeType: () => 'warning', conditionLabel: () => '已过滤，不开仓',
+    fmtPrice: identity, formatCondTs: identity, isWarningNote: () => true,
+    getNoteCategory: () => '准入过滤', formatNoteText: identity, getNoteTooltip: identity,
+    AlertTriangle: {}, Bolt: {}, ExternalLink: {}, InfoCircle: {}, }
+  const app = Vue.createSSRApp({ render() { return render(context, []) } })
+  for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
+    app.component(name, { setup(_, { slots }) {
+      return () => Vue.h('span', slots.trigger ? slots.trigger() : slots.default?.())
+    } })
+  }
+  const html = await renderToString(app)
+  assert.match(html, /pb2611/)
+  assert.match(html, /评分 3.50/)
+  assert.match(html, /止损距离 9.00 tick/)
+  assert.match(html, /已过滤，不开仓/)
+  assert.ok(!html.includes('cond-actions'))
+  assert.ok(!html.includes('行情触价触发'))
+  assert.ok(!html.includes('立即确认开仓'))
+  assert.ok(!html.includes('取消剩余开仓'))
+  assert.ok(!html.includes('当前实例暂无条件单'))
 })

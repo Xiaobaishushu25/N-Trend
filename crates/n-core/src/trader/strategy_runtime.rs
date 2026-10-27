@@ -1,6 +1,78 @@
 use super::*;
 
 impl ExecutionEngine {
+    pub async fn needs_market_history(&self) -> bool {
+        let s = self.state.lock().await;
+        self.registry
+            .strategy(&s.definition)
+            .is_ok_and(|p| p.uses_history())
+    }
+    pub async fn on_market_history(
+        &self,
+        symbol: &str,
+        raw: &[crate::fetch::kline::Kline],
+        rollovers: Vec<crate::derive::rollover::RolloverRecord>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let latest = raw
+            .iter()
+            .rev()
+            .find(|b| super::super::candidates::parse_time(&b.datetime).is_ok_and(|t| t <= now));
+        let Some(latest) = latest else {
+            return Ok(());
+        };
+        {
+            let s = self.state.lock().await;
+            if !self
+                .registry
+                .strategy(&s.definition)
+                .is_ok_and(|p| p.uses_history())
+            {
+                return Ok(());
+            }
+            if s.strategy_states
+                .get(&s.definition.revision)
+                .and_then(|v| v["raw_cursor"][symbol].as_str())
+                .is_some_and(|t| t >= latest.datetime.as_str())
+            {
+                return Ok(());
+            }
+        }
+        self.dispatch(StrategyEvent::History5m {
+            symbol: symbol.into(),
+            bars: raw.to_vec(),
+            rollovers,
+            timestamp: now,
+        })
+        .await
+    }
+    pub(super) fn portfolio_decision(
+        &self,
+        s: &ExecutionState,
+        c: &ConditionOrder,
+        now: i64,
+    ) -> EntryDecision {
+        let Some(f) = &c.frozen else {
+            return EntryDecision::Allow;
+        };
+        let Ok(strategy) = self.registry.strategy(&f.definition) else {
+            return EntryDecision::Reject("strategy_unavailable".into());
+        };
+        strategy.check_portfolio(
+            &f.plan,
+            &EntryPortfolio {
+                conditions: &s.conditions,
+                positions: &s.positions,
+                orders: &s.orders,
+                history: &s.history,
+                state: s
+                    .strategy_states
+                    .get(&f.definition.revision)
+                    .unwrap_or(&serde_json::Value::Null),
+            },
+            now,
+        )
+    }
     fn completed_bar_condition(&self, s: &ExecutionState, c: &ConditionOrder) -> bool {
         c.frozen.as_ref().is_some_and(|f| {
             self.registry

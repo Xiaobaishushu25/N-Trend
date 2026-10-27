@@ -95,6 +95,12 @@ pub enum TradeIntent {
 
 #[derive(Debug, Clone)]
 pub enum StrategyEvent {
+    History5m {
+        symbol: String,
+        bars: Vec<crate::fetch::kline::Kline>,
+        rollovers: Vec<crate::derive::rollover::RolloverRecord>,
+        timestamp: i64,
+    },
     Signal {
         source: String,
         payload: Value,
@@ -146,7 +152,26 @@ pub enum EntryDecision {
     Reject(String),
 }
 
+pub struct EntryPortfolio<'a> {
+    pub conditions: &'a std::collections::HashMap<String, super::execution::ConditionOrder>,
+    pub positions: &'a std::collections::HashMap<String, ManagedPosition>,
+    pub orders: &'a std::collections::HashMap<String, super::execution::ExecutionOrder>,
+    pub history: &'a [super::execution::TradeRecord],
+    pub state: &'a Value,
+}
+
 pub trait Strategy: Send + Sync {
+    fn uses_history(&self) -> bool {
+        false
+    }
+    fn check_portfolio(
+        &self,
+        _plan: &EntryPlan,
+        _portfolio: &EntryPortfolio<'_>,
+        _now: i64,
+    ) -> EntryDecision {
+        EntryDecision::Allow
+    }
     fn entry_constraints(&self) -> EntryConstraints {
         EntryConstraints::default()
     }
@@ -218,6 +243,7 @@ impl Default for StrategyRegistry {
         r.register_sizing("n_score_v1", Arc::new(NScoreSizing));
         r.register_sizing("fixed_v1", Arc::new(FixedSizing));
         super::candidates::register(&mut r);
+        super::b5::register(&mut r);
         r
     }
 }
@@ -262,12 +288,18 @@ impl StrategyRegistry {
         self.exit(&d.exit_policy)?;
         self.sizing(&d.sizing_policy)?;
         super::candidates::validate_definition(d)?;
+        super::b5::validate_definition(d)?;
         Ok(())
     }
     pub fn catalog(&self) -> Value {
+        let mut presets = super::candidates::presets()
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        presets.push(super::b5::preset());
         serde_json::json!({"strategies":self.strategies.keys().map(|(id,v)|serde_json::json!({"id":id,"version":v})).collect::<Vec<_>>(),
             "exit_policies":self.exits.keys().collect::<Vec<_>>(), "sizing_policies":self.sizing.keys().collect::<Vec<_>>(),
-            "presets":super::candidates::presets()})
+            "presets":presets})
     }
 }
 

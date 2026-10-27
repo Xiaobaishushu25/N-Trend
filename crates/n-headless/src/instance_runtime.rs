@@ -150,6 +150,29 @@ pub fn spawn(ctx: Arc<ServerContext>) {
     });
 }
 
+pub(crate) async fn forward_strategy_history(
+    ctx: &ServerContext,
+    engine: &n_core::trader::ExecutionEngine,
+    symbol: &str,
+    raw: &[n_core::fetch::kline::Kline],
+) -> anyhow::Result<()> {
+    if !engine.needs_market_history().await {
+        return Ok(());
+    }
+    let rolls = n_core::storage::repo::symbol_rollovers(&ctx.db, symbol)
+        .await?
+        .into_iter()
+        .map(|r| n_core::derive::rollover::RolloverRecord {
+            symbol: r.symbol,
+            ts: r.ts,
+            from_contract: r.from_contract,
+            to_contract: r.to_contract,
+            confirmed: r.confirmed,
+        })
+        .collect();
+    engine.on_market_history(symbol, raw, rolls).await
+}
+
 async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
     let Some(mut rx) = r.quote_rx.lock().await.take() else {
         return;
@@ -223,6 +246,7 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                             .iter()
                             .map(n_core::service::model_to_fetch)
                             .collect::<Vec<_>>();
+                        forward_strategy_history(&ctx, &r.engine, &symbol, &raw).await?;
                         r.engine.on_completed_15m(&symbol, &raw).await?;
                     }
                     let bars = ctx.services.bars_for(&symbol, &tf).await?;

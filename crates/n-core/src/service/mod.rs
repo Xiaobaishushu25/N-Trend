@@ -336,7 +336,7 @@ pub(crate) async fn insert_warning_event(
 /// 事件仍处于未触发或已触发持仓状态，直接抑制新事件；前一条已离场后才退回
 /// 入场价差不超过 0.3R 的相似判断。历史重放时会按预警K线先后逐条插入，
 /// 因此这里比对全部既有事件（含已触发/已了结），避免旧事件重新生成。
-fn has_similar_warning(
+pub(crate) fn has_similar_warning(
     bars: &[Bar],
     candidate: &event::WarningCandidate,
     events: &[pattern_events::Model],
@@ -953,10 +953,7 @@ fn populate_trigger_features(e: &mut pattern_events::Model, bars: &[Bar]) -> boo
     if e.trigger_volume_ratio.is_some() && e.overshoot_r.is_some() {
         return false;
     }
-    let target_ts = e
-        .trigger_bar_ts
-        .as_deref()
-        .or(e.trigger_ts.as_deref());
+    let target_ts = e.trigger_bar_ts.as_deref().or(e.trigger_ts.as_deref());
     let Some(target_ts) = target_ts else {
         return false;
     };
@@ -1084,7 +1081,7 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
     serde_json::to_string(e).unwrap_or_default() != before
 }
 
-fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
+pub(crate) fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
     let Some(w) = bars.iter().position(|b| bar_ts(b) == e.warning_ts) else {
         return false;
     };
@@ -2738,18 +2735,35 @@ impl Services {
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
     pub async fn refresh_data(&self) -> Result<RefreshStats> {
-        self.refresh_data_inner(false).await
+        self.refresh_data_inner(false, &[]).await
+    }
+
+    /// Strategy subscriptions share the normal raw-data refresh without changing
+    /// the user's enabled-symbol list or opening another market connection.
+    pub async fn refresh_data_with_subscriptions(&self, extra: &[String]) -> Result<RefreshStats> {
+        self.refresh_data_inner(false, extra).await
     }
 
     /// 数据源启动/恢复后的安全刷新：无论本地已有多少历史，都强制拉取一段完整窗口，
     /// 避免实时订阅只推进最新时间而把中间缺口掩盖掉。
     pub async fn refresh_data_with_backfill(&self) -> Result<RefreshStats> {
-        self.refresh_data_inner(true).await
+        self.refresh_data_inner(true, &[]).await
     }
 
-    async fn refresh_data_inner(&self, force_backfill: bool) -> Result<RefreshStats> {
+    async fn refresh_data_inner(
+        &self,
+        force_backfill: bool,
+        extra: &[String],
+    ) -> Result<RefreshStats> {
         let _cycle_guard = self.data_cycle_lock.lock().await;
-        let symbols = repo::list_symbols(&self.db, true).await?;
+        let mut symbols = repo::list_symbols(&self.db, true).await?;
+        if !extra.is_empty() {
+            for sym in repo::list_symbols(&self.db, false).await? {
+                if extra.contains(&sym.code) && !symbols.iter().any(|s| s.code == sym.code) {
+                    symbols.push(sym);
+                }
+            }
+        }
         let now = chrono::Local::now();
         let mut stats = RefreshStats::default();
         for sym in symbols {
@@ -5702,7 +5716,10 @@ mod tests {
                 let mut e = pattern_event(1, score, state);
                 e.risk = risk;
                 assert!(advance_event_model(&mut e, &bars));
-                assert_eq!(e.state, "filtered", "initial state={state}, score={score}, risk={risk}");
+                assert_eq!(
+                    e.state, "filtered",
+                    "initial state={state}, score={score}, risk={risk}"
+                );
                 assert_eq!(e.exit_reason.as_deref(), Some("filtered"));
                 assert!(e.trigger_ts.is_none());
                 assert!(e.trigger_bar_ts.is_none());

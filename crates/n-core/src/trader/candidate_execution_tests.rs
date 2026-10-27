@@ -122,6 +122,41 @@ async fn tick(e: &ExecutionEngine, p: &PaperBroker, price: f64) {
 }
 
 #[tokio::test]
+async fn filtered_signal_keeps_display_evidence_after_restart_without_orders() {
+    let root = directory();
+    let p = broker(&root, "audit");
+    let e = engine(&root, "audit", p.clone()).await;
+    let mut payload = signal("filtered");
+    payload["id"] = json!(123);
+    payload["entry_score"] = json!(2.9);
+    send(&e, payload.clone()).await;
+    tick(&e, &p, 1002.).await;
+    assert!(e.list_conditions().await.is_empty());
+    assert!(e.list_orders().await.is_empty());
+    let revision = e.definition().await.revision;
+    let diagnostics = e.strategy_diagnostics().await;
+    let decisions = diagnostics["states"][&revision]["decisions"].as_object().unwrap();
+    let decision = decisions.values().next().unwrap();
+    assert_eq!(decision["reason"], "score_below_min");
+    assert_eq!(decision["values"]["snapshot"]["instrument"], "pb2611");
+    assert_eq!(decision["values"]["warning"]["id"], 123);
+    assert_eq!(decision["values"]["warning"]["symbol"], "PB0");
+    assert_eq!(decision["values"]["warning"]["direction"], "up");
+    drop(e);
+    let mut restored = ExecutionEngine::with_config_path(
+        BrokerClient::Paper(p.clone()), config(),
+        Some(root.join("audit/trader_config.json")),
+    );
+    restored.registry = registry();
+    restored.bind("audit", "audit").await.unwrap();
+    send(&restored, payload).await;
+    tick(&restored, &p, 1002.).await;
+    assert_eq!(restored.strategy_diagnostics().await["states"], diagnostics["states"]);
+    assert!(restored.list_conditions().await.is_empty());
+    assert!(restored.list_orders().await.is_empty());
+}
+
+#[tokio::test]
 async fn p3_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
     let root = directory();
     let p = broker(&root, "a");

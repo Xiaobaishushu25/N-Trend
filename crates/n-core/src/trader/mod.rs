@@ -1,4 +1,5 @@
 pub mod broker;
+pub mod b5;
 pub mod candidates;
 pub mod client;
 pub mod comparison;

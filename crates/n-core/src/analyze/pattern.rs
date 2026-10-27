@@ -333,8 +333,26 @@ pub(crate) fn best_pattern_for_b_end(
     max_a_bars: usize,
     max_b_bars: usize,
 ) -> Option<NPattern> {
+    best_pattern_for_b_end_selected(
+        level, dir, b_end, bars, starts, trend_k, max_a_bars, max_b_bars, false,
+    )
+}
+
+/// Instance-local selection; never changes the legacy scanner's ranking.
+pub(crate) fn best_pattern_for_b_end_selected(
+    level: &'static str,
+    dir: Dir,
+    b_end: Swing,
+    bars: &[Bar],
+    starts: &[Swing],
+    trend_k: &[(bool, bool)],
+    max_a_bars: usize,
+    max_b_bars: usize,
+    nearest: bool,
+) -> Option<NPattern> {
     let mut best: Option<NPattern> = None;
     let atr20 = indicators::atr(bars, ATR_PERIOD);
+    let relaxed = nearest.then(|| indicators::trend_flags_relaxed(bars, &atr20));
 
     for s0 in starts.iter().rev() {
         if s0.index >= b_end.index {
@@ -363,13 +381,23 @@ pub(crate) fn best_pattern_for_b_end(
         }
 
         if let Some(p) = make_pattern(level, dir, *s0, s1, b_end, bars, trend_k) {
+            if nearest
+                && (!matches!(p.grade, Grade::A | Grade::B | Grade::C)
+                    || is_small_n(&p, &atr20)
+                    || a_leg_strong_count(&p, relaxed.as_ref().unwrap()) < MIN_STRONG_A_LEG
+                    || crate::analyze::pattern_window_has_rollover_until(bars, &p, b_end.index))
+            {
+                continue;
+            }
             let cur_score = scoring::score_a(bars, &atr20, &p) * 0.6 + scoring::score_b(&p) * 0.2;
             let best_score = best
                 .as_ref()
                 .map(|b| scoring::score_a(bars, &atr20, b) * 0.6 + scoring::score_b(b) * 0.2)
                 .unwrap_or(f64::NEG_INFINITY);
             if best.as_ref().map_or(true, |b| {
-                if p.hard_failure != b.hard_failure {
+                if nearest && p.s0.index != b.s0.index {
+                    p.s0.index > b.s0.index
+                } else if p.hard_failure != b.hard_failure {
                     !p.hard_failure
                 } else if cur_score > best_score + 1e-9 {
                     true

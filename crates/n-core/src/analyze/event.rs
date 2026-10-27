@@ -91,6 +91,7 @@ fn pattern_for_current_bar(
     w: usize,
     max_a_bars: usize,
     max_b_bars: usize,
+    nearest: bool,
 ) -> Option<NPattern> {
     let b_end = Swing {
         index: w,
@@ -101,8 +102,8 @@ fn pattern_for_current_bar(
         },
         is_high: dir == Dir::Down,
     };
-    pattern::best_pattern_for_b_end(
-        level, dir, b_end, bars, starts, trend_k, max_a_bars, max_b_bars,
+    pattern::best_pattern_for_b_end_selected(
+        level, dir, b_end, bars, starts, trend_k, max_a_bars, max_b_bars, nearest,
     )
 }
 
@@ -177,10 +178,22 @@ fn candidate_for(
 /// event references a future bar.  For each warning bar only the best-scoring
 /// AB candidate is returned.
 pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCandidate> {
+    selected_warnings(symbol, bars, tick, false, 0)
+}
+
+/// The six-product B5 uses nearest eligible A and unmerged pivots. `from` only
+/// skips old decisions; every calculated feature still sees its full prefix.
+pub fn selected_warnings(
+    symbol: &str,
+    bars: &[Bar],
+    tick: f64,
+    nearest: bool,
+    from: usize,
+) -> Vec<WarningCandidate> {
     let mut best_by_warning: std::collections::HashMap<(Dir, usize), WarningCandidate> =
         std::collections::HashMap::new();
 
-    for w in 0..bars.len() {
+    for w in from..bars.len() {
         let prefix = &bars[..=w];
         if prefix.len() < ATR_PERIOD + 2 {
             continue;
@@ -188,8 +201,8 @@ pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCand
         let atr20 = indicators::atr(prefix, ATR_PERIOD);
         let trend_k = indicators::trend_flags(prefix, &atr20);
         let trend_k_relaxed = indicators::trend_flags_relaxed(prefix, &atr20);
-        let swings_fine = indicators::find_swings(prefix, &atr20, 2, 8);
-        let swings_large = indicators::find_swings(prefix, &atr20, 5, 10);
+        let swings_fine = indicators::find_swings(prefix, &atr20, 2, if nearest { 0 } else { 8 });
+        let swings_large = indicators::find_swings(prefix, &atr20, 5, if nearest { 0 } else { 10 });
 
         let mut patterns: Vec<NPattern> = Vec::new();
         for dir in [Dir::Up, Dir::Down] {
@@ -215,6 +228,7 @@ pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCand
                 w,
                 pattern::FINE_MAX_A_BARS,
                 pattern::FINE_MAX_B_BARS,
+                nearest,
             ) {
                 patterns.push(p);
             }
@@ -241,6 +255,7 @@ pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCand
                 w,
                 pattern::LARGE_MAX_A_BARS,
                 pattern::LARGE_MAX_B_BARS,
+                nearest,
             ) {
                 patterns.push(p);
             }
@@ -251,7 +266,12 @@ pub fn replay_warnings(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCand
             {
                 let key = (c.direction, c.warning_index);
                 match best_by_warning.get(&key) {
-                    Some(existing) if existing.entry_score >= c.entry_score => {}
+                    Some(existing)
+                        if if nearest && existing.s0_index != c.s0_index {
+                            existing.s0_index > c.s0_index
+                        } else {
+                            existing.entry_score >= c.entry_score
+                        } => {}
                     _ => {
                         best_by_warning.insert(key, c);
                     }

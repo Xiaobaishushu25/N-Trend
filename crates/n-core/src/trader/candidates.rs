@@ -73,7 +73,7 @@ pub struct Fees {
     pub roundtrip_fixed_yuan_per_lot: Option<f64>,
 }
 impl Fees {
-    fn bound(&self, fill: f64, close: f64, mult: f64) -> f64 {
+    pub(crate) fn bound(&self, fill: f64, close: f64, mult: f64) -> f64 {
         self.roundtrip_fixed_yuan_per_lot.unwrap_or_else(|| {
             self.open.as_ref().unwrap().charge(fill, mult)
                 + self
@@ -163,7 +163,7 @@ impl Parameters {
         }
         Ok(())
     }
-    fn fee(&self, symbol: &str, instrument: &str) -> Option<&Fees> {
+    pub(crate) fn fee(&self, symbol: &str, instrument: &str) -> Option<&Fees> {
         self.fees
             .products
             .get(&instrument.to_uppercase())
@@ -173,7 +173,7 @@ impl Parameters {
                     .get(&SessionCalendar::contract_prefix(symbol))
             })
     }
-    fn block(&self, symbol: &str, now: i64) -> Option<&'static str> {
+    pub(crate) fn block(&self, symbol: &str, now: i64) -> Option<&'static str> {
         if now < parse_time(&self.calendar.coverage_start).ok()?
             || now > parse_time(&self.calendar.coverage_end).ok()?
         {
@@ -189,7 +189,7 @@ impl Parameters {
             .any(|(cut, reopen)| now >= *cut && now < *reopen)
             .then_some("filtered_weekend_window")
     }
-    fn flat_reason(&self, symbol: &str, opened: i64, now: i64) -> Option<&'static str> {
+    pub(crate) fn flat_reason(&self, symbol: &str, opened: i64, now: i64) -> Option<&'static str> {
         if self.calendar.windows.iter().any(|h| {
             opened < parse_time(&h.reopen).unwrap() && now >= parse_time(&h.flat_at).unwrap()
         }) {
@@ -427,7 +427,9 @@ impl CandidateStrategy {
         if state.seen.contains(&key) {
             return Ok(vec![]);
         }
-        let values = json!({"entry":p["entry"],"stop":p["stop"],"target":p["target"],
+        let values = json!({"id":p["id"],"symbol":p["symbol"],"instrument_id":p["instrument_id"],
+            "direction":p["direction"],"warning_ts":p["warning_ts"],"created_at_epoch":now,
+            "entry":p["entry"],"stop":p["stop"],"target":p["target"],"risk":p["risk"],
             "score":p["entry_score"],"tick":p["tick_size"],"multiplier":p["multiplier"],"warning_context":p["warning_context"],
             "fee_version":self.parameters.fees.id,"calendar_version":self.parameters.calendar.id,"execution_version":EXECUTION_VERSION});
         let snapshot = (|| -> Result<Snapshot> {

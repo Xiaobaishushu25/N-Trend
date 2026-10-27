@@ -33,7 +33,8 @@ const strategy = ref<StrategyDefinition | null>(null)
 const parameters = ref('{}')
 const createPreset = ref('')
 const presets = computed(() => trader.instanceCatalog?.modules?.presets || [])
-const isCandidate = computed(() => strategy.value?.strategy_id === 'n_p2' || strategy.value?.strategy_id === 'n_p3')
+const isCandidate = computed(() => ['n_p2', 'n_p3', 'n_b5_six'].includes(strategy.value?.strategy_id || ''))
+const isB5 = computed(() => strategy.value?.strategy_id === 'n_b5_six')
 const compareOpen = ref(false)
 const compareBusy = ref(false)
 const compare = ref<any>(null)
@@ -65,7 +66,7 @@ const localDate = (timestamp: number) => {
 const from = ref(localDate(Date.now() - 30 * 86400000))
 const to = ref(localDate(Date.now()))
 const number = (v: unknown, digits = 2) => typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '—'
-const moduleLabel = (id: string) => ({ n_pattern: 'N 字形', n_exit_v1: '现有 N 字形退出', n_score_v1: '现有评分分档', fixed_v1: '计划手数', protect_only_v1: '保护价退出', n_p2: 'P2 · ATR / 原 S1', n_p3: 'P3 · ATR / 2R 上限', p2_fixed_exit_v1: 'P2 固定止损与原 S1', p3_fixed_exit_v1: 'P3 固定止损与 2R 上限', candidate_one_lot_v1: 'P2/P3 固定一手' }[id] || id)
+const moduleLabel = (id: string) => ({ n_b5_six: '六品种 B5', b5_structural_exit_v1: 'B5 结构目标与固定止损', n_pattern: 'N 字形', n_exit_v1: '现有 N 字形退出', n_score_v1: '现有评分分档', fixed_v1: '计划手数', protect_only_v1: '保护价退出', n_p2: 'P2 · ATR / 原 S1', n_p3: 'P3 · ATR / 2R 上限', p2_fixed_exit_v1: 'P2 固定止损与原 S1', p3_fixed_exit_v1: 'P3 固定止损与 2R 上限', candidate_one_lot_v1: 'P2/P3 固定一手' }[id] || id)
 
 const connectionTooltip = computed(() => {
   if (trader.errorMsg) return trader.errorMsg
@@ -523,7 +524,7 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
                   <option v-for="p in presets" :key="p.definition.strategy_id" :value="p.definition.strategy_id">{{ p.label }}</option>
                 </select>
               </div>
-              <p v-if="createPreset" class="field-hint">P2/P3 使用固定一手、10 tick 最小风险和半自动模式。创建后请在配置中核对冻结费用与交易日历。</p>
+              <p v-if="createPreset" class="field-hint">候选策略使用固定一手、10 tick 最小风险和半自动模式。创建后请核对费用与日历；六品种 B5 固定交易 EG、PP、PVC、JD、SR、CJ。</p>
 
               <div class="form-row">
                 <label class="form-label">账户类型</label>
@@ -678,7 +679,8 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
                 <textarea v-model="parameters" rows="4" spellcheck="false" class="form-textarea font-mono" />
               </div>
 
-              <p v-if="isCandidate" class="field-hint">P2/P3 固定一手、原结构止损；P3 按实际成交价锁定目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
+              <p v-if="isB5" class="field-hint">六品种 B5：最近合格 A、不合并摆点、目标成本比≤10%、A 净实体同向；小时不顺向同组同向最多两单，同 A 两次原止损后停试。固定一手，独立生成新预警。</p>
+              <p v-else-if="isCandidate" class="field-hint">P2/P3 固定一手、原结构止损；P3 按实际成交价锁定目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
             </template>
 
             <div v-if="error" role="alert" class="alert-bar is-error">{{ error }}</div>

@@ -971,6 +971,7 @@ export interface LiveTraderSnapshot {
   account_kind?: 'ctp' | 'paper'
   paused?: boolean
   strategy?: StrategyDefinition
+  strategy_diagnostics?: StrategyDiagnostics | null
   _stream_id?: string
   _revision?: number
   strategy_comparison?: StrategyComparisonSummary | null
@@ -986,6 +987,15 @@ export interface LiveTraderSnapshot {
   statistics?: LiveTradeStatistics | null
   execution_error?: string | null
   execution_orders?: ExecutionOrder[] // Legacy servers only; never used as the paged archive.
+}
+
+export interface StrategyDiagnostics {
+  states: Record<string, { decisions?: Record<string, { reason: string; values: Record<string, any> }> }>
+}
+
+export type ConditionPoolRow = Omit<LiveConditionOrder, 'state'> & {
+  state: LiveConditionOrder['state'] | 'filtered'
+  display_only?: boolean
 }
 
 export interface ExecutionOrder {

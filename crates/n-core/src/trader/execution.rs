@@ -1628,6 +1628,17 @@ impl ExecutionEngine {
                 };
                 if hit {
                     if constraints.one_per_symbol {
+                        match self.portfolio_decision(&s, &cond, chrono::Utc::now().timestamp()) {
+                            EntryDecision::Allow => {}
+                            EntryDecision::Wait(reason) => {
+                                Self::set_entry_note(&mut s, &cond.id, reason);
+                                continue;
+                            }
+                            EntryDecision::Reject(reason) => {
+                                Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                continue;
+                            }
+                        }
                         let frozen = cond.frozen.as_ref().unwrap();
                         let proposed = if cond.direction == "up" { q.ask } else { q.bid };
                         match strategy.as_ref().unwrap().check_entry(
@@ -2146,6 +2157,18 @@ impl ExecutionEngine {
                 continue;
             };
             if reason.is_none() {
+                match self.portfolio_decision(&s, &cond, now) {
+                    EntryDecision::Allow => {}
+                    EntryDecision::Wait(reason) => {
+                        entry_state_changed |= Self::set_entry_note(&mut s, &cond.id, reason);
+                        continue;
+                    }
+                    EntryDecision::Reject(reason) => {
+                        Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                        entry_state_changed = true;
+                        continue;
+                    }
+                }
                 if let (Some(strategy), Some(frozen)) = (&strategy, &cond.frozen) {
                     let decision = strategy.check_entry(&frozen.plan, &q, price, now);
                     match decision {
@@ -2392,3 +2415,7 @@ mod instance_tests;
 #[cfg(test)]
 #[path = "candidate_execution_tests.rs"]
 mod candidate_execution_tests;
+
+#[cfg(test)]
+#[path = "b5_execution_tests.rs"]
+mod b5_execution_tests;

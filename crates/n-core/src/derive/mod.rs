@@ -87,6 +87,15 @@ enum BucketKey {
 
 /// 把升序 5m 序列聚合为目标级别（输入需已按时间排序）。
 pub fn aggregate(bars: &[Kline], target: Timeframe) -> Vec<Kline> {
+    aggregate_mode(bars, target, false)
+}
+
+/// Correct endpoint-at-midnight grouping for the versioned B5 lane.
+pub fn aggregate_endpoints(bars: &[Kline], target: Timeframe) -> Vec<Kline> {
+    aggregate_mode(bars, target, true)
+}
+
+fn aggregate_mode(bars: &[Kline], target: Timeframe, midnight_endpoint: bool) -> Vec<Kline> {
     if bars.is_empty() {
         return Vec::new();
     }
@@ -102,7 +111,14 @@ pub fn aggregate(bars: &[Kline], target: Timeframe) -> Vec<Kline> {
         let Some(dt) = parse_ts(&bar.datetime) else {
             continue;
         };
-        let key = bucket_key(dt, target);
+        let key = if midnight_endpoint
+            && target.minutes().is_some()
+            && dt.time() == chrono::NaiveTime::MIN
+        {
+            BucketKey::Minute(dt - chrono::Duration::minutes(target.minutes().unwrap()))
+        } else {
+            bucket_key(dt, target)
+        };
         let session_break = target.minutes().is_some()
             && prev_dt
                 .map(|prev| (dt - prev).num_minutes() > BASE_STEP_MINUTES)

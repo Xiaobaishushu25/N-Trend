@@ -337,6 +337,16 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                             .iter()
                             .map(n_core::service::model_to_fetch)
                             .collect::<Vec<_>>();
+                        if let Err(e) = crate::instance_runtime::forward_strategy_history(
+                            &ctx,
+                            &ctx.execution_engine,
+                            &symbol,
+                            &bars,
+                        )
+                        .await
+                        {
+                            tracing::warn!("策略独立历史推进失败: {e}");
+                        }
                         if let Err(e) = ctx.execution_engine.on_completed_15m(&symbol, &bars).await
                         {
                             tracing::warn!("候选策略完整K线推进失败: {e}");
@@ -683,7 +693,26 @@ fn spawn_scheduler(ctx: Arc<ServerContext>) {
 async fn run_refresh(ctx: &Arc<ServerContext>) -> anyhow::Result<RefreshStats> {
     let t0 = Instant::now();
     tracing::info!("🔄 刷新触发 | {}", Local::now().format("%H:%M:%S"));
-    match ctx.services.refresh_data().await {
+    let mut strategy_symbols = Vec::new();
+    if let Some(manager) = ctx.instances.get() {
+        for instance in manager.all().await {
+            strategy_symbols.extend(
+                instance
+                    .engine
+                    .market_subscriptions()
+                    .await
+                    .into_iter()
+                    .map(|s| s.symbol),
+            );
+        }
+    }
+    strategy_symbols.sort();
+    strategy_symbols.dedup();
+    match ctx
+        .services
+        .refresh_data_with_subscriptions(&strategy_symbols)
+        .await
+    {
         Ok(s) => {
             *ctx.last_refresh.write().await = Some(Local::now().naive_local());
             tracing::info!(
