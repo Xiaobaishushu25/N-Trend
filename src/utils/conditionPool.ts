@@ -55,6 +55,7 @@ export function filteredConditionRows(diagnostics: StrategyDiagnostics | null, r
     const [symbol, direction, , , , warningTs] = key.split('|')
     return [{
       id: `filtered:${revision}:${key}`,
+      signal_key: key,
       event_id: typeof warning.id === 'number' ? warning.id : null,
       symbol: s.symbol || warning.symbol || symbol || '',
       instrument_id: s.instrument || warning.instrument_id || symbol || '',

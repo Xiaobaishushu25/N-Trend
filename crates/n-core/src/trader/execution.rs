@@ -16,6 +16,8 @@ use std::sync::Arc;
 #[path = "strategy_runtime.rs"]
 mod strategy_runtime;
 
+const MARKET_CONNECTION_ERROR: &str = "执行行情连接中断，暂停新报单并保留未完成任务";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionTier {
@@ -1477,26 +1479,63 @@ impl ExecutionEngine {
             s.comparison.mark_quote_gap();
         }
         s.quotes.clear();
-        s.market_error = Some("执行行情连接中断，暂停新报单并保留未完成任务".into());
+        s.market_error = Some(MARKET_CONNECTION_ERROR.into());
         if let Err(e) = self.save(&mut s) {
             tracing::error!("行情缺口状态保存失败: {e}");
         }
     }
 
+    /// A successful stream response proves transport recovery even when the
+    /// exchange is closed. It does not make cached books tradable, clear event
+    /// gaps, release latched exits, or clear broker/persistence/strategy errors.
+    pub async fn market_recovered(&self) -> bool {
+        let mut s = self.state.lock().await;
+        if s.market_error.as_deref() == Some(MARKET_CONNECTION_ERROR) {
+            s.market_error = None;
+            return true;
+        }
+        false
+    }
+
     pub async fn quote_gap(&self) -> Result<()> {
+        self.quote_gap_with_reason("行情事件缓存缺口").await
+    }
+
+    pub async fn quote_gap_with_reason(&self, reason: &str) -> Result<()> {
         let mut s = self.state.lock().await;
         s.quote_gaps.push(chrono::Utc::now().timestamp());
         s.comparison.mark_quote_gap();
         let ids = s
             .orders
             .values()
+            .filter(|o| {
+                !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                    || o.filled < o.reported_filled
+            })
             .map(|o| o.condition_id.clone())
+            .chain(
+                s.positions
+                    .values()
+                    .filter(|p| !p.is_closed && p.volume > 0)
+                    .map(|p| p.id.clone()),
+            )
             .collect::<HashSet<_>>();
+        let mut affected = 0;
         for id in ids {
-            let reference = s.conditions[&id].stop_price;
+            let Some(condition) = s.conditions.get(&id) else {
+                continue;
+            };
+            let reference = condition.stop_price;
             Self::latch_exit(&mut s, &id, "market_gap", reference, true);
+            affected += 1;
         }
-        s.error = Some("执行行情发生跳号，已终止补仓并启动风险退出".into());
+        // Recover transport health on the next fresh quote. The affected tasks
+        // remain latched, so recovery never resumes their unfinished entries.
+        s.quotes.clear();
+        s.market_error = Some(format!(
+            "执行行情事件不连续（{reason}），{affected} 个未完成任务已停止补仓并锁定风险退出，等待新行情恢复"
+        ));
+        tracing::warn!(reason, affected, "执行行情缺口，已锁定未完成任务");
         self.save(&mut s)
     }
 
@@ -1504,14 +1543,39 @@ impl ExecutionEngine {
         // Observe every tick, then submit using the newest book, not a queued old tick.
         let guard = self.drive_lock.lock().await;
         for (code, quote) in events {
-            self.on_quotes([(code, quote)].into_iter().collect())
-                .await?;
+            if let Err(error) = self
+                .observe_quotes([(code, quote)].into_iter().collect(), false)
+                .await
+            {
+                self.save(&mut *self.state.lock().await)?;
+                return Err(error);
+            }
         }
+        // No broker action can run before this commit. Critical transitions
+        // commit immediately; ordinary observations need only one batch commit.
+        self.save(&mut *self.state.lock().await)?;
         drop(guard);
         self.drive().await
     }
 
     pub async fn on_quotes(&self, quotes: HashMap<String, ExecutionQuote>) -> Result<()> {
+        self.observe_quotes(quotes, true).await
+    }
+
+    async fn observe_quotes(
+        &self,
+        quotes: HashMap<String, ExecutionQuote>,
+        persist: bool,
+    ) -> Result<()> {
+        // Strategy callbacks need the current requested alias (e.g. EG0) as
+        // well as the actual contract key, including the first tick after roll.
+        {
+            let mut s = self.state.lock().await;
+            for (code, q) in &quotes {
+                s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
+                s.quotes.insert(code.to_uppercase(), q.clone());
+            }
+        }
         for quote in quotes.values().filter(|q| q.valid()) {
             if let Err(e) = self.dispatch(StrategyEvent::Quote(quote.clone())).await {
                 self.pause(true).await?;
@@ -1520,6 +1584,7 @@ impl ExecutionEngine {
         }
         let mode = self.get_config().await.mode;
         let mut s = self.state.lock().await;
+        let mut must_persist = persist;
         let observed = quotes
             .values()
             .filter(|q| q.valid())
@@ -1532,10 +1597,6 @@ impl ExecutionEngine {
         if quotes.values().any(|q| q.valid()) {
             s.market_error = None;
         }
-        for q in quotes.values() {
-            s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
-        }
-        s.quotes.extend(quotes);
         let state = &mut *s;
         state
             .comparison
@@ -1548,6 +1609,30 @@ impl ExecutionEngine {
                 &b.id,
             ))
         });
+        // Orders do not change while observing this quote. Index once instead
+        // of rescanning the complete order archive for every condition.
+        let started_entries = s
+            .orders
+            .values()
+            .filter(|o| o.reason.is_none())
+            .map(|o| o.condition_id.clone())
+            .collect::<HashSet<_>>();
+        let exposed_entries = s
+            .orders
+            .values()
+            .filter(|o| {
+                o.reason.is_none()
+                    && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                        || o.filled < o.reported_filled)
+            })
+            .map(|o| o.condition_id.clone())
+            .chain(
+                s.positions
+                    .values()
+                    .filter(|p| p.volume > 0)
+                    .map(|p| p.id.clone()),
+            )
+            .collect::<HashSet<_>>();
         for cond in entries {
             let strategy = cond
                 .frozen
@@ -1572,6 +1657,7 @@ impl ExecutionEngine {
                     )
                 }) {
                     c.state = ConditionState::Expired;
+                    must_persist = true;
                 }
             }
             let Some(q) = s
@@ -1602,6 +1688,7 @@ impl ExecutionEngine {
                     <= 0.0
             {
                 Self::reject_strategy_entry(&mut s, &cond.id, "invalidated");
+                must_persist = true;
                 continue;
             }
             if cond.state == ConditionState::Pending
@@ -1636,6 +1723,7 @@ impl ExecutionEngine {
                             }
                             EntryDecision::Reject(reason) => {
                                 Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                must_persist = true;
                                 continue;
                             }
                         }
@@ -1653,6 +1741,7 @@ impl ExecutionEngine {
                             }
                             EntryDecision::Reject(reason) => {
                                 Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                must_persist = true;
                                 continue;
                             }
                             EntryDecision::Allow => {}
@@ -1690,26 +1779,18 @@ impl ExecutionEngine {
                     if mode == ExecutionMode::FullAuto {
                         s.authorized_entries.insert(cond.id.clone());
                     }
+                    must_persist = true;
                 }
             }
             // A stop also terminates an unfilled or partly filled entry.
-            let entry_started = s
-                .orders
-                .values()
-                .any(|o| o.condition_id == cond.id && o.reason.is_none());
+            let entry_started = started_entries.contains(&cond.id);
             let stop_hit = cond.stop_price > 0.0
                 && if cond.direction == "up" {
                     q.last <= cond.stop_price
                 } else {
                     q.last >= cond.stop_price
                 };
-            let exposed = s.positions.get(&cond.id).is_some_and(|p| p.volume > 0)
-                || s.orders.values().any(|o| {
-                    o.condition_id == cond.id
-                        && o.reason.is_none()
-                        && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                            || o.filled < o.reported_filled)
-                });
+            let exposed = exposed_entries.contains(&cond.id);
             if !exposed
                 && s.authorized_entries.contains(&cond.id)
                 && !s.aborted_entries.contains(&cond.id)
@@ -1719,9 +1800,11 @@ impl ExecutionEngine {
                 let o = s.conditions.get_mut(&cond.id).unwrap();
                 o.state = ConditionState::Canceled;
                 o.note = "报单前行情已越过止损，终止本次入场".into();
+                must_persist = true;
             }
             if entry_started && exposed && stop_hit {
                 Self::latch_exit(&mut s, &cond.id, "stop", cond.stop_price, true);
+                must_persist = true;
             }
             let Some(mut pos) = s.positions.get(&cond.id).cloned().filter(|p| !p.is_closed) else {
                 continue;
@@ -1753,6 +1836,7 @@ impl ExecutionEngine {
                     Err(_) => {
                         s.paused = true;
                         s.strategy_error = Some("退出模块异常，使用已保存的保护价".into());
+                        must_persist = true;
                         self.registry
                             .exit("protect_only_v1")?
                             .on_quote(&pos, &q, parameters)
@@ -1767,6 +1851,7 @@ impl ExecutionEngine {
                 {
                     s.paused = true;
                     s.strategy_error = Some("退出模块返回无效保护价或平仓数量".into());
+                    must_persist = true;
                     update = self
                         .registry
                         .exit("protect_only_v1")?
@@ -1781,11 +1866,13 @@ impl ExecutionEngine {
                         update.stop.min(pos.current_stop_price)
                     };
                 }
+                must_persist |= pos.current_stop_price != update.stop;
                 pos.current_stop_price = update.stop;
                 if (update.stop - pos.fill_price) * sign > 0.0 {
                     pos.trailing_grade = pos.trailing_grade.max(2)
                 }
                 if let Some((reason, volume)) = update.close {
+                    must_persist = true;
                     Self::latch_exit(
                         &mut s,
                         &cond.id,
@@ -1815,10 +1902,14 @@ impl ExecutionEngine {
                 pos.current_stop_price = pos.fill_price;
                 pos.trailing_grade = 1;
                 s.closes.remove(&cond.id);
+                must_persist = true;
             }
             s.positions.insert(cond.id, pos);
         }
-        self.save(&mut s)
+        if must_persist {
+            self.save(&mut s)?;
+        }
+        Ok(())
     }
 
     fn latch_exit(s: &mut ExecutionState, id: &str, reason: &str, reference: f64, all: bool) {

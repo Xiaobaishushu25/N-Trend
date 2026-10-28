@@ -73,6 +73,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self.req_id = 100
         self.order_ref_counter = 1000
         self.lock = threading.RLock()
+        # Serialize submissions without holding the state lock needed by SPI callbacks.
+        self._submission_lock = threading.Lock()
 
         # State flags
         self.is_connected = False
@@ -345,25 +347,30 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 self._inflight = {"id": req_id, "kind": kind, "started": now, "rows": {}, "error": None,
                                   "revision": self._data_revision}
                 self._last_query_sent = now
-                try:
-                    if kind == "account":
-                        req = tdapi.CThostFtdcQryTradingAccountField()
-                        send = self.api.ReqQryTradingAccount
-                    elif kind == "positions":
-                        req = tdapi.CThostFtdcQryInvestorPositionField()
-                        send = self.api.ReqQryInvestorPosition
-                    elif kind == "orders":
-                        req = tdapi.CThostFtdcQryOrderField()
-                        send = self.api.ReqQryOrder
-                    else:
-                        req = tdapi.CThostFtdcQryTradeField()
-                        send = self.api.ReqQryTrade
-                    req.BrokerID = self.config.get("BrokerID", "9999")
-                    req.InvestorID = self.config.get("UserID", "")
-                    ret = send(req, req_id)
-                    if ret != 0:
+            # Native CTP calls can wait for a callback thread. SPI callbacks also
+            # need self.lock, so entering the SDK under that lock can deadlock
+            # both threads while the SDK spins on its own internal lock.
+            try:
+                if kind == "account":
+                    req = tdapi.CThostFtdcQryTradingAccountField()
+                    send = self.api.ReqQryTradingAccount
+                elif kind == "positions":
+                    req = tdapi.CThostFtdcQryInvestorPositionField()
+                    send = self.api.ReqQryInvestorPosition
+                elif kind == "orders":
+                    req = tdapi.CThostFtdcQryOrderField()
+                    send = self.api.ReqQryOrder
+                else:
+                    req = tdapi.CThostFtdcQryTradeField()
+                    send = self.api.ReqQryTrade
+                req.BrokerID = self.config.get("BrokerID", "9999")
+                req.InvestorID = self.config.get("UserID", "")
+                ret = send(req, req_id)
+                if ret != 0:
+                    with self._condition:
                         self._finish_query(req_id, f"{kind} 查询发送失败: {ret}")
-                except Exception as exc:
+            except Exception as exc:
+                with self._condition:
                     self._finish_query(req_id, str(exc))
 
     def _finish_query(self, req_id, error=None):
@@ -711,31 +718,49 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         os.replace(temp, self._journal_path)
 
     def send_order(self, instrument_id, direction, offset, price, volume, exchange_id=None, custom_ref=None):
-        with self.lock:
-            fingerprint = json.dumps([instrument_id, direction, offset, price, volume, exchange_id])
-            if custom_ref and custom_ref in self._submitted_requests:
-                old = self._submitted_requests[custom_ref]
-                if old["fingerprint"] != fingerprint:
-                    return {"success": False, "msg": "委托标识已用于不同报单参数"}
-                return old["result"]
-            if custom_ref:
-                self._submitted_requests[custom_ref] = {"fingerprint": fingerprint, "result": {
-                    "success": True, "order_ref": custom_ref, "msg": "提交结果待查询确认，不能重复提交"}}
-                try:
-                    self._save_journal()  # Before any call which could reach the counter.
-                except OSError as exc:
-                    self._submitted_requests.pop(custom_ref, None)
-                    return {"success": False, "order_ref": custom_ref, "msg": f"委托日志保存失败，未提交: {exc}"}
+        with self._submission_lock:
+            with self.lock:
+                fingerprint = json.dumps([instrument_id, direction, offset, price, volume, exchange_id])
+                if custom_ref and custom_ref in self._submitted_requests:
+                    old = self._submitted_requests[custom_ref]
+                    if old["fingerprint"] != fingerprint:
+                        return {"success": False, "msg": "委托标识已用于不同报单参数"}
+                    return old["result"]
+                if custom_ref:
+                    self._submitted_requests[custom_ref] = {"fingerprint": fingerprint, "result": {
+                        "success": True, "order_ref": custom_ref, "msg": "提交结果待查询确认，不能重复提交"}}
+                    try:
+                        self._save_journal()  # Before any call which could reach the counter.
+                    except OSError as exc:
+                        self._submitted_requests.pop(custom_ref, None)
+                        return {"success": False, "order_ref": custom_ref, "msg": f"委托日志保存失败，未提交: {exc}"}
             result = self._send_order(instrument_id, direction, offset, price, volume, exchange_id, custom_ref)
-            if custom_ref:
-                self._submitted_requests[custom_ref]["result"] = result
-                try:
-                    self._save_journal()
-                except OSError:
-                    logger.exception("报单结果保存失败；初始提交意图仍保留，禁止盲目重报")
+            with self.lock:
+                if custom_ref:
+                    self._submitted_requests[custom_ref]["result"] = result
+                    try:
+                        self._save_journal()
+                    except OSError:
+                        logger.exception("报单结果保存失败；初始提交意图仍保留，禁止盲目重报")
             return result
 
-    def _send_order(
+    def _send_order(self, *args, **kwargs):
+        with self.lock:
+            prepared = self._prepare_order(*args, **kwargs)
+        if isinstance(prepared, dict):
+            return prepared
+        req, req_id, order_ref, inst, exch, c_offset, c_dir, volume, price = prepared
+        res = self.api.ReqOrderInsert(req, req_id)
+        offset_label = "开仓" if c_offset == tdapi.THOST_FTDC_OF_Open else "平仓"
+        dir_label = "买" if c_dir == tdapi.THOST_FTDC_D_Buy else "卖"
+        logger.info(
+            f"[发送委托] -> {offset_label}{dir_label} {inst} {volume}手 @ {price:.1f} (OrderRef: {order_ref}, Exch: {exch})，调用返回码: {res}"
+        )
+        if res == 0:
+            return {"success": True, "order_ref": order_ref, "msg": "报单已发送到柜台"}
+        return {"success": False, "order_ref": order_ref, "msg": f"报单提交失败 (错误码: {res})"}
+
+    def _prepare_order(
         self,
         instrument_id: str,
         direction: str,  # "buy" or "sell"
@@ -744,7 +769,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         volume: int,
         exchange_id: Optional[str] = None,
         custom_ref: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ):
         if not self.is_ready:
             return {"success": False, "msg": "CTP交易前置未就绪 (尚未登录或结算单未确认)"}
 
@@ -808,16 +833,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
 
         req_id = self.get_req_id()
         self._order_requests[req_id] = req
-        res = self.api.ReqOrderInsert(req, req_id)
-        offset_label = "开仓" if c_offset == tdapi.THOST_FTDC_OF_Open else "平仓"
-        dir_label = "买" if c_dir == tdapi.THOST_FTDC_D_Buy else "卖"
-        logger.info(
-            f"[发送委托] -> {offset_label}{dir_label} {inst} {volume}手 @ {price:.1f} (OrderRef: {order_ref}, Exch: {exch})，调用返回码: {res}"
-        )
-        if res == 0:
-            return {"success": True, "order_ref": order_ref, "msg": "报单已发送到柜台"}
-        else:
-            return {"success": False, "order_ref": order_ref, "msg": f"报单提交失败 (错误码: {res})"}
+        return req, req_id, order_ref, inst, exch, c_offset, c_dir, volume, price
 
     def cancel_order(
         self,
@@ -894,7 +910,12 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
                 while not g_trader_mgr._stop_requested:
                     with g_trader_mgr._condition:
                         if revision == g_trader_mgr._data_revision:
-                            g_trader_mgr._condition.wait(15)
+                            g_trader_mgr._condition.wait_for(
+                                lambda: g_trader_mgr._stop_requested or revision != g_trader_mgr._data_revision,
+                                timeout=15,
+                            )
+                        if g_trader_mgr._stop_requested:
+                            break
                         snapshot = g_trader_mgr.stream_snapshot()
                         revision = snapshot["revision"]
                     data = json.dumps(snapshot, ensure_ascii=False)
@@ -990,37 +1011,39 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             # 撤销所有排队中订单
             canceled_count = 0
             with g_trader_mgr.lock:
-                for ref, ord_info in list(g_trader_mgr.orders.items()):
-                    if ord_info.get("status") in ("queueing", "part_traded"):
-                        g_trader_mgr.cancel_order(
-                            order_ref=ref,
-                            instrument_id=ord_info["instrument_id"],
-                            exchange_id=ord_info.get("exchange_id"),
-                        )
-                        canceled_count += 1
+                orders = [(ref, dict(info)) for ref, info in g_trader_mgr.orders.items()]
+            for ref, ord_info in orders:
+                if ord_info.get("status") in ("queueing", "part_traded"):
+                    g_trader_mgr.cancel_order(
+                        order_ref=ref,
+                        instrument_id=ord_info["instrument_id"],
+                        exchange_id=ord_info.get("exchange_id"),
+                    )
+                    canceled_count += 1
             return self._send_json(200, {"success": True, "canceled_count": canceled_count})
 
         elif path == "/emergency/close_all":
             # 一键全平所有持仓
             closed_orders = []
             with g_trader_mgr.lock:
-                for pos in list(g_trader_mgr.positions.values()):
-                    inst = pos["instrument_id"]
-                    vol = pos["position"]
-                    if vol <= 0:
-                        continue
-                    # 如果持有多头，平仓为卖平；如果持有空头，平仓为买平
-                    close_dir = "sell" if pos["direction"] == "buy" else "buy"
-                    # 以涨跌停/超滑点对价平仓
-                    price = pos["open_cost"] # 参考价，实际可由客户端传入最新价
-                    res = g_trader_mgr.send_order(
-                        instrument_id=inst,
-                        direction=close_dir,
-                        offset="auto",
-                        price=price,
-                        volume=vol,
-                    )
-                    closed_orders.append({"instrument_id": inst, "result": res})
+                positions = [dict(p) for p in g_trader_mgr.positions.values()]
+            for pos in positions:
+                inst = pos["instrument_id"]
+                vol = pos["position"]
+                if vol <= 0:
+                    continue
+                # 如果持有多头，平仓为卖平；如果持有空头，平仓为买平
+                close_dir = "sell" if pos["direction"] == "buy" else "buy"
+                # 以涨跌停/超滑点对价平仓
+                price = pos["open_cost"] # 参考价，实际可由客户端传入最新价
+                res = g_trader_mgr.send_order(
+                    instrument_id=inst,
+                    direction=close_dir,
+                    offset="auto",
+                    price=price,
+                    volume=vol,
+                )
+                closed_orders.append({"instrument_id": inst, "result": res})
             return self._send_json(200, {"success": True, "closed_orders": closed_orders})
 
         elif path == "/sync":

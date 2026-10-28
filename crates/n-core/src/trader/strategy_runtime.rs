@@ -637,14 +637,16 @@ impl ExecutionEngine {
         let identity = self.identity.read().await.clone();
         let instance_id = identity.1.clone();
         let mut guard = self.state.lock().await;
-        let mut s = guard.clone();
-        if let StrategyEvent::Quote(q) = &event {
-            s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
-        }
-        let active = s.definition.clone();
+        let active = guard.definition.clone();
         let mut versions =
             HashMap::from([(active.revision.clone(), (active.clone(), cfg.clone()))]);
-        for c in s.conditions.values().filter(|c| {
+        let unsettled_conditions = guard
+            .orders
+            .values()
+            .filter(|o| !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected))
+            .map(|o| o.condition_id.clone())
+            .collect::<HashSet<_>>();
+        for c in guard.conditions.values().filter(|c| {
             matches!(
                 c.state,
                 ConditionState::Pending
@@ -654,11 +656,8 @@ impl ExecutionEngine {
                     | ConditionState::Working
                     | ConditionState::PartFilled
                     | ConditionState::Closing
-            ) || s.positions.get(&c.id).is_some_and(|p| !p.is_closed)
-                || s.orders.values().any(|o| {
-                    o.condition_id == c.id
-                        && !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                })
+            ) || guard.positions.get(&c.id).is_some_and(|p| !p.is_closed)
+                || unsettled_conditions.contains(&c.id)
         }) {
             if let Some(f) = &c.frozen {
                 versions.insert(
@@ -667,10 +666,26 @@ impl ExecutionEngine {
                 );
             }
         }
+        let handlers = versions
+            .values()
+            .map(|(d, config)| (d, config, self.registry.strategy(d)))
+            .collect::<Vec<_>>();
+        // The N signal module does not consume quote events. Avoid cloning the
+        // entire persistent order archive for a no-op dispatch on every tick.
+        if handlers
+            .iter()
+            .all(|(_, _, strategy)| strategy.as_ref().is_ok_and(|p| !p.handles_event(&event)))
+        {
+            return Ok(());
+        }
+        let mut s = guard.clone();
+        if let StrategyEvent::Quote(q) = &event {
+            s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
+        }
         let mut actions = vec![];
         let mut changed = false;
-        for (d, version_config) in versions.values() {
-            let strategy = match self.registry.strategy(d) {
+        for (d, version_config, strategy) in handlers {
+            let strategy = match strategy {
                 Ok(strategy) => strategy,
                 Err(e) => {
                     s.paused = true;

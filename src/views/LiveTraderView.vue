@@ -3,6 +3,7 @@ import TraderInstancesPanel from '../components/TraderInstancesPanel.vue'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { openLiveTraderWindow } from '../utils/openLiveTraderWindow'
+import { traderWindowTitle } from '../utils/traderWindowTitle'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { emit } from '@tauri-apps/api/event'
@@ -285,7 +286,7 @@ function getNoteTooltip(note?: string | null): string {
     const reason = reasonMatch ? reasonMatch[1].toLowerCase() : ''
 
     const reasonMap: Record<string, string> = {
-      market_gap: '【行情跳号/跳空风控】行情推送序列出现断层或跳空，超出系统容忍阈值。为防止数据中断期间产生不可控的极端穿透滑点，系统启动最高优先级风控，锁定任务并立即平仓保护本金。',
+      market_gap: '【行情事件缺口风控】行情源事件缓存或本实例消费队列发生丢失，无法确认缺失期间是否触及止损。系统停止受影响任务的后续开仓，并锁定风险退出；待有效行情和柜台状态就绪后执行撤单、平仓。此提示不表示价格发生跳空，行情恢复也不会解除已锁定任务。',
       stop: '【触及硬止损】盘中价格击穿建仓时设定的初始止损保护线，按纪律坚决全平止损，严格控制单笔最大风险。',
       target_1r: '【+1.0R第1止盈位】浮盈达到1倍初始风险目标。若是1手则全平落袋；若是多手则平第1手止盈，并将剩余持仓止损线自动移至开仓成本线保本。',
       breakeven: '【保本平仓离场】在第1手止盈落袋后，行情未能进一步走高而是回落至开仓成本价，系统自动平掉剩余持仓，保住已获利润，做到零回撤。',
@@ -419,11 +420,9 @@ watch(() => route.query.instance_id, async (newId) => {
   }
 })
 
-watch(selectedInstance, (inst) => {
-  if (inst && isTauri()) {
-    const accId = inst.account.user_id || inst.account.name || inst.account.id
-    const winTitle = `实盘量化执行终端 · ${inst.instance.name} (${accId})`
-    void getCurrentWindow().setTitle(winTitle)
+watch([selectedInstance, () => trader.currentStrategy], ([inst, strategy]) => {
+  if (isTauri()) {
+    void getCurrentWindow().setTitle(traderWindowTitle(strategy?.strategy_id || inst?.strategy.strategy_id, inst?.instance.name))
   }
 }, { immediate: true })
 
@@ -517,9 +516,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
     <header class="trader-header" @mousedown="onHeaderMouseDown">
       <div class="header-top-row">
         <div class="header-status-box">
-          <span class="live-status-pill" :class="trader.bridgeOnline ? 'is-online' : 'is-offline'">
+          <span class="live-status-pill" :class="trader.bridgeOnline ? 'is-online' : 'is-offline'"
+            title="此处表示柜台通信状态；执行行情是否连续，请查看右侧风险提示。">
             <span class="status-indicator-dot" />
-            {{ trader.bridgeOnline ? '数据通信正常' : '数据通信中断' }}
+            {{ trader.bridgeOnline ? '柜台通信正常' : '柜台通信中断' }}
           </span>
           <span class="header-subtitle font-num">
             柜台更新: {{ formatAccountUpdateTime(trader.account?.updated_at) }}
@@ -1045,6 +1045,12 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 >
                   <template #icon><n-icon :component="Bolt" /></template>
                   Event #{{ cond.event_id }}
+                  <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
+                </n-tag>
+                <n-tag v-else-if="cond.signal_key || cond.origin?.signal_id" size="small" type="info" round
+                  class="signal-badge-btn" :title="`策略信号：${cond.signal_key || cond.origin?.signal_id}；点击打开实时行情图`"
+                  @click="openActiveChart(cond.symbol)">
+                  策略信号 {{ cond.signal_key || cond.origin?.signal_id }}
                   <n-icon :component="ExternalLink" size="12" style="margin-left: 3px" />
                 </n-tag>
                 <span class="score-badge">评分 {{ Number.isFinite(cond.score) ? cond.score.toFixed(2) : '—' }}</span>

@@ -1,0 +1,10 @@
+use n_core::{fetch::kline::Kline,v2::replay::ReplayEvent,v3::ablation::{evaluate_research,Experiment,Policy,ResearchRules}};
+use chrono::{Duration,NaiveDateTime};
+fn bar(m:i64,h:f64,l:f64,c:f64)->Kline{let t=NaiveDateTime::parse_from_str("2026-01-05 09:00:00","%Y-%m-%d %H:%M:%S").unwrap()+Duration::minutes(m);Kline{datetime:t.format("%Y-%m-%d %H:%M:%S").to_string(),open:c,high:h,low:l,close:c,volume:1.,hold:1.}}
+fn eval(bs:&[Kline],stall:bool)->n_core::v3::ablation::ResultRow{let mut e=ReplayEvent{symbol:"RB0".into(),direction:"up".into(),warning_ts:"2026-01-05 08:59:00".into(),entry:100.,stop:74.,target:160.,risk:26.,tick_size:1.,..Default::default()};e.setup_features.setup_quality=4.;evaluate_research(&e,bs,&[],&Default::default(),Experiment{policy:Policy::OriginalS1,no_follow_bar:Some(5),slip_ticks:1.,fee_ticks:0.},10.,None,ResearchRules{c_structure:stall,c_stall:stall,c_initial_origin:Some(90.),..Default::default()})}
+#[test]
+fn losing_no_C_after_prior_half_R_excursion_exits_next_open_at_existing_checkpoint(){let mut bs=vec![bar(0,101.,100.,100.)];for i in 1..=61{bs.push(if i<=5{bar(i,116.,100.,110.)}else{bar(i,100.,89.,90.)});}let a=eval(&bs,false);assert_ne!(a.evaluation.status,"closed");let b=eval(&bs,true);assert_eq!(b.evaluation.entry_ts.as_deref(),Some("2026-01-05 09:00:00"));assert_eq!(b.evaluation.exit_reason.as_deref(),Some("c_not_formed"));assert_eq!(b.evaluation.exit_ts.as_deref(),Some("2026-01-05 10:01:00"));assert_eq!(b.evaluation.risk,27.);assert_ne!(eval(&bs[..61],true).evaluation.status,"closed");}
+#[test]
+fn currently_profitable_no_C_position_is_not_forced_out(){let mut bs=vec![bar(0,101.,100.,100.)];for i in 1..=61{bs.push(bar(i,116.,100.,110.));}assert_ne!(eval(&bs,true).evaluation.status,"closed");}
+#[test]
+fn a_previously_confirmed_C_is_not_exited_when_its_support_later_breaks(){let mut bs=vec![bar(0,101.,100.,100.)];let shape=[(110.,100.),(116.,105.),(113.,103.),(112.,101.),(114.,105.)];for i in 1..=25{let(h,l)=shape[(i-1)/5];bs.push(bar(i as i64,h,l,(h+l)/2.));}for i in 26..=61{bs.push(bar(i,100.,89.,90.));}let a=eval(&bs,true);assert_ne!(a.evaluation.status,"closed");}

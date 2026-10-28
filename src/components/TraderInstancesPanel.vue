@@ -2,9 +2,10 @@
 import { computed, ref, watch } from 'vue'
 import { api } from '../services/api'
 import { useLiveTraderStore } from '../stores/liveTrader'
-import type { CtpConnectionSettings, ExecutionConfig, StrategyDefinition } from '../types'
+import type { CtpConnectionSettings, ExecutionConfig, StrategyDefinition, TraderInstanceRow } from '../types'
 import SimnowLoginFields from './SimnowLoginFields.vue'
 import { emptySimnowLogin, ctpConnectionLabel } from '../utils/simnow'
+import { openContextMenu } from '../utils/contextMenu'
 
 
 const trader = useLiveTraderStore()
@@ -206,11 +207,86 @@ function curve(samples: { equity: number }[]) {
   return samples.map((p, i) => `${i * 160 / (samples.length - 1)},${32 - (p.equity - low) / (high - low || 1) * 28}`).join(' ')
 }
 
+const emit = defineEmits<{
+  (e: 'open-window', instanceId: string, name?: string): void
+}>()
+
 function popOutWindow(instanceId?: string, instanceName?: string) {
   if (!instanceId) return
+  emit('open-window', instanceId, instanceName)
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('open-live-trader-window', { detail: { instanceId, name: instanceName } }))
   }
+}
+
+const instancePositionCounts = ref<Record<string, number>>({})
+
+watch(
+  [() => trader.selectedInstanceId, () => trader.activePositions.length],
+  ([id, count]) => {
+    if (id) {
+      instancePositionCounts.value[id] = count
+    }
+  },
+  { immediate: true },
+)
+
+function getActivePositionCount(instanceId: string): number {
+  if (instanceId === trader.selectedInstanceId) {
+    return trader.activePositions.length
+  }
+  return instancePositionCounts.value[instanceId] ?? 0
+}
+
+function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
+  openContextMenu(e, {
+    items: [
+      {
+        label: `在新窗口独立打开【${row.instance.name}】`,
+        onClick: () => popOutWindow(row.instance.id, row.instance.name),
+      },
+      {
+        label: '重命名实例',
+        onClick: () => {
+          if (row.instance.id !== trader.selectedInstanceId) {
+            void trader.selectInstance(row.instance.id).then(() => openRename())
+          } else {
+            openRename()
+          }
+        },
+      },
+      {
+        label: row.paused ? '恢复策略运行 (开始入场)' : '暂停策略新入场 (继续盯仓)',
+        onClick: async () => {
+          if (row.instance.id !== trader.selectedInstanceId) {
+            await trader.selectInstance(row.instance.id)
+          }
+          await togglePause()
+        },
+      },
+      {
+        label: '克隆当前策略配置',
+        divided: true,
+        onClick: () => {
+          if (row.instance.id !== trader.selectedInstanceId) {
+            void trader.selectInstance(row.instance.id).then(() => openCreate(true))
+          } else {
+            openCreate(true)
+          }
+        },
+      },
+      {
+        label: '配置策略与风控参数',
+        onClick: () => {
+          if (row.instance.id !== trader.selectedInstanceId) {
+            void trader.selectInstance(row.instance.id).then(() => openConfigure())
+          } else {
+            openConfigure()
+          }
+        },
+      },
+    ],
+  })
 }
 </script>
 
@@ -231,44 +307,106 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
       </button>
     </div>
 
-    <!-- 顶部综合控制工具栏 -->
+    <!-- 顶部综合控制工具栏（多实盘 Tab 切换 + 当前实例操作） -->
     <template v-if="trader.instancesSupported">
-      <div class="instance-bar">
-        <!-- 左侧：实例切换、账户类型、连接状态、启停与新窗口盯盘 -->
-        <div class="bar-left">
-          <div class="instance-selector-group">
-            <span class="selector-label">策略实例</span>
-            <div class="select-box">
-              <select
-                :value="trader.selectedInstanceId"
-                :disabled="busy"
-                class="instance-select"
-                @change="trader.selectInstance(($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="row in trader.instanceCatalog?.instances" :key="row.instance.id" :value="row.instance.id">
-                  {{ row.instance.name }} ({{ row.account.user_id || row.account.name || '本地模拟' }})
-                </option>
-              </select>
-              <svg class="select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </div>
+      <!-- 1. 实盘多 Tab 标签栏 -->
+      <div class="instance-tabs-bar">
+        <div class="instance-tabs-track">
+          <div
+            v-for="row in trader.instanceCatalog?.instances"
+            :key="row.instance.id"
+            class="instance-tab-item"
+            :class="{
+              'is-active': row.instance.id === trader.selectedInstanceId,
+              'is-paused': row.paused,
+              'is-error': !!row.error,
+            }"
+            :title="`右键查看更多操作\n实例：${row.instance.name}\n账号：${row.account.user_id || row.account.name || '本地模拟'}`"
+            @click="trader.selectInstance(row.instance.id)"
+            @contextmenu="onTabContextMenu(row, $event)"
+          >
+            <!-- 运行状态指示点 -->
+            <span
+              class="tab-dot"
+              :class="{
+                'is-running': !row.paused && !row.error,
+                'is-paused': row.paused,
+                'is-error': !!row.error,
+              }"
+            />
 
-            <!-- 快捷重命名当前实例名称 -->
+            <!-- 实例名称与账号 -->
+            <span class="tab-name" :title="row.instance.name">{{ row.instance.name }}</span>
+            <span class="tab-user font-num">
+              ({{ row.account.user_id || row.account.name || '模拟' }})
+            </span>
+
+            <!-- 账户类型小徽标 -->
+            <span class="tab-kind" :class="row.account.kind">
+              {{ row.account.kind === 'paper' ? '模拟' : row.account.broker_id === '9999' ? 'SimNow' : 'CTP' }}
+            </span>
+
+            <!-- 在手持仓数量角标 -->
+            <span
+              v-if="getActivePositionCount(row.instance.id) > 0"
+              class="tab-pos-badge font-num"
+              title="当前活跃在手持仓"
+            >
+              {{ getActivePositionCount(row.instance.id) }}仓
+            </span>
+
+            <!-- 独立新窗口弹出盯盘小按钮 -->
             <button
               type="button"
-              class="btn-icon-rename"
-              title="重命名当前实例"
-              :disabled="busy || !selected"
-              @click="openRename"
+              class="tab-popout-btn"
+              title="在独立新窗口打开此账户盯盘"
+              @click.stop="popOutWindow(row.instance.id, row.instance.name)"
             >
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 20h9" />
-                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                <path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" />
+                <path d="M11 13l9 -9" />
+                <path d="M15 4h5v5" />
               </svg>
             </button>
           </div>
 
+          <!-- + 新建实盘快捷按钮 -->
+          <button
+            type="button"
+            class="tab-new-btn"
+            title="新建策略实例与交易账户"
+            :disabled="busy"
+            @click="openCreate(false)"
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+            <span>新建实例</span>
+          </button>
+        </div>
+
+        <!-- 标签栏右侧全局操作 -->
+        <div class="tabs-bar-right">
+          <button
+            type="button"
+            class="btn btn-sm btn-action"
+            :class="{ 'is-active': compareOpen }"
+            @click="showComparison"
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="20" x2="18" y2="10" />
+              <line x1="12" y1="20" x2="12" y2="4" />
+              <line x1="6" y1="20" x2="6" y2="14" />
+            </svg>
+            {{ compareOpen ? '收起对比' : '账户对比' }}
+          </button>
+        </div>
+      </div>
+
+      <!-- 2. 当前选中实盘的操作工具条 -->
+      <div class="instance-active-toolbar">
+        <div class="toolbar-left">
           <!-- 账户类型徽章 -->
           <span class="badge-kind" :class="selected?.account.kind">
             {{ accountLabel(selected?.account) }}
@@ -285,6 +423,21 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
           >
             <span class="state-dot" />
             {{ selected?.paused ? '已暂停 (点此启用)' : '运行中 (点此暂停)' }}
+          </button>
+
+          <!-- 快捷重命名当前实例名称 -->
+          <button
+            type="button"
+            class="btn btn-sm btn-outline"
+            title="重命名当前实例"
+            :disabled="busy || !selected"
+            @click="openRename"
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+            重命名
           </button>
 
           <!-- 核心功能：在新窗口独立打开此账户盯盘 -->
@@ -304,9 +457,9 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
           </button>
         </div>
 
-        <!-- 右侧：前置连接状态与登录认证 (独立置于右上角)，以及配置、新建、克隆与账户对比 -->
-        <div class="bar-right">
-          <!-- 柜台连接与登录认证组（右上角独立） -->
+        <!-- 右侧：前置连接状态与登录认证，以及配置、克隆 -->
+        <div class="toolbar-right">
+          <!-- 柜台连接与登录认证组 -->
           <div v-if="selected?.account.kind === 'ctp'" class="connection-group">
             <!-- CTP 前置机连接状态徽章 -->
             <span
@@ -352,34 +505,12 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
               配置
             </button>
 
-            <button type="button" class="btn btn-sm btn-action" :disabled="busy" @click="openCreate(false)">
-              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <line x1="5" y1="12" x2="19" y2="12" />
-              </svg>
-              新建
-            </button>
-
             <button type="button" class="btn btn-sm btn-action" :disabled="busy" title="复制当前策略配置到新账户" @click="openCreate(true)">
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
               </svg>
               克隆
-            </button>
-
-            <button
-              type="button"
-              class="btn btn-sm btn-action"
-              :class="{ 'is-active': compareOpen }"
-              @click="showComparison"
-            >
-              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <line x1="18" y1="20" x2="18" y2="10" />
-                <line x1="12" y1="20" x2="12" y2="4" />
-                <line x1="6" y1="20" x2="6" y2="14" />
-              </svg>
-              {{ compareOpen ? '收起对比' : '账户对比' }}
             </button>
           </div>
         </div>
@@ -730,8 +861,177 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
   color: #0284c7;
 }
 
-/* 综合控制栏 */
-.instance-bar {
+/* 实盘多标签栏 (Instance Tabs) */
+.instance-tabs-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.instance-tabs-track {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+  min-width: 0;
+  padding: 1px 0;
+}
+.instance-tabs-track::-webkit-scrollbar {
+  display: none;
+}
+
+.instance-tab-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  font-size: 12px;
+  font-weight: 500;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.instance-tab-item:hover {
+  background: #f1f5f9;
+  border-color: #94a3b8;
+  color: #0f172a;
+}
+
+.instance-tab-item.is-active {
+  background: #ffffff;
+  border-color: #2563eb;
+  color: #1e40af;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12), inset 0 0 0 1px #2563eb;
+}
+
+.instance-tab-item.is-paused:not(.is-active) {
+  opacity: 0.85;
+}
+
+/* Tab 内部指示灯 */
+.tab-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tab-dot.is-running {
+  background: #16a34a;
+  box-shadow: 0 0 4px rgba(22, 163, 74, 0.5);
+}
+.tab-dot.is-paused {
+  background: #f59e0b;
+}
+.tab-dot.is-error {
+  background: #ef4444;
+}
+
+.tab-name {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-user {
+  font-size: 11px;
+  color: inherit;
+  opacity: 0.8;
+  margin-left: -2px;
+}
+
+.tab-kind {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.2;
+}
+.tab-kind.paper {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+.tab-kind.ctp, .tab-kind.simnow {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.tab-pos-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+  line-height: 1.2;
+}
+
+.tab-popout-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-left: 2px;
+}
+.tab-popout-btn:hover {
+  background: #e2e8f0;
+  color: #2563eb;
+}
+
+.tab-new-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  font-size: 12px;
+  font-weight: 500;
+  color: #64748b;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.tab-new-btn:hover:not(:disabled) {
+  border-color: #2563eb;
+  border-style: solid;
+  color: #2563eb;
+  background: #eff6ff;
+}
+
+.tabs-bar-right {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* 当前选中实盘工具栏 (Active Toolbar) */
+.instance-active-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -739,89 +1039,11 @@ function popOutWindow(instanceId?: string, instanceName?: string) {
   gap: 8px 14px;
 }
 
-.bar-left, .bar-right {
+.toolbar-left, .toolbar-right {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-}
-
-/* 实例选择器 */
-.instance-selector-group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.selector-label {
-  font-size: 12px;
-  font-weight: 600;
-  color: #475569;
-  white-space: nowrap;
-}
-
-.select-box {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-}
-
-.instance-select {
-  appearance: none;
-  background: #f8fafc;
-  border: 1px solid #cbd5e1;
-  border-radius: 6px;
-  padding: 4px 26px 4px 10px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #0f172a;
-  cursor: pointer;
-  outline: none;
-  transition: all 0.15s ease;
-  max-width: 280px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.instance-select:hover {
-  border-color: #2563eb;
-  background: #ffffff;
-}
-
-.instance-select:focus {
-  border-color: #2563eb;
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
-}
-
-.select-chevron {
-  position: absolute;
-  right: 8px;
-  width: 14px;
-  height: 14px;
-  color: #64748b;
-  pointer-events: none;
-}
-
-/* 实例重命名小按钮 */
-.btn-icon-rename {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  border-radius: 5px;
-  background: #f8fafc;
-  border: 1px solid #cbd5e1;
-  color: #64748b;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-.btn-icon-rename:hover:not(:disabled) {
-  background: #eff6ff;
-  border-color: #2563eb;
-  color: #2563eb;
 }
 
 /* 徽章胶囊 */

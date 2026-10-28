@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { dismiss, notifyItems, resume, suspend } from '../utils/notify'
+import { dismiss, dismissAll, notifyItems, resume, suspend } from '../utils/notify'
 import type { NotifyItem } from '../utils/notify'
 import router from '../router'
 import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
@@ -21,6 +21,12 @@ function fmtPrice(v: number): string {
 
 <template>
   <div class="notify-root">
+    <div v-if="notifyItems.length > 1" class="notify-header">
+      <span class="notify-header-count">共 {{ notifyItems.length }} 条通知</span>
+      <button type="button" class="notify-header-clear-btn" @click.stop="dismissAll">
+        一键清空全部
+      </button>
+    </div>
     <transition-group name="notify" tag="div" class="notify-list">
       <div
         v-for="item in notifyItems"
@@ -171,6 +177,37 @@ function fmtPrice(v: number): string {
   flex-direction: column;
   /* 40px 标题栏 + 12px 间距 + 66px 底部留白，通知区始终不盖住标题栏 */
   max-height: calc(100vh - 40px - 66px - 12px);
+}
+.notify-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 4px 6px 8px;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+.notify-header-count {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+}
+.notify-header-clear-btn {
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  transition: all 0.15s ease;
+}
+.notify-header-clear-btn:hover {
+  background: #fee2e2;
+  color: #dc2626;
+  border-color: #fca5a5;
 }
 .notify-list {
   display: flex;

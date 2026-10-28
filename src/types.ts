@@ -1044,6 +1044,8 @@ export interface StrategyComparisonSummary {
 
 export interface LiveConditionOrder {
   id: string
+  signal_key?: string
+  origin?: { signal_id?: string }
   event_id?: number | null
   symbol: string
   instrument_id: string

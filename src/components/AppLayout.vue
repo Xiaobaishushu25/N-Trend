@@ -42,6 +42,8 @@ import { useActionsStore } from '../stores/actions'
 import { useAppStore } from '../stores/app'
 import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
+import { useLiveTraderStore } from '../stores/liveTrader'
+import { traderWindowTitle } from '../utils/traderWindowTitle'
 import { openNotificationsWindow } from '../utils/openNotificationsWindow'
 import { openReviewWindow } from '../utils/openReviewWindow'
 import { openTradeReviewWindow } from '../utils/openTradeReviewWindow'
@@ -57,6 +59,7 @@ const appStore = useAppStore()
 const settingsStore = useSettingsStore()
 const actionsStore = useActionsStore()
 const symbolsStore = useSymbolsStore()
+const traderStore = useLiveTraderStore()
 const { isMobile, isNativeMobile } = usePlatform()
 const showMobileSearch = ref(false)
 const showMobileStatusModal = ref(false)
@@ -96,9 +99,8 @@ const windowTitle = computed(() => {
       : route.name === 'trade-review'
         ? '量化复盘工作台'
         : route.name === 'live-trader'
-          ? (typeof route.query.instance_id === 'string' && route.query.instance_id.trim()
-            ? `实盘量化执行终端 · ${route.query.instance_id.trim()}`
-            : '实盘量化执行终端')
+          ? traderWindowTitle(traderStore.currentStrategy?.strategy_id || traderStore.instanceCatalog?.instances.find(r => r.instance.id === traderStore.selectedInstanceId)?.strategy.strategy_id,
+            traderStore.instanceCatalog?.instances.find(r => r.instance.id === traderStore.selectedInstanceId)?.instance.name || (typeof route.query.instance_id === 'string' ? route.query.instance_id : undefined))
           : route.name === 'notifications'
             ? '历史通知'
             : ''

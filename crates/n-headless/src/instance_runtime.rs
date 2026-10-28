@@ -5,8 +5,38 @@ use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     sync::{atomic::Ordering, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+pub(crate) type HistoryRevision = Vec<(String, Option<String>, i64)>;
+
+/// A cheap revision check avoids loading and allocating the complete history
+/// every five seconds. Row counts also detect older bars being backfilled.
+pub(crate) async fn market_history_revision(
+    db: &n_core::sea_orm::DatabaseConnection,
+    symbol: &str,
+    timeframe: &str,
+) -> anyhow::Result<HistoryRevision> {
+    use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT timeframe, MAX(ts) AS latest, COUNT(*) AS row_count FROM klines \
+         WHERE symbol=? AND timeframe IN ('5m', ?) AND (timeframe != '5m' OR source='raw') \
+         GROUP BY timeframe ORDER BY timeframe",
+            [symbol.into(), timeframe.into()],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "timeframe")?,
+                row.try_get("", "latest")?,
+                row.try_get("", "row_count")?,
+            ))
+        })
+        .collect()
+}
 
 pub fn spawn(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
@@ -182,9 +212,12 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
     let mut publisher =
         n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
     let mut last_bars = HashMap::<(String, String), String>::new();
+    let mut history_versions = HashMap::<(String, String), (String, HistoryRevision)>::new();
     let mut ticks = 0u64;
+    let mut next_history_refresh = Instant::now();
     loop {
         let quotes = tokio::select! { _=timer.tick()=>None, batch=rx.recv()=>batch };
+        let quotes = quotes.map(|events| crate::runtime::drain_quote_batches(&mut rx, events));
         let manager = ctx.instances.get().unwrap();
         if ctx.is_shutting_down.load(Ordering::Relaxed)
             || manager.get(&r.definition.id).await.is_err()
@@ -193,7 +226,9 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
         }
         let result: anyhow::Result<()> = async {
             if r.quote_gap.swap(false, Ordering::Relaxed) {
-                r.engine.quote_gap().await?;
+                r.engine
+                    .quote_gap_with_reason("本实例行情消费队列已满")
+                    .await?;
             }
             if let Some(events) = quotes {
                 if let BrokerClient::Paper(p) = &r.broker {
@@ -222,7 +257,8 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 *r.snapshot.write().await = s;
             }
             // Bar reads use the shared cache, not another market connection.
-            if ticks % 5 == 0 {
+            if Instant::now() >= next_history_refresh {
+                next_history_refresh = Instant::now() + Duration::from_secs(5);
                 let mut subscriptions = r
                     .engine
                     .active_symbols()
@@ -239,7 +275,16 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 );
                 subscriptions.sort();
                 subscriptions.dedup();
+                let strategy_revision = r.engine.definition().await.revision;
                 for (symbol, tf) in subscriptions {
+                    let key = (symbol.clone(), tf.clone());
+                    let version = (
+                        strategy_revision.clone(),
+                        market_history_revision(&ctx.db, &symbol, &tf).await?,
+                    );
+                    if history_versions.get(&key) == Some(&version) {
+                        continue;
+                    }
                     if tf == "15m" && r.engine.needs_completed_15m().await {
                         let rows = n_core::storage::repo::raw_klines(&ctx.db, &symbol).await?;
                         let raw = rows
@@ -250,7 +295,6 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                         r.engine.on_completed_15m(&symbol, &raw).await?;
                     }
                     let bars = ctx.services.bars_for(&symbol, &tf).await?;
-                    let key = (symbol.clone(), tf.clone());
                     let last = if let Some(last) = last_bars.get(&key) {
                         Some(last.clone())
                     } else if tf == "15m" {
@@ -299,6 +343,7 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                             )
                             .await?;
                     }
+                    history_versions.insert(key, version);
                 }
             }
             *r.runtime_error.write().await = None;
@@ -350,5 +395,58 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             tracing::warn!("实例 {} 推进失败: {e:#}", r.definition.id);
         }
         ticks = ticks.wrapping_add(1);
+    }
+}
+
+#[cfg(test)]
+mod history_revision_tests {
+    use super::*;
+    use n_core::sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    #[tokio::test]
+    async fn revision_detects_backfill_and_derived_updates_without_loading_bar_payloads() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE TABLE klines(symbol TEXT,timeframe TEXT,ts TEXT,source TEXT)".to_owned(),
+        ))
+        .await
+        .unwrap();
+        let empty = market_history_revision(&db, "PB0", "15m").await.unwrap();
+        assert!(empty.is_empty());
+        db.execute(Statement::from_string(DbBackend::Sqlite,
+            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:05:00','raw'),('PB0','15m','2026-10-27 10:00:00','derived')".to_owned()
+        )).await.unwrap();
+        let initial = market_history_revision(&db, "PB0", "15m").await.unwrap();
+        assert_eq!(
+            initial,
+            market_history_revision(&db, "PB0", "15m").await.unwrap()
+        );
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:00:00','raw')".to_owned(),
+        ))
+        .await
+        .unwrap();
+        let backfilled = market_history_revision(&db, "PB0", "15m").await.unwrap();
+        assert_ne!(initial, backfilled);
+        assert_eq!(initial[1].1, backfilled[1].1);
+        db.execute(Statement::from_string(DbBackend::Sqlite,
+            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:10:00','derived'),('CU0','5m','2026-10-27 10:10:00','raw')".to_owned()
+        )).await.unwrap();
+        assert_eq!(
+            backfilled,
+            market_history_revision(&db, "PB0", "15m").await.unwrap()
+        );
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "INSERT INTO klines VALUES('PB0','15m','2026-10-27 10:15:00','derived')".to_owned(),
+        ))
+        .await
+        .unwrap();
+        assert_ne!(
+            backfilled,
+            market_history_revision(&db, "PB0", "15m").await.unwrap()
+        );
     }
 }

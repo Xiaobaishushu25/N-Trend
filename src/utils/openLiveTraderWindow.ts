@@ -2,6 +2,7 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow"
 import { isTauri } from "@tauri-apps/api/core"
 import { isNativeMobile, usePlatform } from './platform'
 import router from '../router'
+import { traderWindowTitle } from './traderWindowTitle'
 
 async function showAndFocusWindow(label: string): Promise<boolean> {
   try {
@@ -22,7 +23,7 @@ export async function openLiveTraderWindow(instanceId?: string | unknown, titleN
   const hasInstance = Boolean(targetId)
   const windowLabel = hasInstance ? `live-trader-${targetId!.replace(/[^a-zA-Z0-9_-]/g, '_')}` : 'live-trader'
   const targetUrl = hasInstance ? `/#/live-trader?instance_id=${encodeURIComponent(targetId!)}` : '/#/live-trader'
-  const targetTitle = hasInstance ? `实盘量化执行终端 · ${titleName || targetId}` : '实盘量化执行终端'
+  const targetTitle = traderWindowTitle(undefined, hasInstance ? (titleName || targetId) : undefined)
 
   if (isNativeMobile || isMobile.value || !isTauri()) {
     void router.push({

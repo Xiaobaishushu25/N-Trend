@@ -6,6 +6,7 @@ import socketserver
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import types
 import unittest
@@ -19,6 +20,10 @@ def load_bridge():
     api.CThostFtdcQryTradingAccountField = types.SimpleNamespace
     api.CThostFtdcQryInvestorPositionField = types.SimpleNamespace
     api.CThostFtdcInputOrderActionField = types.SimpleNamespace
+    api.CThostFtdcInputOrderField = types.SimpleNamespace
+    for name in ["D_Buy", "D_Sell", "OF_Open", "OF_CloseToday", "OF_Close", "OPT_LimitPrice",
+                 "HF_Speculation", "TC_GFD", "VC_AV", "CC_Immediately", "FCC_NotForceClose"]:
+        setattr(api, "THOST_FTDC_" + name, name)
     api.THOST_FTDC_AF_Delete = "0"
     api.THOST_FTDC_PD_Long = "2"
     package = types.ModuleType("openctp_ctp")
@@ -132,6 +137,67 @@ class QueryTests(unittest.TestCase):
         self.assertTrue(self.m.api.wait_for(2))
         self.assertEqual([c[0] for c in self.m.api.calls], ["account", "positions"])
         self.assertGreaterEqual(self.m.api.calls[1][2] - self.m.api.calls[0][2], 0.03)
+
+    def test_query_sdk_call_allows_a_callback_to_acquire_state_lock(self):
+        callback_finished = threading.Event()
+        blocked = []
+        callbacks = []
+
+        def send(req, req_id):
+            def callback():
+                self.m.OnRspQryTradingAccount(account(), None, req_id, True)
+                callback_finished.set()
+            worker = threading.Thread(target=callback, daemon=True)
+            callbacks.append(worker)
+            worker.start()
+            blocked.append(not callback_finished.wait(0.5))
+            return 0
+
+        self.m.api.ReqQryTradingAccount = send
+        self.m.query_account()
+        self.m._start_periodic_query()
+        self.assertTrue(callback_finished.wait(2))
+        self.m.stop()
+        for worker in callbacks:
+            worker.join(timeout=1)
+        self.assertEqual(blocked, [False])
+        self.assertIsNone(self.m._inflight)
+
+    def test_concurrent_order_replay_is_idempotent_without_blocking_spi_callback(self):
+        self.m.is_ready = True
+        callback_finished = threading.Event()
+        blocked = []
+        calls = []
+        results = []
+        start = threading.Barrier(3)
+        with tempfile.TemporaryDirectory() as directory:
+            self.m._journal_path = str(pathlib.Path(directory) / "journal.json")
+
+            def send(req, req_id):
+                calls.append(req.OrderRef)
+                saved = json.loads(pathlib.Path(self.m._journal_path).read_text(encoding="utf-8"))
+                self.assertIn("1001", saved)
+                worker = threading.Thread(target=lambda: (self.m.health_snapshot(), callback_finished.set()), daemon=True)
+                worker.start()
+                blocked.append(not callback_finished.wait(0.5))
+                return 0
+
+            def submit():
+                start.wait()
+                results.append(self.m.send_order("pb2611", "buy", "open", 1000, 1, custom_ref="1001"))
+
+            self.m.api.ReqOrderInsert = send
+            workers = [threading.Thread(target=submit, daemon=True) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            start.wait()
+            for worker in workers:
+                worker.join(timeout=2)
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(calls, ["1001"])
+            self.assertEqual(blocked, [False])
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result["success"] for result in results))
 
     def test_position_snapshot_is_atomic_aggregated_and_can_be_empty(self):
         self.m.positions = {"old": {"position": 1}}

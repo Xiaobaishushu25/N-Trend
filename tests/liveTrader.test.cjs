@@ -446,6 +446,20 @@ test('legacy invalid-input audits retain per-signal identity and show unavailabl
   assert.match(row.note, /缺少该合约的费用参数/)
 })
 
+test('B5 filtered signals retain their strategy identity without inventing an event ID', () => {
+  const { store } = setup()
+  const key = 'CJ0|up|2026-10-28 09:00:00|2026-10-28 09:15:00|2026-10-28 09:30:00|2026-10-28 09:30:00'
+  store.applySnapshot({ ...snapshot(), strategy: { revision: '1' }, strategy_diagnostics: {
+    states: { '1': { decisions: { [key]: { reason: 'target_cost_above10', values: {
+      snapshot: { symbol: 'CJ0', instrument: 'CJ701', direction: 'Long', warning_ts: '2026-10-28 09:30:00' },
+      cost_to_gross_space: 0.32,
+    } } } } },
+  } })
+  assert.equal(store.conditionPool[0].signal_key, key)
+  assert.equal(store.conditionPool[0].event_id, null)
+  assert.equal(store.conditionPool[0].symbol, 'CJ0')
+})
+
 test('all P2/P3 pre-entry filters have readable reasons', () => {
   const { store } = setup()
   for (const reason of ['score_below_min', 'risk_ticks_below_min', 'friction_above20', 'atr_unavailable',

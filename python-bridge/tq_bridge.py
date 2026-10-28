@@ -257,6 +257,7 @@ class TqDataWorker:
         self.execution_events = deque(maxlen=4096)
         self.execution_seq = 0
         self.execution_latest = {}
+        self.execution_books = {}
         self.events = deque(maxlen=2048)
         self.events_lock = threading.Lock()
         self.next_event_id = itertools.count(1)
@@ -512,22 +513,50 @@ class TqDataWorker:
         if updated:
             self.last_market_event_at = time.time()
             self._detect_closed_bars()
-            for code, tq_symbol in list(self.execution_symbols.items()):
-                quote = self.quotes.get(tq_symbol)
-                if quote is None:
-                    continue
-                data = execution_quote(quote, tq_symbol)
-                with self.events_lock:
-                    if self.execution_latest.get(code) != data:
-                        self.execution_latest[code] = data
-                        self.execution_seq += 1
-                        self.execution_events.append({"id": self.execution_seq, "code": code, "quote": data})
+            self._publish_execution_quotes()
         return updated
+
+    def _publish_execution_quotes(self):
+        books = {}
+        for code, tq_symbol in list(self.execution_symbols.items()):
+            source = self.quotes.get(tq_symbol)
+            if source is None:
+                continue
+            actual = tq_symbol
+            if tq_symbol.startswith("KQ."):
+                actual = str(getattr(source, "underlying_symbol", "") or "")
+            # Continuous/index prices are never relabelled as executable books.
+            # An unresolved/rolled alias emits an invalid quote to invalidate its
+            # former book; the new actual SDK subscription supplies all prices.
+            if re.fullmatch(r"[A-Z]+\.[A-Za-z]+[0-9]{3,4}", actual or ""):
+                if actual not in self.quotes:
+                    self.quote_symbols.add(actual)
+                    self.quotes[actual] = self.api.get_quote(actual)
+                data = execution_quote(self.quotes[actual], actual)
+                data["underlying_symbol"] = actual
+            else:
+                data = execution_quote(None, "")
+            key = actual if data["instrument_id"] else "unresolved:" + code
+            entry = books.setdefault(key, {"code": code, "codes": [], "quote": data})
+            entry["codes"].append(code)
+        with self.events_lock:
+            for key, entry in books.items():
+                for code in entry["codes"]:
+                    self.execution_latest[code] = entry["quote"]
+                previous = self.execution_books.get(key)
+                # Aliases of one SDK book share one tick. Adding an alias must
+                # not fabricate a next quote for the strategy's entry gate.
+                if previous is None or previous["quote"] != entry["quote"]:
+                    self.execution_seq += 1
+                    self.execution_events.append({"id": self.execution_seq, **entry})
+            self.execution_books = books
 
     def _handle_cmd(self, cmd: str, args: dict):
         if cmd == "subscribe_execution":
             self.execution_symbols.update(args["mapping"])
-            return self._handle_cmd("subscribe_quotes", {"tq_symbols": list(args["mapping"].values())})
+            result = self._handle_cmd("subscribe_quotes", {"tq_symbols": list(args["mapping"].values())})
+            self._publish_execution_quotes()
+            return result
         if cmd == "subscribe_quotes":
             tq_symbols = args["tq_symbols"]
             self.quote_symbols.update(tq_symbols)
@@ -1090,6 +1119,19 @@ def execution_quote(q, tq_symbol):
             "datetime": str(getattr(q, "datetime", "") or "")}
 
 
+def requested_execution_event(event, mapping):
+    aliases = [code for code in event.get("codes", [event["code"]]) if code in mapping]
+    if not aliases:
+        actual = event["quote"]["underlying_symbol"]
+        aliases = [code for code, symbol in mapping.items() if actual and symbol == actual]
+    if not aliases:
+        return None
+    # Keep the requested main alias for strategy context, while actual-contract
+    # subscribers in other instances can still route by quote.instrument_id.
+    code = next((code for code in aliases if mapping[code].startswith("KQ.")), aliases[0])
+    return {"id": event["id"], "code": code, "quote": event["quote"]}
+
+
 async def handle_execution_events(request):
     if not worker or not worker.connected:
         return web.json_response({"error": "行情连接未就绪"}, status=503)
@@ -1104,13 +1146,16 @@ async def handle_execution_events(request):
     reset = data.get("stream_id") != STREAM_ID
     deadline = time.monotonic() + min(25.0, float(data.get("wait_seconds", 20)))
     while True:
+        if not worker.connected:
+            return web.json_response({"error": "行情连接中断"}, status=503)
         with worker.events_lock:
             oldest = worker.execution_events[0]["id"] if worker.execution_events else 0
             gap = not reset and after > 0 and oldest > after + 1
-            events = [event.copy() for event in worker.execution_events if event["id"] > after and event["code"] in mapping]
+            source = [event for event in worker.execution_events if event["id"] > after]
             if reset:
-                events = [{"id": worker.execution_seq, "code": code, "quote": dict(quote)}
-                          for code, quote in worker.execution_latest.items() if code in mapping]
+                source = [{"id": worker.execution_seq, **entry} for entry in worker.execution_books.values()]
+            events = [selected for event in source
+                      if (selected := requested_execution_event(event, mapping)) is not None]
             latest = worker.execution_seq
         if events or reset or gap or time.monotonic() >= deadline:
             return web.json_response({"stream_id": STREAM_ID, "latest_event_id": latest, "gap": gap, "events": events})

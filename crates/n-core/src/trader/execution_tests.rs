@@ -977,3 +977,329 @@ async fn comparison_archive_failure_does_not_disable_real_stop_orders() {
     assert!(engine.state.lock().await.persistence_error.is_none());
     assert!(engine.comparison_summary().await["archive_error"].is_string());
 }
+
+#[tokio::test]
+async fn quote_gap_protects_live_exposure_without_reopening_historical_tasks() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+    )
+    .await;
+    {
+        let mut s = engine.state.lock().await;
+        let mut historical = s.conditions[&id].clone();
+        historical.id = "historical".into();
+        historical.state = ConditionState::Closed;
+        historical.note = "already closed".into();
+        s.conditions.insert(historical.id.clone(), historical);
+        let mut position = s.positions[&id].clone();
+        position.id = "historical".into();
+        position.is_closed = true;
+        position.volume = 0;
+        s.positions.insert(position.id.clone(), position);
+        let mut historical_order = s.orders.values().next().unwrap().clone();
+        historical_order.condition_id = "historical".into();
+        s.orders
+            .insert("historical".into(), historical_order.clone());
+        let mut rejected = s.conditions[&id].clone();
+        rejected.id = "rejected".into();
+        rejected.state = ConditionState::Rejected;
+        s.conditions.insert(rejected.id.clone(), rejected);
+        historical_order.condition_id = "rejected".into();
+        historical_order.phase = OrderPhase::Rejected;
+        historical_order.filled = 0;
+        historical_order.reported_filled = 0;
+        s.orders.insert("rejected".into(), historical_order);
+        // An orphaned archive entry must not panic the risk handler.
+        let mut orphan = s.orders.values().next().unwrap().clone();
+        orphan.condition_id = "missing".into();
+        orphan.phase = OrderPhase::Unknown;
+        s.orders.insert("orphan".into(), orphan);
+    }
+    engine
+        .quote_gap_with_reason("offline regression")
+        .await
+        .unwrap();
+    {
+        let s = engine.state.lock().await;
+        assert_eq!(s.closes.len(), 1);
+        assert_eq!(s.closes[&id].reason, "market_gap");
+        assert!(s.aborted_entries.contains(&id));
+        assert!(!s.aborted_entries.contains("historical"));
+        assert!(!s.aborted_entries.contains("rejected"));
+        assert_eq!(s.conditions["historical"].state, ConditionState::Closed);
+        assert_eq!(s.conditions["historical"].note, "already closed");
+        assert_eq!(s.conditions["rejected"].state, ConditionState::Rejected);
+        assert!(s.quotes.is_empty());
+        assert!(s
+            .market_error
+            .as_ref()
+            .unwrap()
+            .contains("offline regression"));
+        assert!(s.error.is_none());
+    }
+    // Recovery clears transport health but never releases the latched exit.
+    engine.market_recovered().await;
+    assert!(engine.state.lock().await.market_error.is_some());
+    engine.drive().await.unwrap();
+    assert_eq!(counter.inserts().len(), 1);
+    age(&engine).await;
+    quote(&engine, 1001.0).await;
+    assert!(engine.execution_error().await.is_none());
+    assert_eq!(engine.state.lock().await.closes[&id].reason, "market_gap");
+    assert_eq!(counter.inserts().len(), 2);
+    assert_eq!(counter.inserts()[1]["offset"], "auto");
+    assert_eq!(counter.inserts()[1]["volume"], 2);
+    drop(engine);
+    let restored = counter.engine(ExecutionMode::FullAuto, 2);
+    assert_eq!(restored.state.lock().await.closes[&id].reason, "market_gap");
+}
+
+#[tokio::test]
+async fn quote_gap_keeps_terminal_orders_with_unreconciled_fills_protected() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(&engine, vec![order(&open, "canceled", 1)], vec![]).await;
+    engine.quote_gap().await.unwrap();
+    assert!(engine.state.lock().await.aborted_entries.contains(&id));
+    ready(
+        &engine,
+        vec![order(&open, "canceled", 1)],
+        vec![trade(&open, "late-fill", 1, 1000.0)],
+    )
+    .await;
+    age(&engine).await;
+    quote(&engine, 1001.0).await;
+    assert_eq!(counter.inserts().len(), 2);
+    assert_eq!(counter.inserts()[1]["volume"], 1);
+    assert_eq!(counter.inserts()[1]["offset"], "auto");
+}
+
+#[tokio::test]
+async fn quote_batch_keeps_an_intermediate_stop_and_persists_before_using_latest_book() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+    )
+    .await;
+    age(&engine).await;
+    let mut q = engine.state.lock().await.quotes["PB2611"].clone();
+    q.last = 989.0;
+    q.bid = 988.0;
+    q.ask = 990.0;
+    let first = ("PB2611".into(), q.clone());
+    q.last = 1001.0;
+    q.bid = 1000.0;
+    q.ask = 1002.0;
+    engine
+        .on_quote_batch(vec![first, ("PB2611".into(), q)])
+        .await
+        .unwrap();
+    assert_eq!(engine.state.lock().await.closes[&id].reason, "stop");
+    assert_eq!(counter.inserts().len(), 2);
+    assert_eq!(counter.inserts()[1]["offset"], "auto");
+    assert!(counter.inserts()[1]["price"].as_f64().unwrap() >= 990.0);
+    drop(engine);
+    let restored = counter.engine(ExecutionMode::FullAuto, 2);
+    assert_eq!(restored.state.lock().await.closes[&id].reason, "stop");
+}
+
+#[tokio::test]
+async fn batched_observation_persists_a_stop_immediately_before_the_batch_finishes() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+    )
+    .await;
+    let mut q = engine.state.lock().await.quotes["PB2611"].clone();
+    q.last = 989.0;
+    q.bid = 988.0;
+    q.ask = 990.0;
+    engine
+        .observe_quotes([("PB2611".into(), q)].into_iter().collect(), false)
+        .await
+        .unwrap();
+    let persisted: ExecutionState = serde_json::from_slice(
+        &std::fs::read(counter.directory.join("trader_execution.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted.closes[&id].reason, "stop");
+    assert!(persisted.aborted_entries.contains(&id));
+    assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn quote_gap_health_waits_for_fresh_data_without_clearing_broker_errors() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::MonitorOnly, 2);
+    quote(&engine, 1000.0).await;
+    let mut q = engine.state.lock().await.quotes["PB2611"].clone();
+    engine.quote_gap().await.unwrap();
+    q.timestamp -= 60;
+    engine
+        .on_quotes([("PB2611".into(), q.clone())].into_iter().collect())
+        .await
+        .unwrap();
+    assert!(engine.state.lock().await.market_error.is_some());
+    engine.state.lock().await.error = Some("broker mismatch".into());
+    q.timestamp = chrono::Utc::now().timestamp();
+    engine
+        .on_quotes([("PB2611".into(), q)].into_iter().collect())
+        .await
+        .unwrap();
+    assert!(engine.state.lock().await.market_error.is_none());
+    assert_eq!(
+        engine.execution_error().await.as_deref(),
+        Some("broker mismatch")
+    );
+}
+
+#[tokio::test]
+async fn idle_transport_recovery_works_for_n_p2_and_b5_without_clearing_other_errors() {
+    use crate::trader::{b5, candidates};
+    for definition in [
+        StrategyDefinition::default(),
+        candidates::definition(candidates::P2, candidates::Parameters::reference_snapshot()),
+        b5::definition(),
+    ] {
+        let counter = Counter::new();
+        let engine = counter.engine(ExecutionMode::FullAuto, 2);
+        engine.set_definition(definition).await.unwrap();
+        engine.pause(true).await.unwrap();
+        engine.market_unavailable().await;
+        assert!(engine.execution_error().await.is_some());
+        engine.market_recovered().await; // healthy heartbeat, no quotes at all
+        assert!(engine.execution_error().await.is_none());
+        {
+            let mut s = engine.state.lock().await;
+            assert!(s.paused);
+            assert!(s.quotes.is_empty());
+            s.error = Some("broker mismatch".into());
+            s.persistence_error = Some("disk full".into());
+            s.strategy_error = Some("strategy failed".into());
+        }
+        engine.market_recovered().await;
+        let s = engine.state.lock().await;
+        assert_eq!(s.error.as_deref(), Some("broker mismatch"));
+        assert_eq!(s.persistence_error.as_deref(), Some("disk full"));
+        assert_eq!(s.strategy_error.as_deref(), Some("strategy failed"));
+        assert!(counter.inserts().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovered_transport_cannot_submit_using_a_closed_session_book() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    register(&engine, 1000.0, 990.0).await;
+    // Cache a valid book without driving, then simulate a transport failure.
+    let mut q = ExecutionQuote {
+        instrument_id: "pb2611".into(),
+        exchange_id: "SHFE".into(),
+        underlying_symbol: String::new(),
+        last: 1000.,
+        bid: 999.,
+        ask: 1001.,
+        tick: 1.,
+        lower: 500.,
+        upper: 2000.,
+        timestamp: chrono::Utc::now().timestamp(),
+    };
+    engine
+        .on_quotes([("PB0".into(), q.clone())].into_iter().collect())
+        .await
+        .unwrap();
+    engine.market_unavailable().await;
+    engine.market_recovered().await;
+    engine.drive().await.unwrap();
+    assert!(counter.inserts().is_empty());
+    q.timestamp -= 60;
+    engine
+        .on_quote_batch(vec![("PB0".into(), q.clone())])
+        .await
+        .unwrap();
+    assert!(counter.inserts().is_empty());
+    assert!(engine.execution_error().await.is_none());
+    q.timestamp = chrono::Utc::now().timestamp();
+    engine
+        .on_quote_batch(vec![("PB0".into(), q)])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn strategy_quote_callback_sees_current_alias_book_on_first_tick_and_roll() {
+    struct AliasStrategy;
+    impl Strategy for AliasStrategy {
+        fn on_event(
+            &self,
+            event: &StrategyEvent,
+            c: &StrategyContext<'_>,
+            state: &mut Value,
+        ) -> Result<Vec<TradeIntent>> {
+            if let StrategyEvent::Quote(q) = event {
+                let alias = &c.quotes["PB0"];
+                assert_eq!(alias.instrument_id, q.instrument_id);
+                assert_eq!(alias.last, q.last);
+                *state = json!({"seen": q.instrument_id});
+            }
+            Ok(vec![])
+        }
+    }
+    let counter = Counter::new();
+    let mut engine = counter.engine(ExecutionMode::MonitorOnly, 2);
+    let mut registry = StrategyRegistry::default();
+    registry.register_strategy(N_STRATEGY, N_VERSION, |_| Ok(Box::new(AliasStrategy)));
+    engine.registry = Arc::new(registry);
+    for (instrument, price) in [("pb2611", 1000.), ("pb2612", 1100.)] {
+        let q = ExecutionQuote {
+            instrument_id: instrument.into(),
+            exchange_id: "SHFE".into(),
+            underlying_symbol: format!("SHFE.{instrument}"),
+            last: price,
+            bid: price - 1.,
+            ask: price + 1.,
+            tick: 1.,
+            lower: 500.,
+            upper: 2000.,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        engine
+            .on_quote_batch(vec![("PB0".into(), q)])
+            .await
+            .unwrap();
+        let s = engine.state.lock().await;
+        assert!(s.strategy_error.is_none());
+        assert_eq!(
+            s.strategy_states[&s.definition.revision]["seen"],
+            instrument
+        );
+    }
+}

@@ -75,21 +75,41 @@ export interface NotifyItem {
   manualLevel?: ManualLevelAlert
 }
 
-export const notifyItems = reactive<NotifyItem[]>([])
+const globalScope = (typeof window !== 'undefined' ? window : globalThis) as any
 
-const timers = new Map<number, ReturnType<typeof setTimeout>>()
+if (!globalScope.__ntrend_notify_items) {
+  globalScope.__ntrend_notify_items = reactive<NotifyItem[]>([])
+}
+export const notifyItems: NotifyItem[] = globalScope.__ntrend_notify_items
+
+if (!globalScope.__ntrend_notify_timers) {
+  globalScope.__ntrend_notify_timers = new Map<number, ReturnType<typeof setTimeout>>()
+}
+const timers: Map<number, ReturnType<typeof setTimeout>> = globalScope.__ntrend_notify_timers
+
 let seed = 0
-let hostApp: ReturnType<typeof createApp> | null = null
+let hostApp: ReturnType<typeof createApp> | null = globalScope.__ntrend_notify_host_app || null
 
 function ensureHost() {
   if (hostApp) return
   // 通知只在主窗口展示，设置窗口等子窗口不弹右下角通知
   if (!isMainWindow()) return
-  const container = document.createElement('div')
-  container.className = 'app-notify-host-root'
-  document.body.appendChild(container)
+  if (typeof document === 'undefined') return
+  let container = document.querySelector('.app-notify-host-root') as HTMLDivElement | null
+  if (!container) {
+    container = document.createElement('div')
+    container.className = 'app-notify-host-root'
+    document.body.appendChild(container)
+  } else {
+    container.innerHTML = ''
+  }
   hostApp = createApp(AppNotificationHost)
   hostApp.mount(container)
+  globalScope.__ntrend_notify_host_app = hostApp
+}
+
+if (typeof window !== 'undefined') {
+  ensureHost()
 }
 
 export function isMainWindow(): boolean {
@@ -174,6 +194,7 @@ export function dismissAll() {
   timers.clear()
   notifyItems.splice(0, notifyItems.length)
 }
+globalScope.__ntrend_dismiss_all = dismissAll
 
 /** 悬停暂停：记住剩余时长并取消定时器 */
 export function suspend(id: number) {
