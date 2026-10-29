@@ -195,6 +195,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     migrate_pattern_event_unique(db).await?;
     create_finality_tables(db).await?;
     create_v2_tables(db).await?;
+    crate::quality::store::ensure(db).await?;
     info!("数据库表结构已就绪");
     Ok(())
 }

@@ -9,6 +9,7 @@ pub mod finality;
 pub mod integrity;
 pub mod notify;
 pub mod precision;
+pub mod quality;
 pub mod process;
 pub mod scheduler;
 pub mod service;

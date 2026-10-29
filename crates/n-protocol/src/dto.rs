@@ -266,6 +266,8 @@ pub struct RefreshStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScanResult {
+    #[serde(default)]
+    pub quality_by_event: std::collections::BTreeMap<i64, crate::quality::SignalQualityDto>,
     pub scanned: i64,
     pub active_count: i64,
     pub summary: String,
@@ -284,6 +286,8 @@ pub struct OutcomeRefresh {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutcomeDetail {
     pub event_id: i64,
+    #[serde(default)]
+    pub quality: Option<crate::quality::SignalQualityDto>,
     pub symbol: String,
     pub logic_version: String,
     pub warning_kind: String,

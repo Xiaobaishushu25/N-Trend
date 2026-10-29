@@ -46,3 +46,7 @@ path = "src/bin/signal_optimize.rs"
 [[bin]]
 name = "signal-search"
 path = "src/bin/signal_search.rs"
+
+[[bin]]
+name = "signal-quality"
+path = "src/quality/cli.rs"

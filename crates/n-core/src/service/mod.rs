@@ -58,6 +58,7 @@ pub struct ScanResult {
     pub active_count: i64,
     pub summary: String,
     pub signals: Vec<pattern_events::Model>,
+    pub quality_by_event: HashMap<i64, n_protocol::quality::SignalQualityDto>,
     /// 本轮扫描新识别出的预警事件
     pub new_warnings: Vec<pattern_events::Model>,
     /// 本轮推进时新触发的事件
@@ -94,6 +95,7 @@ pub struct OutcomeRefresh {
 #[derive(Debug, Clone, Serialize)]
 pub struct OutcomeDetail {
     pub event_id: i64,
+    pub quality: Option<n_protocol::quality::SignalQualityDto>,
     pub symbol: String,
     /// 事件版本：前向事件系统固定为 4
     pub logic_version: String,
@@ -330,6 +332,37 @@ pub(crate) async fn insert_warning_event(
         },
     )
     .await?;
+    // Display-only sidecar runs after legacy candidate selection and persistence.
+    // Its failure must not prevent a legacy warning from being delivered.
+    if crate::quality::store::enabled(db).await {
+        let origin = if recent
+            && repo::get_setting(db, "signal_origin")
+                .await
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some("historical_rebuild")
+        {
+            "live_frozen"
+        } else {
+            "historical_recompute"
+        };
+        let tick = match candidate.direction {
+            Dir::Up => candidate.entry - bars[candidate.warning_index].high,
+            Dir::Down => bars[candidate.warning_index].low - candidate.entry,
+        };
+        let evaluation = crate::quality::evaluate(
+            &model,
+            bars,
+            tick,
+            &model.warning_ts,
+            origin,
+            &crate::quality::Rules::default(),
+        );
+        if let Err(error) = crate::quality::store::save(db, &evaluation).await {
+            tracing::warn!(event_id = model.id, "保存独立形态评价失败: {error:#}");
+        }
+    }
     Ok(model)
 }
 
@@ -600,6 +633,7 @@ fn stat_row_from(e: &pattern_events::Model, _tick: Option<f64>) -> Option<outcom
 fn outcome_detail_from(e: &pattern_events::Model, _tick: Option<f64>) -> OutcomeDetail {
     OutcomeDetail {
         event_id: e.id,
+        quality: None,
         symbol: e.symbol.clone(),
         logic_version: EVENT_LOGIC_VERSION.to_string(),
         warning_kind: e.warning_kind.clone(),
@@ -1290,7 +1324,6 @@ pub struct Services {
     pub active_single_bars: Arc<RwLock<HashMap<String, crate::analyze::model::SingleBarAlert>>>,
     /// 仅供图表读取的后台实时快照，不进入正式库和策略。
     pub live_chart: Arc<live_chart::LiveChartCache>,
-
 }
 
 impl Services {
@@ -3477,7 +3510,9 @@ impl Services {
                     && recovery_message.is_empty()
                 {
                     "历史数据已获取，实时柱正在准备；就绪后自动推送更新。".into()
-                } else { recovery_message },
+                } else {
+                    recovery_message
+                },
                 partial_bar,
             });
         }
@@ -4240,7 +4275,9 @@ impl Services {
             cache.retain(|_, v| v.expire_bar_ts > now_str);
         }
 
+        let quality_by_event = crate::quality::store::display(&self.db, &signals).await;
         Ok(ScanResult {
+            quality_by_event,
             scanned,
             active_count,
             summary,
@@ -4471,6 +4508,16 @@ impl Services {
                 .then_with(|| b.event_id.cmp(&a.event_id))
         });
         rows.truncate(limit);
+        let ids: HashSet<_> = rows.iter().map(|r| r.event_id).collect();
+        let selected: Vec<_> = events
+            .iter()
+            .filter(|e| ids.contains(&e.id))
+            .cloned()
+            .collect();
+        let qualities = crate::quality::store::display(&self.db, &selected).await;
+        for row in &mut rows {
+            row.quality = qualities.get(&row.event_id).cloned();
+        }
         let mut annotations_by_event: HashMap<i64, Vec<SignalAnnotationDto>> = HashMap::new();
         for ann in repo::all_signal_annotations(&self.db).await? {
             annotations_by_event
@@ -4521,6 +4568,9 @@ impl Services {
                 .then(|| crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety))
         });
         let mut outcome = outcome_detail_from(&row, tick);
+        outcome.quality = crate::quality::store::display(&self.db, std::slice::from_ref(&row))
+            .await
+            .remove(&event_id);
         let bars = self.bars_for(&row.symbol, "15m").await?;
         let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
         let index_by_ts: HashMap<String, usize> = bars
@@ -5300,6 +5350,7 @@ mod tests {
 
     fn scan_result(scores: &[f64]) -> ScanResult {
         ScanResult {
+            quality_by_event: HashMap::new(),
             scanned: 0,
             active_count: scores.len() as i64,
             summary: String::new(),

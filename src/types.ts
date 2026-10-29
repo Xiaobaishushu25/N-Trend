@@ -155,6 +155,7 @@ export interface ManualLevelInput {
 }
 
 export interface PatternDto {
+  quality?: SignalQualityDto | null
   number: number
   level: string
   /** 分析版本：1 = 原逻辑，2 = 严格N字 + 箱体；旧记录默认视为 1 */
@@ -221,6 +222,7 @@ export interface AnalysisDetail {
 
 /** 前向信号事件：预警K线收盘即创建，AB端点/预警K线/入场评分落库后永不回改 */
 export interface PatternEvent {
+  quality?: SignalQualityDto | null
   id: number
   symbol: string
   direction: string
@@ -356,6 +358,7 @@ export interface SingleBarEvent {
 }
 
 export interface ScanResult {
+  quality_by_event?: Record<string, SignalQualityDto>
   scanned: number
   active_count: number
   summary: string
@@ -559,6 +562,7 @@ export interface ReviewStats {
 
 /** 复盘页明细表一行 */
 export interface OutcomeDetail {
+  quality?: SignalQualityDto | null
   event_id: number
   symbol: string
   logic_version: string
@@ -1169,3 +1173,26 @@ export interface LiveTradeStatistics {
   total_pnl?: number
 }
 
+/** Independent display-only quality; never a win probability or execution score. */
+export interface SignalQualityDto {
+  event_id: number
+  event_key: string
+  warning_ts: string
+  timeframe: string
+  feature_version: string
+  rules_version: string
+  parameter_hash: string
+  input_hash: string
+  origin: string
+  status: string
+  morphology_score: number | null
+  space_score: number | null
+  quality_score: number | null
+  trend_score: number | null
+  a_score: number | null
+  b_score: number | null
+  features: Record<string, number | null>
+  contributions: { name: string; score: number; weight: number; contribution: number }[]
+  explanations: string[]
+  flags: string[]
+}

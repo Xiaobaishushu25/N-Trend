@@ -54,9 +54,14 @@ impl TradingSessionSpec {
 
     /// 判断当前时刻是否处于该品种的有效交易时间窗口内（含收盘边界分钟）。
     pub fn is_in_trading_time(&self, dt: &DateTime<Local>) -> bool {
+        self.is_in_trading_time_naive(&dt.naive_local())
+    }
+
+    /// Exchange wall-clock adapter for historical data, independent of host timezone.
+    pub fn is_in_trading_time_naive(&self, dt: &NaiveDateTime) -> bool {
         let (h, m) = (dt.hour(), dt.minute());
         let t_mins = h * 60 + m; // 0..1439
-        let date = dt.date_naive();
+        let date = dt.date();
 
         // 1. 日盘时段（09:00-10:15, 10:30-11:30, 13:30-15:00）：必须是法定交易日
         let is_day_window = (540..=615).contains(&t_mins)

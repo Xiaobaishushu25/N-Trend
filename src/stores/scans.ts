@@ -108,8 +108,9 @@ export const useScansStore = defineStore('scans', {
         const sym = symbolsStore.symbols.find((x) => x.code === code)
         return sym && sym.name !== code ? sym.name : ''
       }
-      this.latest = result
-      this.latestSignals = activeSignals(result.signals)
+      const decorated = result.signals.map(e => ({ ...e, quality: result.quality_by_event?.[String(e.id)] ?? e.quality }))
+      this.latest = { ...result, signals: decorated }
+      this.latestSignals = activeSignals(decorated)
       if (result.single_bars?.length) {
         ensureCleanup(this)
         // 单K锤/针：仅对本轮新增的 symbol+trigger_bar_ts 弹一次局内通知（15m内去重）

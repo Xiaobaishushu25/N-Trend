@@ -47,7 +47,17 @@ pub async fn get_active_events(
                 .into_iter()
                 .filter(|e| e.state == "pending" || e.state == "triggered")
                 .collect();
-            Ok(Json(serde_json::to_value(active).unwrap_or_default()))
+            let qualities = n_core::quality::store::display(&ctx.db, &active).await;
+            let decorated: Vec<_> = active
+                .iter()
+                .map(|event| {
+                    let mut value = serde_json::to_value(event).unwrap_or_default();
+                    value["quality"] =
+                        serde_json::to_value(qualities.get(&event.id)).unwrap_or_default();
+                    value
+                })
+                .collect();
+            Ok(Json(serde_json::to_value(decorated).unwrap_or_default()))
         }
         Err(e) => {
             let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取活跃形态失败: {e}"), "");

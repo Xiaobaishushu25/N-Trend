@@ -37,9 +37,16 @@ import {
 import { formatPnlAmount, formatPnlPoints, formatRMultiple } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import type { OpenReviewChartPayload } from '../types'
+import SignalQuality from '../components/SignalQuality.vue'
+import SignalQualityControls from '../components/SignalQualityControls.vue'
+import { compareQuality } from '../utils/signalQuality'
+import { useSignalQualityStore } from '../stores/signalQuality'
 
 const router = useRouter()
 const review = useTradeReviewStore()
+const qualityDisplay = useSignalQualityStore()
+const qualitySort = ref(false)
+const displayedTickets = computed(() => qualitySort.value && qualityDisplay.enabled ? [...review.filteredTickets].sort((a,b) => compareQuality(a.raw.quality,b.raw.quality)) : review.filteredTickets)
 
 function onHeaderMouseDown(e: MouseEvent) {
   if (!isTauri() || e.button !== 0) return
@@ -290,6 +297,7 @@ async function openChartForTicket(ticket: TradeReviewTicket) {
           style="width: 140px"
         />
 
+        <SignalQualityControls v-model:sort="qualitySort" />
         <div class="lots-selector"><span class="lots-label">按冻结策略手数统计；费用为研究估算</span></div>
       </div>
     </div>
@@ -313,7 +321,7 @@ async function openChartForTicket(ticket: TradeReviewTicket) {
 
       <div v-else class="tickets-feed">
         <article
-          v-for="ticket in review.filteredTickets"
+          v-for="ticket in displayedTickets"
           :key="ticket.event_id"
           class="ticket-card"
           :class="[
@@ -377,6 +385,8 @@ async function openChartForTicket(ticket: TradeReviewTicket) {
               <!-- 形态评分标签 -->
               <span class="spec-tag">{{ levelLabel(ticket.level) }}N · {{ ticket.grade }}</span>
               <span class="score-tag">评分 {{ ticket.entry_score.toFixed(2) }}</span>
+
+              <SignalQuality :quality="ticket.raw.quality" :old-score="ticket.entry_score" :rr="ticket.raw.rr" />
 
               <!-- 合约乘数提示 -->
               <span class="multiplier-tag">{{ ticket.multiplier }}吨/点</span>

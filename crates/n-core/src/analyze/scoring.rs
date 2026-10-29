@@ -160,6 +160,18 @@ pub(crate) fn a_leg_detail(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) ->
     }
 }
 
+/// Read-only count of legacy big reverse candles; does not change scoring.
+pub(crate) fn a_leg_big_reverse_count(bars: &[Bar], atr20: &[Option<f64>], p: &NPattern) -> usize {
+    (p.s0.index..=p.s1.index)
+        .filter(|&i| {
+            bars.get(i).is_some_and(|bar| {
+                a_leg_bar_score_detail(bar, atr20.get(i).copied().flatten(), p.dir).1
+                    == ALegBarKind::BigReverse
+            })
+        })
+        .count()
+}
+
 /// a段质量分：衡量“推动腿”的幅度与K线质量，采用乘法短板结构。
 ///
 /// 公式：

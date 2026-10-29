@@ -20,6 +20,10 @@ import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed
 import { useIntradayStore } from '../stores/intraday'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
+import SignalQuality from '../components/SignalQuality.vue'
+import SignalQualityControls from '../components/SignalQualityControls.vue'
+import { compareQuality } from '../utils/signalQuality'
+import { useSignalQualityStore } from '../stores/signalQuality'
 import { useGroupsStore } from '../stores/groups'
 import { useSymbolsStore } from '../stores/symbols'
 import { useKlinesStore } from '../stores/klines'
@@ -61,6 +65,9 @@ const scansStore = useScansStore()
 const groupsStore = useGroupsStore()
 const manualLevelsStore = useManualLevelsStore()
 
+const qualityDisplay = useSignalQualityStore()
+const qualitySort = ref(false)
+const displayedReviewRows = computed(() => qualitySort.value && qualityDisplay.enabled ? [...reviewRows.value].sort((a,b) => compareQuality(a.quality,b.quality)) : reviewRows.value)
 const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
@@ -509,6 +516,7 @@ function toChartSignal(e: PatternEvent): PatternDto {
   const s0High = e.direction === 'down'
   return {
     number: e.id,
+    quality: e.quality,
     level: e.level,
     logic_version: '4',
     warning_kind: e.warning_kind,
@@ -550,6 +558,7 @@ function toChartSignalFromOutcome(row: OutcomeDetail): PatternDto {
   const s0High = row.direction === 'down'
   return {
     number: row.event_id,
+    quality: row.quality,
     level: row.level,
     logic_version: row.logic_version,
     warning_kind: row.warning_kind,
@@ -594,7 +603,7 @@ const signals = computed<PatternDto[]>(() => {
   return scansStore.latestSignals
     .filter((s) => s.symbol === symbol.value && (s.state === 'pending' || s.state === 'triggered'))
     .map(toChartSignal)
-    .sort(compareSignalTime)
+    .sort((a,b) => qualitySort.value && qualityDisplay.enabled ? compareQuality(a.quality,b.quality) || compareSignalTime(a,b) : compareSignalTime(a,b))
 })
 
 const recentSignals = ref<PatternDto[]>([])
@@ -607,7 +616,7 @@ const recentHistorySignals = computed<PatternDto[]>(() => {
   return recentSignals.value
     .filter((s) => s.state !== 'pending' && s.state !== 'triggered' && !activeNumbers.has(s.number))
     .slice()
-    .sort(compareSignalTime)
+    .sort((a,b) => qualitySort.value && qualityDisplay.enabled ? compareQuality(a.quality,b.quality) || compareSignalTime(a,b) : compareSignalTime(a,b))
     .slice(0, 5)
 })
 
@@ -623,7 +632,7 @@ async function loadRecentPatterns() {
   try {
     const rows = await api.getRecentOutcomes(20, { symbol: sym })
     if (seq !== recentSeq) return
-    recentSignals.value = rows.map(toChartSignalFromOutcome).sort(compareSignalTime)
+    recentSignals.value = rows.map(toChartSignalFromOutcome).sort((a,b) => qualitySort.value && qualityDisplay.enabled ? compareQuality(a.quality,b.quality) || compareSignalTime(a,b) : compareSignalTime(a,b))
   } catch {
     if (seq === recentSeq) recentSignals.value = []
   } finally {
@@ -2847,7 +2856,7 @@ onBeforeUnmount(() => {
                   </div>
                 </template>
                 <div class="mfs-patterns-dropdown">
-                  <div class="mfs-pats-header">当前活跃形态信号 ({{ signals.length }})</div>
+                  <div class="mfs-pats-header">当前活跃形态信号 ({{ signals.length }}) <SignalQualityControls v-model:sort="qualitySort" /></div>
                   <div
                     v-for="sig in signals"
                     :key="sig.number"
@@ -2860,6 +2869,7 @@ onBeforeUnmount(() => {
                       </span>
                       <span class="mfs-pi-state" :class="stateType(sig.state)">● {{ sigLabel(sig.state) }}</span>
                       <span class="mfs-pi-score">评分 <b>{{ sig.score.toFixed(1) }}</b></span>
+                      <SignalQuality :quality="sig.quality" :old-score="sig.score" :rr="sig.rr" />
                     </div>
                     <div class="mfs-pi-levels">
                       <span>入 <b>{{ sig.entry.toFixed(1) }}</b></span>
@@ -3522,12 +3532,13 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="reviewMode" class="patterns-card review-card">
+          <SignalQualityControls v-model:sort="qualitySort" />
           <div class="patterns-title">复盘信号明细（{{ reviewRows.length }}）</div>
           <n-scrollbar style="flex: 1">
             <div v-if="reviewLoading" class="patterns-empty">正在加载信号明细...</div>
             <div v-else-if="reviewRows.length" class="review-list">
               <div
-                v-for="row in reviewRows"
+                v-for="row in displayedReviewRows"
                 :key="row.event_id"
                 class="review-row"
                 :class="[
@@ -3571,6 +3582,7 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
 
+                <SignalQuality :quality="row.quality" :old-score="row.entry_score" :rr="row.rr" />
                 <div class="rv-meta">
                   <span class="rv-time" :title="row.created_at">{{ fmtRecentTime(row.created_at) }}</span>
                   <span class="rv-outcome" :class="reviewOutcome(row).cls">
@@ -3785,7 +3797,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-else class="patterns-card">
-          <div class="patterns-title">活跃信号（{{ signals.length }}）</div>
+          <div class="patterns-title">活跃信号（{{ signals.length }}）<SignalQualityControls v-model:sort="qualitySort" /></div>
           <n-scrollbar style="flex: 1">
             <div v-if="signals.length" class="patterns-list">
               <div
@@ -3819,6 +3831,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
+                <SignalQuality :quality="s.quality" :old-score="s.score" :rr="s.rr" />
                 <div class="pc-state" :class="stateType(s.state)">
                   <span class="dot"></span>{{ sigLabel(s.state) }}
                 </div>
@@ -3919,6 +3932,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
+                <SignalQuality :quality="r.quality" :old-score="r.score" :rr="r.rr" />
                 <div class="pc-state" :class="stateType(r.state)">
                   <span class="dot"></span>{{ sigLabel(r.state) }}
                   <span v-if="r.trigger_ts" class="pc-state-time">{{ fmtRecentTime(r.trigger_ts) }}</span>
