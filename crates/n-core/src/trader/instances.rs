@@ -417,7 +417,13 @@ impl InstanceManager {
     }
     /// Login can update credentials for the same account; it can never rebind
     /// an instance with existing orders or positions to another investor.
-    pub async fn set_ctp_credentials(&self, id: &str, user: &str, reference: &str) -> Result<()> {
+    pub async fn set_ctp_credentials(
+        &self,
+        id: &str,
+        broker: &str,
+        user: &str,
+        reference: &str,
+    ) -> Result<()> {
         Self::valid_id(reference)?;
         let runtime = self.get(id).await?;
         let mut catalog = self.catalog.lock().await;
@@ -441,8 +447,8 @@ impl InstanceManager {
                 ..
             } => {
                 ensure!(
-                    broker_id.is_empty() || broker_id == "9999",
-                    "此入口只支持 SimNow 账户"
+                    broker_id.is_empty() || broker_id == broker,
+                    "不能将实例切换为另一个券商，请创建新实例"
                 );
                 ensure!(
                     user_id.is_empty() || user_id == user,
@@ -454,7 +460,7 @@ impl InstanceManager {
                         "账户归属未确认且有未完成交易，须先核对"
                     );
                 }
-                *broker_id = "9999".into();
+                *broker_id = broker.into();
                 *user_id = user.into();
                 *credential_ref = Some(reference.into());
             }
@@ -463,7 +469,7 @@ impl InstanceManager {
         self.persist(&next).await?;
         *catalog = next;
         if let BrokerClient::Ctp(client) = &runtime.broker {
-            client.expect_identity("9999", user);
+            client.expect_identity(broker, user);
         }
         Ok(())
     }

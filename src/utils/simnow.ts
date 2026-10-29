@@ -1,7 +1,7 @@
 import type { CtpHealth, SimnowLoginInput } from '../types'
 
 export function emptySimnowLogin(): SimnowLoginInput {
-  return { user_id: '', password: '', td_front: 'tcp://182.254.243.31:30001', app_id: 'simnow_client_test', auth_code: '0000000000000000' }
+  return { broker_id: '9999', user_id: '', password: '', td_front: 'tcp://182.254.243.31:30001', md_front: '', app_id: 'simnow_client_test', auth_code: '0000000000000000' }
 }
 
 export function ctpConnectionLabel(health: CtpHealth | null, online: boolean): string {

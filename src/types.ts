@@ -949,9 +949,11 @@ export interface TraderInstanceCatalog {
   modules: { strategies: { id: string; version: string }[]; exit_policies: string[]; sizing_policies: string[]; presets?: { label: string; definition: StrategyDefinition }[] }
 }
 export interface SimnowLoginInput {
+  broker_id?: string
   user_id: string
   password: string
   td_front: string
+  md_front?: string
   app_id: string
   auth_code: string
 }
@@ -961,6 +963,7 @@ export interface CtpConnectionSettings {
   user_id?: string
   broker_id?: string
   td_front?: string
+  md_front?: string
   app_id?: string
   password_saved?: boolean
   auth_code_saved?: boolean
