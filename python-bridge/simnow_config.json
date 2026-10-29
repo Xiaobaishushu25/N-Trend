@@ -1,10 +1,10 @@
 {
-  "BrokerID": "9999",
-  "UserID": "278272",
-  "Password": "qwertyuiop123*",
-  "AppID": "simnow_client_test",
-  "AuthCode": "0000000000000000",
-  "TdFront": "tcp://182.254.243.31:30001",
-  "MdFront": "tcp://182.254.243.31:30011",
+  "BrokerID": "2071",
+  "UserID": "0061843030",
+  "Password": "qwertyuiop123",
+  "AppID": "client_ntrend_3.0.1",
+  "AuthCode": "20261028PANGJF01",
+  "TdFront": "tcp://114.94.128.1:42205",
+  "MdFront": "tcp://114.94.128.1:42213",
   "bridge_port": 8766
 }

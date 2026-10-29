@@ -9,17 +9,19 @@ function setup() {
   const calls = []
   const trader = { instanceCatalog: { instances: [], modules: { presets: [preset] } }, selectedInstanceId: 'default',
     async loadInstances() {}, async selectInstance(id) { this.selectedInstanceId = id } }
-  const context = { exports: {}, Date, console, crypto: { randomUUID: () => 'fixture' },
+  const context = { exports: {}, Date, console, crypto: { randomUUID: () => 'fixture' }, defineEmits: () => () => {},
     require(name) {
       if (name === 'vue') return { ref: value => ({ value }), computed: getter => ({ get value() { return getter() } }), watch() {} }
       if (name === '../stores/liveTrader') return { useLiveTraderStore: () => trader }
       if (name === '../services/api') return { api: { async traderInstanceRequest(...args) { calls.push(args); return { instance_id: 'created' } } } }
       if (name === './SimnowLoginFields.vue') return {}
       if (name === '../utils/simnow') return { emptySimnowLogin: () => ({}), ctpConnectionLabel: () => '' }
+      if (name === '../utils/contextMenu') return { showContextMenu: () => {} }
+      if (name === 'naive-ui') return { useMessage: () => ({ error: () => {}, success: () => {}, warning: () => {} }) }
       throw Error(name)
     } }
   const source = fs.readFileSync('src/components/TraderInstancesPanel.vue', 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-  const compiled = ts.transpileModule(source + '\nexport { applyPreset, strategy, parameters, config, createPreset, contracts, create, kind, error };', { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } })
+  const compiled = ts.transpileModule(source + '\nexport { applyPreset, strategy, parameters, config, createPreset, contracts, create, kind, error, dialogError, formatErrorMessage };', { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } })
   vm.runInNewContext(compiled.outputText, context)
   return { ui: context.exports, trader, preset, calls }
 }
@@ -54,4 +56,18 @@ test('creation sends a paired P3 definition and a conservative execution configu
   assert.equal(payload.config.slippage_ticks, 0)
   assert.equal(payload.account.config.contracts.PB2611.open_fee_per_lot, 3)
   assert.equal(trader.selectedInstanceId, 'created')
+})
+
+test('creation failure scopes error to dialogError and provides friendly 422 explanation without polluting main panel error', async () => {
+  const { ui } = setup()
+  ui.kind.value = 'paper'
+  ui.contracts.value = [{ symbol: '', multiplier: '', margin: '', open: '', close: '', today: '' }]
+  await ui.create()
+  assert.equal(ui.error.value, '', 'main panel error should remain empty')
+  assert.match(ui.dialogError.value, /请完整填写每个合约/)
+
+  // Verify 422 friendly formatting
+  const formatted422 = ui.formatErrorMessage('服务端返回错误状态码: 422 Unprocessable Entity')
+  assert.match(formatted422, /422 Unprocessable Entity/)
+  assert.match(formatted422, /BrokerID/)
 })

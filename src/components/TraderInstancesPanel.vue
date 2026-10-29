@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useMessage } from 'naive-ui'
 import { api } from '../services/api'
 import { useLiveTraderStore } from '../stores/liveTrader'
 import type { CtpConnectionSettings, ExecutionConfig, StrategyDefinition, TraderInstanceRow } from '../types'
@@ -8,11 +9,30 @@ import { emptySimnowLogin, ctpConnectionLabel } from '../utils/simnow'
 import { openContextMenu } from '../utils/contextMenu'
 
 
+let message: ReturnType<typeof useMessage> | null = null
+try {
+  message = useMessage()
+} catch {
+  message = null
+}
+
+function formatErrorMessage(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e)
+  if (msg.includes('422') || msg.includes('Unprocessable Entity')) {
+    return '提交失败 (422 Unprocessable Entity)：当前连接的服务端版本较旧，尚未支持 BrokerID 等新增字段。请部署升级服务端程序。'
+  }
+  if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
+    return '网络通信异常：无法连接至服务端，请检查网络或确认服务端运行状态。'
+  }
+  return msg
+}
+
 const trader = useLiveTraderStore()
 const selected = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
 const dialog = ref<'create' | 'configure' | 'login' | 'rename' | null>(null)
 const busy = ref(false)
 const error = ref('')
+const dialogError = ref('')
 const name = ref('')
 const renameInstanceName = ref('')
 const kind = ref<'paper' | 'ctp' | 'simnow'>('paper')
@@ -21,7 +41,38 @@ const savedCredentials = ref(false)
 const loginTarget = ref('')
 const notice = ref('')
 const accountLabel = (account?: { kind: string; broker_id?: string }) => account?.kind === 'paper' ? '本地模拟' : account?.broker_id === '9999' ? 'SimNow 仿真（CTP）' : 'CTP 实盘'
-watch(dialog, value => { if (!value) { simnow.value = emptySimnowLogin(); savedCredentials.value = false } })
+
+function setDialogError(e: unknown) {
+  const formatted = formatErrorMessage(e)
+  dialogError.value = formatted
+  if (message?.error) {
+    message.error(formatted, { duration: 6000 })
+  }
+}
+
+function setInstanceError(e: unknown) {
+  const formatted = formatErrorMessage(e)
+  error.value = formatted
+  if (message?.error) {
+    message.error(formatted, { duration: 6000 })
+  }
+}
+
+function setNotice(msg: string) {
+  notice.value = msg
+  if (message?.success) {
+    message.success(msg, { duration: 4000 })
+  }
+}
+
+watch(dialog, value => {
+  dialogError.value = ''
+  if (!value) { simnow.value = emptySimnowLogin(); savedCredentials.value = false }
+})
+watch(() => trader.selectedInstanceId, () => {
+  error.value = ''
+  notice.value = ''
+})
 const broker = ref('')
 const user = ref('')
 const port = ref(8767)
@@ -42,21 +93,20 @@ const compare = ref<any>(null)
 function openRename() {
   if (!selected.value) return
   renameInstanceName.value = selected.value.instance.name
-  error.value = ''
-  notice.value = ''
+  dialogError.value = ''
   dialog.value = 'rename'
 }
 async function commitRename() {
   if (busy.value || !selected.value) return
   const trimmed = renameInstanceName.value.trim()
-  if (!trimmed) { error.value = '实例名称不能为空'; return }
-  busy.value = true; error.value = ''
+  if (!trimmed) { setDialogError('实例名称不能为空'); return }
+  busy.value = true; dialogError.value = ''
   try {
     await trader.instanceAction({ action: 'rename', name: trimmed })
     dialog.value = null
-    notice.value = `实例已重命名为【${trimmed}】`
+    setNotice(`实例已重命名为【${trimmed}】`)
   } catch (e) {
-    error.value = String(e)
+    setDialogError(e)
   } finally {
     busy.value = false
   }
@@ -102,32 +152,35 @@ function openCreate(copy: boolean) {
   name.value = copy ? `${selected.value?.instance.name || '策略'} 副本` : 'N 字形策略'
   copyFrom.value = copy ? trader.selectedInstanceId : undefined
   createPreset.value = ''
-  kind.value = 'paper'; simnow.value = emptySimnowLogin(); error.value = ''; notice.value = ''; dialog.value = 'create'
+  kind.value = 'paper'; simnow.value = emptySimnowLogin(); dialogError.value = ''; dialog.value = 'create'
 }
 async function openLogin() {
   if (!selected.value || busy.value) return
   const id = trader.selectedInstanceId
-  loginTarget.value = id; error.value = ''; notice.value = ''; simnow.value = emptySimnowLogin()
+  loginTarget.value = id; dialogError.value = ''; simnow.value = emptySimnowLogin()
   simnow.value.user_id = selected.value.account.user_id || ''
+  simnow.value.broker_id = selected.value.account.broker_id || '9999'
   savedCredentials.value = false; dialog.value = 'login'; busy.value = true
   try {
     const connection = await api.traderInstanceRequest<CtpConnectionSettings>('connection', id)
+    simnow.value.broker_id = connection.broker_id || simnow.value.broker_id
     simnow.value.user_id = connection.user_id || simnow.value.user_id
     simnow.value.td_front = connection.td_front || simnow.value.td_front
+    simnow.value.md_front = connection.md_front || ''
     simnow.value.app_id = connection.app_id || simnow.value.app_id
     savedCredentials.value = !!connection.password_saved && !!connection.auth_code_saved
     if (savedCredentials.value) simnow.value.auth_code = ''
-  } catch (e) { error.value = `读取连接配置失败：${String(e)}` }
+  } catch (e) { setDialogError(`读取连接配置失败：${formatErrorMessage(e)}`) }
   finally { busy.value = false }
 }
 async function login() {
   if (busy.value) return
-  busy.value = true; error.value = ''
+  busy.value = true; dialogError.value = ''
   try {
     await trader.loginSimnow(loginTarget.value, { ...simnow.value })
     dialog.value = null
-    notice.value = '连接请求已提交，正在等待柜台认证和资金持仓同步；策略启用状态未改变。'
-  } catch (e) { error.value = String(e) }
+    setNotice('连接请求已提交，正在等待柜台认证和资金持仓同步；策略启用状态未改变。')
+  } catch (e) { setDialogError(e) }
   finally { simnow.value.password = ''; busy.value = false }
 }
 function openConfigure() {
@@ -136,12 +189,12 @@ function openConfigure() {
   strategy.value = { ...selected.value.strategy }
   parameters.value = JSON.stringify(selected.value.strategy.parameters ?? {}, null, 2)
   renameInstanceName.value = selected.value.instance.name
-  error.value = ''
+  dialogError.value = ''
   dialog.value = 'configure'
 }
 async function create() {
   if (busy.value) return
-  busy.value = true; error.value = ''
+  busy.value = true; dialogError.value = ''; error.value = ''
   try {
     const id = `account-${crypto.randomUUID()}`
     let account: Record<string, unknown> = { id, name: name.value, kind: kind.value }
@@ -164,12 +217,12 @@ async function create() {
       ...(preset ? { strategy: preset.definition, config: candidateConfig } : {}) })
     await trader.loadInstances(); await trader.selectInstance(result.instance_id)
     dialog.value = null
-    notice.value = kind.value === 'simnow' ? '已创建独立 SimNow 账户并提交连接；策略保持暂停，请核对资金持仓和配置后启用。' : ''
-  } catch (e) { error.value = String(e) } finally { simnow.value.password = ''; busy.value = false }
+    setNotice(kind.value === 'simnow' ? '已创建 CTP 策略实例并提交连接；策略保持暂停，请核对资金持仓和配置后手动启用。' : '策略实例创建成功。')
+  } catch (e) { setDialogError(e) } finally { simnow.value.password = ''; busy.value = false }
 }
 async function save() {
   if (busy.value || !config.value || !strategy.value) return
-  busy.value = true; error.value = ''
+  busy.value = true; dialogError.value = ''
   try {
     const trimmedRename = renameInstanceName.value.trim()
     if (!trimmedRename) throw new Error('实例名称不能为空')
@@ -183,14 +236,14 @@ async function save() {
     // One operation commits module selection and execution parameters together.
     await trader.instanceAction({ action: 'configure_strategy', strategy: next, config: config.value })
     dialog.value = null
-    notice.value = '配置已保存。'
-  } catch (e) { error.value = String(e) } finally { busy.value = false }
+    setNotice('配置已保存。')
+  } catch (e) { setDialogError(e) } finally { busy.value = false }
 }
 async function togglePause() {
   if (!selected.value || busy.value) return
   busy.value = true; error.value = ''
   try { await trader.instanceAction({ action: selected.value.paused ? 'resume' : 'pause' }) }
-  catch (e) { error.value = String(e) } finally { busy.value = false }
+  catch (e) { setInstanceError(e) } finally { busy.value = false }
 }
 async function loadComparison() {
   compareBusy.value = true; error.value = ''
@@ -198,7 +251,7 @@ async function loadComparison() {
     compare.value = await api.traderInstanceRequest('comparison', undefined, {
       from: Math.floor(new Date(from.value).getTime() / 1000), to: Math.floor(new Date(to.value).getTime() / 1000),
     })
-  } catch (e) { error.value = String(e) } finally { compareBusy.value = false }
+  } catch (e) { setInstanceError(e) } finally { compareBusy.value = false }
 }
 async function showComparison() { compareOpen.value = !compareOpen.value; if (compareOpen.value) await loadComparison() }
 function curve(samples: { equity: number }[]) {
@@ -476,13 +529,12 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               {{ ctpConnectionLabel(trader.health, trader.bridgeOnline) }}
             </span>
 
-            <!-- SimNow 快速登录/认证配置 -->
+            <!-- CTP 快速登录/认证配置 -->
             <button
-              v-if="!selected.account.broker_id || selected.account.broker_id === '9999'"
               type="button"
               class="btn btn-sm btn-login"
               :disabled="busy"
-              title="配置或更换 SimNow 账号与穿透式认证码"
+              :title="selected.account.broker_id === '9999' ? '配置或更换 SimNow 账号与穿透式认证码' : '配置或更换 CTP 账号与穿透式认证码'"
               @click="openLogin"
             >
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -490,7 +542,7 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                 <polyline points="10 17 15 12 10 7" />
                 <line x1="15" y1="12" x2="3" y2="12" />
               </svg>
-              SimNow 登录 / 认证
+              {{ selected.account.broker_id === '9999' ? 'SimNow 登录 / 认证' : 'CTP 登录 / 认证' }}
             </button>
           </div>
 
@@ -516,14 +568,15 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
         </div>
       </div>
 
-      <!-- 消息反馈横条 -->
+      <!-- 实例消息反馈横条（仅挂靠当前实例自身的操作提示） -->
       <div v-if="error" role="alert" class="alert-bar is-error">
         <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="12" cy="12" r="10" />
           <line x1="15" y1="9" x2="9" y2="15" />
           <line x1="9" y1="9" x2="15" y2="15" />
         </svg>
-        <span>{{ error }}</span>
+        <span class="alert-text">{{ error }}</span>
+        <button type="button" class="btn-dismiss" title="关闭提示" @click="error = ''">✕</button>
       </div>
 
       <div v-if="notice" role="status" class="alert-bar is-notice">
@@ -532,7 +585,8 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
           <line x1="12" y1="16" x2="12" y2="12" />
           <line x1="12" y1="8" x2="12.01" y2="8" />
         </svg>
-        <span>{{ notice }}</span>
+        <span class="alert-text">{{ notice }}</span>
+        <button type="button" class="btn-dismiss" title="关闭提示" @click="notice = ''">✕</button>
       </div>
 
       <!-- 账户对比面板（优雅抽屉式展开） -->
@@ -635,11 +689,22 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
       <div v-if="dialog" class="modal-backdrop" @click.self="!busy && (dialog = null)">
         <form class="instance-dialog" @submit.prevent="dialog === 'create' ? create() : dialog === 'login' ? login() : dialog === 'rename' ? commitRename() : save()">
           <div class="dialog-header">
-            <h3>{{ dialog === 'create' ? '创建策略实例' : dialog === 'login' ? 'SimNow 仿真账户登录' : dialog === 'rename' ? '重命名策略实例' : '配置策略与执行参数' }}</h3>
+            <h3>{{ dialog === 'create' ? '创建策略实例' : dialog === 'login' ? (simnow.broker_id === '9999' || (!simnow.broker_id && selected?.account.broker_id === '9999') ? 'SimNow 仿真账户登录' : 'CTP 账户登录 / 认证配置') : dialog === 'rename' ? '重命名策略实例' : '配置策略与执行参数' }}</h3>
             <button type="button" class="btn-close" :disabled="busy" @click="dialog = null">✕</button>
           </div>
 
           <div class="dialog-body">
+            <!-- 弹窗专属错误提示：独立显示于弹窗内，绝不污染外层实例 Tab -->
+            <div v-if="dialogError" role="alert" class="alert-bar is-error dialog-error-bar">
+              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="15" y1="9" x2="9" y2="15" />
+                <line x1="9" y1="9" x2="15" y2="15" />
+              </svg>
+              <span class="alert-text">{{ dialogError }}</span>
+              <button type="button" class="btn-dismiss" title="关闭提示" @click="dialogError = ''">✕</button>
+            </div>
+
             <!-- 创建实例 -->
             <template v-if="dialog === 'create'">
               <div class="form-row">
@@ -661,8 +726,8 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                 <label class="form-label">账户类型</label>
                 <select v-model="kind" class="form-select">
                   <option value="paper">本地模拟账户（无柜台连接，独立账本撮合）</option>
-                  <option value="simnow">SimNow 仿真账户（CTP 协议仿真柜台）</option>
-                  <option value="ctp">其他 CTP 实盘账户（服务端凭据文件）</option>
+                  <option value="simnow">CTP 柜台直连（实盘 / 仿真，在线填写凭据并自动连接）</option>
+                  <option value="ctp">高级：引用服务端已有凭据（手动配置的 ctp_credentials 文件）</option>
                 </select>
               </div>
 
@@ -702,10 +767,10 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               <p class="field-hint">新创建的实例默认保持暂停状态，核对配置无误后手动启用。新实例仅接收创建后的新信号。</p>
             </template>
 
-            <!-- 登录 SimNow -->
+            <!-- 登录 / 重新连接 CTP 柜台 -->
             <template v-else-if="dialog === 'login'">
               <div class="dialog-desc">
-                当前正在连接 <strong>{{ selected?.instance.name }}</strong>（{{ selected?.account.name }}）。重新登录将重建账户专属通信桥，并重新同步资金、在手持仓与在途委托。
+                当前正在连接 <strong>{{ selected?.instance.name }}</strong>（{{ selected?.account.name }}）。提交后将使用最新凭据重建账户专属通信桥，并重新同步资金、在手持仓与在途委托。
               </div>
               <SimnowLoginFields v-model="simnow" :saved="savedCredentials" :lock-user="!!selected?.account.user_id" />
             </template>
@@ -813,8 +878,6 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               <p v-if="isB5" class="field-hint">六品种 B5：最近合格 A、不合并摆点、目标成本比≤10%、A 净实体同向；小时不顺向同组同向最多两单，同 A 两次原止损后停试。固定一手，独立生成新预警。</p>
               <p v-else-if="isCandidate" class="field-hint">P2/P3 固定一手、原结构止损；P3 按实际成交价锁定目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
             </template>
-
-            <div v-if="error" role="alert" class="alert-bar is-error">{{ error }}</div>
           </div>
 
           <div class="dialog-actions">
@@ -1286,6 +1349,37 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
   background: #f0fdf4;
   border: 1px solid #bbf7d0;
   color: #15803d;
+}
+.alert-text {
+  flex: 1;
+  word-break: break-word;
+  line-height: 1.4;
+}
+.btn-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  font-size: 13px;
+  line-height: 1;
+  color: inherit;
+  opacity: 0.65;
+  cursor: pointer;
+  transition: opacity 0.15s, background-color 0.15s;
+  flex-shrink: 0;
+}
+.btn-dismiss:hover {
+  opacity: 1;
+  background: rgba(0, 0, 0, 0.08);
+}
+.dialog-error-bar {
+  margin-top: 0;
+  margin-bottom: 14px;
 }
 
 /* 账户对比抽屉面板 */

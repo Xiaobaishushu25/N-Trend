@@ -25,11 +25,11 @@ async fn client_ctp_credentials_keep_the_bound_identity_after_restart() {
         .await
         .unwrap();
     manager
-        .set_ctp_credentials("default", "123456", "client-default")
+        .set_ctp_credentials("default", "9999", "123456", "client-default")
         .await
         .unwrap();
     assert!(manager
-        .set_ctp_credentials("default", "654321", "client-other")
+        .set_ctp_credentials("default", "9999", "654321", "client-other")
         .await
         .is_err());
     assert_eq!(
@@ -58,7 +58,7 @@ async fn client_ctp_credentials_keep_the_bound_identity_after_restart() {
         paused
     );
     assert!(manager
-        .set_ctp_credentials("default", "654321", "client-other")
+        .set_ctp_credentials("default", "9999", "654321", "client-other")
         .await
         .is_err());
 }
