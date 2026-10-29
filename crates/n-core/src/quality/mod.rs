@@ -5,6 +5,8 @@ pub mod qualification;
 pub mod report;
 pub mod research;
 pub mod store;
+pub mod structure;
+// pub mod structure_study;
 
 use crate::{
     analyze::{indicators, model::Bar},
