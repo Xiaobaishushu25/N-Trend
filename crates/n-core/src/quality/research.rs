@@ -68,7 +68,7 @@ pub struct AuditRow {
 pub async fn run(args: Vec<String>) -> Result<()> {
     let command = args.get(1).map(String::as_str).unwrap_or("help");
     if command == "help" || args.iter().any(|a| a == "--help") {
-        println!("signal-quality <audit|report|backfill|blind-export> (--backup snapshot.sqlite.gz | --db snapshot.sqlite) --out NEW_DIRECTORY [--rules rules.json] [--roundtrip-cost-ticks 2.5]\nsignal-quality blind-import --manifest blind-manifest.json --labels labels.json --out NEW_DIRECTORY\nsignal-quality annotate --manifest blind-manifest.json --audit audit.json --out NEW_DIRECTORY [--review-notes reviewed-notes.json]\nbackfill always creates and writes its own isolated output copy; original input remains read-only.");
+        println!("signal-quality <audit|report|backfill|blind-export> (--backup snapshot.sqlite.gz | --db snapshot.sqlite) --out NEW_DIRECTORY [--rules rules.json] [--roundtrip-cost-ticks 2.5]\nsignal-quality blind-import --manifest blind-manifest.json --labels labels.json --out NEW_DIRECTORY\nsignal-quality annotate --manifest blind-manifest.json --audit audit.json --out NEW_DIRECTORY [--review-notes reviewed-notes.json]\nsignal-quality qualify --manifest blind-manifest.json --audit audit.json --labels previous-labels.json --out NEW_DIRECTORY\nbackfill always creates and writes its own isolated output copy; original input remains read-only.");
         return Ok(());
     }
     ensure!(
@@ -78,7 +78,8 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             "backfill",
             "blind-export",
             "blind-import",
-            "annotate"
+            "annotate",
+            "qualify"
         ]
         .contains(&command),
         "unknown command"
@@ -117,6 +118,9 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     }
     if command == "annotate" {
         return super::assistant_review::annotate(&args, &out);
+    }
+    if command == "qualify" {
+        return super::qualification::export(&args, &out);
     }
     let rules = if let Some(path) = arg(&args, "--rules") {
         serde_json::from_slice::<Rules>(&std::fs::read(path)?)?

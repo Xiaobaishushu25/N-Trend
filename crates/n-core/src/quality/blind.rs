@@ -266,10 +266,28 @@ pub fn import(args: &[String], out: &Path) -> Result<()> {
         }
         joined.push(json!({"label":label,"split":pair["split"],"category":pair["category"],"calibration_group":group}));
     }
-    write_json(
-        &out.join("preferences.json"),
-        &json!({"manifest_hash":claimed,"display_version":manifest["display_version"],"preferences":joined}),
-    )?;
+    let mut imported = json!({"manifest_hash":claimed,"display_version":manifest["display_version"],"preferences":joined});
+    if labels.get("case_assessments").is_some() || labels.get("case_drafts").is_some() {
+        let task = super::qualification::load_task(
+            &manifest_path
+                .parent()
+                .context("manifest parent")?
+                .join("qualification-task.json"),
+        )?;
+        super::qualification::validate_assessments(&task, &labels)?;
+        for key in [
+            "case_assessments",
+            "case_drafts",
+            "qualification_task_hash",
+            "assessment_version",
+            "assessment_display_version",
+        ] {
+            if let Some(value) = labels.get(key) {
+                imported[key] = value.clone();
+            }
+        }
+    }
+    write_json(&out.join("preferences.json"), &imported)?;
     println!("Imported {} preferences; no model trained", joined.len());
     Ok(())
 }

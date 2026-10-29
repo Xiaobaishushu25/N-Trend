@@ -1,0 +1,90 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>信号逐个评价</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f6fa;color:#23324a;font:15px/1.6 system-ui}main{max-width:1250px;margin:auto;padding:22px}h1{font-size:25px;margin:0 0 5px}h2{font-size:18px}p{margin:8px 0}.hint{color:#64748b}.toolbar,.fields,.reasons{display:flex;gap:12px;flex-wrap:wrap;align-items:center}button,select,textarea{font:inherit;color:inherit;border:1px solid #bfcddd;background:white;border-radius:7px;padding:8px}button{cursor:pointer}button:disabled{opacity:.45}.panel{background:white;border:1px solid #dbe3ed;border-radius:12px;padding:17px;margin:15px 0}#chart{height:440px;overflow:auto}#chart svg{display:block}.fields>label{flex:1;min-width:230px}.fields select{display:block;width:100%;margin-top:5px}textarea{width:100%;height:90px;margin:12px 0}.reasons label{white-space:nowrap}summary{font-weight:600;cursor:pointer}.evidence{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.evidence h3{font-size:16px}#message{color:#136c60}#legacy-body{white-space:pre-wrap}.badge{padding:3px 8px;border-radius:4px;background:#edf2fa}#interpretation p{margin:10px 0}@media(max-width:760px){main{padding:12px}.evidence{grid-template-columns:1fr}.toolbar{gap:7px}}
+</style>
+<main><h1>信号逐个评价</h1><p class="hint">先判断本身是否合格。新一轮20例用于研究标准；原20组反馈完整保留，不会自动转换成合格标签。</p>
+<div class="toolbar"><label>案例集 <select id="queue"><option value="new">新一轮案例</option><option value="revisit">复核已有40例</option></select></label><button id="prev">上一例</button><b id="position"></b><button id="next">下一例</button><button id="download">下载全部标签</button><button id="import">导入标签</button><input id="file" type="file" accept=".json,application/json" hidden></div>
+<div class="panel"><div class="toolbar"><b id="direction"></b><span class="badge">截至预警收盘</span><label>纵轴 <select id="scale"><option value="shared">固定尺度：1 ATR = 40像素</option><option value="fit">全图适配</option></select></label><button id="space">显示交易空间</button><span id="space-text"></span></div><p class="hint">横向固定每根K线8像素，预警在右侧。S1转折K、B段及预警K分别标记；固定尺度下可纵向滚动查看背景。</p><div id="chart"></div></div>
+<div class="panel"><div class="fields"><label>形态本身<select id="morphology"><option value="">请选择</option><option value="qualified">合格</option><option value="marginal">勉强</option><option value="rejected">不合格</option><option value="uncertain">无法判断</option></select></label><label>综合交易条件<select id="opportunity"><option value="">请选择</option><option value="qualified">合格</option><option value="marginal">勉强</option><option value="rejected">不合格</option><option value="uncertain">无法判断</option></select></label><label>形态类型<select id="pattern"><option value="">请选择</option><option value="pullback_n">标准回踩N</option><option value="impulse">快速脉冲</option><option value="consolidation_breakout">整理突破</option><option value="other">其他</option><option value="uncertain">无法判断</option></select></label></div>
+<p class="hint">形态合格不代表综合条件合格。综合判断前可显示入场、止损与到S1的空间。</p>
+<div class="reasons">关注原因：<label><input type="checkbox" value="a">A段</label><label><input type="checkbox" value="b">B段</label><label><input type="checkbox" value="trend">趋势</label><label><input type="checkbox" value="space">空间</label><label><input type="checkbox" value="warning">端点/预警</label><label><input type="checkbox" value="scale">尺度/噪声</label></div>
+<textarea id="note" maxlength="2000" placeholder="补充说明；你的原话独立保留，不由我的理解覆盖。"></textarea><button id="save">保存本例</button> <span id="message"></span><p class="hint" id="progress"></p></div>
+<details class="panel" id="assistant"><summary>点击展示我的理解与结构诊断</summary><p class="hint">预警前数据生成的解读草稿，未逐图复核，不代表胜率或合格结论。首次展开会保留你此前的判断。</p><div id="interpretation"></div><div class="evidence" id="evidence"></div></details>
+<details class="panel" id="legacy"><summary>查看此前的配对选择和你的原说明</summary><div id="legacy-body"></div></details>
+<p class="hint">本轮是原任务中未讨论行情的诊断抽样，不是随机市场样本。页面完全离线。新诊断不进入现有评分或交易准入；未提供的tick尺度明确留空。请下载JSON保存结果，浏览器本地存储可能被清理。</p></main>
+<script type="application/json" id="payload">__QUALIFICATION_PAYLOAD__</script>
+<script>
+'use strict';
+const $=id=>document.getElementById(id),task=JSON.parse($('payload').textContent),NS='http://www.w3.org/2000/svg';
+const key='signal-quality-qualification:'+task.task_hash,grades=['qualified','marginal','rejected','uncertain'],types=['pullback_n','impulse','consolidation_breakout','other','uncertain'],reasonCodes=['a','b','trend','space','warning','scale'];
+let completed={},drafts={},references={},legacy=task.legacy_labels.slice(),index=0,revealed=false;
+try{const saved=JSON.parse(localStorage.getItem(key)||'null');if(saved){completed=saved.completed||{};drafts=saved.drafts||{};references=saved.references||{};legacy=saved.legacy||legacy}}catch{}
+const queue=()=>task[$('queue').value==='revisit'?'revisit_queue':'new_queue'];
+const current=()=>task.cases[queue()[index]];
+function node(tag,text){const n=document.createElement(tag);n.textContent=text;return n}
+function el(tag,attrs,text){const n=document.createElementNS(NS,tag);for(const[k,v]of Object.entries(attrs))n.setAttribute(k,v);if(text!=null)n.textContent=text;return n}
+function form(){return{morphology_qualification:$('morphology').value,opportunity_qualification:$('opportunity').value,pattern_type:$('pattern').value,reasons:[...document.querySelectorAll('input[type=checkbox]')].filter(n=>n.checked).map(n=>n.value),note:$('note').value}}
+function persist(){try{localStorage.setItem(key,JSON.stringify({completed,drafts,references,legacy}));return true}catch{$('message').textContent='本地存储失败，请下载JSON保留结果。';return false}}
+function capture(){const c=current();if(c){drafts[c.case_id]=form();persist()}}
+function reference(c){return references[c.case_id]||{viewed:false,version:task.version,task_hash:task.task_hash}}
+function draw(c){const bs=c.bars.slice(0,c.warning_index+1),s0=c.points[0][0],s1=c.points[1][0],s2=c.points[2][0],w=c.warning_index;
+ let low=Math.min(...bs.map(b=>b[2])),high=Math.max(...bs.map(b=>b[1]));if(revealed){low=Math.min(low,c.entry,c.stop,c.target);high=Math.max(high,c.entry,c.stop,c.target)}low=Math.floor(low-1);high=Math.ceil(high+1);
+ const px=$('scale').value==='shared'?40:390/Math.max(high-low,1),height=Math.max(440,(high-low)*px+60),width=Math.max(900,bs.length*8+90),x=i=>width-65-(bs.length-1-i)*8,y=v=>25+(high-v)*px;
+ const svg=el('svg',{width,height,viewBox:`0 0 ${width} ${height}`,'data-pixels-per-atr':px,'aria-label':'预警前K线、MA20和形态端点'});
+ for(let v=low;v<=high;v+=Math.max(1,Math.ceil((high-low)/14))){const yy=y(v);svg.append(el('line',{x1:0,x2:width-55,y1:yy,y2:yy,stroke:'#e6edf6'}),el('text',{x:width-52,y:yy+4,fill:'#6c7b90','font-size':11},v+' ATR'))}
+ svg.append(el('rect',{x:x(s0)-4,y:20,width:(s1-s0)*8+8,height:height-40,fill:'#eaf0ff',opacity:.5}),el('rect',{x:x(s1)+4,y:20,width:Math.max(0,(s2-s1)*8),height:height-40,fill:'#fff4dc',opacity:.65}));
+ const ma=[];bs.forEach((b,i)=>{const color=b[3]>=b[0]?'#df4d4d':'#199f80';svg.append(el('line',{x1:x(i),x2:x(i),y1:y(b[1]),y2:y(b[2]),stroke:color}),el('rect',{x:x(i)-2.6,y:Math.min(y(b[0]),y(b[3])),width:5.2,height:Math.max(1,Math.abs(y(b[0])-y(b[3]))),fill:b[3]>=b[0]?'white':color,stroke:color}));if(b[4]!=null)ma.push(x(i)+','+y(b[4]))});
+ svg.append(el('polyline',{points:ma.join(' '),fill:'none',stroke:'#426cf1','stroke-width':1.5}),el('polyline',{points:c.points.map(p=>x(p[0])+','+y(p[1])).join(' '),fill:'none',stroke:'#df922e','stroke-width':1.5}));
+ c.points.forEach((p,i)=>svg.append(el('circle',{cx:x(p[0]),cy:y(p[1]),r:3,fill:'#bd781d'}),el('text',{x:x(p[0])-10,y:y(p[1])+(i===1?-12:20),fill:'#80541f','font-size':12},'S'+i)));
+ svg.append(el('rect',{x:x(w)-4,y:y(bs[w][1])-4,width:8,height:Math.max(12,y(bs[w][2])-y(bs[w][1])+8),fill:'none',stroke:'#7c4dce','stroke-width':2}),el('text',{x:x(w)-36,y:y(bs[w][1])-12,fill:'#7c4dce','font-size':12},'预警收盘'));
+ if(revealed)for(const[label,v,col]of[['入场',c.entry,'#2867bd'],['止损',c.stop,'#d44545'],['S1',c.target,'#16825e']])svg.append(el('line',{x1:0,x2:width-55,y1:y(v),y2:y(v),stroke:col,'stroke-dasharray':'4 3'}),el('text',{x:8,y:y(v)-4,fill:col,'font-size':12},label));
+ $('chart').replaceChildren(svg);$('chart').scrollLeft=width;$('chart').scrollTop=Math.max(0,y((bs[w][1]+bs[w][2])/2)-210);
+ $('space-text').textContent=revealed?'到S1：'+c.rr.toFixed(2)+'R':'';
+}
+const n=(x,d=2)=>Number.isFinite(x)?x.toFixed(d):'数据不足';
+const pct=x=>Number.isFinite(x)?(100*x).toFixed(0)+'%':'数据不足';
+function showInterpretation(c){const d=c.diagnostics,a=d.a,b=d.b,p=b.path_without_warning;$('interpretation').replaceChildren();
+ for(const line of d.interpretation||[])$('interpretation').append(node('p',line));
+ const columns=[['A段推进',[
+  `完整${a.bars}根，内部${a.interior_bars}根；幅度${n(a.amplitude_atr)} ATR。`,
+  `顺向实体最大单根占比${pct(a.directional_body.largest_share)}，前两根合计${pct(a.directional_body.largest_two_share)}；等效贡献根数${n(a.directional_body.effective_bars)}。`,
+  `收盘新进展最大单步占比${pct(a.closing_records.largest_share)}；这与实体集中度分别计算。`,
+  `旧过程窗口：${a.legacy_process_window==='interior'?'剔除端点':'短A使用完整段'}；S1反向影线占本根${pct(a.s1_opposing_wick_fraction)}。`]],
+ ['B段独立性',[
+  `截至S2共${b.bars_including_warning_if_s2}根；排除预警后${b.bars_without_warning}根。`,
+  `预警前区间超出S1范围${n(b.outside_s1_before_warning_atr)} ATR，收盘超出${n(b.close_outside_s1_before_warning_atr)} ATR。`,
+  `首次区间超出：${b.first_range_exit_bar==null?'尚未出现':'第'+b.first_range_exit_bar+'根'}；区间超出${b.range_exit_bars}根，收盘超出${b.close_exit_bars}根。`]],
+ ['整理还是争夺',[
+  `预警前B段平均重叠${pct(p.mean_overlap)}；影线占比${pct(p.mean_wick_fraction)}。`,
+  `收盘净位移${n(p.close_net_atr)} ATR，收盘总路程${n(p.close_travel_atr)} ATR。`,
+  `后半区间/前半区间：${n(p.second_half_range_ratio)}；少于4根时不推断收敛。`,
+  `此前20根背景影线占比${pct(d.background.mean_wick_fraction)}。tick尺度：原任务未提供。`]]];
+ $('evidence').replaceChildren();for(const[title,lines]of columns){const col=document.createElement('div');col.append(node('h3',title));for(const text of lines)col.append(node('p',text));$('evidence').append(col)}
+}
+function render(){const q=queue();index=Math.min(index,Math.max(0,q.length-1));const c=current();$('prev').disabled=index===0;$('next').disabled=index>=q.length-1;$('position').textContent=q.length?`${index+1} / ${q.length}`:'没有可用案例';if(!c){$('save').disabled=true;return}
+ const saved=drafts[c.case_id]||completed[c.case_id]||{};$('morphology').value=saved.morphology_qualification||'';$('opportunity').value=saved.opportunity_qualification||'';$('pattern').value=saved.pattern_type||'';$('note').value=saved.note||'';document.querySelectorAll('input[type=checkbox]').forEach(e=>e.checked=(saved.reasons||[]).includes(e.value));
+ $('direction').textContent=c.direction==='up'?'做多形态':'做空形态';$('assistant').open=false;$('legacy').open=false;$('interpretation').replaceChildren();$('evidence').replaceChildren();$('message').textContent='';
+ const context=task.context[c.case_id],old=legacy.find(l=>l.pair_id===context.pair_id);$('legacy-body').textContent=old?`这是原配对的${context.side==='left'?'左':'右'}侧。\n原形态选择：${old.morphology}；综合选择：${old.opportunity}。\n你的原说明：${old.note||'未填写'}\n原选择属于相对偏好，没有自动转换为本例合格结论。`:'本例没有此前配对反馈。';
+ $('progress').textContent=`本案例集已完成 ${q.filter(id=>completed[id]).length} / ${q.length}；原配对标签保留 ${legacy.length} 组。${reference(c).viewed?'本例已看过解读，展开前判断已保留。':''}`;draw(c);
+}
+for(const id of['morphology','opportunity','pattern','note'])$(id).oninput=capture;
+document.querySelectorAll('input[type=checkbox]').forEach(e=>e.onchange=capture);
+$('assistant').ontoggle=()=>{if(!$('assistant').open)return;const c=current();if(!reference(c).viewed){references[c.case_id]={viewed:true,version:task.version,task_hash:task.task_hash,opened_at:new Date().toISOString(),before:form()};capture()}showInterpretation(c)};
+$('prev').onclick=()=>{capture();if(index)index--;revealed=false;render()};$('next').onclick=()=>{capture();if(index+1<queue().length)index++;revealed=false;render()};$('queue').onchange=()=>{index=0;revealed=false;render()};
+$('scale').onchange=()=>draw(current());$('space').onclick=()=>{revealed=!revealed;draw(current())};
+function assessment(c,f){return{case_id:c.case_id,input_hash:c.input_hash,...f,assistant_reference:reference(c)}}
+$('save').onclick=()=>{const c=current(),f=form();capture();if(!f.morphology_qualification||!f.opportunity_qualification||!f.pattern_type){$('message').textContent='请完成三项选择；不确定时可明确选择“无法判断”。';return}completed[c.case_id]=assessment(c,f);if(persist()){$('message').textContent='已保存；可继续下一例。';$('progress').textContent=`本案例集已完成 ${queue().filter(id=>completed[id]).length} / ${queue().length}；原配对标签保留 ${legacy.length} 组。`}};
+function validateForm(f,partial){for(const k of['morphology_qualification','opportunity_qualification'])if(!grades.includes(f[k])&&!(partial&&f[k]===''))throw Error('合格判断格式不合法');if(!types.includes(f.pattern_type)&&!(partial&&f.pattern_type===''))throw Error('形态类型格式不合法');if(typeof f.note!=='string'||f.note.length>2000||!Array.isArray(f.reasons)||f.reasons.some(x=>!reasonCodes.includes(x)))throw Error('说明或原因格式不合法')}
+function validateCase(l,partial){const c=task.cases[l.case_id];if(!c||c.input_hash!==l.input_hash)throw Error('案例身份或行情哈希不一致');validateForm(l,partial);const r=l.assistant_reference;if(!r||r.version!==task.version||r.task_hash!==task.task_hash||typeof r.viewed!=='boolean')throw Error('解读版本不一致');if(r.viewed){validateForm(r.before,true);if(!r.opened_at||!Number.isFinite(Date.parse(r.opened_at)))throw Error('解读时间不合法')}}
+$('download').onclick=()=>{capture();const bundle={manifest_hash:task.base_manifest_hash,display_version:task.base_display_version,labels:legacy,annotation_version:'qualification-additive-v1',assessment_version:task.version,assessment_display_version:task.display_version,qualification_task_hash:task.task_hash,
+ case_assessments:Object.values(completed).map(l=>({...l,assistant_reference:reference(task.cases[l.case_id])})),case_drafts:Object.entries(drafts).map(([id,f])=>assessment(task.cases[id],f))};
+ const blob=new Blob([JSON.stringify(bundle,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='signal-quality-qualifications.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('import').onclick=()=>$('file').click();
+$('file').onchange=async()=>{const file=$('file').files?.[0];if(!file)return;try{const b=JSON.parse(await file.text());if(b.manifest_hash!==task.base_manifest_hash||b.display_version!==task.base_display_version||!Array.isArray(b.labels))throw Error('来自其他标注任务');
+ const pairMap=new Map(task.pair_identities.map(p=>[p.pair_id,p])),seenPairs=new Set();for(const l of b.labels){const p=pairMap.get(l.pair_id);if(!p||seenPairs.has(l.pair_id))throw Error('未知或重复配对');seenPairs.add(l.pair_id);for(const k of['left_case_id','left_input_hash','right_case_id','right_input_hash'])if(l[k]!==p[k])throw Error('原配对身份不一致');for(const k of['morphology','opportunity'])if(!['left','right','tie','uncertain'].includes(l[k]))throw Error('原配对选择不合法');if(typeof l.note!=='string'||l.note.length>2000||!Array.isArray(l.reasons)||l.reasons.some(x=>!['a','b','trend','space'].includes(x)))throw Error('原配对说明不合法');if(l.assistant_reference&&(l.assistant_reference.version!==task.legacy_reference_version||l.assistant_reference.notes_hash!==task.legacy_reference_hash))throw Error('原配对解读版本不一致')}
+ if(b.case_assessments!==undefined||b.case_drafts!==undefined){if(b.qualification_task_hash!==task.task_hash||b.assessment_version!==task.version||b.assessment_display_version!==task.display_version||!Array.isArray(b.case_assessments)||!Array.isArray(b.case_drafts||[]))throw Error('逐例评价版本不一致');for(const[key,partial]of[['case_assessments',false],['case_drafts',true]]){const seen=new Set();for(const l of b[key]||[]){if(seen.has(l.case_id))throw Error('重复逐例评价');seen.add(l.case_id);validateCase(l,partial)}}}
+ // Validate the entire file before merging any state.
+ const merged=new Map(legacy.map(l=>[l.pair_id,l]));for(const l of b.labels)merged.set(l.pair_id,l);legacy=[...merged.values()];for(const l of b.case_assessments||[]){completed[l.case_id]=l;if(!references[l.case_id]?.viewed)references[l.case_id]=l.assistant_reference;drafts[l.case_id]=l}for(const l of b.case_drafts||[]){drafts[l.case_id]=l;if(!references[l.case_id]?.viewed)references[l.case_id]=l.assistant_reference}persist();render();$('message').textContent=`导入完成，保留原配对 ${legacy.length} 组；逐例评价 ${Object.keys(completed).length} 例。`;
+ }catch(e){$('message').textContent=e.message||'导入失败'}finally{$('file').value=''}};
+render();
+</script></html>
