@@ -1,4 +1,5 @@
 //! Causal, independent display-only quality. Legacy selection and execution never call these scores.
+pub mod assistant_review;
 pub mod blind;
 pub mod report;
 pub mod research;

@@ -141,13 +141,8 @@ pub fn export(out: &Path, rows: &[AuditRow], cases: &HashMap<i64, Value>) -> Res
     let id = hash(&serde_json::to_vec_pretty(&manifest)?);
     manifest["manifest_hash"] = json!(id);
     write_json(&out.join("blind-manifest.json"), &manifest)?;
-    // Script-safe JSON: an adversarial label cannot close the script element.
-    let payload = serde_json::to_string(&manifest)?
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026");
-    let html = include_str!("blind-review.html").replace("__BLIND_PAYLOAD__", &payload);
-    std::fs::write(out.join("blind-review.html"), html)?;
+    let notes = super::assistant_review::build(&manifest, rows)?;
+    super::assistant_review::write_page(out, &manifest, &notes)?;
     Ok(())
 }
 pub fn import(args: &[String], out: &Path) -> Result<()> {
@@ -157,28 +152,11 @@ pub fn import(args: &[String], out: &Path) -> Result<()> {
             .map(|p| p[1].clone())
             .with_context(|| format!("{name} required"))
     };
-    let manifest_text = std::fs::read_to_string(arg("--manifest")?)?;
-    let mut manifest: Value = serde_json::from_str(&manifest_text)?;
+    let manifest_path = std::path::PathBuf::from(arg("--manifest")?);
+    let manifest = load_manifest(&manifest_path)?;
     let claimed = manifest["manifest_hash"]
         .as_str()
-        .context("manifest hash missing")?
-        .to_string();
-    manifest
-        .as_object_mut()
-        .context("manifest object")?
-        .remove("manifest_hash");
-    ensure!(
-        hash(
-            manifest_text
-                .replacen(
-                    &format!("\"manifest_hash\": \"{claimed}\""),
-                    &format!("\"manifest_hash\": \"{}\"", "0".repeat(64)),
-                    1
-                )
-                .as_bytes()
-        ) == claimed,
-        "manifest changed"
-    );
+        .context("manifest hash missing")?;
     let labels: Value = serde_json::from_slice(&std::fs::read(arg("--labels")?)?)?;
     ensure!(
         labels["manifest_hash"] == claimed
@@ -191,6 +169,20 @@ pub fn import(args: &[String], out: &Path) -> Result<()> {
         .iter()
         .map(|p| (p["pair_id"].as_str().unwrap_or(""), p))
         .collect();
+    let references = if labels["labels"]
+        .as_array()
+        .context("labels array")?
+        .iter()
+        .any(|label| label.get("assistant_reference").is_some())
+    {
+        let path = manifest_path
+            .parent()
+            .context("manifest parent")?
+            .join("assistant-notes.json");
+        Some(super::assistant_review::load(&path, &manifest)?)
+    } else {
+        None
+    };
     let mut seen = HashSet::new();
     let mut joined = Vec::new();
     for label in labels["labels"].as_array().context("labels array")? {
@@ -223,7 +215,56 @@ pub fn import(args: &[String], out: &Path) -> Result<()> {
                 .is_some_and(|s| s.chars().count() <= 2000),
             "invalid note"
         );
-        joined.push(json!({"label":label,"split":pair["split"],"category":pair["category"]}));
+        let mut group = "legacy_unrecorded";
+        if let Some(reference) = label.get("assistant_reference") {
+            ensure!(
+                reference.is_object(),
+                "invalid assistant reference metadata"
+            );
+            let notes = references.as_ref().context("assistant notes missing")?;
+            ensure!(
+                reference["notes_hash"] == notes["notes_hash"]
+                    && reference["version"] == notes["version"],
+                "assistant reference version mismatch"
+            );
+            let viewed = reference["viewed"]
+                .as_bool()
+                .context("reference viewed flag required")?;
+            group = if viewed {
+                "reference_viewed"
+            } else {
+                "no_reference_opened"
+            };
+            if viewed {
+                let before = &reference["before"];
+                for field in ["morphology", "opportunity"] {
+                    ensure!(
+                        ["", "left", "right", "tie", "uncertain"]
+                            .contains(&before[field].as_str().unwrap_or("invalid")),
+                        "invalid pre-reference choice"
+                    );
+                }
+                ensure!(
+                    before["note"]
+                        .as_str()
+                        .is_some_and(|s| s.chars().count() <= 2000),
+                    "invalid pre-reference note"
+                );
+                ensure!(
+                    before["reasons"].as_array().is_some_and(|rs| rs
+                        .iter()
+                        .all(|r| ["trend", "a", "b", "space"].contains(&r.as_str().unwrap_or("")))),
+                    "invalid pre-reference reasons"
+                );
+                ensure!(
+                    reference["opened_at"]
+                        .as_str()
+                        .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+                    "invalid reference timestamp"
+                );
+            }
+        }
+        joined.push(json!({"label":label,"split":pair["split"],"category":pair["category"],"calibration_group":group}));
     }
     write_json(
         &out.join("preferences.json"),
@@ -231,4 +272,31 @@ pub fn import(args: &[String], out: &Path) -> Result<()> {
     )?;
     println!("Imported {} preferences; no model trained", joined.len());
     Ok(())
+}
+
+pub fn load_manifest(path: &Path) -> Result<Value> {
+    let manifest_text = std::fs::read_to_string(path)?;
+    let mut manifest: Value = serde_json::from_str(&manifest_text)?;
+    let claimed = manifest["manifest_hash"]
+        .as_str()
+        .context("manifest hash missing")?
+        .to_string();
+    manifest
+        .as_object_mut()
+        .context("manifest object")?
+        .remove("manifest_hash");
+    ensure!(
+        hash(
+            manifest_text
+                .replacen(
+                    &format!("\"manifest_hash\": \"{claimed}\""),
+                    &format!("\"manifest_hash\": \"{}\"", "0".repeat(64)),
+                    1
+                )
+                .as_bytes()
+        ) == claimed,
+        "manifest changed"
+    );
+    manifest["manifest_hash"] = json!(claimed);
+    Ok(manifest)
 }

@@ -89,3 +89,62 @@ test('offline blind review preserves unsaved choices when revealing space and ex
   assert.equal(result.labels[0].left_input_hash, 'left-hash')
   assert.deepEqual(result.labels[0].reasons, ['a'])
 })
+
+function referenceHarness() {
+  class Element {
+    constructor() { this.textContent = ''; this.value = ''; this.checked = false; this.open = false; this.children = []; this.scrollWidth = 1000 }
+    setAttribute() {} append(...nodes) { this.children.push(...nodes) } replaceChildren(...nodes) { this.children = nodes } click() {}
+  }
+  const nodes = new Map(), get = id => nodes.get(id) || (nodes.set(id, new Element()), nodes.get(id))
+  const inputs = ['trend', 'a', 'b', 'space'].map(value => Object.assign(new Element(), { value }))
+  const makeCase = id => ({ case_id: id, input_hash: id + '-hash', direction: 'up', bars: [[0, 1, -.1, .8, .3], [.8, 1.1, .7, 1, .5]], points: [[0, 0], [1, 1], [1, .7]], entry: .9, stop: .6, target: 1, rr: .33 })
+  const pairs = [1, 2].map(n => ({ pair_id: 'pair-' + n, left: makeCase('left-' + n), right: makeCase('right-' + n) }))
+  const data = { manifest_hash: 'manifest', display_version: 'blind-quality-v1', pairs }
+  const readings = { trend: ['趋势背景'], push: ['小K有进展'], pullback: ['回到均线'], space: ['结构空间'] }
+  const notes = { base_manifest_hash: 'manifest', version: 'notes-v1', notes_hash: 'notes-hash', pairs: Object.fromEntries(pairs.map(p => [p.pair_id, { review_status: 'structure_draft', left: readings, right: readings, comparison: ['单独A段偏左；整体有取舍。'], uncertainties: ['尚未逐图复核。'] }])) }
+  get('payload').textContent = JSON.stringify(data); get('assistant-payload').textContent = JSON.stringify(notes)
+  const storage = new Map(); let downloaded
+  const document = { getElementById: get, createElementNS: () => new Element(), createElement: () => new Element(), querySelectorAll: selector => selector === 'input:checked' ? inputs.filter(n => n.checked) : inputs }
+  const source = fs.readFileSync('crates/n-core/src/quality/blind-review.html', 'utf8').match(/<script>\s*([\s\S]*?)<\/script>/)[1]
+  vm.runInNewContext(source, { document, localStorage: { getItem: key => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) }, Blob, URL: { createObjectURL: blob => { downloaded = blob; return 'blob:labels' }, revokeObjectURL() {} }, setTimeout: callback => callback() })
+  return { get, pairs, inputs, download: async () => { get('download').onclick(); return JSON.parse(await downloaded.text()) } }
+}
+
+test('reference starts hidden and preserves first independent choices, prose and ever-viewed state', async () => {
+  const h = referenceHarness(), $ = h.get
+  assert.equal($('assistant-panel').open, false)
+  assert.equal($('assistant-body').children.length, 0)
+  $('morphology').value = 'left'; $('opportunity').value = 'tie'; $('note').value = '先独立写：连续推进'; h.inputs[1].checked = true
+  $('assistant-panel').open = true; $('assistant-panel').ontoggle()
+  assert.ok($('assistant-body').children.length > 0)
+  assert.equal($('note').value, '先独立写：连续推进')
+  $('morphology').value = 'right'; $('note').value = '对照后补充：更看重趋势'
+  $('assistant-panel').open = false; $('assistant-panel').ontoggle()
+  $('reveal').onclick()
+  assert.equal($('note').value, '对照后补充：更看重趋势')
+  $('assistant-panel').open = true; $('assistant-panel').ontoggle()
+  $('save').onclick()
+  const first = (await h.download()).labels[0]
+  assert.equal(first.morphology, 'right')
+  assert.equal(first.assistant_reference.before.morphology, 'left')
+  assert.equal(first.assistant_reference.before.note, '先独立写：连续推进')
+  assert.equal(first.note, '对照后补充：更看重趋势')
+  assert.equal(first.assistant_reference.viewed, true)
+  assert.equal(first.assistant_reference.notes_hash, 'notes-hash')
+  $('next').onclick(); assert.equal($('assistant-panel').open, false)
+  $('morphology').value = 'tie'; $('opportunity').value = 'uncertain'; $('save').onclick()
+  assert.equal((await h.download()).labels[1].assistant_reference.viewed, false)
+})
+
+test('legacy JSON imports without losing notes; wrong task import leaves existing work intact', async () => {
+  const h = referenceHarness(), $ = h.get, p = h.pairs[0]
+  const label = { pair_id: p.pair_id, left_case_id: p.left.case_id, right_case_id: p.right.case_id, left_input_hash: p.left.input_hash, right_input_hash: p.right.input_hash, morphology: 'left', opportunity: 'right', reasons: ['a'], note: '旧页已经写好的补充' }
+  const data = { manifest_hash: 'manifest', display_version: 'blind-quality-v1', labels: [label] }
+  $('labels-file').files = [{ text: async () => JSON.stringify(data) }]; await $('labels-file').onchange()
+  assert.equal($('note').value, label.note)
+  assert.equal((await h.download()).labels[0].note, label.note)
+  data.manifest_hash = 'other-task'; data.labels[0].note = '不能覆盖'
+  $('labels-file').files = [{ text: async () => JSON.stringify(data) }]; await $('labels-file').onchange()
+  assert.equal($('note').value, '旧页已经写好的补充')
+  assert.ok($('message').textContent.includes('其他盲评任务'))
+})

@@ -526,6 +526,49 @@ fn blind_export_has_no_future_scores_or_outcomes_and_import_checks_identity() {
     let accepted = folder.join("accepted");
     std::fs::create_dir(&accepted).unwrap();
     blind::import(&args, &accepted).unwrap();
+    let imported: Value =
+        serde_json::from_slice(&std::fs::read(accepted.join("preferences.json")).unwrap()).unwrap();
+    assert_eq!(
+        imported["preferences"][0]["calibration_group"],
+        "legacy_unrecorded"
+    );
+    let notes =
+        super::assistant_review::load(&folder.join("assistant-notes.json"), &manifest).unwrap();
+    // The companion prose depends only on warning-time raw features, never outcome or total scores.
+    let mut changed = rows.clone();
+    for r in &mut changed {
+        r.old_score = 999.;
+        r.quality.quality_score = Some(0.);
+        r.quality.morphology_score = Some(100.);
+        r.evaluations
+            .insert("future_profit".into(), serde_json::json!({"net_r":999.}));
+    }
+    assert_eq!(
+        notes,
+        super::assistant_review::build(&manifest, &changed).unwrap()
+    );
+    labels["labels"][0]["assistant_reference"] = serde_json::json!({"viewed":true,"version":notes["version"],"notes_hash":notes["notes_hash"],"opened_at":"2026-10-29T09:20:00Z","before":{"morphology":"right","opportunity":"","reasons":["a"],"note":"先写下的独立判断"}});
+    std::fs::write(&label_path, serde_json::to_vec(&labels).unwrap()).unwrap();
+    let referenced = folder.join("referenced");
+    std::fs::create_dir(&referenced).unwrap();
+    blind::import(&args, &referenced).unwrap();
+    let imported: Value =
+        serde_json::from_slice(&std::fs::read(referenced.join("preferences.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        imported["preferences"][0]["calibration_group"],
+        "reference_viewed"
+    );
+    assert_eq!(
+        imported["preferences"][0]["label"]["assistant_reference"]["before"]["note"],
+        "先写下的独立判断"
+    );
+    labels["labels"][0]["assistant_reference"]["notes_hash"] = serde_json::json!("wrong-version");
+    std::fs::write(&label_path, serde_json::to_vec(&labels).unwrap()).unwrap();
+    assert!(blind::import(&args, &referenced)
+        .unwrap_err()
+        .to_string()
+        .contains("reference version"));
     labels["labels"][0]["left_input_hash"] = serde_json::json!("stale");
     std::fs::write(&label_path, serde_json::to_vec(&labels).unwrap()).unwrap();
     assert!(blind::import(&args, &accepted).is_err());
