@@ -137,7 +137,6 @@ pub fn run() {
                 &data_dir,
                 api,
                 realtime,
-                kline_cache,
                 credentials,
                 backup_scheduler,
             ));

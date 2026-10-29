@@ -27,6 +27,7 @@ use crate::storage::entities::{
 };
 use crate::storage::repo;
 
+pub mod live_chart;
 pub mod pipeline;
 pub use pipeline::{RawPipeline, SymbolLocks};
 
@@ -1287,10 +1288,9 @@ pub struct Services {
     pub pipeline: RawPipeline,
     /// 活跃单K（上影锤/下影锤）形态缓存
     pub active_single_bars: Arc<RwLock<HashMap<String, crate::analyze::model::SingleBarAlert>>>,
-    /// 内存中常驻维护的各品种当前 5m 未决 K 线（由行情快照轮询更新，或图表主动探测缓存）
-    pub live_5m_bars: Arc<RwLock<HashMap<String, KlineDto>>>,
-    /// 内存中缓存的派生周期未决 K 线 ((symbol, timeframe) -> KlineDto)
-    pub live_derived_bars: Arc<RwLock<HashMap<(String, String), KlineDto>>>,
+    /// 仅供图表读取的后台实时快照，不进入正式库和策略。
+    pub live_chart: Arc<live_chart::LiveChartCache>,
+
 }
 
 impl Services {
@@ -1405,8 +1405,7 @@ impl Services {
             data_cycle_lock: Mutex::new(()),
             pipeline,
             active_single_bars: Arc::new(RwLock::new(HashMap::new())),
-            live_5m_bars: Arc::new(RwLock::new(HashMap::new())),
-            live_derived_bars: Arc::new(RwLock::new(HashMap::new())),
+            live_chart: Arc::new(live_chart::LiveChartCache::default()),
         })
     }
 
@@ -2726,11 +2725,7 @@ impl Services {
         repo::remove_symbol(&self.db, code).await?;
         repo::delete_symbol_klines(&self.db, code).await?;
         repo::delete_symbol_rollovers(&self.db, code).await?;
-        self.live_5m_bars.write().await.remove(code);
-        self.live_derived_bars
-            .write()
-            .await
-            .retain(|(sym, _), _| sym != code);
+        self.live_chart.remove(code);
         Ok(())
     }
     /// 定时增量刷新：每品种按增量窗口抓取，缺口过大时回补。
@@ -3347,17 +3342,13 @@ impl Services {
             let rows = repo::klines(&self.db, symbol, "5m", limit, None).await?;
             return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
-        let raw_cutoff = repo::raw_klines(&self.db, symbol)
+        let raw_cutoff = repo::latest_raw_ts(&self.db, symbol)
             .await?
-            .last()
-            .map(|r| r.ts.clone())
             .unwrap_or_default();
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
-            let rows = repo::klines(&self.db, symbol, tf.as_str(), limit, None)
-                .await?
-                .into_iter()
-                .filter(|r| r.ts <= raw_cutoff)
-                .collect::<Vec<_>>();
+            // 截止时间和数量都下推到 SQL；派生库尾部的未闭合桶不能挤占显示数量。
+            let rows =
+                repo::klines(&self.db, symbol, tf.as_str(), limit, Some(&raw_cutoff)).await?;
             if !rows.is_empty() {
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
@@ -3415,6 +3406,8 @@ impl Services {
                 partial_bar: None,
             });
         }
+
+        self.live_chart.request(symbol);
 
         // 健康检查有自己的冷却与连续成功策略，避免短暂抖动时反复切换。
         let tq_ready = self.data_source.tq_available_or_probe().await;
@@ -3479,7 +3472,12 @@ impl Services {
                 } else {
                     "tqsdk".to_string()
                 },
-                message: recovery_message,
+                message: if partial_bar.is_none()
+                    && crate::scheduler::is_symbol_trading_time(symbol, &now)
+                    && recovery_message.is_empty()
+                {
+                    "历史数据已获取，实时柱正在准备；就绪后自动推送更新。".into()
+                } else { recovery_message },
                 partial_bar,
             });
         }
@@ -3773,307 +3771,20 @@ impl Services {
         })
     }
 
-    /// 根据实时行情快照更新常驻内存中的 5m 未决 K 线。
-    /// 在当前 5m 桶内就地更新最新价、最高价、最低价；跨入新桶时开盘价继承前一桶收盘价，返回被更新的 K 线列表。
-    pub async fn update_live_bars_from_quotes(
-        &self,
-        snapshots: &[MarketSnapshot],
-    ) -> Vec<KlineDto> {
-        let now = chrono::Local::now();
-        if !crate::scheduler::is_trading_time(&now) {
-            return Vec::new();
-        }
-        let now_dt = now.naive_local();
-        let bucket_5m_end =
-            crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
-
-        let mut updated = Vec::new();
-        let mut map = self.live_5m_bars.write().await;
-        for s in snapshots {
-            let Some(latest) = s.latest else {
-                continue;
-            };
-            if latest <= 0.0 {
-                continue;
-            }
-            let symbol = &s.code;
-
-            match map.get_mut(symbol) {
-                Some(bar) if bar.ts == bucket_5m_end => {
-                    bar.close = latest;
-                    if latest > bar.high {
-                        bar.high = latest;
-                    }
-                    if latest < bar.low {
-                        bar.low = latest;
-                    }
-                    updated.push(bar.clone());
-                }
-                Some(bar) => {
-                    // 判断是否紧邻上一桶（时间差 <= 10 分钟且处于同一天），若跨日或跨休市则开盘价取当前最新价
-                    let is_consecutive = if let Ok(prev_dt) =
-                        chrono::NaiveDateTime::parse_from_str(&bar.ts, "%Y-%m-%d %H:%M:%S")
-                    {
-                        let diff_min = (now_dt - prev_dt).num_minutes();
-                        diff_min >= 0 && diff_min <= 10 && prev_dt.date() == now_dt.date()
-                    } else {
-                        false
-                    };
-                    let open = if is_consecutive { bar.close } else { latest };
-                    *bar = KlineDto {
-                        symbol: symbol.clone(),
-                        timeframe: "5m".to_string(),
-                        ts: bucket_5m_end.clone(),
-                        open,
-                        high: open.max(latest),
-                        low: open.min(latest),
-                        close: latest,
-                        volume: 0.0,
-                        hold: 0.0,
-                        source: "live_quote".to_string(),
-                        rollover: false,
-                    };
-                    updated.push(bar.clone());
-                }
-                None => {
-                    let new_bar = KlineDto {
-                        symbol: symbol.clone(),
-                        timeframe: "5m".to_string(),
-                        ts: bucket_5m_end.clone(),
-                        open: latest,
-                        high: latest,
-                        low: latest,
-                        close: latest,
-                        volume: 0.0,
-                        hold: 0.0,
-                        source: "live_quote".to_string(),
-                        rollover: false,
-                    };
-                    map.insert(symbol.clone(), new_bar.clone());
-                    updated.push(new_bar);
-                }
-            }
-        }
-        updated
-    }
-
-    /// 获取或快速探测 5m 未决 K 线。
-    /// 优先使用天勤桥接内存极速探测（<=80ms），超时或无数据从内存缓存 live_5m_bars 回退，
-    /// 若内存尚无则尝试读取最新行情快照就地构造，确保毫秒级响应不阻塞图表渲染。
-    pub async fn get_or_probe_live_5m_bar(&self, symbol: &str) -> Option<KlineDto> {
-        if self.config().await.data_source.primary_source == "offline" {
-            return None;
-        }
-        let now = chrono::Local::now();
-        if !crate::scheduler::is_symbol_trading_time(symbol, &now) {
-            return None;
-        }
-        let now_dt = now.naive_local();
-        let bucket_5m_end =
-            crate::derive::current_bucket_end_ts(now_dt, crate::derive::Timeframe::M5);
-
-        // 1. 如果天勤可用，设置 80ms 极短超时快速探测一次天勤内存中是否有真实未决 5m 柱
-        if self.data_source.tq_is_available() {
-            let tq = self.data_source.tq_client().await;
-            let query = tq.fetch_minute_raw(symbol, "5m", 1);
-            if let Ok(Ok(raw)) =
-                tokio::time::timeout(std::time::Duration::from_millis(80), query).await
-            {
-                if let Some(last) = raw.klines.into_iter().last() {
-                    let dto = KlineDto {
-                        symbol: symbol.to_string(),
-                        timeframe: "5m".to_string(),
-                        ts: last.datetime,
-                        open: last.open,
-                        high: last.high,
-                        low: last.low,
-                        close: last.close,
-                        volume: last.volume,
-                        hold: last.hold,
-                        source: "tqsdk_partial".to_string(),
-                        rollover: false,
-                    };
-                    self.live_5m_bars
-                        .write()
-                        .await
-                        .insert(symbol.to_string(), dto.clone());
-                    return Some(dto);
-                }
-            }
-        }
-
-        // 2. 若天勤未返回或超时，直接读 live_5m_bars 内存（仅接受当前桶，杜绝历史陈旧数据）
-        {
-            let map = self.live_5m_bars.read().await;
-            if let Some(bar) = map.get(symbol) {
-                if bar.ts == bucket_5m_end {
-                    return Some(bar.clone());
-                }
-            }
-        }
-
-        // 3. 若内存中尚无该品种的 live bar（如刚冷启动），尝试从快照源拉取当前品种最新 quote 补齐
-        if let Ok(quotes) = self.data_source.fetch_quotes(&[symbol.to_string()]).await {
-            if let Some(q) = quotes.get(symbol) {
-                if q.latest > 0.0 {
-                    let dto = KlineDto {
-                        symbol: symbol.to_string(),
-                        timeframe: "5m".to_string(),
-                        ts: bucket_5m_end,
-                        open: q.latest,
-                        high: q.latest,
-                        low: q.latest,
-                        close: q.latest,
-                        volume: 0.0,
-                        hold: 0.0,
-                        source: "live_quote".to_string(),
-                        rollover: false,
-                    };
-                    self.live_5m_bars
-                        .write()
-                        .await
-                        .insert(symbol.to_string(), dto.clone());
-                    return Some(dto);
-                }
-            }
-        }
-
-        None
-    }
-
-    /// 通过最近已闭合 5m 历史与当前 5m 未决柱，动态聚合出长周期的精确未决 K 线。
-    /// 包含真实的开盘价、极值最高价、极值最低价以及累计成交量，毫秒级就绪且不向天勤发起长周期订阅。
-    pub async fn derive_partial_kline(
-        &self,
-        symbol: &str,
-        target_tf: crate::derive::Timeframe,
-    ) -> Option<KlineDto> {
-        let now = chrono::Local::now();
-        if !crate::scheduler::is_symbol_trading_time(symbol, &now) {
-            return None;
-        }
-        let live_5m = self.get_or_probe_live_5m_bar(symbol).await?;
-        let now_dt = now.naive_local();
-        let target_bucket_end = crate::derive::current_bucket_end_ts(now_dt, target_tf);
-
-        let needed = match target_tf {
-            crate::derive::Timeframe::M15 => 5,
-            crate::derive::Timeframe::M30 => 10,
-            crate::derive::Timeframe::M60 => 18,
-            crate::derive::Timeframe::M120 => 30,
-            crate::derive::Timeframe::M240 => 60,
-            crate::derive::Timeframe::Day => 90,
-            _ => 90,
-        };
-
-        let closed_models = repo::klines(&self.db, symbol, "5m", Some(needed), None)
-            .await
-            .ok()?;
-        let mut bars: Vec<Kline> = closed_models.iter().map(model_to_fetch).collect();
-
-        let live_bar = Kline {
-            datetime: live_5m.ts.clone(),
-            open: live_5m.open,
-            high: live_5m.high,
-            low: live_5m.low,
-            close: live_5m.close,
-            volume: live_5m.volume,
-            hold: live_5m.hold,
-        };
-
-        if let Some(last) = bars.last_mut() {
-            if last.datetime == live_bar.datetime {
-                *last = live_bar;
-            } else if live_bar.datetime > last.datetime {
-                bars.push(live_bar);
-            }
-        } else {
-            bars.push(live_bar);
-        }
-
-        // A 15m bar at the start of a session must include each 5m slice seen so far.
-        // Otherwise a delayed database refresh can turn the whole night opening move
-        // into a tiny candle starting at the latest quote.
-        if target_tf == crate::derive::Timeframe::M15 {
-            let end =
-                NaiveDateTime::parse_from_str(&target_bucket_end, "%Y-%m-%d %H:%M:%S").ok()?;
-            let live_end = NaiveDateTime::parse_from_str(&live_5m.ts, "%Y-%m-%d %H:%M:%S").ok()?;
-            let first = end - ChronoDuration::minutes(10);
-            let missing_slice = |rows: &[Kline]| {
-                (0..3).any(|i| {
-                    let ts = first + ChronoDuration::minutes(i * 5);
-                    ts <= live_end
-                        && !rows
-                            .iter()
-                            .any(|row| row.datetime == ts.format("%Y-%m-%d %H:%M:%S").to_string())
-                })
-            };
-            if missing_slice(&bars) && self.data_source.tq_is_available() {
-                let tq = self.data_source.tq_client().await;
-                if let Ok(Ok(raw)) = tokio::time::timeout(
-                    Duration::from_millis(500),
-                    tq.fetch_minute_raw(symbol, "5m", 4),
-                )
-                .await
-                {
-                    let mut by_ts: std::collections::BTreeMap<String, Kline> = bars
-                        .into_iter()
-                        .map(|bar| (bar.datetime.clone(), bar))
-                        .collect();
-                    for bar in raw.klines {
-                        if bar.datetime <= live_5m.ts {
-                            by_ts.insert(bar.datetime.clone(), bar);
-                        }
-                    }
-                    bars = by_ts.into_values().collect();
-                }
-            }
-            if missing_slice(&bars) {
-                tracing::warn!(
-                    symbol,
-                    target_bucket_end,
-                    "15m 临时K线缺少同桶5m数据，暂不绘制不完整K线"
-                );
-                return None;
-            }
-        }
-
-        let aggregated = crate::derive::aggregate(&bars, target_tf);
-        let last_agg = aggregated.into_iter().last()?;
-
-        if last_agg.datetime >= target_bucket_end || last_agg.datetime == target_bucket_end {
-            let dto = KlineDto {
-                symbol: symbol.to_string(),
-                timeframe: target_tf.as_str().to_string(),
-                ts: last_agg.datetime,
-                open: last_agg.open,
-                high: last_agg.high,
-                low: last_agg.low,
-                close: last_agg.close,
-                volume: last_agg.volume,
-                hold: last_agg.hold,
-                source: "derived_partial".to_string(),
-                rollover: false,
-            };
-            self.live_derived_bars.write().await.insert(
-                (symbol.to_string(), target_tf.as_str().to_string()),
-                dto.clone(),
-            );
-            Some(dto)
-        } else {
-            None
-        }
-    }
-
-    /// 获取当前交易时段内正在进行的实时K线（未闭合 Bar）。
-    /// 5m 走内存或极速 80ms 探测，长周期通过 derive 毫秒级聚合，彻底避免向外部数据源阻塞等待。
+    /// 图表请求仅读取后台维护且未过期的完整实时柱，不请求桥接、不查历史、不现场补片。
     pub async fn get_partial_kline(&self, symbol: &str, timeframe: &str) -> Option<KlineDto> {
-        let tf = crate::derive::Timeframe::parse(timeframe)?;
-        if tf == crate::derive::Timeframe::M5 {
-            self.get_or_probe_live_5m_bar(symbol).await
-        } else {
-            self.derive_partial_kline(symbol, tf).await
+        let tf = Timeframe::parse(timeframe)?;
+        if self.config().await.data_source.primary_source != "tqsdk"
+            || !self.data_source.tq_is_available()
+        {
+            return None;
         }
+        self.live_chart.request(symbol);
+        let now = Local::now();
+        if !crate::scheduler::is_symbol_trading_time(symbol, &now) {
+            return None;
+        }
+        self.live_chart.get(symbol, tf, now.naive_local())
     }
 
     /// 天勤恢复后只补本地实际缺口加20根重叠数据，不固定重拉500/1000根。
@@ -5425,6 +5136,61 @@ fn parse_dt(s: &str) -> Option<DT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chart_limit_uses_only_finalized_raw_history() {
+        use sea_orm::Set;
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let row = |symbol: &str, tf: &str, ts: &str, source: &str| {
+            crate::storage::entities::klines::ActiveModel {
+                symbol: Set(symbol.into()),
+                timeframe: Set(tf.into()),
+                ts: Set(ts.into()),
+                open: Set(100.0),
+                high: Set(101.0),
+                low: Set(99.0),
+                close: Set(100.0),
+                volume: Set(1.0),
+                hold: Set(1.0),
+                source: Set(source.into()),
+            }
+        };
+        repo::upsert_klines(
+            &db,
+            vec![
+                row("RB0", "5m", "2026-01-05 11:25:00", "raw"),
+                row("RB0", "5m", "2026-01-05 11:30:00", "live_quote"),
+                row("SR0", "5m", "2026-01-05 11:35:00", "raw"),
+                row("RB0", "15m", "2026-01-05 10:45:00", "derived"),
+                row("RB0", "15m", "2026-01-05 11:00:00", "derived"),
+                row("RB0", "15m", "2026-01-05 11:15:00", "derived"),
+                row("RB0", "15m", "2026-01-05 11:30:00", "derived"),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo::latest_raw_ts(&db, "RB0").await.unwrap().as_deref(),
+            Some("2026-01-05 11:25:00")
+        );
+        assert_eq!(repo::latest_raw_ts(&db, "missing").await.unwrap(), None);
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db,
+            config,
+            std::env::temp_dir().join("chart-limit-no-config.json"),
+        )
+        .await
+        .unwrap();
+        let rows = services.get_klines("RB0", "15m", Some(2)).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.ts.as_str()).collect::<Vec<_>>(),
+            vec!["2026-01-05 11:00:00", "2026-01-05 11:15:00"]
+        );
+    }
 
     fn source_test_bar(ts: &str, price: f64) -> Kline {
         Kline {

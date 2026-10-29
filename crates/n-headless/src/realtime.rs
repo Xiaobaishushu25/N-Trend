@@ -318,4 +318,10 @@ impl RealtimeHub {
     pub async fn active_connections(&self) -> usize {
         self.clients.read().await.len()
     }
+
+    pub async fn chart_symbols(&self) -> HashSet<String> {
+        self.clients.read().await.values()
+            .flat_map(|session| session.subscribed_symbols.iter().cloned())
+            .collect()
+    }
 }

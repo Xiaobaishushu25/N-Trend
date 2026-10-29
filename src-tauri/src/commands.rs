@@ -476,7 +476,6 @@ pub async fn get_klines(
 #[tauri::command]
 pub async fn get_chart_klines(
     state: State<'_, Arc<AppState>>,
-    app: AppHandle,
     symbol: String,
     timeframe: String,
     limit: Option<usize>,
@@ -495,94 +494,28 @@ pub async fn get_chart_klines(
         .await;
     tracing::info!(%trace_id, elapsed_ms = started.elapsed().as_millis(), "K线实时订阅完成");
 
-    // 1. 如果有极新鲜的内存缓存（3秒内，如快速来回切换周期/品种），直接命中返回，实现 0ms 秒出图
-    if let Some(fresh) =
-        state
-            .kline_cache
-            .get_fresh(&symbol, &timeframe, std::time::Duration::from_secs(3))
-    {
-        tracing::info!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = fresh.rows.len(), "K线命中3秒内存缓存");
-        return Ok(fresh);
-    }
-
-    let cached = state.kline_cache.get(&symbol, &timeframe);
-    tracing::info!(%trace_id, cached = cached.is_some(), elapsed_ms = started.elapsed().as_millis(), "K线缓存检查完成");
-
-    // 回退缓存后继续同一次下载；不能在 1500ms 时取消下载并从头重发。
-    let fetch_state = state.inner().clone();
-    let fetch_symbol = symbol.clone();
-    let fetch_timeframe = timeframe.clone();
-    let fetch_trace_id = trace_id.clone();
-    let mut fetch_fut = Box::pin(async move {
+    // 每次切换均读取服务端；失败时明确报错，不以客户端旧缓存冒充新响应。
+    let fetch_fut = async {
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            fetch_state.api.get_chart_klines(
-                &fetch_symbol,
-                &fetch_timeframe,
-                limit,
-                None,
-                &fetch_trace_id,
-            ),
-        )
-        .await
-        {
+            state.api.get_chart_klines(&symbol, &timeframe, limit, None, &trace_id),
+        ).await {
             Ok(res) => res.map_err(|e| e.message),
-            Err(_) => {
-                tracing::warn!(trace_id = %fetch_trace_id, symbol = %fetch_symbol, timeframe = %fetch_timeframe, "获取K线超时(30s)");
-                Err("获取K线超时，请检查网络或服务端状态".to_string())
-            }
+            Err(_) => Err("获取K线超时，请检查网络或服务端状态".to_string()),
         }
-    });
-    let resp_res = if cached.is_some() {
-        match tokio::time::timeout(std::time::Duration::from_millis(1500), &mut fetch_fut).await {
-            Ok(res) => res,
-            Err(_) => {
-                tracing::warn!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), "网络或服务端响应慢，先显示内存缓存");
-                let bg_state = state.inner().clone();
-                let bg_app = app.clone();
-                let sym = symbol.clone();
-                let tf = timeframe.clone();
-                let bg_trace_id = trace_id.clone();
-                tokio::spawn(async move {
-                    if let Ok(resp) = fetch_fut.await {
-                        tracing::info!(trace_id = %bg_trace_id, rows = resp.rows.len(), "K线后台刷新完成");
-                        bg_state.kline_cache.put(&sym, &tf, &resp);
-                        let _ = bg_app.emit(
-                            "chart-klines-refreshed",
-                            serde_json::json!({
-                                "symbol": sym,
-                                "timeframe": tf,
-                                "response": resp,
-                            }),
-                        );
-                    } else {
-                        tracing::warn!(trace_id = %bg_trace_id, "K线后台刷新失败");
-                    }
-                });
-                return Ok(cached.unwrap());
-            }
-        }
-    } else {
-        fetch_fut.await
     };
 
-    match resp_res {
+    match fetch_fut.await {
         Ok(resp) => {
             tracing::info!(%trace_id, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), status = %resp.status, "K线客户端请求完成");
             if started.elapsed() >= std::time::Duration::from_millis(500) {
                 tracing::warn!(%trace_id, symbol, timeframe, elapsed_ms = started.elapsed().as_millis(), rows = resp.rows.len(), "K线客户端请求较慢");
             }
-            state.kline_cache.put(&symbol, &timeframe, &resp);
             Ok(resp)
         }
         Err(e) => {
             tracing::warn!(%trace_id, elapsed_ms = started.elapsed().as_millis(), error = %e, "K线客户端请求结束于错误");
-            if let Some(c) = cached {
-                tracing::warn!("网络异常，展示内存缓存K线数据: {e}");
-                Ok(c)
-            } else {
-                Err(e)
-            }
+            Err(e)
         }
     }
 }

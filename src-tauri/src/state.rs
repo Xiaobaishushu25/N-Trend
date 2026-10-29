@@ -5,14 +5,13 @@ use tokio::sync::RwLock;
 use n_protocol::config::ClientLocalSettings;
 use n_protocol::dto::{NewNotificationHistoryItem, NotificationHistoryItem};
 
-use crate::client::{BackupScheduler, CredentialStore, KlineMemoryCache, RealtimeClient, RemoteApiClient};
+use crate::client::{BackupScheduler, CredentialStore, RealtimeClient, RemoteApiClient};
 
 pub const NOTIFICATION_HISTORY_LIMIT: usize = 40;
 
 pub struct AppState {
     pub api: Arc<RemoteApiClient>,
     pub realtime: Arc<RealtimeClient>,
-    pub kline_cache: Arc<KlineMemoryCache>,
     pub credentials: Arc<CredentialStore>,
     pub backup_scheduler: Arc<BackupScheduler>,
     pub local_settings: RwLock<ClientLocalSettings>,
@@ -26,7 +25,6 @@ impl AppState {
         data_dir: &Path,
         api: Arc<RemoteApiClient>,
         realtime: Arc<RealtimeClient>,
-        kline_cache: Arc<KlineMemoryCache>,
         credentials: Arc<CredentialStore>,
         backup_scheduler: Arc<BackupScheduler>,
     ) -> Self {
@@ -42,7 +40,6 @@ impl AppState {
         Self {
             api,
             realtime,
-            kline_cache,
             credentials,
             backup_scheduler,
             local_settings: RwLock::new(local_settings),

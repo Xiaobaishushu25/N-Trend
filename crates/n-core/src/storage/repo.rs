@@ -318,6 +318,21 @@ pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<kli
     Ok(rows)
 }
 
+/// 只查询正式 5m 历史的截止时间，避免图表为了一个时间戳加载整个品种历史。
+pub async fn latest_raw_ts(db: &DatabaseConnection, symbol: &str) -> Result<Option<String>> {
+    klines::Entity::find()
+        .select_only()
+        .column(klines::Column::Ts)
+        .filter(klines::Column::Symbol.eq(symbol))
+        .filter(klines::Column::Timeframe.eq("5m"))
+        .filter(klines::Column::Source.eq("raw"))
+        .order_by_desc(klines::Column::Ts)
+        .into_tuple::<String>()
+        .one(db)
+        .await
+        .context("查询原始K线截止时间失败")
+}
+
 /// 抢占指定K线的扫描水位。相同指纹已经完成时返回 false；修订后的新指纹允许重扫。
 pub async fn claim_scan_watermark(
     db: &DatabaseConnection,

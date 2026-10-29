@@ -5,6 +5,91 @@ const vm = require('node:vm')
 const ts = require('typescript')
 
 const flush = () => new Promise(setImmediate)
+
+function klinesHarness() {
+  const requests = []
+  const context = { exports: {}, performance, require(name) {
+    if (name === 'pinia') return { defineStore: (_, options) => () => {
+      const store = options.state()
+      for (const [key, action] of Object.entries(options.actions)) store[key] = action.bind(store)
+      return store
+    } }
+    if (name === '../services/api') return { api: { getChartKlines() {
+      const request = deferred()
+      requests.push(request)
+      return request.promise
+    } } }
+    if (name === '../utils/notify') return { notify: { error() {} } }
+    if (name === '../utils/performanceLog') return { reportPerformance() {} }
+    throw Error(`Unexpected module ${name}`)
+  } }
+  const source = ts.transpileModule(fs.readFileSync('src/stores/klines.ts', 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  })
+  vm.runInNewContext(source.outputText, context)
+  return { store: context.exports.useKlinesStore(), requests }
+}
+
+const response = (close) => ({ rows: [{ close }], status: 'tqsdk', message: '' })
+
+const bar = (close, symbol = 'CF0', timeframe = '15m', ts = '2026-10-29 14:15:00') => ({ symbol, timeframe, ts, close })
+
+test('live push before the history response keeps its newer candle without dismissing the mask', async () => {
+  const { store, requests } = klinesHarness()
+  const load = store.load('CF0', '15m')
+  assert.equal(store.acceptPartial('CF0', '15m', bar(123)), true)
+  assert.equal(store.loading, true, 'a partial candle cannot replace the pending history request')
+  requests[0].resolve({ ...response(100), partial_bar: bar(99) })
+  await load
+  assert.equal(store.rows[0].close, 100)
+  assert.equal(store.partialBar.close, 123)
+  assert.equal(store.loading, false)
+})
+
+test('every explicit reload clears prior data and a failed request never falls back to it', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  requests[0].resolve(response(100))
+  await first
+  const second = store.load('CF0', '15m')
+  assert.equal(store.rows.length, 0)
+  assert.equal(store.dataReceivedAt, 0)
+  requests[1].reject(Error('network unavailable'))
+  await second
+  assert.equal(store.rows.length, 0)
+  assert.equal(store.error, 'network unavailable')
+  assert.equal(store.loading, false)
+})
+
+test('superseded loads and other-symbol pushes cannot alter the current chart', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  const second = store.load('SR0', '15m')
+  requests[0].resolve(response(100))
+  await first
+  assert.equal(store.loading, true)
+  assert.equal(store.rows.length, 0)
+  assert.equal(store.acceptPartial('CF0', '15m', bar(456)), false)
+  requests[1].resolve(response(600))
+  await second
+  assert.equal(store.loading, false)
+  assert.equal(store.rows[0].close, 600)
+})
+
+test('a missing-slice push invalidates live data and older candle pushes are rejected', async () => {
+  const { store, requests } = klinesHarness()
+  const load = store.load('CF0', '15m')
+  requests[0].resolve(response(100))
+  await load
+  store.acceptPartial('CF0', '15m', bar(123))
+  assert.equal(store.acceptPartial('CF0', '15m', bar(99, 'CF0', '15m', '2026-10-29 14:00:00')), false)
+  assert.equal(store.partialBar.close, 123)
+  store.acceptPartial('CF0', '15m', null)
+  assert.equal(store.partialBar, null)
+  assert.equal(store.partialReceivedAt, 0)
+  assert.equal(store.partialExpected, true)
+})
+
 function deferred() {
   let resolve, reject
   const promise = new Promise((yes, no) => { resolve = yes; reject = no })

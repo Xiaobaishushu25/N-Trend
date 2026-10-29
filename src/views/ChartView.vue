@@ -16,7 +16,7 @@ import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Chevron
 import KLineChart from '../components/KLineChart.vue'
 import IntradayChart from '../components/IntradayChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import { api, onChartKlinesRefreshed, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useIntradayStore } from '../stores/intraday'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
@@ -439,6 +439,7 @@ async function handleBack() {
 /** 手动或重试重新拉取K线数据 */
 async function retryLoadKlines() {
   if (!symbol.value) return
+  liveBars.value = []
   await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, false)
   if (klinesStore.rows.length > 0) {
     notify.success(`已成功加载 [${symbol.value}] ${timeframe.value} K线数据 (${klinesStore.rows.length} 根)`)
@@ -449,6 +450,7 @@ async function retryLoadKlines() {
 function handleTimeframeClick(t: Timeframe) {
   isIntradayMode.value = false
   if (timeframe.value === t) {
+    liveBars.value = []
     void klinesStore.load(symbol.value, t, chartLoadLimit.value, false)
     return
   }
@@ -1077,95 +1079,25 @@ const snapshots = ref<Record<string, MarketSnapshot>>({})
 const rowFlash = ref<Record<string, 'up' | 'down'>>({})
 const flashTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const FLASH_MS = 1000
-/** 分钟级周期的长度（分钟），用于把实时报价对齐到当前正在形成的K线桶 */
-const TIMEFRAME_MINUTES: Record<string, number> = {
-  '5m': 5,
-  '15m': 15,
-  '30m': 30,
-  '60m': 60,
-  '120m': 120,
-  '240m': 240,
-}
-/**
- * 实时拼出的K线：最后一个元素是「当前正在形成」的一根，
- * 之前的元素是已收盘但库内还没落地的闭环；与后端分桶规则保持一致
- * （按自然日分钟网格取整、桶末时间戳），切换品种/周期时清空。
- */
+/** 图表只使用服务端校准的实时柱；报价仍用于盘口和分时图。 */
 const liveBars = ref<KlineRow[]>([])
-
-/** 按后端相同规则计算当前正在形成的桶的结束时间（桶末时间戳） */
-function liveBucketLabel(date: Date, timeframe: string): string | null {
-  const minutes = TIMEFRAME_MINUTES[timeframe]
-  if (!minutes) return null
-  const elapsed = date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60
-  const endMin = Math.max(1, Math.ceil(elapsed / minutes)) * minutes
-  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, endMin, 0, 0)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:00`
-}
-
-/** 用实时报价刷新当前正在形成的K线；进入新桶时把前一根自动转为“已收未落地” */
-function updateLiveBar(latest: number) {
-  if (!symbol.value || !Number.isFinite(latest) || latest <= 0) return
-  const curSymbol = symbol.value
-  const curTf = timeframe.value
-  const label = liveBucketLabel(new Date(), curTf)
-  if (!label) return
-
-  // 严格过滤出属于当前品种与周期的实时K线
-  const arr = liveBars.value.filter((b) => b.symbol === curSymbol && b.timeframe === curTf)
-  const last = arr[arr.length - 1]
-  if (last && last.symbol === curSymbol && last.timeframe === curTf && last.ts === label) {
-    if (last.close === latest) return
-    arr[arr.length - 1] = {
-      ...last,
-      high: Math.max(last.high, latest),
-      low: Math.min(last.low, latest),
-      close: latest,
-    }
-  } else {
-    // 桶起点基准：优先用库内同桶成形K线（定时/手动刷新已落库，带真实开盘与成交量），
-    // 否则用前一根收盘价保证连续。
-    // 严格检查 prev 是否确实属于当前品种且价格在合理范围内，彻底阻断跨品种价格污染！
-    const currentRows = displayRows.value
-    const prev = currentRows.length ? currentRows[currentRows.length - 1] : null
-    // 跨休市段时，前一根收盘价不能代替新时段的开盘价。
-    // 等服务端给出包含完整 5m 切片的 partialBar，再画第一根 15m K线。
-    const prevTime = prev ? new Date(prev.ts.replace(' ', 'T')).getTime() : NaN
-    const currentTime = new Date(label.replace(' ', 'T')).getTime()
-    if (!prev || !Number.isFinite(prevTime) || currentTime - prevTime > (TIMEFRAME_MINUTES[curTf] ?? 0) * 60_000) {
-      liveBars.value = []
-      return
-    }
-    const isPrevValid =
-      prev != null &&
-      prev.symbol === curSymbol &&
-      prev.timeframe === curTf &&
-      Number.isFinite(prev.close) &&
-      prev.close > 0
-
-    const seed = isPrevValid && prev.ts === label ? prev : null
-    const open = seed ? seed.open : (isPrevValid ? prev.close : latest)
-    arr.push({
-      symbol: curSymbol,
-      timeframe: curTf,
-      ts: label,
-      open,
-      high: seed ? Math.max(seed.high, latest) : Math.max(open, latest),
-      low: seed ? Math.min(seed.low, latest) : Math.min(open, latest),
-      close: latest,
-      volume: seed?.volume ?? 0,
-      hold: seed?.hold ?? 0,
-      source: seed ? 'live' : 'live_quote',
-      rollover: false,
-    })
-    // 只保留最近一小段，等库内每 5 分钟刷新后自然由历史序列接管
-    if (arr.length > 12) arr.splice(0, arr.length - 12)
+const chartClock = ref(Date.now())
+let chartClockTimer: ReturnType<typeof setInterval> | undefined
+const chartDataStatus = computed(() => {
+  if (klinesStore.loading) return '正在获取服务端数据…'
+  if (!klinesStore.dataReceivedAt) return ''
+  const received = new Date(klinesStore.dataReceivedAt).toLocaleTimeString('zh-CN', { hour12: false })
+  const prefix = `服务端数据收到于 ${received}`
+  if (klinesStore.partialReceivedAt) {
+    const time = new Date(klinesStore.partialReceivedAt).toLocaleTimeString('zh-CN', { hour12: false })
+    return chartClock.value - klinesStore.partialReceivedAt > 10_000
+      ? `${prefix} · 实时柱更新已暂停（最后收到 ${time}）`
+      : `${prefix} · 实时柱最近收到于 ${time}${klinesStore.partialBar?.source === 'live_quote_calibrating' ? '（报价更新，成交量与持仓量待校准）' : ''}`
   }
-  liveBars.value = arr
-}
+  return `${prefix} · ${klinesStore.partialExpected ? '实时柱尚未就绪，等待后台更新' : '当前无未完成柱'}`
+})
 
-/** 展示序列：历史完整K线 + 实时拼出的K线（时间戳重叠时以后者更新、保留库内成交量） */
+/** 展示序列：正式历史 + 服务端校准的实时柱。 */
 const displayRows = computed<KlineRow[]>(() => {
   const sym = symbol.value
   const tf = timeframe.value
@@ -1182,7 +1114,10 @@ const displayRows = computed<KlineRow[]>(() => {
   if (!rows.length) return []
 
   // 实时K线也必须严格过滤出当前品种与周期
-  const live = liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf)
+  const partial = klinesStore.partialBar
+  const live = partial && chartClock.value - klinesStore.partialReceivedAt <= 10_000
+    ? [...liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf && b.ts < partial.ts), partial]
+    : []
   if (!live.length) return rows
   const liveByTs = new Map(live.map((b) => [b.ts, b]))
   const rowByTs = new Map(rows.map((r) => [r.ts, r]))
@@ -1592,11 +1527,6 @@ async function loadSnapshots() {
   try {
     const list = await api.getMarketSnapshot()
     snapshots.value = Object.fromEntries(list.map((s) => [s.code, s]))
-    // 若当前品种已有实时价格，同步尝试推进实时K线，避免首屏静态等待
-    const curLatest = symbol.value ? snapshots.value[symbol.value]?.latest : null
-    if (curLatest != null) {
-      updateLiveBar(curLatest)
-    }
   } catch {
     // 快照加载失败不影响看图
   }
@@ -2192,10 +2122,6 @@ watch([symbol, timeframe], async () => {
     if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
       liveBars.value = [klinesStore.partialBar]
     }
-    const curLatest = snapshots.value[symbol.value]?.latest
-    if (curLatest != null) {
-      updateLiveBar(curLatest)
-    }
     void loadTrendLine()
     void scansStore.refreshLatestSignals()
   }
@@ -2223,6 +2149,7 @@ watch(
 )
 
 onMounted(async () => {
+  chartClockTimer = setInterval(() => { chartClock.value = Date.now() }, 1000)
   window.addEventListener('keydown', onReviewKeydown)
   window.addEventListener('popstate', onPopState)
   document.addEventListener('fullscreenchange', onDocumentFullscreenChange)
@@ -2242,16 +2169,6 @@ onMounted(async () => {
       // the prediction rows; historical backfill is a separate maintenance
       // operation and must not delay the live card.
       void refreshV2Predictions()
-    }),
-  )
-  unlisteners.push(
-    await onChartKlinesRefreshed(({ symbol: refreshedSymbol, timeframe: refreshedTimeframe, response }) => {
-      if (refreshedSymbol !== symbol.value || refreshedTimeframe !== timeframe.value) return
-      if (!klinesStore.acceptRefreshed(refreshedSymbol, timeframe.value, response)) return
-      liveBars.value = response.partial_bar ? [response.partial_bar] : []
-      const latest = snapshots.value[refreshedSymbol]?.latest
-      if (latest != null) updateLiveBar(latest)
-      void loadTrendLine()
     }),
   )
   unlisteners.push(
@@ -2277,10 +2194,6 @@ onMounted(async () => {
         if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
           liveBars.value = [klinesStore.partialBar]
         }
-        const curLatest = snapshots.value[symbol.value]?.latest
-        if (curLatest != null) {
-          updateLiveBar(curLatest)
-        }
         loadTrendLine()
       }
     }),
@@ -2298,9 +2211,8 @@ onMounted(async () => {
         if (s.latest != null && prev?.latest != null && s.latest !== prev.latest) {
           setRowFlash(s.code, s.latest > prev.latest ? 'up' : 'down')
         }
-        // 用当前品种的实时报价拼出正在形成的K线与分时增量
+        // 分时图继续使用实时报价；K线图由服务端完整实时柱更新。
         if (s.latest != null && s.code === symbol.value) {
-          updateLiveBar(s.latest)
           intradayStore.onRealtimeTick(s)
         }
         next[s.code] = s
@@ -2310,19 +2222,18 @@ onMounted(async () => {
   )
   unlisteners.push(
     await onKlinePartial((payload) => {
-      if (payload.symbol === symbol.value && payload.timeframe === timeframe.value && payload.bar) {
-        const bar = payload.bar as KlineRow
-        const arr = liveBars.value.filter((b) => b.symbol === symbol.value && b.timeframe === timeframe.value)
-        const idx = arr.findIndex((b) => b.ts === bar.ts)
-        if (idx >= 0) {
-          arr[idx] = bar
-        } else {
-          arr.push(bar)
-        }
-        liveBars.value = arr
-      }
+      if (!klinesStore.acceptPartial(payload.symbol, payload.timeframe as Timeframe, payload.bar ?? null)) return
+      if (payload.symbol !== symbol.value || payload.timeframe !== timeframe.value) return
+      if (!payload.bar) { liveBars.value = []; return }
+      const bar = payload.bar as KlineRow
+      const arr = liveBars.value.filter((b) => b.symbol === symbol.value && b.timeframe === timeframe.value)
+      const idx = arr.findIndex((b) => b.ts === bar.ts)
+      if (idx >= 0) arr[idx] = bar
+      else arr.push(bar)
+      liveBars.value = arr.slice(-12)
     }),
   )
+
   unlisteners.push(
     await onKlineClosed((payload) => {
       if (payload.symbol === symbol.value && payload.timeframe === timeframe.value) {
@@ -2343,6 +2254,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  clearInterval(chartClockTimer)
   ++chartLoadSeq
   ++trendSeq
   window.removeEventListener('keydown', onReviewKeydown)
@@ -3213,6 +3125,9 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <div v-if="!isIntradayMode && chartDataStatus" class="chart-update-status" role="status">
+          {{ chartDataStatus }}
+        </div>
         <div
           v-if="klinesStore.chartStatus !== 'tqsdk' || klinesStore.chartMessage"
           class="chart-data-notice"
@@ -4754,6 +4669,12 @@ onBeforeUnmount(() => {
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+.chart-update-status {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text-color-2, #666);
 }
 .chart-data-notice {
   flex: 0 0 auto;

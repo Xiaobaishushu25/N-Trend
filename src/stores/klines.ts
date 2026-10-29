@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { reportPerformance } from '../utils/performanceLog'
-import type { ChartKlineResponse, KlineRow, Timeframe } from '../types'
+import type { KlineRow, Timeframe } from '../types'
 
 export const useKlinesStore = defineStore('klines', {
   state: () => ({
@@ -16,16 +16,21 @@ export const useKlinesStore = defineStore('klines', {
     chartStatus: 'tqsdk' as string,
     chartMessage: '' as string,
     loadSeq: 0,
+    dataReceivedAt: 0,
+    partialReceivedAt: 0,
+    partialSeq: 0,
+    partialExpected: false,
   }),
   actions: {
-    acceptRefreshed(symbol: string, timeframe: Timeframe, response: ChartKlineResponse) {
+    acceptPartial(symbol: string, timeframe: Timeframe, bar: KlineRow | null) {
       if (this.symbol !== symbol || this.timeframe !== timeframe) return false
-      this.loadSeq++
-      this.rows = response.rows
-      this.partialBar = response.partial_bar ?? null
-      this.chartStatus = response.status
-      this.chartMessage = response.message
-      this.error = ''
+      if (bar && (bar.symbol !== symbol || bar.timeframe !== timeframe)) return false
+      if (bar && this.partialBar && bar.ts < this.partialBar.ts) return false
+      this.partialSeq++
+      this.partialBar = bar
+      this.partialReceivedAt = bar ? Date.now() : 0
+      this.partialExpected = true
+      if (this.chartMessage === '历史数据已获取，实时柱正在准备；就绪后自动推送更新。') this.chartMessage = ''
       return true
     },
     async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
@@ -38,16 +43,20 @@ export const useKlinesStore = defineStore('klines', {
       }
       this.error = ''
       const isSwitch = this.symbol !== symbol || this.timeframe !== timeframe
-      if (isSwitch) {
+      if (isSwitch || !silent) {
         // 切换品种或周期时，立即清空旧数据，防止旧品种数据残留被误用为新数据基准
         this.rows = []
         this.partialBar = null
+        this.dataReceivedAt = 0
+        this.partialReceivedAt = 0
+        this.partialExpected = false
       }
       this.symbol = symbol
       this.timeframe = timeframe
       this.chartStatus = 'tqsdk'
       this.chartMessage = ''
       const seq = ++this.loadSeq
+      const partialSeq = this.partialSeq
       try {
         const response = await api.getChartKlines(symbol, timeframe, limit)
         if (seq !== this.loadSeq) {
@@ -55,9 +64,15 @@ export const useKlinesStore = defineStore('klines', {
           return
         }
         this.rows = response.rows
-        this.partialBar = response.partial_bar ?? null
+        this.dataReceivedAt = Date.now()
+        // 实时推送可能在历史响应之前到达，不能被稍旧的HTTP快照覆盖。
+        if (partialSeq === this.partialSeq) {
+          this.partialBar = response.partial_bar ?? null
+          this.partialReceivedAt = this.partialBar ? Date.now() : 0
+          this.partialExpected = !!this.partialBar || response.message.includes('实时柱正在准备')
+        }
         this.chartStatus = response.status
-        this.chartMessage = response.message
+        this.chartMessage = this.partialBar && response.message.includes('实时柱正在准备') ? '' : response.message
         if (!silent) reportPerformance('chart_load_finished', performance.now() - started, { symbol, timeframe, rows: response.rows.length })
       } catch (e: any) {
         if (seq !== this.loadSeq) return
@@ -67,15 +82,10 @@ export const useKlinesStore = defineStore('klines', {
           notify.error(`获取 [${symbol}] ${timeframe} K线失败: ${this.error}`)
         }
       } finally {
-        if (!silent) {
-          this.loadingCount = Math.max(0, this.loadingCount - 1)
-        }
-        // 当所有非静默请求已结束，或最新请求（即使是静默更新）已落定，确保 loading 状态正确关闭
-        if (this.loadingCount === 0 || seq === this.loadSeq) {
+        // 旧请求结束不能关闭新品种的遮罩；后台推送也会作废当前请求。
+        if (seq === this.loadSeq) {
           this.loading = false
-          if (seq === this.loadSeq) {
-            this.loadingCount = 0
-          }
+          this.loadingCount = 0
         }
       }
     },
@@ -89,6 +99,9 @@ export const useKlinesStore = defineStore('klines', {
       this.loadingCount = 0
       this.chartStatus = 'tqsdk'
       this.chartMessage = ''
+      this.dataReceivedAt = 0
+      this.partialReceivedAt = 0
+      this.partialExpected = false
     },
   },
 })

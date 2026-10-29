@@ -73,6 +73,7 @@ fn registered_event_ids(
 pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
     spawn_scheduler(ctx.clone());
     spawn_quote_poller(ctx.clone());
+    spawn_live_chart_publisher(ctx.clone());
     spawn_tq_bar_event_consumer(ctx.clone());
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
@@ -1135,6 +1136,66 @@ fn spawn_preclose_candidate_emails(
     });
 }
 
+/// Separate from quote/execution polling: bridge waits never delay those loops or chart requests.
+fn spawn_live_chart_publisher(ctx: Arc<ServerContext>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = ctx.services.live_chart.wake.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+            }
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            let config = ctx.services.config().await;
+            if config.data_source.primary_source != "tqsdk"
+                || !ctx.services.data_source.tq_is_available()
+            {
+                ctx.services.live_chart.clear();
+                continue;
+            }
+            for symbol in ctx.realtime_hub.chart_symbols().await {
+                ctx.services.live_chart.request(&symbol);
+            }
+            // Four bounded local bridge reads at a time; the bridge already maintains 5m serials.
+            let mut jobs = tokio::task::JoinSet::new();
+            for symbol in ctx.services.live_chart.due_symbols(4) {
+                if !n_core::scheduler::is_symbol_trading_time(&symbol, &Local::now()) { continue; }
+                let ctx = ctx.clone();
+                let bridge_port = config.data_source.bridge_port;
+                jobs.spawn(async move {
+                    use n_core::fetch::MarketDataSource;
+                    let tq = ctx.services.data_source.tq_client().await;
+                    let requested_at = Instant::now();
+                    match tokio::time::timeout(Duration::from_millis(1000), tq.fetch_minute_raw(&symbol, "5m", 300)).await {
+                        Ok(Ok(raw)) => {
+                            let current = ctx.services.config().await;
+                            if current.data_source.primary_source != "tqsdk"
+                                || current.data_source.bridge_port != bridge_port
+                                || !ctx.services.data_source.tq_is_available()
+                            { return; }
+                            let now = Local::now();
+                            let bars = ctx.services.live_chart.publish_after(&symbol, raw.klines, now.naive_local(), requested_at);
+                            for tf in n_core::derive::Timeframe::supported() {
+                                let bar = bars.iter().find(|bar| bar.timeframe == tf.as_str());
+                                let payload = serde_json::json!({
+                                    "symbol": symbol, "timeframe": tf.as_str(), "bar": bar,
+                                    "updated_at": now.timestamp_millis(),
+                                });
+                                ctx.realtime_hub.broadcast_kline(
+                                    ctx.next_event_seq(), "kline.partial", &symbol, tf.as_str(), payload,
+                                ).await;
+                            }
+                        }
+                        _ => tracing::debug!(symbol, "后台实时柱更新未就绪，旧结果按新鲜度自动过期"),
+                    }
+                });
+            }
+            while let Some(result) = jobs.join_next().await {
+                if let Err(error) = result { tracing::warn!(%error, "后台实时柱任务失败"); }
+            }
+        }
+    });
+}
+
 fn spawn_quote_poller(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
         loop {
@@ -1166,9 +1227,13 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                 .await
             {
                 Ok((snapshots, held_quotes)) => {
-                    // 同步更新服务端常驻维护的 5m 未决 K 线内存
-                    let updated_bars = ctx.services.update_live_bars_from_quotes(&snapshots).await;
-
+                    // Normal price updates maintain all seeded periods without SQL or bridge reads.
+                    let cfg = ctx.services.config().await;
+                    let updated_bars = if cfg.data_source.primary_source == "tqsdk"
+                        && ctx.services.data_source.tq_is_available()
+                    {
+                        ctx.services.live_chart.update_prices(&snapshots, Local::now().naive_local())
+                    } else { Vec::new() };
                     let seq = ctx.next_event_seq();
                     let mut display_quotes = snapshots.clone();
                     display_quotes.extend(held_quotes);
@@ -1180,19 +1245,13 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                         )
                         .await;
 
-                    // 广播实时未决 K 线给已订阅客户端（图表可原地平滑更新）
                     for bar in updated_bars {
-                        let bar_seq = ctx.next_event_seq();
                         let sym = bar.symbol.clone();
                         let tf = bar.timeframe.clone();
-                        let payload = serde_json::json!({
-                            "symbol": sym,
-                            "timeframe": tf,
-                            "bar": bar,
-                        });
-                        ctx.realtime_hub
-                            .broadcast_kline(bar_seq, "kline.partial", &sym, &tf, payload)
-                            .await;
+                        ctx.realtime_hub.broadcast_kline(
+                            ctx.next_event_seq(), "kline.partial", &sym, &tf,
+                            serde_json::json!({ "symbol": sym, "timeframe": tf, "bar": bar }),
+                        ).await;
                     }
 
                     // 检测入场价命中
