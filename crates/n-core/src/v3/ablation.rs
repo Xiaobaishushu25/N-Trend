@@ -41,6 +41,8 @@ pub enum EntryMode {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResearchRules {
+    /// Offline fixed-policy score studies only. ActualTier always keeps admission.
+    pub disable_admission_for_fixed_policy: bool,
     pub entry_mode: EntryMode,
     pub target_cap_r: Option<f64>,
     pub fast_fail_bucket: Option<usize>,
@@ -621,8 +623,9 @@ pub fn evaluate_research_with_holidays(
         confirmed_at: None,
         holidays: holidays.to_vec(),
     };
-    if ev.setup_features.setup_quality < 2.5
-        || ev.risk / ev.tick_size + 1e-6 < config.min_entry_risk_ticks as f64
+    if !(rules.disable_admission_for_fixed_policy && ex.policy != Policy::ActualTier)
+        && (ev.setup_features.setup_quality < 2.5
+            || ev.risk / ev.tick_size + 1e-6 < config.min_entry_risk_ticks as f64)
     {
         state.e.status = "filtered".into();
         return ResultRow {
@@ -1511,6 +1514,63 @@ mod tests {
                 "filtered"
             );
         }
+    }
+    #[test]
+    fn score_study_bypass_is_explicit_and_never_disables_actual_tier_admission() {
+        let mut e = event(false, 2.4);
+        e.stop = 98.;
+        e.risk = 2.;
+        let bars = [bar(50, 100., 112., 99., 111.)];
+        let rules = ResearchRules {
+            disable_admission_for_fixed_policy: true,
+            ..Default::default()
+        };
+        let ex = Experiment {
+            policy: Policy::FixedOneR,
+            no_follow_bar: None,
+            slip_ticks: 0.,
+            fee_ticks: 0.,
+        };
+        assert_eq!(
+            evaluate(&e, &bars, &[], &ExecutionConfig::default(), ex, 10.)
+                .evaluation
+                .status,
+            "filtered"
+        );
+        assert_eq!(
+            evaluate_research(
+                &e,
+                &bars,
+                &[],
+                &ExecutionConfig::default(),
+                ex,
+                10.,
+                None,
+                rules
+            )
+            .evaluation
+            .status,
+            "closed"
+        );
+        let actual = Experiment {
+            policy: Policy::ActualTier,
+            ..ex
+        };
+        assert_eq!(
+            evaluate_research(
+                &e,
+                &bars,
+                &[],
+                &ExecutionConfig::default(),
+                actual,
+                10.,
+                None,
+                rules
+            )
+            .evaluation
+            .status,
+            "filtered"
+        );
     }
     #[test]
     fn truncated_trade_is_not_used_as_a_negative_label() {

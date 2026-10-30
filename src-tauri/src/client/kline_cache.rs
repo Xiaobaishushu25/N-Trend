@@ -1,8 +1,8 @@
+use lru::LruCache;
+use n_protocol::dto::{ChartKlineResponse, KlineDto};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::Instant;
-use lru::LruCache;
-use n_protocol::dto::{ChartKlineResponse, KlineDto};
 
 const MAX_SERIES: usize = 24;
 const MAX_BARS_PER_SERIES: usize = 2000;
@@ -31,7 +31,12 @@ impl KlineMemoryCache {
         }
     }
 
-    pub fn get_fresh(&self, symbol: &str, timeframe: &str, max_age: std::time::Duration) -> Option<ChartKlineResponse> {
+    pub fn get_fresh(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        max_age: std::time::Duration,
+    ) -> Option<ChartKlineResponse> {
         let mut lock = self.cache.lock().unwrap();
         let key = (symbol.to_string(), timeframe.to_string());
         let series = lock.get(&key)?;
@@ -39,18 +44,7 @@ impl KlineMemoryCache {
             return None;
         }
 
-        let mut rows = series.bars.clone();
-        if let Some(partial) = &series.partial_bar {
-            if let Some(last) = rows.last_mut() {
-                if last.ts == partial.ts {
-                    *last = partial.clone();
-                } else {
-                    rows.push(partial.clone());
-                }
-            } else {
-                rows.push(partial.clone());
-            }
-        }
+        let rows = series.bars.clone();
 
         Some(ChartKlineResponse {
             rows,
@@ -72,23 +66,16 @@ impl KlineMemoryCache {
         let key = (symbol.to_string(), timeframe.to_string());
         let series = lock.get(&key)?;
 
-        let mut rows = series.bars.clone();
-        if let Some(partial) = &series.partial_bar {
-            if let Some(last) = rows.last_mut() {
-                if last.ts == partial.ts {
-                    *last = partial.clone();
-                } else {
-                    rows.push(partial.clone());
-                }
-            } else {
-                rows.push(partial.clone());
-            }
-        }
+        let rows = series.bars.clone();
 
         Some(ChartKlineResponse {
             rows,
             status: series.status.clone(),
-            message: format!("从内存缓存加载（{} 根）。{}", series.bars.len(), series.message),
+            message: format!(
+                "从内存缓存加载（{} 根）。{}",
+                series.bars.len(),
+                series.message
+            ),
             latest_closed_ts: series.latest_closed_ts,
             series_revision: series.series_revision,
             server_time: Some(chrono::Utc::now().timestamp_millis()),
@@ -128,6 +115,7 @@ impl KlineMemoryCache {
         let mut lock = self.cache.lock().unwrap();
         let key = (symbol.to_string(), timeframe.to_string());
         if let Some(series) = lock.get_mut(&key) {
+            let closed_ts = bar.ts.clone();
             if let Some(pos) = series.bars.iter().position(|b| b.ts == bar.ts) {
                 series.bars[pos] = bar;
             } else {
@@ -136,7 +124,20 @@ impl KlineMemoryCache {
                     series.bars.remove(0);
                 }
             }
-            series.partial_bar = None;
+            series.bars.sort_by(|a, b| a.ts.cmp(&b.ts));
+            series.latest_closed_ts = series.bars.last().and_then(|b| {
+                chrono::NaiveDateTime::parse_from_str(&b.ts, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .and_then(|dt| dt.and_local_timezone(chrono::Local).single())
+                    .map(|dt| dt.timestamp_millis())
+            });
+            if series
+                .partial_bar
+                .as_ref()
+                .is_some_and(|partial| partial.ts <= closed_ts)
+            {
+                series.partial_bar = None;
+            }
         }
     }
 
@@ -144,6 +145,14 @@ impl KlineMemoryCache {
         let mut lock = self.cache.lock().unwrap();
         let key = (symbol.to_string(), timeframe.to_string());
         if let Some(series) = lock.get_mut(&key) {
+            if series.bars.last().is_some_and(|closed| bar.ts <= closed.ts)
+                || series
+                    .partial_bar
+                    .as_ref()
+                    .is_some_and(|partial| bar.ts < partial.ts)
+            {
+                return;
+            }
             series.partial_bar = Some(bar);
         }
     }
@@ -207,7 +216,9 @@ mod tests {
                 .fetched_at = Instant::now() - Duration::from_secs(10);
         }
         cache.update_partial_bar("EG0", "15m", bar());
-        assert!(cache.get_fresh("EG0", "15m", Duration::from_secs(3)).is_none());
+        assert!(cache
+            .get_fresh("EG0", "15m", Duration::from_secs(3))
+            .is_none());
         let response = cache.get("EG0", "15m").unwrap();
         assert_eq!(response.status, "tq_unavailable");
         assert!(response.message.contains("仅显示本地历史数据"));
@@ -229,15 +240,63 @@ mod tests {
             partial_bar: None,
         };
         cache.put("EG0", "15m", &response);
-        let fresh = cache.get_fresh("EG0", "15m", Duration::from_secs(3)).unwrap();
+        let fresh = cache
+            .get_fresh("EG0", "15m", Duration::from_secs(3))
+            .unwrap();
         assert!(fresh.message.is_empty());
-        assert!(cache.get("EG0", "15m").unwrap().message.contains("从内存缓存加载"));
+        assert!(cache
+            .get("EG0", "15m")
+            .unwrap()
+            .message
+            .contains("从内存缓存加载"));
 
         response.status = "tq_unavailable".into();
         response.message = "仅显示本地历史数据".into();
         cache.put("EG0", "15m", &response);
-        let fresh = cache.get_fresh("EG0", "15m", Duration::from_secs(3)).unwrap();
+        let fresh = cache
+            .get_fresh("EG0", "15m", Duration::from_secs(3))
+            .unwrap();
         assert_eq!(fresh.status, "tq_unavailable");
         assert_eq!(fresh.message, response.message);
+    }
+
+    #[test]
+    fn finalized_cache_rows_are_separate_and_reject_late_partial_updates() {
+        let cache = KlineMemoryCache::new();
+        let response = ChartKlineResponse {
+            rows: vec![],
+            status: "tqsdk".into(),
+            message: String::new(),
+            latest_closed_ts: None,
+            series_revision: None,
+            server_time: None,
+            has_more: None,
+            next_before: None,
+            full_reload_required: None,
+            partial_bar: Some(bar()),
+        };
+        cache.put("EG0", "15m", &response);
+        assert!(cache.get("EG0", "15m").unwrap().rows.is_empty());
+        assert!(cache
+            .get_fresh("EG0", "15m", Duration::from_secs(3))
+            .unwrap()
+            .rows
+            .is_empty());
+        let mut final_bar = bar();
+        final_bar.close = 4950.0;
+        cache.merge_closed_bar("EG0", "15m", final_bar.clone());
+        cache.update_partial_bar("EG0", "15m", bar());
+        let got = cache.get("EG0", "15m").unwrap();
+        assert_eq!(got.rows[0].close, 4950.0);
+        assert!(got.partial_bar.is_none());
+        assert!(got.latest_closed_ts.is_some());
+        let mut next = bar();
+        next.ts = "2026-10-19 21:30:00".into();
+        cache.update_partial_bar("EG0", "15m", next);
+        cache.merge_closed_bar("EG0", "15m", final_bar);
+        assert_eq!(
+            cache.get("EG0", "15m").unwrap().partial_bar.unwrap().ts,
+            "2026-10-19 21:30:00"
+        );
     }
 }

@@ -251,6 +251,7 @@ class TqDataWorker:
         self.startup_error: Optional[str] = None
         self.last_update_time = 0.0
         self.last_market_event_at = 0.0
+        self.last_close_check_at = 0.0
         self.quote_symbols = set()
         self.subscription_specs = {}
         self.execution_symbols = {}
@@ -512,8 +513,11 @@ class TqDataWorker:
         self.last_update_time = time.time()
         if updated:
             self.last_market_event_at = time.time()
-            self._detect_closed_bars()
             self._publish_execution_quotes()
+        # Session closure must progress even when there are no post-close ticks.
+        if updated or time.monotonic() - self.last_close_check_at >= 1.0:
+            self.last_close_check_at = time.monotonic()
+            self._detect_closed_bars()
         return updated
 
     def _publish_execution_quotes(self):
@@ -631,7 +635,7 @@ class TqDataWorker:
                 }
                 self.subscription_specs[key] = spec
                 try:
-                    if key not in self.klines:
+                    if key not in self.klines or key not in self.kline_meta:
                         self._prepare_subscription(spec)
                     created.append(key)
                 except Exception as error:
@@ -825,6 +829,26 @@ class TqDataWorker:
                     self._emit_closed_bar(meta, klines.iloc[-1], "session_not_trading")
                     meta["session_candidate"] = None
             meta["last_trade_status"] = current_status
+
+            # Recovery after a missed status transition or a restart during a
+            # break. Use the exchange-provided session end and the same 75s
+            # settlement floor as Rust, never an ordinary stale intraday tail.
+            if self.connected and not self.reconnecting and not self.reconnect_requested.is_set():
+                bar = self._row_to_bar(klines.iloc[-1], meta["duration"])
+                quote = self.quotes.get(meta["tq_symbol"])
+                if self._settled_session_tail(quote, bar["datetime"], meta["duration"], time.time()):
+                    self._emit_closed_bar(meta, klines.iloc[-1], "session_settled")
+
+    @classmethod
+    def _settled_session_tail(cls, quote, bar_end: str, duration: int, now: float) -> bool:
+        if duration != 300 or not cls._is_expected_session_end(quote, bar_end):
+            return False
+        try:
+            shanghai = datetime.timezone(datetime.timedelta(hours=8))
+            end = datetime.datetime.strptime(bar_end, "%Y-%m-%d %H:%M:%S").replace(tzinfo=shanghai)
+            return now - end.timestamp() >= 75.0
+        except (ValueError, TypeError):
+            return False
 
     def _expire_session_candidates(self):
         for meta in self.kline_meta.values():

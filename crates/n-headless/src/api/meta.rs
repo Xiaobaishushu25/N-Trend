@@ -16,7 +16,7 @@ pub async fn get_meta() -> impl IntoResponse {
     let meta = MetaDto {
         api_version: n_protocol::API_VERSION.to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-        min_client_version: n_protocol::MIN_CLIENT_VERSION.to_string(),
+        required_client_version: n_protocol::REQUIRED_CLIENT_VERSION.to_string(),
         server_time: now,
     };
     Json(meta)

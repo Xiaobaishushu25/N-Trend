@@ -1,13 +1,11 @@
 <script setup lang="ts">
 import { h, onMounted, onBeforeUnmount, ref } from 'vue'
-import { emit } from '@tauri-apps/api/event'
-import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
+import ReviewWorkbench from '../components/ReviewWorkbench.vue'
 import {
   NButton,
   NCard,
   NDataTable,
   NEmpty,
-  NInput,
   NInputNumber,
   NIcon,
   NSelect,
@@ -28,7 +26,7 @@ import {
 } from '../stores/review'
 import { notify } from '../utils/notify'
 import { ChevronDown, ChevronUp } from '@vicons/tabler'
-import type { GroupStat, OpenReviewChartPayload, OutcomeDetail, V2ModelRow } from '../types'
+import type { GroupStat, V2ModelRow } from '../types'
 
 const review = useReviewStore()
 const v2Columns: any = [
@@ -44,56 +42,14 @@ const rebuilding = ref(false)
 const error = ref('')
 /** V2 预测表属于诊断明细，默认收起，避免挤压下方复盘统计和最近信号明细 */
 const showV2Details = ref(false)
-/** 品种筛选本地输入（防抖后再生效） */
-const symbolInput = ref('')
+const showLegacyStats = ref(false)
+function toggleLegacyStats() { showLegacyStats.value = !showLegacyStats.value; if (showLegacyStats.value) void load() }
 /** 评分区间筛选：上下限为空表示不限制 */
 const scoreMinInput = ref<number | null>(null)
 const scoreMaxInput = ref<number | null>(null)
 
-const dirLabel = (d: string) => (d === 'up' ? '做多' : d === 'down' ? '做空' : d)
-const levelLabel = (l: string) =>
-  l === 'fine' ? '精细' : l === 'large' ? '较大' : l === 'box' ? '箱体' : l
-
-const outcomeLabel: Record<string, { text: string; type: 'success' | 'error' | 'warning' | 'default' }> = {
-  win: { text: '盈利', type: 'error' },
-  loss: { text: '亏损', type: 'success' },
-  no_trigger: { text: '未触发', type: 'default' },
-  open: { text: '持仓中', type: 'warning' },
-  insufficient_data: { text: '数据不足', type: 'default' },
-  rollover: { text: '换月', type: 'warning' },
-}
-
-const exitLabel: Record<string, string> = {
-  stop: '止损',
-  target: '止盈',
-  no_follow: '无跟随退出',
-  time_exit: '时间退出',
-  rollover: '换月',
-  '': '—',
-}
-
 /** 绿跌红涨：盈利/正向用红，亏损/负向用绿 */
 const rColor = (v: number | null | undefined) => (v == null || v >= 0 ? '#e03131' : '#0f9d58')
-
-function outcomeTag(outcome: string) {
-  const meta = outcomeLabel[outcome] ?? { text: outcome, type: 'default' as const }
-  return h(NTag, { type: meta.type, size: 'small' }, { default: () => meta.text })
-}
-
-function stateLabel(state: string) {
-  switch (state) {
-    case 'pending':
-      return '等待触发'
-    case 'triggered':
-      return '已触发'
-    case 'closed':
-      return '已了结'
-    case 'expired':
-      return '已失效'
-    default:
-      return state
-  }
-}
 
 function sampleTag(n: number) {
   if (n < 20) {
@@ -256,190 +212,6 @@ const groupColumns: DataTableColumns<GroupStat> = [
   },
 ]
 
-const recentColumns: DataTableColumns<OutcomeDetail> = [
-  { title: 'ID', key: 'event_id', width: 70 },
-  { title: '品种', key: 'symbol', width: 80 },
-  { title: '方向', key: 'direction', width: 70, render: (r) => dirLabel(r.direction) },
-  { title: '级别', key: 'level', width: 70, render: (r) => levelLabel(r.level) },
-  {
-    title: '版本',
-    key: 'logic_version',
-    width: 70,
-    render: (r) => r.logic_version || '1',
-  },
-  { title: '等级', key: 'grade', width: 90 },
-  {
-    title: '评分',
-    key: 'entry_score',
-    width: 80,
-    align: 'right',
-    render: (r) => r.entry_score.toFixed(2),
-  },
-  { title: '预警K线', key: 'warning_ts', width: 150, render: (r) => r.warning_ts },
-  { title: '状态', key: 'state', width: 80, render: (r) => stateLabel(r.state) },
-  {
-    title: '开仓',
-    key: 'opened',
-    width: 80,
-    render: (r) => {
-      if (r.opened == null) {
-        return h('span', { style: 'color:#9aa3b2' }, '未记录')
-      }
-      return h(
-        'span',
-        { style: `color:${r.opened ? '#e03131' : '#64748b'};font-weight:600` },
-        r.opened ? '已开仓' : '未开仓',
-      )
-    },
-  },
-  { title: '入场', key: 'entry', width: 90, align: 'right', render: (r) => r.entry.toFixed(1) },
-  { title: '止损', key: 'stop', width: 90, align: 'right', render: (r) => r.stop.toFixed(1) },
-  { title: '目标位(参考)', key: 'target', width: 100, align: 'right', render: (r) => r.target.toFixed(1) },
-  {
-    title: '扫描时间',
-    key: 'created_at',
-    width: 150,
-    render: (r) => h('span', { title: '该行是扫描时刻的快照，盘中快照含未走完的当前桶' }, r.created_at),
-  },
-  { title: '结局', key: 'outcome', width: 90, render: (r) => outcomeTag(r.outcome) },
-  { title: '出场原因', key: 'exit_reason', width: 110, render: (r) => exitLabel[r.exit_reason] ?? r.exit_reason },
-  {
-    title: '出场价',
-    key: 'exit_price',
-    width: 90,
-    align: 'right',
-    render: (r) => (r.exit_price == null ? '—' : r.exit_price.toFixed(1)),
-  },
-  {
-    title: 'R',
-    key: 'r_multiple',
-    width: 90,
-    align: 'right',
-    render: (r) => {
-      if (r.r_multiple == null) return '—'
-      return h('span', { style: `color:${rColor(r.r_multiple)};font-weight:600` }, fmtR(r.r_multiple))
-    },
-  },
-  {
-    title: 'MFE',
-    key: 'mfe_r',
-    width: 80,
-    align: 'right',
-    render: (r) => {
-      if (r.mfe_r == null) return '—'
-      return h('span', { style: `color:${rColor(r.mfe_r)}` }, r.mfe_r.toFixed(2))
-    },
-  },
-  {
-    title: 'MAE',
-    key: 'mae_r',
-    width: 80,
-    align: 'right',
-    render: (r) => {
-      if (r.mae_r == null) return '—'
-      return h('span', { style: `color:${rColor(r.mae_r)}` }, r.mae_r.toFixed(2))
-    },
-  },
-  { title: 'K线', key: 'bars_held', width: 70, align: 'right', render: (r) => r.bars_held ?? '—' },
-  {
-    title: '换月',
-    key: 'rollover_crossed',
-    width: 70,
-    render: (r) => (r.rollover_crossed ? '是' : '—'),
-  },
-  {
-    title: '缺口',
-    key: 'gap_crossed_entry',
-    width: 70,
-    render: (r) => {
-      const parts: string[] = []
-      if (r.gap_crossed_entry) parts.push('入')
-      if (r.gap_crossed_exit) parts.push('出')
-      return parts.length ? parts.join('/') : '—'
-    },
-  },
-  {
-    title: '量能',
-    key: 'trigger_volume_ratio',
-    width: 80,
-    align: 'right',
-    render: (r) => (r.trigger_volume_ratio == null ? '—' : r.trigger_volume_ratio.toFixed(2)),
-  },
-  { title: '触发时间', key: 'trigger_ts', width: 150, render: (r) => r.trigger_ts ?? '—' },
-  {
-    title: '持仓评分',
-    key: 'hold_score',
-    width: 80,
-    align: 'right',
-    render: (r) => (r.hold_score == null ? '—' : r.hold_score.toFixed(2)),
-  },
-  {
-    title: 'b/a速度',
-    key: 'speed_ratio',
-    width: 90,
-    align: 'right',
-    render: (r) =>
-      r.a_move == null || r.b_move == null || r.a_move === 0
-        ? '—'
-        : (r.b_move / r.a_move).toFixed(2),
-  },
-  {
-    title: '根数比',
-    key: 'bar_ratio',
-    width: 80,
-    align: 'right',
-    render: (r) =>
-      r.a_bars == null || r.b_bars == null || r.a_bars === 0
-        ? '—'
-        : (r.b_bars / r.a_bars).toFixed(2),
-  },
-  {
-    title: '追价深度',
-    key: 'overshoot_r',
-    width: 100,
-    align: 'right',
-    render: (r) => (r.overshoot_r == null ? '—' : `${r.overshoot_r.toFixed(2)}R`),
-  },
-  {
-    title: '净R',
-    key: 'net_r',
-    width: 90,
-    align: 'right',
-    render: (r) => {
-      if (r.net_r == null) return '—'
-      return h('span', { style: `color:${rColor(r.net_r)};font-weight:600` }, fmtR(r.net_r))
-    },
-  },
-]
-
-const directionOptions = [
-  { label: '做多', value: 'up' },
-  { label: '做空', value: 'down' },
-]
-const levelOptions = [
-  { label: '精细', value: 'fine' },
-  { label: '较大', value: 'large' },
-  { label: '箱体', value: 'box' },
-]
-const versionOptions = [
-  { label: '4.0', value: '4' },
-]
-const gradeOptions = [
-  { label: 'A级', value: 'A级' },
-  { label: 'B级', value: 'B级' },
-  { label: 'C级', value: 'C级' },
-  { label: '回撤过浅', value: '回撤过浅' },
-  { label: '回撤过深', value: '回撤过深' },
-]
-const outcomeOptions = [
-  { label: '盈利', value: 'win' },
-  { label: '亏损', value: 'loss' },
-  { label: '持仓中', value: 'open' },
-  { label: '未触发', value: 'no_trigger' },
-  { label: '数据不足', value: 'insufficient_data' },
-  { label: '换月', value: 'rollover' },
-]
-
 async function load(dim?: string, scope?: StatsScopeKey) {
   loading.value = true
   error.value = ''
@@ -483,14 +255,6 @@ async function rebuildAll() {
   }
 }
 
-let symbolTimer: ReturnType<typeof setTimeout> | undefined
-function onSymbolInput() {
-  if (symbolTimer) clearTimeout(symbolTimer)
-  symbolTimer = setTimeout(() => {
-    void review.setRecentFilter({ symbol: symbolInput.value.trim() })
-  }, 400)
-}
-
 let scoreTimer: ReturnType<typeof setTimeout> | undefined
 function onScoreRangeInput() {
   if (scoreTimer) clearTimeout(scoreTimer)
@@ -499,98 +263,38 @@ function onScoreRangeInput() {
   }, 400)
 }
 
-async function resetFilters() {
-  if (scoreTimer) clearTimeout(scoreTimer)
-  scoreMinInput.value = null
-  scoreMaxInput.value = null
-  symbolInput.value = ''
-  await review.resetRecentFilters()
-}
-
-/** 点击明细行：通知主窗口打开对应K线图并重绘形态与进出场点位，同时聚焦主窗口 */
-async function openReviewChart(row: OutcomeDetail) {
-  try {
-    const payload: OpenReviewChartPayload = {
-      symbol: row.symbol,
-      eventId: row.event_id,
-      filters: { ...review.recentFilters },
-    }
-    await emit('open-review-chart', payload)
-    const main = await WebviewWindow.getByLabel('main')
-    if (main != null) {
-      await main.show()
-      await main.unminimize()
-      await main.setFocus()
-    }
-  } catch (e) {
-    notify.error(String(e))
-  }
-}
-
-function rowProps(row: OutcomeDetail) {
-  return {
-    style: 'cursor: pointer',
-    onClick: () => openReviewChart(row),
-  }
-}
-
 let unlisten: (() => void) | null = null
 
 onMounted(async () => {
   try {
     unlisten = await onScanCompleted(() => {
-      void load()
+      void review.loadReviewPage()
+      if (showLegacyStats.value) void load()
     })
   } catch {
     // 旧构建/权限缺失时监听失败不应阻塞数据加载
   }
-  // 打开窗口即触发一次回填并加载，避免首次打开出现空表
-  await refresh()
+  // 形态工作台自行只读加载；旧统计在展开时再请求。
 })
 
 onBeforeUnmount(() => {
-  if (symbolTimer) clearTimeout(symbolTimer)
   if (scoreTimer) clearTimeout(scoreTimer)
   unlisten?.()
 })
 </script>
 
 <template>
-  <div class="page">
-    <n-card size="small" class="head-card">
-      <n-space justify="space-between" align="center" style="width: 100%">
-        <n-text strong style="font-size: 16px">复盘统计</n-text>
-        <n-space align="center" :size="10">
-          <n-text depth="3" style="font-size: 12px">口径</n-text>
-          <n-select
-            v-model:value="review.statsScope"
-            :options="REVIEW_STATS_SCOPES.map((s) => ({ label: s.label, value: s.key }))"
-            size="small"
-            style="width: 110px"
-            @update:value="(v: string) => load(undefined, v as StatsScopeKey)"
-          />
-          <n-select
-            v-model:value="review.dimension"
-            :options="REVIEW_DIMENSIONS.map((d) => ({ label: d.label, value: d.key }))"
-            size="small"
-            style="width: 170px"
-            @update:value="() => load()"
-          />
-          <n-button size="small" type="primary" :loading="review.refreshing" @click="refresh">
-            刷新
-          </n-button>
-          <n-button size="small" :loading="rebuilding" @click="rebuildAll">
-            重建全部识别
-          </n-button>
-        </n-space>
-      </n-space>
-      <n-text v-if="error" type="error" style="display: block; margin-top: 8px">{{ error }}</n-text>
-      <n-text depth="3" style="display: block; font-size: 12px; margin-top: 8px">
-        形态评分用于描述结构。回放对齐当前实盘分批退出规则；路径不明、缺数据和未结束样本不计净胜负。研究费用为明确标注的代理假设，不能当作实际账户收益。
-
-      </n-text>
-    </n-card>
-
+  <div class="page review-workspace">
+    <header class="workspace-header">
+      <div><div class="workspace-eyebrow">SIGNAL REVIEW</div><h1>形态与评分复盘</h1><p>按评分挑选信号，逐条对照形态与评分分项。</p></div>
+      <div class="workspace-actions"><span>v1基线 · v2研究候选</span><n-button secondary type="primary" :loading="review.browserLoading" @click="review.loadReviewPage()">刷新评分与明细</n-button></div>
+    </header>
+    <ReviewWorkbench />
+    <section class="legacy-section">
+      <button class="legacy-toggle" @click="toggleLegacyStats">{{ showLegacyStats ? '收起' : '展开' }}历史交易统计与概率模型 <span>旧入场分口径，独立于上方形态筛选</span></button>
+      <div v-if="showLegacyStats" class="legacy-body">
+        <n-space align="center"><n-select v-model:value="review.statsScope" :options="REVIEW_STATS_SCOPES.map(s => ({ label: s.label, value: s.key }))" style="width:140px" @update:value="(v: string) => load(undefined, v as StatsScopeKey)" /><n-select v-model:value="review.dimension" :options="REVIEW_DIMENSIONS.map(d => ({ label: d.label, value: d.key }))" style="width:180px" @update:value="() => load()" /><n-button :loading="review.refreshing" @click="refresh">刷新结局统计</n-button><n-button :loading="rebuilding" @click="rebuildAll">重建全部识别</n-button></n-space>
+        <n-text v-if="error" type="error">{{ error }}</n-text>
     <n-card size="small" class="v2-card">
       <template #header>
         <div class="v2-header">
@@ -647,7 +351,6 @@ onBeforeUnmount(() => {
       </n-space>
     </n-card>
 
-    <div class="body">
       <n-card size="small" class="overall-card">
         <n-space size="large" wrap>
           <div class="stat-item">
@@ -745,86 +448,8 @@ onBeforeUnmount(() => {
         />
       </n-card>
 
-      <n-card
-        size="small"
-        title="最近信号明细"
-        class="details-card"
-        :content-style="{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }"
-      >
-        <div class="filter-bar">
-          <n-input
-            v-model:value="symbolInput"
-            size="small"
-            clearable
-            placeholder="品种，如 RB"
-            style="width: 140px"
-            @update:value="onSymbolInput"
-          />
-          <n-select
-            v-model:value="review.recentFilters.direction"
-            size="small"
-            clearable
-            placeholder="方向"
-            style="width: 100px"
-            :options="directionOptions"
-            @update:value="() => review.loadRecent()"
-          />
-          <n-select
-            v-model:value="review.recentFilters.version"
-            size="small"
-            clearable
-            placeholder="版本"
-            style="width: 90px"
-            :options="versionOptions"
-            @update:value="() => review.load()"
-          />
-          <n-select
-            v-model:value="review.recentFilters.level"
-            size="small"
-            clearable
-            placeholder="级别"
-            style="width: 100px"
-            :options="levelOptions"
-            @update:value="() => review.loadRecent()"
-          />
-          <n-select
-            v-model:value="review.recentFilters.grade"
-            size="small"
-            clearable
-            placeholder="等级"
-            style="width: 110px"
-            :options="gradeOptions"
-            @update:value="() => review.loadRecent()"
-          />
-          <n-select
-            v-model:value="review.recentFilters.outcome"
-            size="small"
-            clearable
-            placeholder="结局"
-            style="width: 110px"
-            :options="outcomeOptions"
-            @update:value="() => review.loadRecent()"
-          />
-          <n-button size="small" @click="resetFilters">重置</n-button>
-        </div>
-        <n-data-table
-          class="details-table"
-          :columns="recentColumns"
-          :data="review.recent"
-          :row-props="rowProps"
-          size="small"
-          :bordered="false"
-          :scroll-x="2900"
-          flex-height
-          :loading="loading || review.recentLoading"
-        />
-        <n-empty
-          v-if="!loading && !review.recent.length"
-          description="暂无明细"
-          style="margin-top: 12px"
-        />
-      </n-card>
-    </div>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -833,8 +458,8 @@ onBeforeUnmount(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 16px;
+  gap: 14px;
+  padding: 20px 24px;
   box-sizing: border-box;
   overflow: hidden;
 }
@@ -943,4 +568,5 @@ onBeforeUnmount(() => {
   font-size: 11px;
   line-height: 1.6;
 }
+.review-workspace{background:#f5f7fb;overflow:auto}.workspace-header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex:none}.workspace-eyebrow{font-size:9px;letter-spacing:2.1px;color:#8699b6;font-weight:600}.workspace-header h1{font-size:21px;color:#273d5c;letter-spacing:.3px;margin:3px 0 4px;font-weight:650}.workspace-header p{margin:0;color:#8a99ae;font-size:11px}.workspace-actions{display:flex;align-items:center;gap:15px}.workspace-actions>span{font-size:10px;color:#8a99ae}.legacy-section{flex:none}.legacy-toggle{border:0;background:none;color:#7f8ea3;font-size:11px;cursor:pointer;padding:0 0 4px}.legacy-toggle span{color:#a8b2c0;margin-left:15px;font-size:10px}.legacy-body{display:flex;flex-direction:column;gap:14px;padding-top:12px}@media(max-width:800px){.review-workspace{padding:14px}.workspace-actions>span,.legacy-toggle span{display:none}.workspace-header h1{font-size:18px}.workspace-actions{gap:0}}
 </style>

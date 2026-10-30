@@ -17,6 +17,36 @@ use tokio_tungstenite::tungstenite::Message;
 use super::credential_store::CredentialStore;
 use super::kline_cache::KlineMemoryCache;
 
+fn decode_gzip_message(bytes: &[u8]) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut output = Vec::new();
+    flate2::read::GzDecoder::new(bytes).take(LIMIT + 1).read_to_end(&mut output)?;
+    if output.len() as u64 > LIMIT {
+        return Err(Error::new(ErrorKind::InvalidData, "实时消息超过16MiB"));
+    }
+    String::from_utf8(output).map_err(|error| Error::new(ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn encode(text: &[u8]) -> Vec<u8> {
+        let mut encoder=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::fast());
+        encoder.write_all(text).unwrap();encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn compressed_snapshot_retains_exact_json_and_rejects_corrupt_or_oversized_frames() {
+        let text=serde_json::json!({"conditions":vec!["完整交易信息";1000],"revision":42}).to_string();
+        assert_eq!(decode_gzip_message(&encode(text.as_bytes())).unwrap(),text);
+        assert!(decode_gzip_message(b"invalid gzip").is_err());
+        assert!(decode_gzip_message(&encode(&vec![b'a';16*1024*1024+1])).is_err());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionStatus {
@@ -217,11 +247,11 @@ impl RealtimeClient {
             let token = self.credentials.get_token();
 
             let ws_url = if server_url.starts_with("https://") {
-                format!("wss://{}/api/v1/ws", &server_url[8..])
+                format!("wss://{}/api/{}/ws", &server_url[8..], n_protocol::API_VERSION)
             } else if server_url.starts_with("http://") {
-                format!("ws://{}/api/v1/ws", &server_url[7..])
+                format!("ws://{}/api/{}/ws", &server_url[7..], n_protocol::API_VERSION)
             } else {
-                format!("ws://{}/api/v1/ws", server_url)
+                format!("ws://{}/api/{}/ws", server_url, n_protocol::API_VERSION)
             };
 
             tracing::info!("🔌 正在尝试连接实时服务: {ws_url}");
@@ -246,13 +276,27 @@ impl RealtimeClient {
             }
 
             let mut reconnect_requested = false;
+            req.headers_mut().insert(n_protocol::version::RELEASE_HEADER,
+                HeaderValue::from_static(n_protocol::CURRENT_SERVER_VERSION));
+            req.headers_mut().insert(n_protocol::version::API_HEADER,
+                HeaderValue::from_static(n_protocol::API_VERSION));
             req.headers_mut()
                 .insert("X-Ntrend-Trader-Delta", HeaderValue::from_static("1"));
+            req.headers_mut()
+                .insert("X-Ntrend-Ws-Gzip", HeaderValue::from_static("1"));
             let connection = tokio::select! {
                 _ = &mut reconnect => { backoff_idx = 0; continue; }
                 result = tokio::time::timeout(Duration::from_secs(8), connect_async(req)) => result,
             };
             match connection {
+                Ok(Ok((_ws_stream, resp))) if n_protocol::version::require_current_peer(
+                    "服务端",
+                    resp.headers().get(n_protocol::version::RELEASE_HEADER).and_then(|v| v.to_str().ok()),
+                    resp.headers().get(n_protocol::version::API_HEADER).and_then(|v| v.to_str().ok()),
+                ).is_err() => {
+                    tracing::error!("实时连接版本不匹配：请将客户端和服务端同时升级到同一最新版本，已拒绝接收旧版数据");
+                    self.set_status(ConnectionStatus::VersionMismatch).await;
+                }
                 Ok(Ok((ws_stream, _resp))) => {
                     self.trader_cache.write().await.reset();
                     tracing::info!("✅ 实时 WebSocket 连接已建立");
@@ -323,6 +367,12 @@ impl RealtimeClient {
                                     Some(Ok(Message::Text(text))) => {
                                         self.handle_incoming_text(&text).await;
                                     }
+                                    Some(Ok(Message::Binary(bytes))) => {
+                                        match decode_gzip_message(&bytes) {
+                                            Ok(text) => self.handle_incoming_text(&text).await,
+                                            Err(error) => { tracing::warn!("实时压缩消息无效: {error}"); break; }
+                                        }
+                                    }
                                     Some(Ok(Message::Close(_))) | None => {
                                         tracing::warn!("WebSocket 连接由对端关闭");
                                         break;
@@ -342,10 +392,19 @@ impl RealtimeClient {
                 Ok(Err(e)) => {
                     tracing::warn!("❌ WebSocket 连接失败: {e}");
                     if let tokio_tungstenite::tungstenite::Error::Http(response) = &e {
-                        match response.status().as_u16() {
-                            401 | 403 => self.set_status(ConnectionStatus::Unauthorized).await,
-                            426 => self.set_status(ConnectionStatus::VersionMismatch).await,
-                            _ => {}
+                        if let Err(error) = n_protocol::version::require_current_peer(
+                            "服务端",
+                            response.headers().get(n_protocol::version::RELEASE_HEADER).and_then(|v| v.to_str().ok()),
+                            response.headers().get(n_protocol::version::API_HEADER).and_then(|v| v.to_str().ok()),
+                        ) {
+                            tracing::error!("{error}");
+                            self.set_status(ConnectionStatus::VersionMismatch).await;
+                        } else {
+                            match response.status().as_u16() {
+                                401 | 403 => self.set_status(ConnectionStatus::Unauthorized).await,
+                                426 => self.set_status(ConnectionStatus::VersionMismatch).await,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -355,6 +414,13 @@ impl RealtimeClient {
             }
 
             let status = self.status.read().await.clone();
+            if status == ConnectionStatus::VersionMismatch {
+                // A release mismatch cannot be repaired by network retries.
+                // Wait for explicit reconnection after upgrading/reconfiguring.
+                reconnect.await;
+                backoff_idx = 0;
+                continue;
+            }
             if !matches!(
                 status,
                 ConnectionStatus::Unauthorized | ConnectionStatus::VersionMismatch

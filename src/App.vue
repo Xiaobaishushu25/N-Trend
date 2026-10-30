@@ -41,8 +41,15 @@ onBeforeUnmount(() => {
       <n-notification-provider>
         <n-message-provider>
           <AppLayout />
+          <div v-if="appStore.connectionStatus === 'version_mismatch'" role="alert" class="version-error">
+            版本不匹配，已停止连接。请将客户端和服务端同时升级到同一最新版本（当前客户端 {{ appStore.info.version }}）。
+          </div>
         </n-message-provider>
       </n-notification-provider>
     </n-dialog-provider>
   </n-config-provider>
 </template>
+
+<style scoped>
+.version-error{position:fixed;top:48px;left:16px;right:16px;z-index:10000;padding:14px 18px;border:1px solid #f1a7a7;border-radius:8px;background:#fff1f0;color:#a61d24;font-size:14px;box-shadow:0 2px 12px #0001}
+</style>

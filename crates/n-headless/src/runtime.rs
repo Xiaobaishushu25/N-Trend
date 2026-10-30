@@ -1144,7 +1144,12 @@ fn spawn_live_chart_publisher(ctx: Arc<ServerContext>) {
                 _ = ctx.services.live_chart.wake.notified() => {},
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {},
             }
-            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
             let config = ctx.services.config().await;
             if config.data_source.primary_source != "tqsdk"
                 || !ctx.services.data_source.tq_is_available()
@@ -1158,39 +1163,63 @@ fn spawn_live_chart_publisher(ctx: Arc<ServerContext>) {
             // Four bounded local bridge reads at a time; the bridge already maintains 5m serials.
             let mut jobs = tokio::task::JoinSet::new();
             for symbol in ctx.services.live_chart.due_symbols(4) {
-                if !n_core::scheduler::is_symbol_trading_time(&symbol, &Local::now()) { continue; }
+                if !n_core::scheduler::is_symbol_trading_time(&symbol, &Local::now()) {
+                    continue;
+                }
                 let ctx = ctx.clone();
                 let bridge_port = config.data_source.bridge_port;
                 jobs.spawn(async move {
                     use n_core::fetch::MarketDataSource;
                     let tq = ctx.services.data_source.tq_client().await;
                     let requested_at = Instant::now();
-                    match tokio::time::timeout(Duration::from_millis(1000), tq.fetch_minute_raw(&symbol, "5m", 300)).await {
+                    match tokio::time::timeout(
+                        Duration::from_millis(1000),
+                        tq.fetch_minute_raw(&symbol, "5m", 300),
+                    )
+                    .await
+                    {
                         Ok(Ok(raw)) => {
                             let current = ctx.services.config().await;
                             if current.data_source.primary_source != "tqsdk"
                                 || current.data_source.bridge_port != bridge_port
                                 || !ctx.services.data_source.tq_is_available()
-                            { return; }
+                            {
+                                return;
+                            }
                             let now = Local::now();
-                            let bars = ctx.services.live_chart.publish_after(&symbol, raw.klines, now.naive_local(), requested_at);
+                            let bars = ctx.services.live_chart.publish_after(
+                                &symbol,
+                                raw.klines,
+                                now.naive_local(),
+                                requested_at,
+                            );
                             for tf in n_core::derive::Timeframe::supported() {
                                 let bar = bars.iter().find(|bar| bar.timeframe == tf.as_str());
                                 let payload = serde_json::json!({
                                     "symbol": symbol, "timeframe": tf.as_str(), "bar": bar,
                                     "updated_at": now.timestamp_millis(),
                                 });
-                                ctx.realtime_hub.broadcast_kline(
-                                    ctx.next_event_seq(), "kline.partial", &symbol, tf.as_str(), payload,
-                                ).await;
+                                ctx.realtime_hub
+                                    .broadcast_kline(
+                                        ctx.next_event_seq(),
+                                        "kline.partial",
+                                        &symbol,
+                                        tf.as_str(),
+                                        payload,
+                                    )
+                                    .await;
                             }
                         }
-                        _ => tracing::debug!(symbol, "后台实时柱更新未就绪，旧结果按新鲜度自动过期"),
+                        _ => {
+                            tracing::debug!(symbol, "后台实时柱更新未就绪，旧结果按新鲜度自动过期")
+                        }
                     }
                 });
             }
             while let Some(result) = jobs.join_next().await {
-                if let Err(error) = result { tracing::warn!(%error, "后台实时柱任务失败"); }
+                if let Err(error) = result {
+                    tracing::warn!(%error, "后台实时柱任务失败");
+                }
             }
         }
     });
@@ -1232,8 +1261,12 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                     let updated_bars = if cfg.data_source.primary_source == "tqsdk"
                         && ctx.services.data_source.tq_is_available()
                     {
-                        ctx.services.live_chart.update_prices(&snapshots, Local::now().naive_local())
-                    } else { Vec::new() };
+                        ctx.services
+                            .live_chart
+                            .update_prices(&snapshots, Local::now().naive_local())
+                    } else {
+                        Vec::new()
+                    };
                     let seq = ctx.next_event_seq();
                     let mut display_quotes = snapshots.clone();
                     display_quotes.extend(held_quotes);
@@ -1248,10 +1281,15 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                     for bar in updated_bars {
                         let sym = bar.symbol.clone();
                         let tf = bar.timeframe.clone();
-                        ctx.realtime_hub.broadcast_kline(
-                            ctx.next_event_seq(), "kline.partial", &sym, &tf,
-                            serde_json::json!({ "symbol": sym, "timeframe": tf, "bar": bar }),
-                        ).await;
+                        ctx.realtime_hub
+                            .broadcast_kline(
+                                ctx.next_event_seq(),
+                                "kline.partial",
+                                &sym,
+                                &tf,
+                                serde_json::json!({ "symbol": sym, "timeframe": tf, "bar": bar }),
+                            )
+                            .await;
                     }
 
                     // 检测入场价命中
@@ -1328,6 +1366,7 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
         let mut is_first = true;
         let mut after_id = 0u64;
+        let mut stream_id = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             if ctx
@@ -1344,13 +1383,6 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                 continue;
             }
 
-            let now = Local::now();
-            if !n_core::scheduler::is_trading_time(&now) {
-                // 非交易时段（如周末、夜盘收盘后）无行情 Tick 与闭合 K 线，静默休眠
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                continue;
-            }
-
             if is_first {
                 is_first = false;
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1358,10 +1390,33 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
 
             let tq = ctx.services.data_source.tq_client().await;
             if let Ok(response) = tq.poll_closed_bar_events(after_id, 25).await {
-                for ev in response.events {
-                    if ev.event_id > after_id {
-                        after_id = ev.event_id;
+                if stream_id.is_empty() {
+                    stream_id = response.stream_id.clone();
+                } else if stream_id != response.stream_id {
+                    stream_id = response.stream_id;
+                    after_id = 0;
+                    // Replay the new stream from the beginning after a bridge restart.
+                    continue;
+                }
+                let enabled = match n_core::storage::repo::list_symbols(&ctx.db, true).await {
+                    Ok(symbols) => symbols,
+                    Err(error) => {
+                        tracing::warn!("读取闭合事件启用品种失败: {error:#}");
+                        continue;
                     }
+                };
+                for ev in response.events {
+                    if !enabled.iter().any(|symbol| symbol.code == ev.symbol) {
+                        after_id = after_id.max(ev.event_id);
+                        continue;
+                    }
+                    // A closure notification is a commitment that the final bar
+                    // and its derived candles are already readable in the DB.
+                    if let Err(error) = ctx.services.store_tq_closed_bar_event(&ev).await {
+                        tracing::warn!(symbol = %ev.symbol, bar_end = %ev.bar_end, "闭合K线入库失败，将重试: {error:#}");
+                        break;
+                    }
+                    after_id = after_id.max(ev.event_id);
                     tracing::info!(
                         "🔔 [FAST_PATH] 收到天勤闭合K线: {} {} {}",
                         ev.symbol,
@@ -1391,6 +1446,31 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                     ctx.realtime_hub
                         .broadcast_kline(seq, "kline.closed", &ev.symbol, &ev.period, payload)
                         .await;
+                    // Notify every derived timeframe that actually closed here.
+                    // The chart uses the finalized DB row, never the display cache.
+                    for tf in ["15m", "30m", "60m", "120m", "240m", "1d"] {
+                        use chrono::Timelike;
+                        let end =
+                            chrono::NaiveDateTime::parse_from_str(&ev.bar_end, "%Y-%m-%d %H:%M:%S")
+                                .unwrap();
+                        let target = n_core::derive::Timeframe::parse(tf).unwrap();
+                        let closes_here = target
+                            .minutes()
+                            .map_or(end.hour() == 15 && end.minute() == 0, |minutes| {
+                                (end.hour() as i64 * 60 + end.minute() as i64) % minutes == 0
+                            });
+                        if !closes_here {
+                            continue;
+                        }
+                        if let Ok(rows) = ctx.services.get_klines(&ev.symbol, tf, Some(1)).await {
+                            if let Some(bar) = rows.last().filter(|bar| bar.ts == ev.bar_end) {
+                                ctx.realtime_hub.broadcast_kline(
+                                    ctx.next_event_seq(), "kline.closed", &ev.symbol, tf,
+                                    serde_json::json!({ "symbol": ev.symbol, "timeframe": tf, "bar": bar }),
+                                ).await;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1399,21 +1479,26 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
 
 fn spawn_tq_warmup(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let cfg = ctx.services.config().await;
-        if cfg.data_source.primary_source != "tqsdk" || !ctx.services.data_source.tq_is_available()
-        {
-            return;
-        }
-        let tq = ctx.services.data_source.tq_client().await;
-        if let Ok(symbols) = n_core::storage::repo::list_symbols(&ctx.db, true).await {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) { break; }
+            if ctx.services.config().await.data_source.primary_source != "tqsdk" { break; }
+            if !ctx.services.data_source.tq_available_or_probe().await { continue; }
+            let Ok(symbols) = n_core::storage::repo::list_symbols(&ctx.db, true).await else { continue; };
             let codes: Vec<String> = symbols.into_iter().map(|s| s.code).collect();
-            if !codes.is_empty() {
-                tracing::info!(
-                    "🔥 正在为 {} 个活跃品种预热天勤 5m K 线订阅...",
-                    codes.len()
-                );
-                let _ = tq.subscribe_klines(&codes, "5m", 300).await;
+            if codes.is_empty() { break; }
+            let tq = ctx.services.data_source.tq_client().await;
+            match tq.subscribe_klines(&codes, "5m", 300).await {
+                Ok(response) if response.failed.is_empty() && response.subscribed.len() == codes.len() => {
+                    // Also works when the server starts during a break: no trading
+                    // tick or scheduler refresh is required to recover the last bar.
+                    let stats = ctx.services.reconcile_tq_finality(&codes).await;
+                    tracing::info!("收盘订阅预热及补偿完成: 成功 {} 失败 {}", stats.succeeded, stats.failures);
+                    ctx.realtime_hub.broadcast(ctx.next_event_seq(), "data.updated", serde_json::to_value(&stats).unwrap_or_default()).await;
+                    if stats.failures == 0 { break; }
+                }
+                Ok(response) => tracing::warn!("收盘订阅尚未就绪: 已订阅 {} 失败 {:?}", response.subscribed.len(), response.failed),
+                Err(error) => tracing::warn!("收盘订阅失败，将重试: {error:#}"),
             }
         }
     });

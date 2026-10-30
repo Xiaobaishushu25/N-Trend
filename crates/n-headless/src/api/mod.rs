@@ -14,6 +14,7 @@ pub mod signals;
 pub mod symbols;
 pub mod trader;
 pub mod ws_handler;
+mod version;
 
 use crate::state::ServerContext;
 use axum::extract::DefaultBodyLimit;
@@ -24,7 +25,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
-    let api_v1 = Router::new()
+    let api = Router::new()
         // 元数据与探活
         .route("/meta", get(meta::get_meta))
         .route("/status", get(meta::get_status))
@@ -219,7 +220,8 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
 
     Router::new()
         .route("/healthz", get(meta::healthz))
-        .nest("/api/v1", api_v1)
+        .nest(&format!("/api/{}", n_protocol::API_VERSION), api)
+        .layer(axum::middleware::from_fn(version::enforce_version))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(log_http_request))

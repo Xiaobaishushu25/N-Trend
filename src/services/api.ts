@@ -2,6 +2,8 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { reviewFilterQuery } from '../utils/reviewFilters'
+import type { ReviewPage } from '../types'
 import type {
   V2ModelRow,
   V2PredictionRow,
@@ -165,7 +167,10 @@ export const api = {
       scoreMin: filters?.scoreMin ?? null,
       scoreMax: filters?.scoreMax ?? null,
       outcome: filters?.outcome || null,
+      filters: reviewFilterQuery(filters),
     }),
+  getReviewPage: (limit: number, offset: number, filters: RecentOutcomeFilters) =>
+    invoke<ReviewPage>('get_review_page', { limit, offset, filters: reviewFilterQuery(filters) }),
   getReviewSignal: (eventId: number) =>
     invoke<ReviewSignalDetail | null>('get_review_signal', { eventId }),
   getSignalUserData: (eventId: number) =>

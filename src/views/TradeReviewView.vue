@@ -36,6 +36,7 @@ import {
 } from '../stores/tradeReview'
 import { formatPnlAmount, formatPnlPoints, formatRMultiple } from '../utils/multipliers'
 import { notify } from '../utils/notify'
+import { openReviewWindow } from '../utils/openReviewWindow'
 import type { OpenReviewChartPayload } from '../types'
 import SignalQuality from '../components/SignalQuality.vue'
 import SignalQualityControls from '../components/SignalQualityControls.vue'
@@ -175,6 +176,7 @@ async function openChartForTicket(ticket: TradeReviewTicket) {
           <span class="header-subtitle">交易全生命周期 · 盈亏归因 · 策略账本</span>
         </div>
         <div class="header-action-group">
+          <n-button size="small" type="primary" secondary @click="openReviewWindow">形态与评分筛选</n-button>
           <n-button size="small" secondary :loading="review.refreshing" @click="review.refresh">
             <template #icon>
               <n-icon :component="Refresh" />

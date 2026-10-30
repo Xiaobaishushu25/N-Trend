@@ -18,7 +18,8 @@ pub async fn ws_handler(
     let trader_delta = headers
         .get("X-Ntrend-Trader-Delta")
         .and_then(|v| v.to_str().ok()) == Some("1");
-    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, trader_delta))
+    let gzip = headers.get("X-Ntrend-Ws-Gzip").and_then(|v| v.to_str().ok()) == Some("1");
+    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, trader_delta, gzip))
 }
 
 async fn handle_socket(
@@ -26,6 +27,7 @@ async fn handle_socket(
     ctx: Arc<ServerContext>,
     device: AuthDevice,
     trader_delta: bool,
+    gzip: bool,
 ) {
     let (client_id, mut rx, disconnect) = ctx
         .realtime_hub
@@ -59,6 +61,14 @@ async fn handle_socket(
     let send_task = tokio::spawn(async move {
         while let Some(queued) = rx.recv().await {
             let (msg, _permit) = queued.into_parts();
+            // Preserve every field and event order. Only an opted-in client gets
+            // gzip binary frames; legacy clients continue to receive text JSON.
+            let msg = if gzip && matches!(&msg, Message::Text(text) if text.len() >= 8192) {
+                match tokio::task::spawn_blocking(move || gzip_message(msg)).await {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                }
+            } else { msg };
             match tokio::time::timeout(Duration::from_secs(10), sender.send(msg)).await {
                 Ok(Ok(())) => {}
                 _ => break,
@@ -144,6 +154,18 @@ async fn handle_socket(
     );
 }
 
+fn gzip_message(msg: Message) -> Message {
+    use std::io::Write;
+    let Message::Text(text) = msg else { return msg; };
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    if encoder.write_all(text.as_bytes()).is_ok() {
+        if let Ok(bytes) = encoder.finish() {
+            if bytes.len() < text.len() { return Message::Binary(bytes); }
+        }
+    }
+    Message::Text(text)
+}
+
 async fn finish_connection(
     mut send_task: tokio::task::JoinHandle<()>,
     mut recv_task: tokio::task::JoinHandle<()>,
@@ -172,6 +194,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
+
+    #[test]
+    fn gzip_snapshot_keeps_all_fields_without_sending_megabytes_of_text() {
+        use std::io::Read;
+        let text=serde_json::json!({"topic":"trader.updated","payload":{"conditions":vec!["历史条件及完整信息";10000],"active":true}}).to_string();
+        let Message::Binary(bytes)=gzip_message(Message::Text(text.clone())) else { panic!("large snapshot should compress") };
+        assert!(bytes.len()<text.len()/10);
+        let mut restored=String::new();
+        flate2::read::GzDecoder::new(bytes.as_slice()).read_to_string(&mut restored).unwrap();
+        assert_eq!(restored,text);
+        assert!(matches!(gzip_message(Message::Ping(vec![])),Message::Ping(_)));
+    }
 
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {

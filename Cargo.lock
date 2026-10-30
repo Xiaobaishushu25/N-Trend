@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "n-core"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2952,11 +2952,12 @@ dependencies = [
 
 [[package]]
 name = "n-headless"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "flate2",
  "futures-util",
  "n-core",
  "n-protocol",
@@ -2975,7 +2976,7 @@ dependencies = [
 
 [[package]]
 name = "n-protocol"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "chrono",
  "serde",
@@ -2985,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "n-trend-analyzer"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "bytes",

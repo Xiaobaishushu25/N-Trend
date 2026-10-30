@@ -725,8 +725,9 @@ pub async fn get_recent_outcomes(
     score_min: Option<f64>,
     score_max: Option<f64>,
     outcome: Option<String>,
+    filters: Option<RecentOutcomeFilters>,
 ) -> Result<Value, String> {
-    let filters = RecentOutcomeFilters {
+    let filters = filters.unwrap_or(RecentOutcomeFilters {
         symbol,
         version,
         direction,
@@ -735,12 +736,20 @@ pub async fn get_recent_outcomes(
         score_min,
         score_max,
         outcome,
-    };
+        ..Default::default()
+    });
     state
         .api
         .get_recent_outcomes(limit, Some(&filters))
         .await
         .map_err(|e| e.message)
+}
+
+#[tauri::command]
+pub async fn get_review_page(
+    state: State<'_, Arc<AppState>>, limit: usize, offset: usize, filters: RecentOutcomeFilters,
+) -> Result<Value, String> {
+    state.api.get_review_page(limit, offset, &filters).await.map_err(|e| e.message)
 }
 
 #[tauri::command]

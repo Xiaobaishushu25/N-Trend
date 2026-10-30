@@ -96,6 +96,37 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+test('final history retires a live candle and rejects delayed partial pushes', async () => {
+  const { store, requests } = klinesHarness()
+  const load = store.load('CF0', '15m')
+  const final = bar(110)
+  store.acceptPartial('CF0', '15m', bar(99))
+  requests[0].resolve({ rows: [final], status: 'tqsdk', message: '', partial_bar: bar(98) })
+  await load
+  assert.equal(store.latestClosedTs, final.ts)
+  assert.equal(store.partialBar, null)
+  assert.equal(store.acceptPartial('CF0', '15m', bar(97)), false)
+  assert.equal(store.rows[0].close, 110)
+  assert.equal(store.acceptPartial('CF0', '15m', bar(120, 'CF0', '15m', '2026-10-29 14:30:00')), true)
+  const reload = store.load('CF0', '15m', 500, true)
+  requests[1].resolve({ rows: [final], status: 'tqsdk', message: '' })
+  await reload
+  assert.equal(store.acceptPartial('CF0', '15m', bar(90)), false)
+})
+
+test('closure watermark resets when switching symbols', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  requests[0].resolve({ rows: [bar(110)], status: 'tqsdk', message: '' })
+  await first
+  const next = store.load('SR0', '15m')
+  assert.equal(store.latestClosedTs, '')
+  assert.equal(store.acceptPartial('SR0', '15m', bar(95, 'SR0', '15m', '2026-10-29 14:00:00')), true)
+  requests[1].resolve({ rows: [bar(90, 'SR0', '15m', '2026-10-29 13:45:00')], status: 'tqsdk', message: '' })
+  await next
+  assert.equal(store.partialBar.close, 95)
+})
+
 // Execute the view's real request and switch handlers with controlled network ordering.
 function chartHarness() {
   const source = fs.readFileSync('src/views/ChartView.vue', 'utf8')

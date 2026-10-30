@@ -33,3 +33,18 @@ pub struct SignalQualityDto {
     pub explanations: Vec<String>,
     pub flags: Vec<String>,
 }
+
+/// Frozen v2 research candidate, presented beside v1 without changing execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewScoreDto {
+    pub candidate_version: String,
+    pub status: String,
+    pub morphology_score: Option<f64>,
+    pub quality_score: Option<f64>,
+    pub a_score: Option<f64>,
+    pub b_score: Option<f64>,
+    pub levels_score: Option<f64>,
+    pub levels_partial: bool,
+    pub explanations: Vec<String>,
+    pub evidence: Option<serde_json::Value>,
+}

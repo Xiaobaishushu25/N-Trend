@@ -22,6 +22,9 @@ import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
 import SignalQuality from '../components/SignalQuality.vue'
 import SignalQualityControls from '../components/SignalQualityControls.vue'
+import ReviewFilters from '../components/ReviewFilters.vue'
+import ReviewScoreDetail from '../components/ReviewScoreDetail.vue'
+import { defaultReviewFilters, reviewScore } from '../utils/reviewFilters'
 import { compareQuality } from '../utils/signalQuality'
 import { useSignalQualityStore } from '../stores/signalQuality'
 import { useGroupsStore } from '../stores/groups'
@@ -67,7 +70,10 @@ const manualLevelsStore = useManualLevelsStore()
 
 const qualityDisplay = useSignalQualityStore()
 const qualitySort = ref(false)
-const displayedReviewRows = computed(() => qualitySort.value && qualityDisplay.enabled ? [...reviewRows.value].sort((a,b) => compareQuality(a.quality,b.quality)) : reviewRows.value)
+const displayedReviewRows = computed(() => reviewRows.value)
+const reviewFiltersOpen = ref(false)
+const chartReviewFilters = computed(() => ({ ...defaultReviewFilters(), ...reviewListFilters.value }))
+const chartReviewSymbolOptions = computed(() => symbolsStore.symbols.map(s => ({ label: `${s.name || s.code} · ${s.code}`, value: s.code })))
 const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
@@ -284,6 +290,9 @@ const reviewMode = computed(() => reviewSignalId.value != null)
 const reviewRows = ref<OutcomeDetail[]>([])
 const reviewLoading = ref(false)
 const reviewListKey = ref('')
+const reviewTotal = ref(0)
+const reviewOffset = ref(0)
+const reviewPageSize = ref(80)
 // 默认列表跟随当前品种；从复盘统计带来的筛选则允许跨品种切换。
 const reviewListFilters = computed(() =>
   appStore.reviewJumpFilters ?? (symbol.value ? { symbol: symbol.value } : undefined),
@@ -362,10 +371,24 @@ async function loadReviewList(force = false) {
   }
   try {
     // 优先带上当前品种以走单品种极速路径（~100ms），避免无筛选时全量扫描50+品种SQLite（~8秒）
-    let rows = reuseRows ? [...reviewRows.value] : await api.getRecentOutcomes(150, reviewListFilters.value)
+    let rows: OutcomeDetail[]
+    if (reuseRows) rows = [...reviewRows.value]
+    else if (reviewListFilters.value?.pageOffset != null) {
+      const page = await api.getReviewPage(reviewListFilters.value.pageSize || 80, reviewListFilters.value.pageOffset, reviewListFilters.value)
+      if (!isCurrent()) return
+      rows = page.items
+      reviewTotal.value = page.total
+      reviewOffset.value = page.offset
+      reviewPageSize.value = page.limit
+    } else {
+      rows = await api.getRecentOutcomes(150, reviewListFilters.value)
+      if (!isCurrent()) return
+      reviewTotal.value = rows.length
+      reviewOffset.value = 0
+    }
     if (!isCurrent()) return
     // 目标信号不在筛选结果里时，单查当前信号并补入列表头部，保证滚轮能覆盖当前信号而无需重拉全量
-    if (!rows.some((r) => r.event_id === id)) {
+    if (!rows.some((r) => r.event_id === id) && reviewListFilters.value?.pageOffset == null) {
       try {
         const detail = await api.getReviewSignal(id)
         if (detail?.outcome) {
@@ -424,9 +447,40 @@ function switchReviewSignal(dir: number) {
   const rows = reviewRows.value
   if (!rows.length) return
   const cur = reviewIndex.value
+  if (reviewListFilters.value?.pageOffset != null) {
+    if (dir > 0 && cur === rows.length - 1) { if (reviewOffset.value + rows.length < reviewTotal.value) void changeReviewPage(1); return }
+    if (dir < 0 && cur === 0) { if (reviewOffset.value > 0) void changeReviewPage(-1); return }
+  }
   const base = cur >= 0 ? cur : dir > 0 ? -1 : 0
   const next = rows[(base + dir + rows.length) % rows.length]
   selectReviewSignal(next)
+}
+
+function updateChartReviewFilters(patch: Partial<import('../types').RecentOutcomeFilters>) {
+  appStore.reviewJumpFilters = { ...chartReviewFilters.value, ...patch, pageOffset: 0, pageSize: reviewPageSize.value }
+}
+async function changeReviewPage(direction: number) {
+  if (reviewLoading.value) return
+  const contextKey = reviewListContextKey.value
+  const activeId = reviewSignalId.value
+  const isCurrent = () => contextKey === reviewListContextKey.value && activeId === reviewSignalId.value
+  const offset = Math.max(0, reviewOffset.value + direction * reviewPageSize.value)
+  const filters = { ...chartReviewFilters.value, pageOffset: offset, pageSize: reviewPageSize.value }
+  reviewLoading.value = true
+  try {
+    const page = await api.getReviewPage(reviewPageSize.value, offset, filters)
+    if (!isCurrent()) return
+    reviewLoading.value = false
+    if (!page.items.length) return
+    appStore.reviewJumpFilters = filters
+    reviewRows.value = page.items
+    reviewListKey.value = JSON.stringify(filters)
+    reviewTotal.value = page.total
+    reviewOffset.value = page.offset
+    selectReviewSignal(direction < 0 ? page.items[page.items.length - 1] : page.items[0])
+  } catch (error) {
+    if (isCurrent()) { reviewLoading.value = false; notify.error(`加载复盘页失败：${error}`) }
+  }
 }
 
 /** 返回导航：如果是独立历史复盘图表窗口，则关闭独立窗口；若是主窗口则返回仪表盘 */
@@ -1126,29 +1180,14 @@ const displayRows = computed<KlineRow[]>(() => {
   const partial = klinesStore.partialBar
   const live = partial && chartClock.value - klinesStore.partialReceivedAt <= 10_000
     ? [...liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf && b.ts < partial.ts), partial]
+      .filter((b) => b.ts > klinesStore.latestClosedTs)
     : []
   if (!live.length) return rows
-  const liveByTs = new Map(live.map((b) => [b.ts, b]))
   const rowByTs = new Map(rows.map((r) => [r.ts, r]))
-  // 只有最后一根实时桶还在形成中，允许它更新历史行；
-  // 更早的“已收未落地”桶一旦库里已有成形K线，就以库内为准，避免旧实时收盘覆盖落库结果。
-  const currentLiveTs = live.length ? live[live.length - 1].ts : null
+  // 正式库中的柱子已经确认收盘，同时间戳的实时缓存不能覆盖它。
   const out: KlineRow[] = []
   for (const r of rows) {
-    const bar = liveByTs.get(r.ts)
-    if (bar && bar.ts === currentLiveTs) {
-      // 库内已有同桶K线（刷新落库的成形桶）：保留真实开盘/成交量，
-      // 实时值只负责把高低扩展到已观测到的范围、并更新收盘
-      out.push({
-        ...r,
-        high: Math.max(r.high, bar.high),
-        low: Math.min(r.low, bar.low),
-        close: bar.close,
-        source: 'live',
-      })
-    } else {
-      out.push(r)
-    }
+    out.push(r)
   }
   for (const bar of live) {
     if (!rowByTs.has(bar.ts) && out.length > 0 && bar.ts > out[out.length - 1].ts) {
@@ -3532,8 +3571,9 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="reviewMode" class="patterns-card review-card">
-          <SignalQualityControls v-model:sort="qualitySort" />
-          <div class="patterns-title">复盘信号明细（{{ reviewRows.length }}）</div>
+          <div class="patterns-title">评分复盘（{{ reviewTotal }}）<button class="review-filter-toggle" @click="reviewFiltersOpen = !reviewFiltersOpen">{{ reviewFiltersOpen ? '收起筛选' : '筛选 / 排序' }}</button></div>
+          <ReviewFilters v-if="reviewFiltersOpen" compact :filters="chartReviewFilters" :symbols="chartReviewSymbolOptions" @change="updateChartReviewFilters" @reset="updateChartReviewFilters(defaultReviewFilters())" />
+          <div v-if="reviewListFilters?.pageOffset != null" class="review-page-controls"><button :disabled="reviewOffset === 0 || reviewLoading" @click="changeReviewPage(-1)">上一页</button><span>{{ reviewOffset + 1 }}—{{ Math.min(reviewOffset + reviewRows.length, reviewTotal) }} / {{ reviewTotal }}</span><button :disabled="reviewOffset + reviewRows.length >= reviewTotal || reviewLoading" @click="changeReviewPage(1)">下一页</button></div>
           <n-scrollbar style="flex: 1">
             <div v-if="reviewLoading" class="patterns-empty">正在加载信号明细...</div>
             <div v-else-if="reviewRows.length" class="review-list">
@@ -3582,9 +3622,10 @@ onBeforeUnmount(() => {
                   </span>
                 </div>
 
-                <SignalQuality :quality="row.quality" :old-score="row.entry_score" :rr="row.rr" />
+                <div class="rv-new-scores"><span>v2综合 <b>{{ reviewScore(row, 'quality_v2')?.toFixed(1) ?? '—' }}</b></span><span>v2形态 {{ reviewScore(row, 'morphology_v2')?.toFixed(1) ?? '—' }}</span><span>v1综合 {{ reviewScore(row, 'quality_v1')?.toFixed(1) ?? '—' }}</span></div>
+                <details v-if="row.event_id === reviewSignalId" @click.stop><summary class="rv-score-expand">评分拆解与形态证据</summary><ReviewScoreDetail :row="row" /></details>
                 <div class="rv-meta">
-                  <span class="rv-time" :title="row.created_at">{{ fmtRecentTime(row.created_at) }}</span>
+                  <span class="rv-time" :title="row.warning_ts">预警 {{ fmtRecentTime(row.warning_ts) }}</span>
                   <span class="rv-outcome" :class="reviewOutcome(row).cls">
                     {{ reviewOutcome(row).text }}
                   </span>
@@ -7328,4 +7369,5 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid #e2e8f0;
   padding-bottom: 4px;
 }
+.review-filter-toggle{float:right;border:0;background:#edf2ff;color:#5e73a9;border-radius:5px;padding:3px 7px;font-size:10px;cursor:pointer}.review-page-controls{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:10px;color:#94a3b8;margin:9px 0}.review-page-controls button{border:1px solid #e2e8f0;border-radius:4px;background:#fff;color:#637795;padding:3px 7px;cursor:pointer}.review-page-controls button:disabled{opacity:.4;cursor:default}.rv-new-scores{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0;font-size:10px;color:#8b98ac}.rv-new-scores b{font-size:15px;color:#5970b0;font-variant-numeric:tabular-nums}.rv-score-expand{font-size:10px;color:#7d8ea8;cursor:pointer;margin:5px 0}
 </style>

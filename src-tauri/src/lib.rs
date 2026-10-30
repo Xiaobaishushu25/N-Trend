@@ -237,6 +237,7 @@ pub fn run() {
             commands::refresh_outcomes_now,
             commands::get_review_stats,
             commands::get_recent_outcomes,
+            commands::get_review_page,
             commands::get_review_signal,
             commands::get_signal_user_data,
             commands::add_signal_annotation,

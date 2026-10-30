@@ -13,6 +13,48 @@ use std::time::Duration;
 
 use super::credential_store::CredentialStore;
 
+fn require_current_server(response: &reqwest::Response) -> Result<(), ApiErrorResponse> {
+    n_protocol::version::require_current_peer(
+        "服务端",
+        response.headers().get(n_protocol::version::RELEASE_HEADER).and_then(|v| v.to_str().ok()),
+        response.headers().get(n_protocol::version::API_HEADER).and_then(|v| v.to_str().ok()),
+    )
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn mock_response(headers: &str) -> reqwest::Response {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n{headers}\r\n[]");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            stream.write_all(raw.as_bytes()).unwrap();
+        });
+        let response = Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap()
+            .get(format!("http://{address}/api/v2/review/outcomes")).send().await.unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn successful_old_or_unversioned_responses_are_rejected_before_decoding() {
+        for headers in [String::new(), format!("{}: 3.0.1\r\n{}: v1\r\n", n_protocol::version::RELEASE_HEADER, n_protocol::version::API_HEADER)] {
+            let response = mock_response(&headers).await;
+            assert_eq!(require_current_server(&response).unwrap_err().code, "UPGRADE_REQUIRED");
+        }
+        let response = mock_response(&format!("{}: {}\r\n{}: {}\r\n", n_protocol::version::RELEASE_HEADER,
+            n_protocol::CURRENT_SERVER_VERSION, n_protocol::version::API_HEADER, n_protocol::API_VERSION)).await;
+        assert!(require_current_server(&response).is_ok());
+    }
+}
+
 pub struct RemoteApiClient {
     client: Client,
     credentials: Arc<CredentialStore>,
@@ -46,12 +88,14 @@ impl RemoteApiClient {
         let base = self.server_url();
         let base = base.trim_end_matches('/');
         let path = path.trim_start_matches('/');
-        format!("{base}/api/v1/{path}")
+        format!("{base}/api/{}/{path}", n_protocol::API_VERSION)
     }
 
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let full_url = self.url(path);
-        let mut builder = self.client.request(method, &full_url);
+        let mut builder = self.client.request(method, &full_url)
+            .header(n_protocol::version::RELEASE_HEADER, n_protocol::CURRENT_SERVER_VERSION)
+            .header(n_protocol::version::API_HEADER, n_protocol::API_VERSION);
 
         let token = self.credentials.get_token();
         if !token.is_empty() {
@@ -104,6 +148,9 @@ impl RemoteApiClient {
             }
         };
 
+        // A successful response from an old server is still an error. Never
+        // decode it as the current schema or retry a version mismatch.
+        require_current_server(&resp)?;
         let status = resp.status();
         let url = resp.url().clone();
         if let Some(trace_id) = trace_id {
@@ -194,7 +241,7 @@ impl RemoteApiClient {
             } else if status == StatusCode::UPGRADE_REQUIRED {
                 Err(ApiErrorResponse::new(
                     "UPGRADE_REQUIRED",
-                    "客户端版本过低，请升级后继续使用",
+                    "版本不匹配，请将客户端和服务端同时升级到同一最新版本后继续使用",
                     "",
                 ))
             } else {
@@ -239,6 +286,7 @@ impl RemoteApiClient {
             }
         };
 
+        require_current_server(&resp)?;
         let status = resp.status();
         let url = resp.url().clone();
         if status.is_success() {
@@ -741,37 +789,15 @@ impl RemoteApiClient {
         limit: Option<usize>,
         filters: Option<&RecentOutcomeFilters>,
     ) -> Result<Value, ApiErrorResponse> {
-        let mut path = "review/outcomes?".to_string();
-        if let Some(l) = limit {
-            path.push_str(&format!("limit={l}&"));
-        }
-        if let Some(f) = filters {
-            if let Some(s) = &f.symbol {
-                path.push_str(&format!("symbol={s}&"));
-            }
-            if let Some(v) = &f.version {
-                path.push_str(&format!("version={v}&"));
-            }
-            if let Some(d) = &f.direction {
-                path.push_str(&format!("direction={d}&"));
-            }
-            if let Some(lv) = &f.level {
-                path.push_str(&format!("level={lv}&"));
-            }
-            if let Some(g) = &f.grade {
-                path.push_str(&format!("grade={g}&"));
-            }
-            if let Some(s) = f.score_min {
-                path.push_str(&format!("score_min={s}&"));
-            }
-            if let Some(s) = f.score_max {
-                path.push_str(&format!("score_max={s}&"));
-            }
-            if let Some(o) = &f.outcome {
-                path.push_str(&format!("outcome={o}&"));
-            }
-        }
-        self.execute(self.request(Method::GET, &path)).await
+        let mut request = self.request(Method::GET, "review/outcomes");
+        if let Some(limit) = limit { request = request.query(&[("limit", limit)]); }
+        if let Some(filters) = filters { request = request.query(filters); }
+        self.execute(request).await
+    }
+
+    pub async fn get_review_page(&self, limit: usize, offset: usize, filters: &RecentOutcomeFilters) -> Result<Value, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "review/outcomes")
+            .query(filters).query(&[("limit",limit), ("offset",offset)]).query(&[("paged",true)])).await
     }
 
     pub async fn get_review_signal(&self, event_id: i64) -> Result<Value, ApiErrorResponse> {
@@ -1015,6 +1041,7 @@ impl RemoteApiClient {
                 ApiErrorResponse::new("BACKUP_DOWNLOAD_FAILED", format!("下载备份失败: {e}"), "")
             })?;
 
+        require_current_server(&resp)?;
         if !resp.status().is_success() {
             return Err(ApiErrorResponse::new(
                 "BACKUP_ERROR",

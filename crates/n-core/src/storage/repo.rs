@@ -104,6 +104,26 @@ pub async fn atomically_save_raw_and_derived(
     raw_rows: Vec<klines::ActiveModel>,
     derived_rows: Vec<klines::ActiveModel>,
 ) -> Result<()> {
+    write_raw_and_derived(db, symbol, raw_rows, derived_rows, true).await
+}
+
+/// Incremental updates keep unrelated historical rows and their revisions intact.
+pub async fn atomically_upsert_raw_and_derived(
+    db: &DatabaseConnection,
+    symbol: &str,
+    raw_rows: Vec<klines::ActiveModel>,
+    derived_rows: Vec<klines::ActiveModel>,
+) -> Result<()> {
+    write_raw_and_derived(db, symbol, raw_rows, derived_rows, false).await
+}
+
+async fn write_raw_and_derived(
+    db: &DatabaseConnection,
+    symbol: &str,
+    raw_rows: Vec<klines::ActiveModel>,
+    derived_rows: Vec<klines::ActiveModel>,
+    replace_history: bool,
+) -> Result<()> {
     let symbol = symbol.to_string();
     db.transaction::<_, (), anyhow::Error>(|txn| {
         Box::pin(async move {
@@ -133,12 +153,14 @@ pub async fn atomically_save_raw_and_derived(
             }
 
             // 2. 事务内原子清理该品种的旧 derived K线
-            klines::Entity::delete_many()
+            if replace_history {
+                klines::Entity::delete_many()
                 .filter(klines::Column::Symbol.eq(symbol))
                 .filter(klines::Column::Source.eq("derived"))
                 .exec(txn)
                 .await
                 .context("事务内清理旧 derived K线失败")?;
+            }
 
             // 3. 事务内批量插入该品种的新 derived K线
             if !derived_rows.is_empty() {
@@ -316,6 +338,22 @@ pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<kli
         .await
         .context("查询原始K线失败")?;
     Ok(rows)
+}
+
+pub async fn raw_klines_window(
+    db: &DatabaseConnection,
+    symbol: &str,
+    start: &str,
+    end: &str,
+) -> Result<Vec<klines::Model>> {
+    klines::Entity::find()
+        .filter(klines::Column::Symbol.eq(symbol))
+        .filter(klines::Column::Timeframe.eq("5m"))
+        .filter(klines::Column::Source.eq("raw"))
+        .filter(klines::Column::Ts.gte(start))
+        .filter(klines::Column::Ts.lte(end))
+        .order_by_asc(klines::Column::Ts)
+        .all(db).await.context("查询原始K线窗口失败")
 }
 
 /// 只查询正式 5m 历史的截止时间，避免图表为了一个时间戳加载整个品种历史。

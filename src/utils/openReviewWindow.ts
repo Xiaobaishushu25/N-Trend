@@ -26,7 +26,7 @@ export async function openReviewWindow() {
     if (await showAndFocusWindow("review")) return
     const webview = new WebviewWindow("review", {
       url: "/#/review",
-      title: "复盘统计",
+      title: "形态与评分复盘",
       width: 1280,
       height: 820,
       minWidth: 960,

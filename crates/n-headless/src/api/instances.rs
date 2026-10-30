@@ -258,6 +258,8 @@ mod tests {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
+            .header(n_protocol::version::RELEASE_HEADER, n_protocol::CURRENT_SERVER_VERSION)
+            .header(n_protocol::version::API_HEADER, n_protocol::API_VERSION)
             .header("content-type", "application/json");
         if let Some(t) = token {
             request = request.header("authorization", format!("Bearer {t}"));
@@ -320,7 +322,7 @@ mod tests {
             call(
                 &router,
                 "GET",
-                "/api/v1/trader/instances",
+                "/api/v2/trader/instances",
                 None,
                 Value::Null
             )
@@ -333,7 +335,7 @@ mod tests {
             call(
                 &router,
                 "POST",
-                "/api/v1/trader/instances",
+                "/api/v2/trader/instances",
                 Some("read-test"),
                 create.clone()
             )
@@ -344,7 +346,7 @@ mod tests {
         let (status, result) = call(
             &router,
             "POST",
-            "/api/v1/trader/instances",
+            "/api/v2/trader/instances",
             Some("admin-test"),
             create,
         )
@@ -355,7 +357,7 @@ mod tests {
         let (_, snapshot) = call(
             &router,
             "GET",
-            &format!("/api/v1/trader/instances/{id}/snapshot"),
+            &format!("/api/v2/trader/instances/{id}/snapshot"),
             Some("read-test"),
             Value::Null,
         )
@@ -368,7 +370,7 @@ mod tests {
         let (_, changed) = call(
             &router,
             "POST",
-            "/api/v1/trader/config",
+            "/api/v2/trader/config",
             Some("admin-test"),
             serde_json::to_value(config).unwrap(),
         )
@@ -394,7 +396,7 @@ mod tests {
         let (_, list) = call(
             &router,
             "GET",
-            "/api/v1/trader/instances",
+            "/api/v2/trader/instances",
             Some("read-test"),
             Value::Null,
         )
@@ -406,14 +408,14 @@ mod tests {
         let (_, created) = call(
             &router,
             "POST",
-            "/api/v1/trader/instances",
+            "/api/v2/trader/instances",
             Some("admin-test"),
             setup.clone(),
         )
         .await;
         assert_eq!(created["success"], true, "{created}");
         let sim_id = created["data"]["instance_id"].as_str().unwrap();
-        let path = format!("/api/v1/trader/instances/{sim_id}/connection");
+        let path = format!("/api/v2/trader/instances/{sim_id}/connection");
         assert_eq!(
             call(&router, "GET", &path, Some("read-test"), Value::Null)
                 .await
@@ -429,7 +431,7 @@ mod tests {
         let (_, duplicate) = call(
             &router,
             "POST",
-            "/api/v1/trader/instances",
+            "/api/v2/trader/instances",
             Some("admin-test"),
             setup.clone(),
         )
@@ -441,7 +443,7 @@ mod tests {
                 .count(),
             1
         );
-        let login_path = format!("/api/v1/trader/instances/{sim_id}/login");
+        let login_path = format!("/api/v2/trader/instances/{sim_id}/login");
         assert_eq!(
             call(
                 &router,
@@ -465,7 +467,7 @@ mod tests {
         let (_, paper_login) = call(
             &router,
             "POST",
-            &format!("/api/v1/trader/instances/{id}/login"),
+            &format!("/api/v2/trader/instances/{id}/login"),
             Some("admin-test"),
             setup["simnow"].clone(),
         )
@@ -491,7 +493,7 @@ mod tests {
         let (_, catalog) = call(
             &router,
             "GET",
-            "/api/v1/trader/instances",
+            "/api/v2/trader/instances",
             Some("read-test"),
             Value::Null,
         )

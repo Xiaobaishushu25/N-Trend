@@ -3,10 +3,12 @@ pub mod assistant_review;
 pub mod blind;
 pub mod qualification;
 pub mod report;
+pub mod review;
 pub mod research;
+pub mod score_scan;
 pub mod store;
 pub mod structure;
-// pub mod structure_study;
+pub mod structure_study;
 
 use crate::{
     analyze::{indicators, model::Bar},
@@ -179,6 +181,20 @@ pub fn evaluate(
     origin: &str,
     rules: &Rules,
 ) -> SignalQualityDto {
+    evaluate_with_research_calendar(e, input, tick, closed_through, origin, rules, None)
+}
+
+/// The default scorer always passes None. Offline archives can supply an explicit
+/// session correction; it is hashed/versioned and never changes the global calendar.
+pub(super) fn evaluate_with_research_calendar(
+    e: &pattern_events::Model,
+    input: &[Bar],
+    tick: f64,
+    closed_through: &str,
+    origin: &str,
+    rules: &Rules,
+    night_override: Option<crate::session::spec::NightSessionType>,
+) -> SignalQualityDto {
     let mut q = SignalQualityDto {
         event_id: e.id,
         event_key: event_key(e),
@@ -201,6 +217,10 @@ pub fn evaluate(
         explanations: vec![],
         flags: vec![],
     };
+    if let Some(night) = night_override {
+        q.feature_version = format!("{FEATURE_VERSION}+research-calendar-v1");
+        q.flags.push(format!("offline_night_override:{night:?}"));
+    }
     if rules.validate().is_err() {
         return fail(q, "invalid_rules", "评分参数不合法");
     }
@@ -251,7 +271,7 @@ pub fn evaluate(
             q.event_key.clone(),
             tick,
             &hash_bars,
-            calendar_signature(&e.symbol, &bars),
+            calendar_signature(&e.symbol, &bars, night_override),
         ))
         .unwrap_or_default(),
     );
@@ -278,7 +298,7 @@ pub fn evaluate(
     if bars.iter().any(|b| b.rollover) {
         return fail(q, "rollover", "评分窗口包含换月，均线证据不可直接延续");
     }
-    if has_missing_session_bar(&e.symbol, &bars) {
+    if has_missing_session_bar(&e.symbol, &bars, night_override) {
         return fail(q, "missing_data", "交易时段存在缺失15分钟K线");
     }
     if ![
@@ -744,7 +764,11 @@ pub(crate) fn legacy_pattern(
 
 /// Inspect minute interiors using the exchange calendar in Asia/Shanghai semantics.
 /// Midpoint checks avoid treating session-end bars as missing bars after a break.
-fn calendar_signature(symbol: &str, bars: &[Bar]) -> Vec<(String, bool, bool)> {
+fn calendar_signature(
+    symbol: &str,
+    bars: &[Bar],
+    night_override: Option<crate::session::spec::NightSessionType>,
+) -> Vec<(String, bool, bool)> {
     let mut values = Vec::new();
     let parse = |b: &Bar| {
         chrono::NaiveDateTime::parse_from_str(&b.dt.to_bar_ts(), "%Y-%m-%d %H:%M:%S")
@@ -758,7 +782,8 @@ fn calendar_signature(symbol: &str, bars: &[Bar]) -> Vec<(String, bool, bool)> {
                 format!(
                     "{}|{:?}",
                     day,
-                    crate::session::SessionCalendar::get(symbol).night_type
+                    night_override
+                        .unwrap_or(crate::session::SessionCalendar::get(symbol).night_type)
                 ),
                 crate::session::SessionCalendar::is_trading_day(&day),
                 crate::session::SessionCalendar::has_night_session_tonight(&day),
@@ -769,9 +794,16 @@ fn calendar_signature(symbol: &str, bars: &[Bar]) -> Vec<(String, bool, bool)> {
     values
 }
 
-fn has_missing_session_bar(symbol: &str, bars: &[Bar]) -> bool {
+fn has_missing_session_bar(
+    symbol: &str,
+    bars: &[Bar],
+    night_override: Option<crate::session::spec::NightSessionType>,
+) -> bool {
     use chrono::Duration;
-    let spec = crate::session::SessionCalendar::get(symbol);
+    let mut spec = crate::session::SessionCalendar::get(symbol);
+    if let Some(night) = night_override {
+        spec.night_type = night;
+    }
     for p in bars.windows(2) {
         let Some(a) =
             chrono::NaiveDateTime::parse_from_str(&p[0].dt.to_bar_ts(), "%Y-%m-%d %H:%M:%S").ok()

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const vm = require('node:vm')
 
-function harness() {
+function harness(modular = false) {
   class Element {
     constructor() { this.textContent = ''; this.value = ''; this.checked = false; this.children = []; this.attributes = {}; this.scrollWidth = 1000 }
     setAttribute(k, v) { this.attributes[k] = v }
@@ -21,6 +21,15 @@ function harness() {
   const task = { task_hash: 'task', version: 'qualification-evidence-v1', display_version: 'qualification-single-v1', base_manifest_hash: 'base', base_display_version: 'blind-quality-v1', legacy_labels: [label],
     new_queue: ['new-1', 'new-2'], revisit_queue: ['old-left', 'old-right'], cases: Object.fromEntries(['new-1', 'new-2', 'old-left', 'old-right'].map(id => [id, makeCase(id)])),
     context: Object.fromEntries(['new-1', 'new-2', 'old-left', 'old-right'].map(id => [id, { pair_id: 'old-pair', side: 'left' }])), pair_identities: [label] }
+  if (modular) {
+    task.version = 'qualification-evidence-v2'; task.display_version = 'qualification-modules-v2'; task.previous_task_hash = 'v1-task'
+    task.previous_case_assessments = [{ case_id: 'new-1', morphology_qualification: 'qualified', opportunity_qualification: 'marginal', note: '<b>原版说明</b>', assistant_reference: { viewed: true } }]
+    task.previous_case_drafts = []
+    for (const c of Object.values(task.cases)) {
+      const ids = ['trend_ma', 'a_process', 'b_process', 'levels', 'warning', 'space']
+      c.diagnostics = { module_order: ids, modules: Object.fromEntries(ids.map(id => [id, { title: id, facts: [id + '事实'], reading: '结构解释', limitations: '待验证', metrics: id === 'levels' ? { prior_high_atr: 1.2, prior_low_atr: .1 } : {} }])) }
+    }
+  }
   get('payload').textContent = JSON.stringify(task); get('queue').value = 'new'; get('scale').value = 'shared'
   const storage = new Map(); let downloaded
   const document = { getElementById: get, createElementNS: () => new Element(), createElement: () => new Element(), querySelectorAll: () => reasons }
@@ -97,4 +106,33 @@ test('importing an older unseen snapshot cannot erase the first reference exposu
   const again = await h.download()
   assert.equal(again.case_assessments[0].assistant_reference.viewed, true)
   assert.equal(again.case_assessments[0].assistant_reference.before.morphology_qualification, 'qualified')
+})
+
+test('v2 retains six modules and readonly v1 judgments; hiding a module does not change labels or the chart', async () => {
+  const h = harness(true), $ = h.get
+  assert.equal($('morphology').value, '')
+  assert.ok($('previous-body').textContent.includes('<b>原版说明</b>'))
+  fill(h); const chart = $('chart').children[0]
+  $('assistant').open = true; $('assistant').ontoggle()
+  assert.equal($('evidence').children.length, 6)
+  assert.equal($('module-controls').children.length, 6)
+  $('module-controls').children[0].onclick()
+  assert.equal($('evidence').children.length, 5)
+  assert.equal($('chart').children[0], chart)
+  $('save').onclick()
+  const b = await h.download()
+  assert.equal(b.assessment_version, 'qualification-evidence-v2')
+  assert.equal(b.previous_case_assessments[0].note, '<b>原版说明</b>')
+  assert.equal(b.case_assessments[0].morphology_qualification, 'qualified')
+  assert.equal(b.case_assessments[0].assistant_reference.viewed_modules.length, 6)
+  const other = harness(true); await other.import(b)
+  assert.equal((await other.download()).case_assessments[0].note, b.case_assessments[0].note)
+})
+
+test('v1 judgments cannot be silently reassigned to v2 exposure history', async () => {
+  const v1 = harness(); fill(v1); v1.get('save').onclick(); const bundle = await v1.download()
+  const v2 = harness(true); await v2.import(bundle)
+  assert.ok(v2.get('message').textContent.includes('版本'))
+  assert.equal((await v2.download()).case_assessments.length, 0)
+  assert.equal(v2.get('morphology').value, '')
 })

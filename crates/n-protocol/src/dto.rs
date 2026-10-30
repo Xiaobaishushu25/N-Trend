@@ -344,6 +344,17 @@ pub struct RecentOutcomeFilters {
     pub score_min: Option<f64>,
     pub score_max: Option<f64>,
     pub outcome: Option<String>,
+    pub symbols: Option<String>,
+    pub quality_metric: Option<String>,
+    pub quality_min: Option<f64>,
+    pub quality_max: Option<f64>,
+    pub quality_status: Option<String>,
+    pub time_field: Option<String>,
+    pub time_start: Option<String>,
+    pub time_end: Option<String>,
+    pub hour_start: Option<String>,
+    pub hour_end: Option<String>,
+    pub sort_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -409,7 +420,7 @@ pub struct AppInfo {
 pub struct MetaDto {
     pub api_version: String,
     pub server_version: String,
-    pub min_client_version: String,
+    pub required_client_version: String,
     pub server_time: i64,
 }
 

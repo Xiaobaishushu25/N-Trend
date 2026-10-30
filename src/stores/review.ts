@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import type { OutcomeDetail, RecentOutcomeFilters, ReviewStats, V2ModelRow, V2PredictionRow, V2ReportBundle } from '../types'
+import { defaultReviewFilters, validateReviewFilters } from '../utils/reviewFilters'
+
+let pageRequest = 0
+const filterKey = 'ntrend.review-browser.filters.v1'
+function savedFilters(): RecentOutcomeFilters {
+  try { return { ...defaultReviewFilters(), ...JSON.parse(localStorage.getItem(filterKey) || '{}'), pageOffset: undefined } }
+  catch { return defaultReviewFilters() }
+}
 
 export const REVIEW_DIMENSIONS = [
   { key: 'score_band', label: '评分段' },
@@ -56,8 +64,71 @@ export const useReviewStore = defineStore('review', {
     loading: false,
     refreshing: false,
     recentLoading: false,
+    browserFilters: savedFilters(),
+    browserRows: [] as OutcomeDetail[],
+    browserTotal: 0,
+    browserScored: 0,
+    browserUnscored: 0,
+    browserSymbols: [] as string[],
+    browserPage: 1,
+    browserPageSize: 80,
+    browserLoading: false,
+    browserError: '',
   }),
   actions: {
+    async loadReviewPage() {
+      const request = ++pageRequest
+      const invalid = validateReviewFilters(this.browserFilters)
+      if (invalid) { this.browserError = invalid; this.browserLoading = false; this.browserRows = []; this.browserTotal = 0; this.browserScored = 0; this.browserUnscored = 0; return }
+      const filters = { ...this.browserFilters, symbols: [...(this.browserFilters.symbols || [])] }
+      const page = this.browserPage
+      this.browserLoading = true
+      this.browserError = ''
+      this.browserRows = []
+      try {
+        const result = await api.getReviewPage(this.browserPageSize, (page - 1) * this.browserPageSize, filters)
+        if (request !== pageRequest) return
+        // Older servers ignore `paged=true` and return the legacy row array.
+        // Validate before changing reactive state: undefined symbols break rendering
+        // before Vue can remove the table's loading overlay.
+        if (Array.isArray(result)) {
+          throw new Error('版本不匹配：复盘接口返回了旧版数据。请将客户端和服务端同时升级到同一最新版本后重新加载。')
+        }
+        if (!result || !Array.isArray(result.items) || !Array.isArray(result.symbols)
+          || !result.symbols.every(symbol => typeof symbol === 'string')
+          || ![result.total, result.scored, result.unscored].every(count => Number.isSafeInteger(count) && count >= 0)
+          || result.scored + result.unscored !== result.total) {
+          throw new Error('复盘接口返回的数据格式不完整，已停止加载。请将客户端和服务端同时升级到同一最新版本后重新加载。')
+        }
+        this.browserRows = result.items
+        this.browserTotal = result.total
+        this.browserScored = result.scored
+        this.browserUnscored = result.unscored
+        this.browserSymbols = result.symbols
+        try { localStorage.setItem(filterKey, JSON.stringify(filters)) } catch { /* session remains usable */ }
+      } catch (e) {
+        if (request === pageRequest) { this.browserError = String(e); this.browserTotal = 0; this.browserScored = 0; this.browserUnscored = 0 }
+      } finally {
+        if (request === pageRequest) this.browserLoading = false
+      }
+    },
+    updateBrowserFilterDraft(patch: Partial<RecentOutcomeFilters>) {
+      ++pageRequest
+      this.browserFilters = { ...this.browserFilters, ...patch, pageOffset: undefined }
+      this.browserPage = 1
+      this.browserRows = []
+      this.browserLoading = true
+      this.browserError = ''
+    },
+    async setBrowserFilters(patch: Partial<RecentOutcomeFilters>) {
+      this.updateBrowserFilterDraft(patch)
+      await this.loadReviewPage()
+    },
+    async resetBrowserFilters() {
+      this.browserFilters = defaultReviewFilters()
+      this.browserPage = 1
+      await this.loadReviewPage()
+    },
     async load(dim?: string, scope?: StatsScopeKey) {
       this.dimension = dim ?? this.dimension
       this.statsScope = scope ?? this.statsScope

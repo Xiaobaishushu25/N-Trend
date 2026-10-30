@@ -43,6 +43,8 @@ npm run build
 cargo tauri build
 ```
 
+从 `3.0.2` 起，客户端和 `n-headless` 服务端必须同时升级到同一最新发布版本，版本号必须完全一致，不接受旧版或跨版本连接。HTTP 与 WebSocket 统一使用 `/api/v2`，请求和响应必须携带 `x-ntrend-version` 与 `x-ntrend-api-version`。缺少版本声明、版本不同或协议不同会立即报错；服务端返回 `426 UPGRADE_REQUIRED`，客户端拒绝解析旧格式，不重试版本错误，也不回退到 `/api/v1`。`/healthz` 和 `/api/v2/meta` 保留用于升级诊断。后续发布必须同步提升 workspace、前端和 Tauri 的版本号。
+
 ## 数据策略
 
 - 只持久化 5m 原始K线（source=raw），增量更新：每轮每品种抓最近 ~10 根做 upsert。

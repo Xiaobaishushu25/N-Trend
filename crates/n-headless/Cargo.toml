@@ -21,4 +21,5 @@ tower-http = { version = "0.5", features = ["cors", "trace", "limit", "compressi
 futures-util = "0.3"
 tokio-tungstenite = "0.21"
 sha2 = "0.10"
+flate2 = "1.0"
 uuid = { version = "1", features = ["v4"] }

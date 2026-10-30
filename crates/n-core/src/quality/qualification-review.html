@@ -2,22 +2,25 @@
 <style>
 *{box-sizing:border-box}body{margin:0;background:#f3f6fa;color:#23324a;font:15px/1.6 system-ui}main{max-width:1250px;margin:auto;padding:22px}h1{font-size:25px;margin:0 0 5px}h2{font-size:18px}p{margin:8px 0}.hint{color:#64748b}.toolbar,.fields,.reasons{display:flex;gap:12px;flex-wrap:wrap;align-items:center}button,select,textarea{font:inherit;color:inherit;border:1px solid #bfcddd;background:white;border-radius:7px;padding:8px}button{cursor:pointer}button:disabled{opacity:.45}.panel{background:white;border:1px solid #dbe3ed;border-radius:12px;padding:17px;margin:15px 0}#chart{height:440px;overflow:auto}#chart svg{display:block}.fields>label{flex:1;min-width:230px}.fields select{display:block;width:100%;margin-top:5px}textarea{width:100%;height:90px;margin:12px 0}.reasons label{white-space:nowrap}summary{font-weight:600;cursor:pointer}.evidence{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.evidence h3{font-size:16px}#message{color:#136c60}#legacy-body{white-space:pre-wrap}.badge{padding:3px 8px;border-radius:4px;background:#edf2fa}#interpretation p{margin:10px 0}@media(max-width:760px){main{padding:12px}.evidence{grid-template-columns:1fr}.toolbar{gap:7px}}
 </style>
-<main><h1>信号逐个评价</h1><p class="hint">先判断本身是否合格。新一轮20例用于研究标准；原20组反馈完整保留，不会自动转换成合格标签。</p>
+<main><h1 id="page-title">信号逐个评价</h1><p class="hint" id="intro">先判断本身是否合格。新一轮20例用于研究标准；原20组反馈完整保留，不会自动转换成合格标签。</p>
 <div class="toolbar"><label>案例集 <select id="queue"><option value="new">新一轮案例</option><option value="revisit">复核已有40例</option></select></label><button id="prev">上一例</button><b id="position"></b><button id="next">下一例</button><button id="download">下载全部标签</button><button id="import">导入标签</button><input id="file" type="file" accept=".json,application/json" hidden></div>
 <div class="panel"><div class="toolbar"><b id="direction"></b><span class="badge">截至预警收盘</span><label>纵轴 <select id="scale"><option value="shared">固定尺度：1 ATR = 40像素</option><option value="fit">全图适配</option></select></label><button id="space">显示交易空间</button><span id="space-text"></span></div><p class="hint">横向固定每根K线8像素，预警在右侧。S1转折K、B段及预警K分别标记；固定尺度下可纵向滚动查看背景。</p><div id="chart"></div></div>
 <div class="panel"><div class="fields"><label>形态本身<select id="morphology"><option value="">请选择</option><option value="qualified">合格</option><option value="marginal">勉强</option><option value="rejected">不合格</option><option value="uncertain">无法判断</option></select></label><label>综合交易条件<select id="opportunity"><option value="">请选择</option><option value="qualified">合格</option><option value="marginal">勉强</option><option value="rejected">不合格</option><option value="uncertain">无法判断</option></select></label><label>形态类型<select id="pattern"><option value="">请选择</option><option value="pullback_n">标准回踩N</option><option value="impulse">快速脉冲</option><option value="consolidation_breakout">整理突破</option><option value="other">其他</option><option value="uncertain">无法判断</option></select></label></div>
 <p class="hint">形态合格不代表综合条件合格。综合判断前可显示入场、止损与到S1的空间。</p>
 <div class="reasons">关注原因：<label><input type="checkbox" value="a">A段</label><label><input type="checkbox" value="b">B段</label><label><input type="checkbox" value="trend">趋势</label><label><input type="checkbox" value="space">空间</label><label><input type="checkbox" value="warning">端点/预警</label><label><input type="checkbox" value="scale">尺度/噪声</label></div>
 <textarea id="note" maxlength="2000" placeholder="补充说明；你的原话独立保留，不由我的理解覆盖。"></textarea><button id="save">保存本例</button> <span id="message"></span><p class="hint" id="progress"></p></div>
-<details class="panel" id="assistant"><summary>点击展示我的理解与结构诊断</summary><p class="hint">预警前数据生成的解读草稿，未逐图复核，不代表胜率或合格结论。首次展开会保留你此前的判断。</p><div id="interpretation"></div><div class="evidence" id="evidence"></div></details>
+<details class="panel" id="assistant"><summary>点击展示我的理解与结构诊断</summary><p class="hint">预警前数据生成的解读草稿，未逐图复核，不代表胜率或合格结论。首次展开会保留你此前的判断。</p><div class="toolbar" id="module-controls"></div><div id="interpretation"></div><div class="evidence" id="evidence"></div></details>
 <details class="panel" id="legacy"><summary>查看此前的配对选择和你的原说明</summary><div id="legacy-body"></div></details>
-<p class="hint">本轮是原任务中未讨论行情的诊断抽样，不是随机市场样本。页面完全离线。新诊断不进入现有评分或交易准入；未提供的tick尺度明确留空。请下载JSON保存结果，浏览器本地存储可能被清理。</p></main>
+<details class="panel" id="previous"><summary>查看此前逐例判断（原版本记录）</summary><div id="previous-body" style="white-space:pre-wrap"></div></details>
+<p class="hint" id="footer-note">本轮是原任务中未讨论行情的诊断抽样，不是随机市场样本。页面完全离线。新诊断不进入现有评分或交易准入；未提供的tick尺度明确留空。请下载JSON保存结果，浏览器本地存储可能被清理。</p></main>
 <script type="application/json" id="payload">__QUALIFICATION_PAYLOAD__</script>
 <script>
 'use strict';
 const $=id=>document.getElementById(id),task=JSON.parse($('payload').textContent),NS='http://www.w3.org/2000/svg';
 const key='signal-quality-qualification:'+task.task_hash,grades=['qualified','marginal','rejected','uncertain'],types=['pullback_n','impulse','consolidation_breakout','other','uncertain'],reasonCodes=['a','b','trend','space','warning','scale'];
 let completed={},drafts={},references={},legacy=task.legacy_labels.slice(),index=0,revealed=false;
+const modular=task.display_version==='qualification-modules-v2',moduleVisibility={};
+if(modular){$('page-title').textContent='信号结构诊断 · 第二版';$('intro').textContent='同一批20例与原40例的模块化复核。趋势、MA20、前高前低均保留；此前逐例判断单独归档，新版选择可留空。';$('footer-note').textContent='本页只含预警收盘前证据，沿用已讨论的开发案例。六模块只控制展示，不代表统计消融或交易评分；端点影线暂作观测，tick来自已校验快照。新判断另行下载，原版本标签保留。'}
 try{const saved=JSON.parse(localStorage.getItem(key)||'null');if(saved){completed=saved.completed||{};drafts=saved.drafts||{};references=saved.references||{};legacy=saved.legacy||legacy}}catch{}
 const queue=()=>task[$('queue').value==='revisit'?'revisit_queue':'new_queue'];
 const current=()=>task.cases[queue()[index]];
@@ -35,6 +38,7 @@ function draw(c){const bs=c.bars.slice(0,c.warning_index+1),s0=c.points[0][0],s1
  svg.append(el('rect',{x:x(s0)-4,y:20,width:(s1-s0)*8+8,height:height-40,fill:'#eaf0ff',opacity:.5}),el('rect',{x:x(s1)+4,y:20,width:Math.max(0,(s2-s1)*8),height:height-40,fill:'#fff4dc',opacity:.65}));
  const ma=[];bs.forEach((b,i)=>{const color=b[3]>=b[0]?'#df4d4d':'#199f80';svg.append(el('line',{x1:x(i),x2:x(i),y1:y(b[1]),y2:y(b[2]),stroke:color}),el('rect',{x:x(i)-2.6,y:Math.min(y(b[0]),y(b[3])),width:5.2,height:Math.max(1,Math.abs(y(b[0])-y(b[3]))),fill:b[3]>=b[0]?'white':color,stroke:color}));if(b[4]!=null)ma.push(x(i)+','+y(b[4]))});
  svg.append(el('polyline',{points:ma.join(' '),fill:'none',stroke:'#426cf1','stroke-width':1.5}),el('polyline',{points:c.points.map(p=>x(p[0])+','+y(p[1])).join(' '),fill:'none',stroke:'#df922e','stroke-width':1.5}));
+ if(modular){const levels=c.diagnostics.modules.levels.metrics;for(const[label,v,color]of[['前高',levels.prior_high_atr,'#8d657b'],['前低',levels.prior_low_atr,'#638877']])if(Number.isFinite(v))svg.append(el('line',{x1:x(Math.max(0,s0-40)),x2:width-55,y1:y(v),y2:y(v),stroke:color,'stroke-dasharray':'2 5'}),el('text',{x:Math.max(8,x(Math.max(0,s0-40))),y:y(v)-5,fill:color,'font-size':11},label+' · S0前40根'))}
  c.points.forEach((p,i)=>svg.append(el('circle',{cx:x(p[0]),cy:y(p[1]),r:3,fill:'#bd781d'}),el('text',{x:x(p[0])-10,y:y(p[1])+(i===1?-12:20),fill:'#80541f','font-size':12},'S'+i)));
  svg.append(el('rect',{x:x(w)-4,y:y(bs[w][1])-4,width:8,height:Math.max(12,y(bs[w][2])-y(bs[w][1])+8),fill:'none',stroke:'#7c4dce','stroke-width':2}),el('text',{x:x(w)-36,y:y(bs[w][1])-12,fill:'#7c4dce','font-size':12},'预警收盘'));
  if(revealed)for(const[label,v,col]of[['入场',c.entry,'#2867bd'],['止损',c.stop,'#d44545'],['S1',c.target,'#16825e']])svg.append(el('line',{x1:0,x2:width-55,y1:y(v),y2:y(v),stroke:col,'stroke-dasharray':'4 3'}),el('text',{x:8,y:y(v)-4,fill:col,'font-size':12},label));
@@ -43,7 +47,13 @@ function draw(c){const bs=c.bars.slice(0,c.warning_index+1),s0=c.points[0][0],s1
 }
 const n=(x,d=2)=>Number.isFinite(x)?x.toFixed(d):'数据不足';
 const pct=x=>Number.isFinite(x)?(100*x).toFixed(0)+'%':'数据不足';
-function showInterpretation(c){const d=c.diagnostics,a=d.a,b=d.b,p=b.path_without_warning;$('interpretation').replaceChildren();
+function showInterpretation(c){const d=c.diagnostics;$('interpretation').replaceChildren();$('module-controls').replaceChildren();
+ if(d.modules){$('interpretation').append(node('p','以下为六个独立模块。切换仅影响文字展示，图中MA20与前高前低继续保留；不计算新的总分或合格结论。'));$('evidence').replaceChildren();
+  for(const id of d.module_order){const m=d.modules[id],visible=moduleVisibility[id]!==false,button=node('button',(visible?'显示：':'已隐藏：')+m.title);button.setAttribute('aria-pressed',String(visible));button.onclick=()=>{moduleVisibility[id]=!visible;showInterpretation(c)};$('module-controls').append(button);if(!visible)continue;
+   const col=document.createElement('section');col.setAttribute('data-module',id);col.append(node('h3',m.title));for(const text of m.facts)col.append(node('p',text));col.append(node('p',m.reading));const limit=node('p',m.limitations);limit.setAttribute('class','hint');col.append(limit);$('evidence').append(col)}
+  const r=references[c.case_id];if(r?.viewed){r.viewed_modules=[...new Set([...(r.viewed_modules||[]),...d.module_order.filter(id=>moduleVisibility[id]!==false)])];persist()}return;
+ }
+ const a=d.a,b=d.b,p=b.path_without_warning;
  for(const line of d.interpretation||[])$('interpretation').append(node('p',line));
  const columns=[['A段推进',[
   `完整${a.bars}根，内部${a.interior_bars}根；幅度${n(a.amplitude_atr)} ATR。`,
@@ -63,8 +73,9 @@ function showInterpretation(c){const d=c.diagnostics,a=d.a,b=d.b,p=b.path_withou
 }
 function render(){const q=queue();index=Math.min(index,Math.max(0,q.length-1));const c=current();$('prev').disabled=index===0;$('next').disabled=index>=q.length-1;$('position').textContent=q.length?`${index+1} / ${q.length}`:'没有可用案例';if(!c){$('save').disabled=true;return}
  const saved=drafts[c.case_id]||completed[c.case_id]||{};$('morphology').value=saved.morphology_qualification||'';$('opportunity').value=saved.opportunity_qualification||'';$('pattern').value=saved.pattern_type||'';$('note').value=saved.note||'';document.querySelectorAll('input[type=checkbox]').forEach(e=>e.checked=(saved.reasons||[]).includes(e.value));
- $('direction').textContent=c.direction==='up'?'做多形态':'做空形态';$('assistant').open=false;$('legacy').open=false;$('interpretation').replaceChildren();$('evidence').replaceChildren();$('message').textContent='';
+ $('direction').textContent=c.direction==='up'?'做多形态':'做空形态';$('assistant').open=false;$('legacy').open=false;$('previous').open=false;$('interpretation').replaceChildren();$('module-controls').replaceChildren();$('evidence').replaceChildren();$('message').textContent='';
  const context=task.context[c.case_id],old=legacy.find(l=>l.pair_id===context.pair_id);$('legacy-body').textContent=old?`这是原配对的${context.side==='left'?'左':'右'}侧。\n原形态选择：${old.morphology}；综合选择：${old.opportunity}。\n你的原说明：${old.note||'未填写'}\n原选择属于相对偏好，没有自动转换为本例合格结论。`:'本例没有此前配对反馈。';
+ const prior=(task.previous_case_assessments||[]).find(l=>l.case_id===c.case_id),names={qualified:'合格',marginal:'勉强',rejected:'不合格',uncertain:'无法判断'};$('previous-body').textContent=prior?`原版逐例判断：形态${names[prior.morphology_qualification]}；综合${names[prior.opportunity_qualification]}。\n你的原说明：${prior.note||'未填写'}\n原版看过解读：${prior.assistant_reference.viewed?'是':'否'}。\n此记录保持原版本，未自动转为新版判断。`:'本例没有此前逐例判断。';
  $('progress').textContent=`本案例集已完成 ${q.filter(id=>completed[id]).length} / ${q.length}；原配对标签保留 ${legacy.length} 组。${reference(c).viewed?'本例已看过解读，展开前判断已保留。':''}`;draw(c);
 }
 for(const id of['morphology','opportunity','pattern','note'])$(id).oninput=capture;
@@ -78,7 +89,8 @@ function validateForm(f,partial){for(const k of['morphology_qualification','oppo
 function validateCase(l,partial){const c=task.cases[l.case_id];if(!c||c.input_hash!==l.input_hash)throw Error('案例身份或行情哈希不一致');validateForm(l,partial);const r=l.assistant_reference;if(!r||r.version!==task.version||r.task_hash!==task.task_hash||typeof r.viewed!=='boolean')throw Error('解读版本不一致');if(r.viewed){validateForm(r.before,true);if(!r.opened_at||!Number.isFinite(Date.parse(r.opened_at)))throw Error('解读时间不合法')}}
 $('download').onclick=()=>{capture();const bundle={manifest_hash:task.base_manifest_hash,display_version:task.base_display_version,labels:legacy,annotation_version:'qualification-additive-v1',assessment_version:task.version,assessment_display_version:task.display_version,qualification_task_hash:task.task_hash,
  case_assessments:Object.values(completed).map(l=>({...l,assistant_reference:reference(task.cases[l.case_id])})),case_drafts:Object.entries(drafts).map(([id,f])=>assessment(task.cases[id],f))};
- const blob=new Blob([JSON.stringify(bundle,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='signal-quality-qualifications.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+ if(modular){bundle.previous_qualification_task_hash=task.previous_task_hash;bundle.previous_case_assessments=task.previous_case_assessments;bundle.previous_case_drafts=task.previous_case_drafts}
+ const blob=new Blob([JSON.stringify(bundle,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=modular?'signal-quality-qualifications-v2.json':'signal-quality-qualifications.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
 $('import').onclick=()=>$('file').click();
 $('file').onchange=async()=>{const file=$('file').files?.[0];if(!file)return;try{const b=JSON.parse(await file.text());if(b.manifest_hash!==task.base_manifest_hash||b.display_version!==task.base_display_version||!Array.isArray(b.labels))throw Error('来自其他标注任务');
  const pairMap=new Map(task.pair_identities.map(p=>[p.pair_id,p])),seenPairs=new Set();for(const l of b.labels){const p=pairMap.get(l.pair_id);if(!p||seenPairs.has(l.pair_id))throw Error('未知或重复配对');seenPairs.add(l.pair_id);for(const k of['left_case_id','left_input_hash','right_case_id','right_input_hash'])if(l[k]!==p[k])throw Error('原配对身份不一致');for(const k of['morphology','opportunity'])if(!['left','right','tie','uncertain'].includes(l[k]))throw Error('原配对选择不合法');if(typeof l.note!=='string'||l.note.length>2000||!Array.isArray(l.reasons)||l.reasons.some(x=>!['a','b','trend','space'].includes(x)))throw Error('原配对说明不合法');if(l.assistant_reference&&(l.assistant_reference.version!==task.legacy_reference_version||l.assistant_reference.notes_hash!==task.legacy_reference_hash))throw Error('原配对解读版本不一致')}

@@ -190,8 +190,27 @@ pub fn selected_warnings(
     nearest: bool,
     from: usize,
 ) -> Vec<WarningCandidate> {
+    scan_warnings(symbol, bars, tick, nearest, from, false)
+}
+
+/// Offline score-comparison population: retain eligible fine/large candidates
+/// before the final legacy-score winner selection. The structural N detector's
+/// existing geometry filters remain in force; this is not exhaustive AB enumeration.
+pub fn research_warning_candidates(symbol: &str, bars: &[Bar], tick: f64) -> Vec<WarningCandidate> {
+    scan_warnings(symbol, bars, tick, false, 0, true)
+}
+
+fn scan_warnings(
+    symbol: &str,
+    bars: &[Bar],
+    tick: f64,
+    nearest: bool,
+    from: usize,
+    all: bool,
+) -> Vec<WarningCandidate> {
     let mut best_by_warning: std::collections::HashMap<(Dir, usize), WarningCandidate> =
         std::collections::HashMap::new();
+    let mut candidates = Vec::new();
 
     for w in from..bars.len() {
         let prefix = &bars[..=w];
@@ -264,6 +283,10 @@ pub fn selected_warnings(
         for p in patterns {
             if let Some(c) = candidate_for(prefix, &atr20, &trend_k, &trend_k_relaxed, &p, w, tick)
             {
+                if all {
+                    candidates.push(c);
+                    continue;
+                }
                 let key = (c.direction, c.warning_index);
                 match best_by_warning.get(&key) {
                     Some(existing)
@@ -281,7 +304,11 @@ pub fn selected_warnings(
     }
 
     let _ = symbol;
-    let mut out: Vec<WarningCandidate> = best_by_warning.into_values().collect();
+    let mut out: Vec<WarningCandidate> = if all {
+        candidates
+    } else {
+        best_by_warning.into_values().collect()
+    };
     out.sort_by(|a, b| {
         a.warning_index.cmp(&b.warning_index).then_with(|| {
             let au = matches!(a.direction, Dir::Up);
@@ -515,6 +542,32 @@ mod tests {
                 "11:30 event must never be rewritten by later bars at end {end}"
             );
         }
+    }
+    #[test]
+    fn research_population_retains_legacy_winners_and_causal_fine_large_choices() {
+        let bars = bu0_series();
+        let all = research_warning_candidates("BU0", &bars, 1.);
+        let old = replay_warnings("BU0", &bars, 1.);
+        assert!(!old.is_empty());
+        for c in &old {
+            let choices: Vec<_> = all
+                .iter()
+                .filter(|x| x.warning_index == c.warning_index && x.direction == c.direction)
+                .collect();
+            assert!(choices.iter().any(|x| x.level == c.level
+                && x.s0_index == c.s0_index
+                && x.s1_index == c.s1_index
+                && x.s2_index == c.s2_index));
+            assert!(choices
+                .iter()
+                .all(|x| x.entry_score <= c.entry_score + 1e-9));
+        }
+        let cut = bars.len() * 3 / 4;
+        let before = research_warning_candidates("BU0", &bars[..cut], 1.);
+        assert_eq!(
+            before.len(),
+            all.iter().filter(|c| c.warning_index < cut).count()
+        );
     }
 
     #[test]

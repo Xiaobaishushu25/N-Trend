@@ -22,14 +22,8 @@ pub struct ReviewStatsQuery {
 #[derive(Deserialize)]
 pub struct RecentOutcomesQuery {
     pub limit: Option<usize>,
-    pub symbol: Option<String>,
-    pub version: Option<String>,
-    pub direction: Option<String>,
-    pub level: Option<String>,
-    pub grade: Option<String>,
-    pub score_min: Option<f64>,
-    pub score_max: Option<f64>,
-    pub outcome: Option<String>,
+    pub offset: Option<usize>,
+    pub paged: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -141,28 +135,19 @@ pub async fn get_recent_outcomes(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
     Query(q): Query<RecentOutcomesQuery>,
+    Query(filters): Query<n_protocol::dto::RecentOutcomeFilters>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
-    let filter = n_core::service::OutcomeFilter {
-        symbol: q.symbol,
-        direction: q.direction,
-        level: q.level,
-        grade: q.grade,
-        score_min: q.score_min,
-        score_max: q.score_max,
-        outcome: q.outcome,
-        version: q.version,
+    let result = if q.paged.unwrap_or(false) {
+        ctx.services.review_page(q.limit.unwrap_or(80), q.offset.unwrap_or(0), &filters).await
+            .and_then(|page| Ok(serde_json::to_value(page)?))
+    } else {
+        ctx.services.recent_outcomes(q.limit.unwrap_or(2000), &filters).await
+            .and_then(|rows| Ok(serde_json::to_value(rows)?))
     };
-
-    match ctx
-        .services
-        .recent_outcomes(q.limit.unwrap_or(2000), &filter)
-        .await
-    {
-        Ok(list) => Ok(Json(serde_json::to_value(list).unwrap_or_default())),
-        Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取明细列表失败: {e}"), "");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
-        }
+    match result {
+        Ok(value) => Ok(Json(value)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ApiErrorResponse::new(
+            "REVIEW_QUERY_FAILED", format!("获取复盘明细失败: {e}"), "")))),
     }
 }
 
@@ -329,5 +314,22 @@ pub async fn set_v2_model_status(
             let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("更新模型状态失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
+    }
+}
+
+#[cfg(test)]
+mod review_query_tests {
+    use super::*;
+    #[test]
+    fn numeric_scores_dates_and_multiple_products_roundtrip_in_query() {
+        let uri = "/review/outcomes?limit=40&offset=80&paged=true&quality_metric=quality_v2&quality_min=70.5&quality_max=90&symbols=BU0%2CSA0&time_field=trigger&time_start=2026-10-01%2009%3A00%3A00&hour_start=21%3A00&hour_end=02%3A30&sort_by=score_desc".parse().unwrap();
+        let Query(page) = Query::<RecentOutcomesQuery>::try_from_uri(&uri).unwrap();
+        let Query(filters) = Query::<n_protocol::dto::RecentOutcomeFilters>::try_from_uri(&uri).unwrap();
+        assert_eq!((page.limit,page.offset,page.paged),(Some(40),Some(80),Some(true)));
+        assert_eq!(filters.quality_min,Some(70.5));
+        assert_eq!(filters.symbols.as_deref(),Some("BU0,SA0"));
+        assert_eq!(filters.time_start.as_deref(),Some("2026-10-01 09:00:00"));
+        assert_eq!(filters.hour_end.as_deref(),Some("02:30"));
+        assert_eq!(filters.sort_by.as_deref(),Some("score_desc"));
     }
 }

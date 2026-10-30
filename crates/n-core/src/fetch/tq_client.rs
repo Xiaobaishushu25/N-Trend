@@ -97,6 +97,7 @@ pub struct SubscribeKlinesResponse {
 pub enum BarCloseProof {
     NextBarStarted,
     SessionNotTrading,
+    SessionSettled,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -345,8 +346,32 @@ impl TqBridgeClient {
     }
 }
 
-fn exclude_current_kline(mut rows: Vec<Kline>, count: usize) -> Vec<Kline> {
-    rows.pop();
+fn finalized_klines(
+    symbol: &str,
+    period: &str,
+    mut rows: Vec<Kline>,
+    count: usize,
+    now: chrono::NaiveDateTime,
+) -> Vec<Kline> {
+    // A session's last 5m bar remains the SDK tail throughout the break.
+    // Event delivery is the fast path; a fresh TQ fetch after the close settlement
+    // period must also recover that bar after a missed event or a restart.
+    let settled_session_tail = matches!(period, "5" | "5m")
+        && rows.last().is_some_and(|row| {
+            use chrono::Timelike;
+            chrono::NaiveDateTime::parse_from_str(&row.datetime, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .is_some_and(|end| {
+                    crate::session::SessionCalendar::is_session_close(
+                        symbol,
+                        end.hour(),
+                        end.minute(),
+                    ) && crate::finality::FinalityJudger::default().is_bar_final(symbol, &end, &now)
+                })
+        });
+    if !settled_session_tail {
+        rows.pop();
+    }
     if rows.len() > count {
         rows.drain(0..rows.len() - count);
     }
@@ -451,12 +476,17 @@ impl MarketDataSource for TqBridgeClient {
     }
 
     async fn fetch_minute(&self, symbol: &str, period: &str, count: usize) -> Result<Vec<Kline>> {
-        // TqSdk 序列最后一行始终是进行中 K 线。没有闭合事件证明时生产接口
-        // 必须无条件排除它；休市最后一根由 ClosedBarEvent 单独入库。
+        // 盘中排除未确认的末根；会话收盘末根在结算期后允许补拉恢复。
         let raw = self
             .fetch_minute_raw(symbol, period, count.saturating_add(1))
             .await?;
-        Ok(exclude_current_kline(raw.klines, count))
+        Ok(finalized_klines(
+            symbol,
+            period,
+            raw.klines,
+            count,
+            chrono::Local::now().naive_local(),
+        ))
     }
 
     async fn fetch_minute_raw(
@@ -577,8 +607,75 @@ mod tests {
             bar("2026-09-02 10:05:00", 2.0),
             bar("2026-09-02 10:10:00", 3.0),
         ];
-        let closed = exclude_current_kline(rows, 10);
+        let now = chrono::NaiveDateTime::parse_from_str("2026-09-02 10:10:20", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+        let closed = finalized_klines("RB0", "5m", rows, 10, now);
         assert_eq!(closed.len(), 2);
         assert_eq!(closed.last().unwrap().datetime, "2026-09-02 10:05:00");
+    }
+
+    #[test]
+    fn session_tail_recovers_after_settlement_without_a_next_bar() {
+        let dt = |s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap();
+        for end in [
+            "2026-10-30 10:15:00",
+            "2026-10-30 11:30:00",
+            "2026-10-30 15:00:00",
+            "2026-10-30 23:00:00",
+        ] {
+            let rows = vec![bar(end, 100.0)];
+            assert!(finalized_klines(
+                "RB0",
+                "5m",
+                rows.clone(),
+                10,
+                dt(end) + chrono::Duration::seconds(74)
+            )
+            .is_empty());
+            assert_eq!(
+                finalized_klines(
+                    "RB0",
+                    "5m",
+                    rows,
+                    10,
+                    dt(end) + chrono::Duration::seconds(75)
+                )
+                .len(),
+                1
+            );
+        }
+        // A stalled ordinary intraday tail is never finalized just because it is old.
+        assert!(finalized_klines(
+            "RB0",
+            "5m",
+            vec![bar("2026-10-30 11:25:00", 1.0)],
+            10,
+            dt("2026-10-30 11:52:00")
+        )
+        .is_empty());
+        assert!(finalized_klines(
+            "RB0",
+            "15m",
+            vec![bar("2026-10-30 11:30:00", 1.0)],
+            10,
+            dt("2026-10-30 11:52:00")
+        )
+        .is_empty());
+        assert!(finalized_klines(
+            "RB0",
+            "5m",
+            vec![bar("invalid", 1.0)],
+            10,
+            dt("2026-10-30 11:52:00")
+        )
+        .is_empty());
+        assert!(finalized_klines(
+            "RB0",
+            "5m",
+            vec![bar("2026-10-30 11:30:00", 1.0)],
+            0,
+            dt("2026-10-30 11:52:00")
+        )
+        .is_empty());
     }
 }

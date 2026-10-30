@@ -18,7 +18,11 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
         let path_str = path.to_string_lossy().replace('\\', "/");
         format!("sqlite://{path_str}?mode=rwc")
     };
-    let db = SeaDatabase::connect(&url)
+    // WAL allows a chart reader to observe the last committed snapshot while a
+    // candle update is being committed. The previous default pool had one slot.
+    let mut options = sea_orm::ConnectOptions::new(url.clone());
+    options.max_connections(if path.to_string_lossy() == ":memory:" { 1 } else { 4 });
+    let db = SeaDatabase::connect(options)
         .await
         .map_err(|e| anyhow!("连接 SQLite 失败 ({}): {e}", url))?;
     let _ = db.execute_unprepared("PRAGMA journal_mode = WAL;").await;
@@ -26,6 +30,27 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
     let _ = db.execute_unprepared("PRAGMA foreign_keys = ON;").await;
     migrate_with_path(&db, Some(path)).await?;
     Ok(db)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use sea_orm::TransactionTrait;
+
+    #[tokio::test]
+    async fn file_read_does_not_wait_for_an_uncommitted_writer() {
+        let path=std::env::temp_dir().join(format!("ntrend-reader-{}.sqlite",uuid::Uuid::new_v4()));
+        let db=connect(&path).await.unwrap();
+        db.execute_unprepared("CREATE TABLE snapshot_probe (n INTEGER); INSERT INTO snapshot_probe VALUES (1)").await.unwrap();
+        let writer=db.begin().await.unwrap();
+        writer.execute_unprepared("UPDATE snapshot_probe SET n=2").await.unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(1),db.query_one(Statement::from_string(DbBackend::Sqlite,"SELECT n FROM snapshot_probe".to_string()))).await;
+        writer.rollback().await.unwrap();
+        let row=result.expect("a chart reader must not queue behind the writer").unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("","n").unwrap(),1);
+        db.close().await.unwrap();
+        let _=std::fs::remove_file(path);
+    }
 }
 
 pub async fn migrate(db: &DatabaseConnection) -> Result<()> {

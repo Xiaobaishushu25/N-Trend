@@ -189,7 +189,7 @@ pub fn diagnose(case: &Value, warning: usize) -> Result<Value> {
 fn field(v: &Value, keys: &[&str]) -> f64 {
     keys.iter().fold(v, |a, k| &a[*k]).as_f64().unwrap_or(0.)
 }
-fn seal(task: &mut Value) -> Result<()> {
+pub(super) fn seal(task: &mut Value) -> Result<()> {
     task["task_hash"] = json!("0".repeat(64));
     task["task_hash"] = json!(hash(&serde_json::to_vec_pretty(task)?));
     Ok(())
@@ -211,7 +211,9 @@ pub fn load_task(path: &Path) -> Result<Value> {
         "qualification task changed"
     );
     ensure!(
-        task["version"] == VERSION && task["display_version"] == DISPLAY,
+        (task["version"] == VERSION && task["display_version"] == DISPLAY)
+            || (task["version"] == super::structure::VERSION
+                && task["display_version"] == super::structure::DISPLAY),
         "qualification version mismatch"
     );
     Ok(task)
@@ -224,8 +226,8 @@ fn choice(value: &Value, allowed: &[&str], optional: bool) -> bool {
 pub fn validate_assessments(task: &Value, labels: &Value) -> Result<()> {
     ensure!(
         labels["qualification_task_hash"] == task["task_hash"]
-            && labels["assessment_version"] == VERSION
-            && labels["assessment_display_version"] == DISPLAY,
+            && labels["assessment_version"] == task["version"]
+            && labels["assessment_display_version"] == task["display_version"],
         "qualification task/version mismatch"
     );
     ensure!(
@@ -284,7 +286,8 @@ pub fn validate_assessments(task: &Value, labels: &Value) -> Result<()> {
         check(label, partial)?;
         let reference = &label["assistant_reference"];
         ensure!(
-            reference["task_hash"] == task["task_hash"] && reference["version"] == VERSION,
+            reference["task_hash"] == task["task_hash"]
+                && reference["version"] == labels["assessment_version"],
             "assessment reference mismatch"
         );
         match reference["viewed"]
@@ -544,8 +547,7 @@ mod tests {
     }
     #[test]
     fn assessment_validation_separates_drafts_from_completed_and_checks_identity() {
-        let task =
-            json!({"task_hash":"task","base_manifest_hash":"base","cases":{"sample":sample()}});
+        let task = json!({"task_hash":"task","base_manifest_hash":"base","version":VERSION,"display_version":DISPLAY,"cases":{"sample":sample()}});
         let form = json!({"case_id":"sample","input_hash":"input","morphology_qualification":"qualified","opportunity_qualification":"marginal","pattern_type":"pullback_n","reasons":["a","b"],"note":"两边都好不同于无法判断","assistant_reference":{"viewed":false,"version":VERSION,"task_hash":"task"}});
         let mut labels = json!({"manifest_hash":"base","qualification_task_hash":"task","assessment_version":VERSION,"assessment_display_version":DISPLAY,"case_assessments":[form.clone()],"case_drafts":[]});
         validate_assessments(&task, &labels).unwrap();

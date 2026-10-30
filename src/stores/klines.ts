@@ -20,11 +20,13 @@ export const useKlinesStore = defineStore('klines', {
     partialReceivedAt: 0,
     partialSeq: 0,
     partialExpected: false,
+    latestClosedTs: '',
   }),
   actions: {
     acceptPartial(symbol: string, timeframe: Timeframe, bar: KlineRow | null) {
       if (this.symbol !== symbol || this.timeframe !== timeframe) return false
       if (bar && (bar.symbol !== symbol || bar.timeframe !== timeframe)) return false
+      if (bar && bar.ts <= this.latestClosedTs) return false
       if (bar && this.partialBar && bar.ts < this.partialBar.ts) return false
       this.partialSeq++
       this.partialBar = bar
@@ -43,6 +45,7 @@ export const useKlinesStore = defineStore('klines', {
       }
       this.error = ''
       const isSwitch = this.symbol !== symbol || this.timeframe !== timeframe
+      if (isSwitch) this.latestClosedTs = ''
       if (isSwitch || !silent) {
         // 切换品种或周期时，立即清空旧数据，防止旧品种数据残留被误用为新数据基准
         this.rows = []
@@ -64,12 +67,20 @@ export const useKlinesStore = defineStore('klines', {
           return
         }
         this.rows = response.rows
+        const closedTs = response.rows[response.rows.length - 1]?.ts ?? ''
+        if (closedTs > this.latestClosedTs) this.latestClosedTs = closedTs
         this.dataReceivedAt = Date.now()
         // 实时推送可能在历史响应之前到达，不能被稍旧的HTTP快照覆盖。
         if (partialSeq === this.partialSeq) {
           this.partialBar = response.partial_bar ?? null
           this.partialReceivedAt = this.partialBar ? Date.now() : 0
           this.partialExpected = !!this.partialBar || response.message.includes('实时柱正在准备')
+        }
+        // A late partial push or an earlier HTTP snapshot cannot overwrite final data.
+        if (this.partialBar && this.partialBar.ts <= this.latestClosedTs) {
+          this.partialBar = null
+          this.partialReceivedAt = 0
+          this.partialExpected = false
         }
         this.chartStatus = response.status
         this.chartMessage = this.partialBar && response.message.includes('实时柱正在准备') ? '' : response.message
@@ -102,6 +113,7 @@ export const useKlinesStore = defineStore('klines', {
       this.dataReceivedAt = 0
       this.partialReceivedAt = 0
       this.partialExpected = false
+      this.latestClosedTs = ''
     },
   },
 })

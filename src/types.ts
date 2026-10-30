@@ -563,6 +563,7 @@ export interface ReviewStats {
 /** 复盘页明细表一行 */
 export interface OutcomeDetail {
   quality?: SignalQualityDto | null
+  review_scores?: ReviewScoreDto | null
   event_id: number
   symbol: string
   logic_version: string
@@ -678,6 +679,43 @@ export interface RecentOutcomeFilters {
   outcome?: string | null
   scoreMin?: number | null
   scoreMax?: number | null
+  symbols?: string[]
+  qualityMetric?: ReviewScoreMetric
+  qualityMin?: number | null
+  qualityMax?: number | null
+  qualityStatus?: 'all' | 'scored' | 'unscored'
+  timeField?: 'warning' | 'trigger'
+  timeStart?: string | null
+  timeEnd?: string | null
+  hourStart?: string | null
+  hourEnd?: string | null
+  sortBy?: 'score_desc' | 'score_asc' | 'time_desc' | 'time_asc'
+  /** Navigation context only; never a signal admission condition. */
+  pageOffset?: number
+  pageSize?: number
+}
+
+export type ReviewScoreMetric = 'old' | 'quality_v1' | 'morphology_v1' | 'quality_v2' | 'morphology_v2'
+export interface ReviewScoreDto {
+  candidate_version: string
+  status: string
+  morphology_score: number | null
+  quality_score: number | null
+  a_score: number | null
+  b_score: number | null
+  levels_score: number | null
+  levels_partial: boolean
+  explanations: string[]
+  evidence: { modules: Record<string, { title: string; facts: string[]; reading: string; limitations: string }> } | null
+}
+export interface ReviewPage {
+  items: OutcomeDetail[]
+  total: number
+  scored: number
+  unscored: number
+  offset: number
+  limit: number
+  symbols: string[]
 }
 
 /** 复盘明细跳转K线图时从复盘窗口带往主窗口的上下文 */
@@ -791,7 +829,7 @@ export interface ClientLocalSettings {
 export interface MetaDto {
   api_version: string
   server_version: string
-  min_client_version: string
+  required_client_version: string
   server_time: number
 }
 

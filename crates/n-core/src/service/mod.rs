@@ -1,5 +1,7 @@
 //! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
+mod review;
+
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
 use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
@@ -96,6 +98,7 @@ pub struct OutcomeRefresh {
 pub struct OutcomeDetail {
     pub event_id: i64,
     pub quality: Option<n_protocol::quality::SignalQualityDto>,
+    pub review_scores: Option<n_protocol::quality::ReviewScoreDto>,
     pub symbol: String,
     /// 事件版本：前向事件系统固定为 4
     pub logic_version: String,
@@ -199,23 +202,7 @@ pub struct SignalUserData {
 }
 
 /// 最近信号明细的筛选条件（均为可选，空值不过滤）。
-#[derive(Debug, Clone, Default)]
-pub struct OutcomeFilter {
-    /// 品种代码包含匹配（不区分大小写）
-    pub symbol: Option<String>,
-    /// up / down
-    pub direction: Option<String>,
-    /// fine / large
-    pub level: Option<String>,
-    /// A级 / B级 / C级 / 回撤过浅 / 回撤过深
-    pub grade: Option<String>,
-    pub score_min: Option<f64>,
-    pub score_max: Option<f64>,
-    /// win / loss / no_trigger / open / insufficient_data / rollover
-    pub outcome: Option<String>,
-    /// 5，缺省不过滤
-    pub version: Option<String>,
-}
+pub type OutcomeFilter = n_protocol::dto::RecentOutcomeFilters;
 
 const EVENT_LOGIC_VERSION: &str = crate::v2::version::EVENT_LOGIC_VERSION;
 
@@ -634,6 +621,7 @@ fn outcome_detail_from(e: &pattern_events::Model, _tick: Option<f64>) -> Outcome
     OutcomeDetail {
         event_id: e.id,
         quality: None,
+        review_scores: None,
         symbol: e.symbol.clone(),
         logic_version: EVENT_LOGIC_VERSION.to_string(),
         warning_kind: e.warning_kind.clone(),
@@ -1324,6 +1312,7 @@ pub struct Services {
     pub active_single_bars: Arc<RwLock<HashMap<String, crate::analyze::model::SingleBarAlert>>>,
     /// 仅供图表读取的后台实时快照，不进入正式库和策略。
     pub live_chart: Arc<live_chart::LiveChartCache>,
+    review_score_cache: RwLock<HashMap<String, n_protocol::quality::ReviewScoreDto>>,
 }
 
 impl Services {
@@ -1439,6 +1428,7 @@ impl Services {
             pipeline,
             active_single_bars: Arc::new(RwLock::new(HashMap::new())),
             live_chart: Arc::new(live_chart::LiveChartCache::default()),
+            review_score_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -3096,6 +3086,33 @@ impl Services {
         &self,
         event: &ClosedBarEvent,
     ) -> Result<FastPathOutcome> {
+        let pipeline_started = Instant::now();
+        self.store_tq_closed_bar_event(event).await?;
+        let pipeline_ms = pipeline_started.elapsed().as_millis();
+        let bar_end = NaiveDateTime::parse_from_str(&event.bar_end, "%Y-%m-%d %H:%M:%S")?;
+        if bar_end.minute() % 15 != 0 {
+            return Ok(FastPathOutcome {
+                scan_result: None,
+                duplicate_skipped: false,
+                pipeline_ms,
+                scan_ms: 0,
+            });
+        }
+        let scan_started = Instant::now();
+        let (scan_result, duplicate_skipped) = self
+            .run_event_scan_symbol(&event.symbol, &event.bar_end)
+            .await?;
+        Ok(FastPathOutcome {
+            scan_result,
+            duplicate_skipped,
+            pipeline_ms,
+            scan_ms: scan_started.elapsed().as_millis(),
+        })
+    }
+
+    /// Persist before announcing closure. The server's existing scheduler remains
+    /// responsible for strategy scans; chart event delivery never starts a scan.
+    pub async fn store_tq_closed_bar_event(&self, event: &ClosedBarEvent) -> Result<()> {
         if event.source != "tqsdk" || event.event_type != "bar_closed" || event.period != "5m" {
             return Err(anyhow!("非法闭合事件来源或类型"));
         }
@@ -3125,6 +3142,39 @@ impl Services {
         if bar_end.minute() % 5 != 0 {
             return Err(anyhow!("闭合事件不在5分钟边界: {}", event.bar_end));
         }
+        if bar_end.second() != 0 || bar_end > Local::now().naive_local() {
+            return Err(anyhow!("闭合事件时间尚未到达或秒数无效: {}", event.bar_end));
+        }
+        match event.proof {
+            crate::fetch::tq_client::BarCloseProof::NextBarStarted => {
+                let next = event
+                    .next_bar_start
+                    .as_deref()
+                    .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok());
+                if !next.is_some_and(|next| next >= bar_end && next <= Local::now().naive_local()) {
+                    return Err(anyhow!("闭合事件缺少有效下一根证明"));
+                }
+            }
+            crate::fetch::tq_client::BarCloseProof::SessionNotTrading
+            | crate::fetch::tq_client::BarCloseProof::SessionSettled => {
+                if !crate::session::SessionCalendar::is_session_close(
+                    &event.symbol,
+                    bar_end.hour(),
+                    bar_end.minute(),
+                ) {
+                    return Err(anyhow!("休市闭合事件不在品种会话末端"));
+                }
+                if event.proof == crate::fetch::tq_client::BarCloseProof::SessionSettled
+                    && !crate::finality::FinalityJudger::default().is_bar_final(
+                        &event.symbol,
+                        &bar_end,
+                        &Local::now().naive_local(),
+                    )
+                {
+                    return Err(anyhow!("休市补偿事件尚未达到结算期"));
+                }
+            }
+        }
         let enabled = repo::list_symbols(&self.db, true)
             .await?
             .into_iter()
@@ -3133,30 +3183,10 @@ impl Services {
             return Err(anyhow!("闭合事件品种未启用: {}", event.symbol));
         }
 
-        let pipeline_started = Instant::now();
         self.pipeline
             .process_final_bar(&event.symbol, &event.kline)
             .await?;
-        let pipeline_ms = pipeline_started.elapsed().as_millis();
-        if bar_end.minute() % 15 != 0 {
-            return Ok(FastPathOutcome {
-                scan_result: None,
-                duplicate_skipped: false,
-                pipeline_ms,
-                scan_ms: 0,
-            });
-        }
-
-        let scan_started = Instant::now();
-        let (scan_result, duplicate_skipped) = self
-            .run_event_scan_symbol(&event.symbol, &event.bar_end)
-            .await?;
-        Ok(FastPathOutcome {
-            scan_result,
-            duplicate_skipped,
-            pipeline_ms,
-            scan_ms: scan_started.elapsed().as_millis(),
-        })
+        Ok(())
     }
 
     /// 低频换月扫描入口：只处理有新增断点或仍待确认的品种，
@@ -4481,80 +4511,7 @@ impl Services {
         limit: usize,
         filter: &OutcomeFilter,
     ) -> Result<Vec<OutcomeDetail>> {
-        let events = repo::all_pattern_events(&self.db).await?;
-        let symbols = repo::list_symbols(&self.db, false).await?;
-        let tick_by_symbol: HashMap<String, f64> = symbols
-            .iter()
-            .map(|sym| {
-                (
-                    sym.code.clone(),
-                    crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety),
-                )
-            })
-            .collect();
-        let mut rows: Vec<OutcomeDetail> = events
-            .iter()
-            .filter(|e| matches_outcome_filter(e, filter))
-            .filter_map(|e| {
-                Some(outcome_detail_from(
-                    e,
-                    tick_by_symbol.get(&e.symbol).copied(),
-                ))
-            })
-            .collect();
-        rows.sort_by(|a, b| {
-            b.warning_ts
-                .cmp(&a.warning_ts)
-                .then_with(|| b.event_id.cmp(&a.event_id))
-        });
-        rows.truncate(limit);
-        let ids: HashSet<_> = rows.iter().map(|r| r.event_id).collect();
-        let selected: Vec<_> = events
-            .iter()
-            .filter(|e| ids.contains(&e.id))
-            .cloned()
-            .collect();
-        let qualities = crate::quality::store::display(&self.db, &selected).await;
-        for row in &mut rows {
-            row.quality = qualities.get(&row.event_id).cloned();
-        }
-        let mut annotations_by_event: HashMap<i64, Vec<SignalAnnotationDto>> = HashMap::new();
-        for ann in repo::all_signal_annotations(&self.db).await? {
-            annotations_by_event
-                .entry(ann.event_id)
-                .or_default()
-                .push(SignalAnnotationDto {
-                    id: ann.id,
-                    event_id: ann.event_id,
-                    content: ann.content,
-                    created_at: ann.created_at,
-                });
-        }
-        let opened_by_event: HashMap<i64, bool> = repo::all_signal_decisions(&self.db)
-            .await?
-            .into_iter()
-            .map(|d| (d.event_id, d.opened))
-            .collect();
-        for row in rows.iter_mut() {
-            row.annotations = annotations_by_event
-                .remove(&row.event_id)
-                .unwrap_or_default();
-            row.opened = opened_by_event.get(&row.event_id).copied();
-        }
-        let symbols_with_rows: HashSet<String> = rows.iter().map(|r| r.symbol.clone()).collect();
-        for code in symbols_with_rows {
-            let bars = self.bars_for(&code, "15m").await?;
-            let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
-            let index_by_ts: HashMap<String, usize> = bars
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (bar_ts(b), i))
-                .collect();
-            for row in rows.iter_mut().filter(|r| r.symbol == code) {
-                fill_leg_detail(row, &bars, &atr20, &index_by_ts);
-            }
-        }
-        Ok(rows)
+        Ok(self.review_page(limit, 0, filter).await?.items)
     }
 
     /// 复盘跳转K线图：按 event_id 返回完整事件 + 真实结局。
@@ -4568,10 +4525,8 @@ impl Services {
                 .then(|| crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety))
         });
         let mut outcome = outcome_detail_from(&row, tick);
-        outcome.quality = crate::quality::store::display(&self.db, std::slice::from_ref(&row))
-            .await
-            .remove(&event_id);
         let bars = self.bars_for(&row.symbol, "15m").await?;
+        self.fill_review_scores(&row, &bars, tick.unwrap_or(0.), &mut outcome).await;
         let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
         let index_by_ts: HashMap<String, usize> = bars
             .iter()
@@ -5186,6 +5141,81 @@ fn parse_dt(s: &str) -> Option<DT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_event_persists_final_5m_and_15m_without_starting_a_scan() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db,
+            config,
+            std::env::temp_dir().join("close-event-test.json"),
+        )
+        .await
+        .unwrap();
+        services.seed_symbols("RB0").await.unwrap();
+        let raw = vec![
+            source_test_bar("2026-01-05 11:20:00", 100.0),
+            source_test_bar("2026-01-05 11:25:00", 101.0),
+        ];
+        services
+            .pipeline
+            .process_raw_batch("RB0", &raw)
+            .await
+            .unwrap();
+        assert!(services
+            .get_klines("RB0", "15m", None)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut event = ClosedBarEvent {
+            event_id: 1,
+            event_type: "bar_closed".into(),
+            source: "tqsdk".into(),
+            proof: crate::fetch::tq_client::BarCloseProof::SessionSettled,
+            symbol: "RB0".into(),
+            tq_symbol: "KQ.m@SHFE.rb".into(),
+            period: "5m".into(),
+            bar_end: "2026-01-05 11:30:00".into(),
+            next_bar_start: None,
+            kline: source_test_bar("2026-01-05 11:30:00", 105.0),
+            market_event_time: String::new(),
+            emitted_at: String::new(),
+            event_lag_ms: 0,
+        };
+        services.store_tq_closed_bar_event(&event).await.unwrap();
+        services.store_tq_closed_bar_event(&event).await.unwrap();
+        let raw = repo::raw_klines(&services.db, "RB0").await.unwrap();
+        assert_eq!(raw.len(), 3);
+        let bars = services.get_klines("RB0", "15m", None).await.unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].ts, event.bar_end);
+        assert_eq!(bars[0].close, 105.0);
+        assert_eq!(bars[0].volume, 300.0);
+        use sea_orm::ConnectionTrait;
+        let count = services
+            .db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM pattern_events".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.try_get::<i64>("", "n").unwrap(), 0);
+        event.kline.high = 1.0;
+        assert!(services.store_tq_closed_bar_event(&event).await.is_err());
+        event.kline = source_test_bar("2026-01-05 11:30:00", 110.0);
+        event.proof = crate::fetch::tq_client::BarCloseProof::NextBarStarted;
+        assert!(services.store_tq_closed_bar_event(&event).await.is_err());
+        assert_eq!(
+            services.get_klines("RB0", "15m", None).await.unwrap()[0].close,
+            105.0
+        );
+    }
 
     #[tokio::test]
     async fn chart_limit_uses_only_finalized_raw_history() {

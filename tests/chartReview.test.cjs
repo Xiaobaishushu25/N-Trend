@@ -18,15 +18,23 @@ function reviewHarness(filters = null) {
   const source = fs.readFileSync('src/views/ChartView.vue', 'utf8')
   const loader = source.slice(source.indexOf('/** 复盘跳转模式：'), source.indexOf('\nfunction selectReviewSignal'))
   const watcher = source.slice(source.indexOf('// 复盘模式：首次进入'), source.indexOf('// 复盘模式：当前行变化'))
+  const pager = source.slice(source.indexOf('async function changeReviewPage('), source.indexOf('/** 返回导航：'))
   assert.ok(loader.length && watcher.length)
-  const listRequests = [], detailRequests = [], stops = []
+  const listRequests = [], pageRequests = [], detailRequests = [], pageSelections = [], stops = []
   const context = {
     ref, reactive, computed,
     watch: (...args) => { stops.push(watch(...args)) },
     symbol: ref('CF0'), timeframe: ref('15m'),
     route: reactive({ query: { review: '1' } }),
     appStore: reactive({ reviewJumpFilters: filters }),
+    selectReviewSignal: row => pageSelections.push(row.event_id),
+    notify: { error() {} },
     api: {
+      getReviewPage: (limit, offset, filters) => {
+        const request = { limit, offset, filters, ...deferred() }
+        pageRequests.push(request)
+        return request.promise
+      },
       getRecentOutcomes: (limit, filters) => {
         const request = { limit, filters, ...deferred() }
         listRequests.push(request)
@@ -39,12 +47,13 @@ function reviewHarness(filters = null) {
       },
     },
   }
-  const compiled = ts.transpileModule(`${loader}\n${watcher}\nObject.assign(globalThis, { reviewRows, reviewLoading })`, {
+  context.chartReviewFilters = computed(() => context.appStore.reviewJumpFilters || {})
+  const compiled = ts.transpileModule(`${loader}\n${watcher}\n${pager}\nObject.assign(globalThis, { reviewRows, reviewLoading, changeReviewPage })`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   })
   vm.runInNewContext(compiled.outputText, context)
   return {
-    context, listRequests, detailRequests,
+    context, listRequests, pageRequests, detailRequests, pageSelections,
     dispose: () => stops.forEach(stop => stop()),
     ids: () => Array.from(context.reviewRows.value, r => r.event_id),
     async navigate(symbol, id) {
@@ -54,6 +63,57 @@ function reviewHarness(filters = null) {
     },
   }
 }
+
+test('a score-review handoff preserves the selected page and server order', async (t) => {
+  const h = reviewHarness({ qualityMetric: 'quality_v2', qualityMin: 70, sortBy: 'score_desc', pageOffset: 160, pageSize: 40 })
+  t.after(h.dispose)
+  assert.equal(h.listRequests.length, 0)
+  assert.equal(h.pageRequests[0].offset, 160)
+  assert.equal(h.pageRequests[0].limit, 40)
+  assert.equal(h.pageRequests[0].filters.qualityMin, 70)
+  h.pageRequests[0].resolve({ items: [row(9), row(1), row(7)], total: 500, offset: 160, limit: 40 })
+  await flush()
+  assert.deepEqual(h.ids(), [9, 1, 7])
+})
+
+test('explicit score filters do not inject an out-of-filter active event into the results', async (t) => {
+  const h = reviewHarness({ qualityMetric: 'quality_v2', qualityMin: 90, pageOffset: 0 })
+  t.after(h.dispose)
+  h.pageRequests[0].resolve({ items: [row(2)], total: 1, offset: 0, limit: 80 })
+  await flush()
+  assert.deepEqual(h.ids(), [2])
+  assert.equal(h.detailRequests.length, 0)
+})
+
+test('a stale score-review page cannot replace a newly filtered page', async (t) => {
+  const h = reviewHarness({ qualityMin: 70, pageOffset: 0 })
+  t.after(h.dispose)
+  h.context.appStore.reviewJumpFilters = { qualityMin: 80, pageOffset: 0 }
+  await nextTick()
+  h.pageRequests[1].resolve({ items: [row(3)], total: 1, offset: 0, limit: 80 })
+  await flush()
+  h.pageRequests[0].resolve({ items: [row(1)], total: 1, offset: 0, limit: 80 })
+  await flush()
+  assert.deepEqual(h.ids(), [3])
+})
+
+test('a late next-page response cannot undo a newer chart filter', async (t) => {
+  const h = reviewHarness({ qualityMin: 70, pageOffset: 0 })
+  t.after(h.dispose)
+  h.pageRequests[0].resolve({ items: [row(1), row(2)], total: 200, offset: 0, limit: 80 })
+  await flush()
+  const paging = h.context.changeReviewPage(1)
+  assert.equal(h.pageRequests[1].offset, 80)
+  h.context.appStore.reviewJumpFilters = { qualityMin: 90, pageOffset: 0 }
+  await nextTick()
+  h.pageRequests[2].resolve({ items: [row(3)], total: 1, offset: 0, limit: 80 })
+  await flush()
+  h.pageRequests[1].resolve({ items: [row(9)], total: 200, offset: 80, limit: 80 })
+  await paging
+  assert.deepEqual(h.ids(), [3])
+  assert.equal(h.context.appStore.reviewJumpFilters.qualityMin, 90)
+  assert.deepEqual(h.pageSelections, [])
+})
 
 test('reusing the history chart for another symbol refreshes the right-hand list', async (t) => {
   const h = reviewHarness()
