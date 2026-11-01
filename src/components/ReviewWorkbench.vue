@@ -435,6 +435,22 @@ onMounted(() => {
     .catch(() => {})
 })
 
+const rebuilding = ref(false)
+async function handleRetryRebuild() {
+  rebuilding.value = true
+  try {
+    await api.reviewRebuild({})
+    notify.success('已触发复盘任务重新计算')
+    setTimeout(() => {
+      void review.loadReviewPage()
+    }, 1200)
+  } catch (e: any) {
+    notify.error(`重试复盘任务失败: ${e?.message || e}`)
+  } finally {
+    rebuilding.value = false
+  }
+}
+
 onBeforeUnmount(() => {
   if (timer) clearTimeout(timer)
 })
@@ -595,7 +611,18 @@ onBeforeUnmount(() => {
             "
           >
             <template #extra>
-              <n-button size="small" @click="reset">清除全部筛选</n-button>
+              <n-space justify="center" size="small">
+                <n-button
+                  v-if="review.metadata?.jobs?.[0]?.status === 'failed'"
+                  size="small"
+                  type="primary"
+                  :loading="rebuilding"
+                  @click="handleRetryRebuild"
+                >
+                  重试复盘任务
+                </n-button>
+                <n-button size="small" @click="reset">清除全部筛选</n-button>
+              </n-space>
             </template>
           </n-empty>
         </template>

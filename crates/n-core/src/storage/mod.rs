@@ -19,14 +19,16 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
         format!("sqlite://{path_str}?mode=rwc")
     };
     // WAL allows a chart reader to observe the last committed snapshot while a
-    // candle update is being committed. The previous default pool had one slot.
+    // candle update is being committed.
     let mut options = sea_orm::ConnectOptions::new(url.clone());
-    options.max_connections(if path.to_string_lossy() == ":memory:" { 1 } else { 4 });
+    options.max_connections(if path.to_string_lossy() == ":memory:" { 1 } else { 8 });
+    options.acquire_timeout(std::time::Duration::from_secs(30));
     let db = SeaDatabase::connect(options)
         .await
         .map_err(|e| anyhow!("连接 SQLite 失败 ({}): {e}", url))?;
     let _ = db.execute_unprepared("PRAGMA journal_mode = WAL;").await;
-    let _ = db.execute_unprepared("PRAGMA busy_timeout = 5000;").await;
+    let _ = db.execute_unprepared("PRAGMA synchronous = NORMAL;").await;
+    let _ = db.execute_unprepared("PRAGMA busy_timeout = 15000;").await;
     let _ = db.execute_unprepared("PRAGMA foreign_keys = ON;").await;
     migrate_with_path(&db, Some(path)).await?;
     Ok(db)

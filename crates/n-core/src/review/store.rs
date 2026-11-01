@@ -379,24 +379,27 @@ impl ReviewEngine {
         })
         .await??;
         let mut coverage = BTreeMap::new();
-        for (detail, holding) in &batch {
-            for key in &detail.summary.coverage {
-                *coverage.entry(key.clone()).or_default() += 1;
+        for chunk in batch.chunks(50) {
+            let tx = self.db.begin().await?;
+            for (detail, holding) in chunk {
+                for key in &detail.summary.coverage {
+                    *coverage.entry(key.clone()).or_default() += 1;
+                }
+                *coverage.entry(detail.summary.state.clone()).or_default() += 1;
+                Self::save_result_tx(&tx, &job.id, detail, holding).await?;
             }
-            *coverage.entry(detail.summary.state.clone()).or_default() += 1;
-            self.save_result(&job.id, detail, holding).await?;
+            tx.commit().await?;
         }
         Ok((batch.len(), coverage))
     }
 
-    async fn save_result(
-        &self,
+    async fn save_result_tx(
+        tx: &sea_orm::DatabaseTransaction,
         job_id: &str,
         detail: &ReviewResultDetail,
         holding: &[ReviewHoldingPoint],
     ) -> Result<()> {
         let s = &detail.summary;
-        let tx = self.db.begin().await?;
         if tx
             .query_one(sql(
                 "SELECT 1 AS present FROM review_results WHERE result_version=?",
@@ -406,7 +409,6 @@ impl ReviewEngine {
             .is_some()
         {
             tx.execute(sql("INSERT INTO review_staging(job_id,event_id,result_version) VALUES (?,?,?) ON CONFLICT(job_id,event_id) DO UPDATE SET result_version=excluded.result_version",vec![job_id.into(),s.event_id.into(),s.result_version.clone().into()])).await?;
-            tx.commit().await?;
             return Ok(());
         }
         let mut head = detail.clone();
@@ -438,6 +440,17 @@ impl ReviewEngine {
             tx.execute(sql(&format!("INSERT OR IGNORE INTO review_holding(result_version,sequence,data) VALUES {placeholders}"),values)).await?;
         }
         tx.execute(sql("INSERT INTO review_staging(job_id,event_id,result_version) VALUES (?,?,?) ON CONFLICT(job_id,event_id) DO UPDATE SET result_version=excluded.result_version",vec![job_id.into(),s.event_id.into(),s.result_version.clone().into()])).await?;
+        Ok(())
+    }
+
+    pub async fn save_result(
+        &self,
+        job_id: &str,
+        detail: &ReviewResultDetail,
+        holding: &[ReviewHoldingPoint],
+    ) -> Result<()> {
+        let tx = self.db.begin().await?;
+        Self::save_result_tx(&tx, job_id, detail, holding).await?;
         tx.commit().await?;
         Ok(())
     }
