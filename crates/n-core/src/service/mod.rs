@@ -4431,6 +4431,8 @@ impl Services {
     }
 
     /// 复盘页“刷新”：只推进在途事件，不重新识别新预警。
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
         let _scan_guard = self.scan_lock.lock().await;
         repo::delete_fast_pattern_events(&self.db).await?;
@@ -4455,6 +4457,8 @@ impl Services {
     }
 
     /// 复盘统计：直接汇总 pattern_events，不再回放补标。
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn review_stats(
         &self,
         dimension: &str,
@@ -4506,6 +4510,8 @@ impl Services {
     }
 
     /// 最近信号明细（复盘页明细表）：真实事件，按预警时间倒序（同时间按 event_id 倒序）。
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn recent_outcomes(
         &self,
         limit: usize,
@@ -4515,6 +4521,8 @@ impl Services {
     }
 
     /// 复盘跳转K线图：按 event_id 返回完整事件 + 真实结局。
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn review_signal(&self, event_id: i64) -> Result<Option<ReviewSignalDetail>> {
         let Some(row) = repo::pattern_event_by_id(&self.db, event_id).await? else {
             return Ok(None);

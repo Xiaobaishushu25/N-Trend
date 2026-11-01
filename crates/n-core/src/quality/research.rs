@@ -68,6 +68,7 @@ pub struct AuditRow {
 pub async fn run(args: Vec<String>) -> Result<()> {
     let command = args.get(1).map(String::as_str).unwrap_or("help");
     if command == "help" || args.iter().any(|a| a == "--help") {
+        println!("signal-quality factor-scan --input PREPARED/scan-input.jsonl --out NEW_DIRECTORY");
         println!("signal-quality <audit|report|backfill|blind-export> (--backup snapshot.sqlite.gz | --db snapshot.sqlite) --out NEW_DIRECTORY [--rules rules.json] [--roundtrip-cost-ticks 2.5]\nsignal-quality blind-import --manifest blind-manifest.json --labels labels.json --out NEW_DIRECTORY\nsignal-quality annotate --manifest blind-manifest.json --audit audit.json --out NEW_DIRECTORY [--review-notes reviewed-notes.json]\nsignal-quality qualify --manifest blind-manifest.json --audit audit.json --labels previous-labels.json --out NEW_DIRECTORY\nsignal-quality structure-study --task qualification-task.json --labels v1-labels.json --audit audit.json --db frozen.sqlite --source-manifest manifest.json --out NEW_DIRECTORY\nsignal-quality score-scan --db frozen.sqlite --source-manifest manifest.json --out NEW_DIRECTORY\nbackfill always creates and writes its own isolated output copy; original input remains read-only.");
         return Ok(());
     }
@@ -81,7 +82,8 @@ pub async fn run(args: Vec<String>) -> Result<()> {
             "annotate",
             "qualify",
             "structure-study",
-            "score-scan"
+            "score-scan",
+            "factor-scan"
         ]
         .contains(&command),
         "unknown command"
@@ -115,6 +117,9 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         "output must remain inside project workspace"
     );
     std::fs::create_dir_all(&out)?;
+    if command == "factor-scan" {
+        return super::factor_scan::run(&args, &out);
+    }
     if command == "blind-import" {
         return super::blind::import(&args, &out);
     }

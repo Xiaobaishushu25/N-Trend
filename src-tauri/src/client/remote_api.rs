@@ -3,6 +3,7 @@ use n_protocol::auth::*;
 use n_protocol::config::*;
 use n_protocol::dto::*;
 use n_protocol::error::*;
+use n_protocol::review::*;
 use reqwest::header::AUTHORIZATION;
 use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::de::DeserializeOwned;
@@ -756,6 +757,8 @@ impl RemoteApiClient {
             .await
     }
 
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn refresh_outcomes_now(&self) -> Result<OutcomeRefresh, ApiErrorResponse> {
         self.execute(self.request(Method::POST, "review/outcomes/refresh"))
             .await
@@ -763,6 +766,75 @@ impl RemoteApiClient {
 
     // ── Signals & Outcomes ──
 
+    pub async fn review_metadata(&self) -> Result<ReviewMetadata, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, "review/metadata"))
+            .await
+    }
+    pub async fn review_query(
+        &self,
+        request: &ReviewQuery,
+    ) -> Result<ReviewQueryResponse, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "review/query").json(request))
+            .await
+    }
+    pub async fn review_items(
+        &self,
+        snapshot_id: &str,
+        request: &ReviewPageRequest,
+    ) -> Result<ReviewItemsPage, ApiErrorResponse> {
+        self.execute(
+            self.request(Method::GET, &format!("review/queries/{snapshot_id}/items"))
+                .query(request),
+        )
+        .await
+    }
+    pub async fn review_aggregate(
+        &self,
+        request: &ReviewAggregateRequest,
+    ) -> Result<ReviewAggregateResponse, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "review/aggregate").json(request))
+            .await
+    }
+    pub async fn review_detail(
+        &self,
+        event_id: i64,
+        version: &str,
+    ) -> Result<ReviewResultDetail, ApiErrorResponse> {
+        self.execute(
+            self.request(Method::GET, &format!("review/signals/{event_id}/detail"))
+                .query(&[("version", version)]),
+        )
+        .await
+    }
+    pub async fn review_holding(
+        &self,
+        event_id: i64,
+        version: &str,
+        request: &ReviewPageRequest,
+    ) -> Result<ReviewHoldingPage, ApiErrorResponse> {
+        self.execute(
+            self.request(Method::GET, &format!("review/signals/{event_id}/holding"))
+                .query(&[("version", version)])
+                .query(request),
+        )
+        .await
+    }
+    pub async fn review_rebuild(
+        &self,
+        request: &ReviewRebuildRequest,
+    ) -> Result<ReviewJob, ApiErrorResponse> {
+        self.execute(self.request(Method::POST, "review/rebuild").json(request))
+            .await
+    }
+    pub async fn review_job(&self, job_id: &str) -> Result<ReviewJob, ApiErrorResponse> {
+        self.execute(self.request(Method::GET, &format!("review/jobs/{job_id}")))
+            .await
+    }
+
+    // LEGACY_REVIEW_API: current review store/chart call get_review_stats,
+    // get_recent_outcomes/get_review_page, get_review_signal and refresh_outcomes_now.
+    // Replace with typed review_* methods above; deletion gates/tests: docs/review-api.md.
+    // Preserve original response and strategy semantics until migration is validated.
     pub async fn get_review_stats(
         &self,
         dimension: &str,
@@ -784,6 +856,8 @@ impl RemoteApiClient {
         self.execute(self.request(Method::GET, &path)).await
     }
 
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn get_recent_outcomes(
         &self,
         limit: Option<usize>,
@@ -795,11 +869,15 @@ impl RemoteApiClient {
         self.execute(request).await
     }
 
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn get_review_page(&self, limit: usize, offset: usize, filters: &RecentOutcomeFilters) -> Result<Value, ApiErrorResponse> {
         self.execute(self.request(Method::GET, "review/outcomes")
             .query(filters).query(&[("limit",limit), ("offset",offset)]).query(&[("paged",true)])).await
     }
 
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn get_review_signal(&self, event_id: i64) -> Result<Value, ApiErrorResponse> {
         self.execute(self.request(Method::GET, &format!("review/signal/{event_id}")))
             .await

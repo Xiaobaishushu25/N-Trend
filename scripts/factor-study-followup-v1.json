@@ -1,0 +1,19 @@
+{
+  "schema": "factor-study-followup-v1",
+  "id": "factor-study-followup-20261031-v1",
+  "targets": ["cash200", "s1"],
+  "no_follow": [5, null],
+  "risk_caps_yuan": [200.0, 500.0],
+  "slip_ticks": [1, 2],
+  "fixed_score_min": 70.0,
+  "model_primary_variant": "cash200_nf5_cap500",
+  "model_alpha": 10.0,
+  "b_models": ["linear", "without_retracement", "b_spline", "b_conditional"],
+  "b_interactions": [["a_move_atr", "retracement"], ["a_core_efficiency", "retracement"]],
+  "admissions": ["rank20", "positive_ev"],
+  "calibration_edges_yuan": [-100.0, -50.0, 0.0, 50.0, 100.0],
+  "minimum_forward_candidate_closed": 100,
+  "deployment": "disabled",
+  "warmup": "Fixed structures warm from all prior snapshots under the same rules; model books use v1>=70 before the first training cutoff and carry existing positions across folds.",
+  "evaluation": "Outer cohorts mature through frozen research end; training and inner selection remain strictly as-of. All results are previously-inspected development history."
+}

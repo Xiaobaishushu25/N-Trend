@@ -3,6 +3,7 @@ pub mod config;
 pub mod dto;
 pub mod error;
 pub mod quality;
+pub mod review;
 pub mod ws;
 pub mod trader_stream;
 pub mod version;

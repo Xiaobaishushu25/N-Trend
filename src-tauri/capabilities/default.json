@@ -11,7 +11,9 @@
     "live-trader",
     "live-trader*",
     "history-chart",
-    "history-chart*"
+    "history-chart*",
+    "review-chart",
+    "review-chart*"
   ],
   "permissions": [
     "core:default",

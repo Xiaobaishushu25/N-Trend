@@ -1,0 +1,21 @@
+{
+  "schema": "factor-study-protocol-v1",
+  "id": "factor-study-20261031-v1",
+  "start": "2026-07-31 00:00:00",
+  "end": "2026-10-31 00:00:00",
+  "warmup_calendar_days": 45,
+  "history_sources": ["data/research_market_history.sqlite"],
+  "calendar": "data/trading_calendar.json",
+  "fees": "scripts/exchange_fees_20261022.json",
+  "symbols": ["BU0","C0","CF0","CJ0","EB0","EG0","FG0","JD0","L0","MA0","PB0","PP0","RB0","SA0","SF0","SH0","SI0","SM0","SR0","SS0","UR0","V0"],
+  "multiplier_overrides": {"JD0": 10.0},
+  "tick_overrides": {"SH0": 1.0},
+  "tick_override_source": "Frozen server_backup.sqlite SH0 tick_size=1; 2026-10-23 candidate specification SH tick=1 multiplier=30",
+  "multiplier_override_source": "2026-10-22 archived study: JD quote point cash value corrected to 10 yuan/lot; shared precision default is not modified",
+  "night_ends": {"BU0":1380,"C0":1380,"CF0":1380,"CJ0":null,"EB0":1380,"EG0":1380,"FG0":1380,"JD0":null,"L0":1380,"MA0":1380,"PB0":60,"PP0":1380,"RB0":1380,"SA0":1380,"SF0":null,"SH0":1380,"SI0":null,"SM0":null,"SR0":1380,"SS0":60,"UR0":null,"V0":1380},
+  "execution": {"lots":1,"planned_loss_cap_yuan":500.0,"target_net_yuan":200.0,"pending_buckets":12,"holding_buckets":60,"no_follow_bucket":5,"no_follow_mfe_r":0.5,"forecast_slip_ticks":1,"slip_scenarios":[0,1,2]},
+  "validation": {"initial_days":30,"outer_days":5,"inner_days":5,"inner_folds":2,"minimum_training_groups":200,"minimum_complex_groups":300,"groups_per_design_column":5,"minimum_inner_closed":20,"minimum_known_fraction":0.95,"minimum_outer_folds":3,"minimum_outer_closed":100},
+  "optimization": {"alphas":[0.1,1.0,10.0,100.0],"sobol_weights":256,"seed":20261031,"selection_quantile":0.8,"minimum_baseline_trade_fraction":0.5,"allowed_drawdown_increase_yuan":200.0},
+  "statistics": {"bootstrap_draws":2000,"block_days":5,"sensitivity_block_days":10,"fdr":0.1,"minimum_cell_groups":30},
+  "confirmation": {"state":"not_started","minimum_trading_days":60,"minimum_completed_trades":200,"minimum_mean_improvement_yuan":10.0,"require_positive_paired_interval":true,"require_positive_two_tick_profit":true}
+}

@@ -12,6 +12,7 @@ import type { OutcomeDetail, RecentOutcomeFilters, SymbolRow } from '../types'
 import { qualityText } from '../utils/signalQuality'
 import { reviewScore, reviewScoreOptions, reviewTime, reviewScoreStatus } from '../utils/reviewFilters'
 import { notify } from '../utils/notify'
+import { openReviewChartWindow } from '../utils/openReviewChartWindow'
 import ReviewFilters from './ReviewFilters.vue'
 import ReviewScoreDetail from './ReviewScoreDetail.vue'
 
@@ -55,17 +56,16 @@ async function reset() { if (timer) clearTimeout(timer); expanded.value = []; aw
 async function page(value: number) { if (timer) clearTimeout(timer); expanded.value = []; review.browserPage = value; await review.loadReviewPage() }
 async function size(value: number) { review.browserPageSize = value; await page(1) }
 async function openChart(row: OutcomeDetail) {
-  const filters = { ...review.browserFilters, symbols: [...(review.browserFilters.symbols || [])], pageSize: review.browserPageSize, pageOffset: (review.browserPage - 1) * review.browserPageSize }
   try {
-    if (!isTauri()) {
-      app.reviewJumpFilters = filters
-      await router.push({ name: 'chart', params: { symbol: row.symbol }, query: { review: String(row.event_id) } })
-      return
-    }
-    await emit('open-review-chart', { symbol: row.symbol, eventId: row.event_id, filters })
-    const main = await WebviewWindow.getByLabel('main')
-    if (main) { await main.show(); await main.unminimize(); await main.setFocus() }
-  } catch (error) { notify.error(`打开形态失败：${error}`) }
+    await openReviewChartWindow({
+      symbol: row.symbol,
+      eventId: row.event_id,
+      version: (row as any).result_version,
+      snapshotId: (review as any).currentSnapshotId,
+    })
+  } catch (error) {
+    notify.error(`打开独立复盘图表失败：${error}`)
+  }
 }
 onMounted(() => { void review.loadReviewPage(); void api.getSymbols().then(value => { names.value = value }).catch(() => {}) })
 onBeforeUnmount(() => { if (timer) clearTimeout(timer) })

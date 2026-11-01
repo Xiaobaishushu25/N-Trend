@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 pub struct ServerContext {
     pub db: DatabaseConnection,
     pub services: Arc<Services>,
+    pub review: Arc<n_core::review::ReviewEngine>,
     pub data_dir: PathBuf,
     pub secrets: Arc<RwLock<ServerSecrets>>,
     pub realtime_hub: Arc<RealtimeHub>,
@@ -82,6 +83,7 @@ impl ServerContext {
         }
         let execution_engine = Arc::new(engine);
         Arc::new(Self {
+            review: Arc::new(n_core::review::ReviewEngine::new(db.clone())),
             db,
             services,
             data_dir,

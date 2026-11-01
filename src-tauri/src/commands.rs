@@ -1,6 +1,7 @@
 use n_protocol::auth::*;
 use n_protocol::config::*;
 use n_protocol::dto::*;
+use n_protocol::review::*;
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,88 @@ use crate::state::AppState;
 
 static LOCAL_TRADER_CONFIG: Mutex<Option<Value>> = Mutex::new(None);
 static CHART_REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[tauri::command]
+pub async fn review_metadata(state: State<'_, Arc<AppState>>) -> Result<ReviewMetadata, String> {
+    state.api.review_metadata().await.map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_query(
+    state: State<'_, Arc<AppState>>,
+    request: ReviewQuery,
+) -> Result<ReviewQueryResponse, String> {
+    state
+        .api
+        .review_query(&request)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_items(
+    state: State<'_, Arc<AppState>>,
+    snapshot_id: String,
+    request: ReviewPageRequest,
+) -> Result<ReviewItemsPage, String> {
+    state
+        .api
+        .review_items(&snapshot_id, &request)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_aggregate(
+    state: State<'_, Arc<AppState>>,
+    request: ReviewAggregateRequest,
+) -> Result<ReviewAggregateResponse, String> {
+    state
+        .api
+        .review_aggregate(&request)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_detail(
+    state: State<'_, Arc<AppState>>,
+    event_id: i64,
+    version: String,
+) -> Result<ReviewResultDetail, String> {
+    state
+        .api
+        .review_detail(event_id, &version)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_holding(
+    state: State<'_, Arc<AppState>>,
+    event_id: i64,
+    version: String,
+    request: ReviewPageRequest,
+) -> Result<ReviewHoldingPage, String> {
+    state
+        .api
+        .review_holding(event_id, &version, &request)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_rebuild(
+    state: State<'_, Arc<AppState>>,
+    request: ReviewRebuildRequest,
+) -> Result<ReviewJob, String> {
+    state
+        .api
+        .review_rebuild(&request)
+        .await
+        .map_err(|e| e.message)
+}
+#[tauri::command]
+pub async fn review_job(
+    state: State<'_, Arc<AppState>>,
+    job_id: String,
+) -> Result<ReviewJob, String> {
+    state.api.review_job(&job_id).await.map_err(|e| e.message)
+}
 
 pub(crate) fn local_trader_config() -> Value {
     LOCAL_TRADER_CONFIG
@@ -685,6 +768,8 @@ pub async fn rebuild_events_now(state: State<'_, Arc<AppState>>) -> Result<Value
 }
 
 #[tauri::command]
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn refresh_outcomes_now(
     state: State<'_, Arc<AppState>>,
 ) -> Result<OutcomeRefresh, String> {
@@ -698,6 +783,8 @@ pub async fn refresh_outcomes_now(
 // ── Review & Signals ──
 
 #[tauri::command]
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_review_stats(
     state: State<'_, Arc<AppState>>,
     dimension: String,
@@ -714,6 +801,8 @@ pub async fn get_review_stats(
 }
 
 #[tauri::command]
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_recent_outcomes(
     state: State<'_, Arc<AppState>>,
     limit: Option<usize>,
@@ -746,6 +835,8 @@ pub async fn get_recent_outcomes(
 }
 
 #[tauri::command]
+// LEGACY_REVIEW_API: current store/chart -> review_query/review_items.
+// Delete only after UI migration and usage validation; docs/review-api.md, tests/reviewBrowser.test.cjs.
 pub async fn get_review_page(
     state: State<'_, Arc<AppState>>, limit: usize, offset: usize, filters: RecentOutcomeFilters,
 ) -> Result<Value, String> {
@@ -753,6 +844,8 @@ pub async fn get_review_page(
 }
 
 #[tauri::command]
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_review_signal(
     state: State<'_, Arc<AppState>>,
     event_id: i64,

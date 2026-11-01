@@ -415,7 +415,7 @@ impl PaperBroker {
             price,
             volume: qty,
             trade_time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            trade_date: day.clone(),
+            trade_date: chrono::Local::now().format("%Y%m%d").to_string(),
             trading_day: day,
         });
         Ok(())

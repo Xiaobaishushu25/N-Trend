@@ -5,6 +5,12 @@ import { listen } from '@tauri-apps/api/event'
 import { reviewFilterQuery } from '../utils/reviewFilters'
 import type { ReviewPage } from '../types'
 import type {
+  ReviewMetadata, ReviewQuery, ReviewQueryResponse, ReviewPageRequest, ReviewItemsPage,
+  ReviewAggregateRequest, ReviewAggregateResponse, ReviewResultDetail, ReviewHoldingPage,
+  ReviewRebuildRequest, ReviewJob,
+  ReviewChanged,
+} from '../types/review'
+import type {
   V2ModelRow,
   V2PredictionRow,
   V2ReportBundle,
@@ -64,6 +70,14 @@ import type {
 } from '../types'
 
 export const api = {
+  reviewMetadata: () => invoke<ReviewMetadata>('review_metadata'),
+  reviewQuery: (request: ReviewQuery = {}) => invoke<ReviewQueryResponse>('review_query', { request }),
+  reviewItems: (snapshotId: string, request: ReviewPageRequest = {}) => invoke<ReviewItemsPage>('review_items', { snapshotId, request }),
+  reviewAggregate: (request: ReviewAggregateRequest) => invoke<ReviewAggregateResponse>('review_aggregate', { request }),
+  reviewDetail: (eventId: number, version: string) => invoke<ReviewResultDetail>('review_detail', { eventId, version }),
+  reviewHolding: (eventId: number, version: string, request: ReviewPageRequest = {}) => invoke<ReviewHoldingPage>('review_holding', { eventId, version, request }),
+  reviewRebuild: (request: ReviewRebuildRequest = {}) => invoke<ReviewJob>('review_rebuild', { request }),
+  reviewJob: (jobId: string) => invoke<ReviewJob>('review_job', { jobId }),
   appInfo: () => invoke<AppInfo>('app_info'),
   setWindowSize: (width: number, height: number) =>
     invoke<void>('set_window_size', { width, height }),
@@ -141,6 +155,9 @@ export const api = {
   runScanFastNow: () => invoke<ScanResult>('run_scan_fast_now'),
   rebuildEventsNow: () => invoke<ScanResult>('rebuild_events_now'),
 
+  // LEGACY_REVIEW_API: current store/workbench/chart still call this block.
+  // Replacements: reviewQuery/Items/Aggregate/Detail/Rebuild; docs/review-api.md.
+  // Remove after callers migrate and usage validation completes; tests/reviewBrowser.test.cjs.
   refreshOutcomesNow: () => invoke<OutcomeRefresh>('refresh_outcomes_now'),
   getReviewStats: (
     dimension: string,
@@ -266,6 +283,10 @@ export function onChartKlinesRefreshed(cb: (payload: { symbol: string; timeframe
 
 export function onStateChanged(cb: (payload: { scope: string; revision: number }) => void) {
   return listen<{ scope: string; revision: number }>('state-changed', (e) => cb(e.payload))
+}
+
+export function onReviewChanged(cb: (payload: ReviewChanged) => void) {
+  return listen<ReviewChanged>('review.changed', (event) => cb(event.payload))
 }
 
 export function onDataUpdated(cb: (stats: RefreshStats) => void) {

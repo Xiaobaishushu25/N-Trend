@@ -116,7 +116,7 @@ pub fn candidate_scores(q: &SignalQualityDto, d: &Value, p: &Profile) -> Option<
         "levels_partial":level.is_none(),"b_absent_before_warning":b["bars_without_warning"]==0,"candidate_version":p.version}),
     )
 }
-fn model(
+pub(super) fn model(
     symbol: &str,
     bars: &[Bar],
     c: &WarningCandidate,

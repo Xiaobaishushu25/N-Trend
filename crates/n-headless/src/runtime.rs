@@ -71,6 +71,7 @@ fn registered_event_ids(
 }
 
 pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
+    spawn_review_worker(ctx.clone());
     spawn_scheduler(ctx.clone());
     spawn_quote_poller(ctx.clone());
     spawn_live_chart_publisher(ctx.clone());
@@ -79,6 +80,42 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
     crate::instance_runtime::spawn(ctx);
+}
+
+fn spawn_review_worker(ctx: Arc<ServerContext>) {
+    tokio::spawn(async move {
+        let mut calendar_check = Instant::now() - Duration::from_secs(60);
+        let mut previous = String::new();
+        loop {
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            if calendar_check.elapsed() >= Duration::from_secs(60) {
+                if let Err(e) = ctx.review.initialize().await {
+                    tracing::error!("review initialize: {e:#}");
+                }
+                calendar_check = Instant::now();
+            }
+            let mut busy = false;
+            match ctx.review.worker_step().await {
+                Ok(Some(job)) => {
+                    busy = job.status == "running";
+                    let key = format!("{}:{}:{}", job.id, job.status, job.completed_symbols);
+                    if key != previous {
+                        previous = key;
+                        let seq = ctx.next_event_seq();
+                        ctx.realtime_hub.broadcast(seq,"review.changed",serde_json::json!({"job_id":job.id,"status":job.status,"completed_symbols":job.completed_symbols,"total_symbols":job.total_symbols,"revision":job.revision})).await;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!("review worker: {e:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(if busy { 100 } else { 5000 })).await;
+        }
+    });
 }
 
 pub async fn register_execution_signals(

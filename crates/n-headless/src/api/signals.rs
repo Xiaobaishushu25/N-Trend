@@ -106,6 +106,8 @@ pub async fn get_preclose_candidates(
     }
 }
 
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_review_stats(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
@@ -131,6 +133,8 @@ pub async fn get_review_stats(
     }
 }
 
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_recent_outcomes(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
@@ -151,6 +155,8 @@ pub async fn get_recent_outcomes(
     }
 }
 
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn get_review_signal(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
@@ -168,6 +174,8 @@ pub async fn get_review_signal(
     }
 }
 
+// LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+// Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
 pub async fn refresh_outcomes(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,

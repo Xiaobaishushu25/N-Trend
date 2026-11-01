@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod quotes;
 pub mod settings;
 pub mod signals;
+pub mod review;
 pub mod symbols;
 pub mod trader;
 pub mod ws_handler;
@@ -26,6 +27,7 @@ use tower_http::cors::CorsLayer;
 
 pub fn build_router(ctx: Arc<ServerContext>) -> Router {
     let api = Router::new()
+        .merge(review::routes())
         // 元数据与探活
         .route("/meta", get(meta::get_meta))
         .route("/status", get(meta::get_status))
@@ -96,6 +98,9 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
             "/signals/preclose-candidates",
             get(signals::get_preclose_candidates),
         )
+        // LEGACY_REVIEW_API: ReviewWorkbench/store/chart still use these routes.
+        // Replacements and removal gates: docs/review-api.md; tests/reviewBrowser.test.cjs.
+        // Keep original semantics until all callers migrate and usage validation completes.
         .route("/review/stats", get(signals::get_review_stats))
         .route("/review/outcomes", get(signals::get_recent_outcomes))
         .route("/review/signal/:id", get(signals::get_review_signal))

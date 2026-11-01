@@ -37,6 +37,7 @@ import {
 import { formatPnlAmount, formatPnlPoints, formatRMultiple } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { openReviewWindow } from '../utils/openReviewWindow'
+import { openReviewChartWindow } from '../utils/openReviewChartWindow'
 import type { OpenReviewChartPayload } from '../types'
 import SignalQuality from '../components/SignalQuality.vue'
 import SignalQualityControls from '../components/SignalQualityControls.vue'
@@ -129,39 +130,15 @@ function exitReasonBadge(reason: string) {
   }
 }
 
-/** 一键图表复盘：聚焦主窗口并绘制开平仓打点 */
+/** 一键图表复盘：独立复盘K线窗口并绘制开平仓打点 */
 async function openChartForTicket(ticket: TradeReviewTicket) {
   try {
-    const payload: OpenReviewChartPayload = {
+    await openReviewChartWindow({
       symbol: ticket.symbol,
       eventId: ticket.event_id,
-      filters: {},
-    }
-    if (isTauri()) {
-      await emit('open-review-chart', payload)
-      try {
-        const main = await WebviewWindow.getByLabel('main')
-        if (main != null) {
-          await main.show()
-          await main.unminimize()
-          await main.setFocus()
-        }
-      } catch (err) {
-        console.warn('获取主窗口失败:', err)
-      }
-    }
-
-    const isMainWin = !isTauri() || getCurrentWindow().label === 'main'
-    if (isMainWin) {
-      void router.push({
-        name: 'chart',
-        params: { symbol: ticket.symbol },
-        query: { review: String(ticket.event_id) },
-      })
-    }
-    notify.success(`已在图表上定位 [${ticket.symbol_name || ticket.symbol}] 复盘打点`)
+    })
   } catch (e) {
-    notify.error(`定位图表失败: ${e}`)
+    notify.error(`定位独立复盘图表失败: ${e}`)
   }
 }
 </script>

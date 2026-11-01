@@ -1,0 +1,24 @@
+{
+  "schema": "factor-study-entry-v1",
+  "entry_modes": ["breakout", "close_confirm", "retest25"],
+  "targets": ["cash200", "s1"],
+  "slip_ticks": [1, 2],
+  "fixed_score_min": 70.0,
+  "planned_loss_cap_yuan": 500.0,
+  "no_follow_bucket": 5,
+  "minimum_closed": 100,
+  "minimum_known_fraction": 0.95,
+  "fdr": 0.1,
+  "deployment": "disabled",
+  "ambiguity_capacity": "Common to every entry rule: cash remains unknown, but with continuously observed quotes release capacity no earlier than the latest mandatory holding expiry across possible branches. Pending branches use bucket 12+60-1; open branches use their observed entry bucket+60-1. Source gaps or insufficient future observations keep occupancy unresolved.",
+  "entry_state_equivalence": "For alternative entries, merge equal execution states when their MFE values differ but the fixed 0.5R no-follow threshold flags agree. Store peak as a lower bound and peak_upper as the upper bound. Different threshold flags or fills remain unknown. Raw original breakout labels stay byte-equivalent to frozen controls.",
+  "rules": {
+    "breakout": "Original warning high/low plus tick, market on breakout; unchanged control.",
+    "close_confirm": "First subsequent completed 1m close reaches original trigger; enter at next observed minute open. Stop invalidation remains active before confirmation and entry. Original pending expiry is not renewed.",
+    "retest25": "Original breakout arms market-on-touch at trigger minus 25% of original trigger-to-structural-stop distance, rounded away from trigger to ticks. Intraminute sequence uncertainty remains unknown. An opening gap already past structural stop cancels the pending order.",
+    "risk": "Same warning-known original breakout plan must pass 500 yuan including forecast costs. Stops unchanged; gaps are never clipped. Entry changes do not rescue warning-ineligible plans.",
+    "targets": "cash200 is calculated using observable entry base and fixed 1tick forecast cost; stress uses same target. S1 uses original fixed structural target.",
+    "capacity": "One pending order or position per product from original warning, carry from all warmup snapshots. Every entry rule has its own continuous book.",
+    "inference": "Fixed six strategies, no threshold fitting. Joint-date 5/10 day blocks and separate BH families for six versus-zero and four same-target versus-breakout comparisons. Previously-inspected history remains development only."
+  }
+}

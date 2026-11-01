@@ -262,6 +262,8 @@ impl Services {
     }
 
     /// Global filters and deterministic ordering precede pagination. No event writes.
+    // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
+    // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn review_page(
         &self,
         limit: usize,

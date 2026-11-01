@@ -81,9 +81,10 @@ const dataSourceTagType = computed<'default' | 'info' | 'warning' | 'success'>((
 /** 设置窗口（独立窗口，路由 /settings）：标题栏只保留窗口标题 */
 const isStandaloneWindow = computed(
   () =>
-    (isTauri() && getCurrentWindow().label === 'history-chart') ||
+    (isTauri() && (getCurrentWindow().label === 'history-chart' || getCurrentWindow().label === 'review-chart')) ||
     route.name === 'settings' ||
     route.name === 'review' ||
+    route.name === 'review-chart' ||
     route.name === 'trade-review' ||
     route.name === 'live-trader' ||
     route.name === 'notifications',
@@ -91,6 +92,9 @@ const isStandaloneWindow = computed(
 const windowTitle = computed(() => {
   if (isTauri() && getCurrentWindow().label === 'history-chart') {
     return `历史复盘图表 · ${route.params.symbol || ''}`
+  }
+  if ((isTauri() && getCurrentWindow().label === 'review-chart') || route.name === 'review-chart') {
+    return `复盘打点K线 · ${route.params.symbol || ''}`
   }
   return route.name === 'settings'
     ? '系统设置'

@@ -23,6 +23,12 @@ export default createRouter({
       meta: { bare: true },
     },
     {
+      path: '/review-chart/:symbol?',
+      name: 'review-chart',
+      component: () => import('../views/ReviewChartView.vue'),
+      meta: { bare: true },
+    },
+    {
       path: '/trade-review',
       name: 'trade-review',
       component: () => import('../views/TradeReviewView.vue'),
