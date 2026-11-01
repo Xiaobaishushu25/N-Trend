@@ -191,6 +191,13 @@ pub fn run(
             grade: event.grade.clone(),
             warning_ts: event.warning_ts.clone(),
             scores,
+            plan: ReviewPlan {
+                entry: event.entry.is_finite().then_some(event.entry),
+                stop: event.stop.is_finite().then_some(event.stop),
+                reference_target: event.target.is_finite().then_some(event.target),
+                risk: event.risk.is_finite().then_some(event.risk),
+                rr: event.rr.is_finite().then_some(event.rr),
+            },
             state: "pending".into(),
             score_status: "unscored".into(),
             ..Default::default()
@@ -556,6 +563,10 @@ pub fn run(
     out.summary.mae_r = out.mae.r;
     out.summary.mfe_amount = out.mfe.amount;
     out.summary.mae_amount = out.mae.amount;
+    out.summary.entry_price = out.entry_price;
+    out.summary.exit_price = out.exit_price;
+    out.summary.mfe = Some(out.mfe.clone());
+    out.summary.mae = Some(out.mae.clone());
     if out.mfe.precision == "bounded" || out.mae.precision == "bounded" {
         out.summary.coverage.push("bounded_excursion".into());
     }

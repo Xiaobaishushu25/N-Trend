@@ -92,17 +92,21 @@ pub struct ResultQuery {
     pub cursor: Option<usize>,
     pub limit: Option<usize>,
 }
+#[derive(Deserialize)]
+pub struct DetailQuery {
+    pub version: Option<String>,
+}
 pub async fn detail(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
     Path(id): Path<i64>,
-    Query(q): Query<ResultQuery>,
+    Query(q): Query<DetailQuery>,
 ) -> Result<Json<ReviewResultDetail>, Failure> {
-    ctx.review
-        .detail(id, &q.version)
-        .await
-        .map(Json)
-        .map_err(failure)
+    let result = match q.version {
+        Some(version) => ctx.review.detail(id, &version).await,
+        None => ctx.review.current_detail(id).await,
+    };
+    result.map(Json).map_err(failure)
 }
 pub async fn holding(
     State(ctx): State<Arc<ServerContext>>,
@@ -325,6 +329,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let page = decoded(&h, &b);
         assert_eq!(page["total"], 0);
+        assert_eq!(page["scored"], 0);
+        assert_eq!(page["unscored"], 0);
         assert!(page["groups"]["score_band"].is_array());
         let (status, h, b) = call(
             &router,
@@ -360,6 +366,8 @@ mod tests {
             .0,
             StatusCode::NOT_FOUND
         );
+        // Event-only links resolve a published head; missing heads are an explicit 404.
+        assert_eq!(call(&router, "GET", "/api/v2/review/signals/1/detail", Some("review-read-test"), Value::Null).await.0, StatusCode::NOT_FOUND);
         let (status, h, b) = call(
             &router,
             "GET",

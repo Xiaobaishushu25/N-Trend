@@ -30,6 +30,8 @@ test('new review client forwards nested filters, versions and pagination without
   await api.reviewRebuild({ symbols: ['RB0'] })
   await api.reviewJob('job')
   await api.reviewMetadata()
+  await api.reviewDetail(6)
+  assert.equal(calls.at(-1).args.version, null, 'event-only links ask the server for a published head, never for a profile')
   const native = fs.readFileSync('src-tauri/src/lib.rs', 'utf8')
   for (const call of calls) assert.ok(native.includes(`commands::${call.command},`), `${call.command} must be registered`)
 })

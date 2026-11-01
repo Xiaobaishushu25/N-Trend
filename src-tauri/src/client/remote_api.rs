@@ -798,13 +798,13 @@ impl RemoteApiClient {
     pub async fn review_detail(
         &self,
         event_id: i64,
-        version: &str,
+        version: Option<&str>,
     ) -> Result<ReviewResultDetail, ApiErrorResponse> {
-        self.execute(
-            self.request(Method::GET, &format!("review/signals/{event_id}/detail"))
-                .query(&[("version", version)]),
-        )
-        .await
+        let mut request = self.request(Method::GET, &format!("review/signals/{event_id}/detail"));
+        if let Some(version) = version {
+            request = request.query(&[("version", version)]);
+        }
+        self.execute(request).await
     }
     pub async fn review_holding(
         &self,

@@ -13,6 +13,7 @@ pub struct ReviewFilters {
     pub levels: Vec<String>,
     pub grades: Vec<String>,
     pub states: Vec<String>,
+    pub outcomes: Vec<String>,
     pub exit_reasons: Vec<String>,
     pub terminal_reasons: Vec<String>,
     pub score_metric: Option<String>,
@@ -77,6 +78,15 @@ pub struct ReviewAggregateRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewPlan {
+    pub entry: Option<f64>,
+    pub stop: Option<f64>,
+    pub reference_target: Option<f64>,
+    pub risk: Option<f64>,
+    pub rr: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewSummary {
     pub event_id: i64,
     pub result_version: String,
@@ -94,6 +104,18 @@ pub struct ReviewSummary {
     pub terminal_reason: Option<String>,
     pub scores: BTreeMap<String, Option<f64>>,
     pub score_status: String,
+    #[serde(default)]
+    pub score_explanations: Vec<String>,
+    #[serde(default)]
+    pub plan: ReviewPlan,
+    #[serde(default)]
+    pub entry_price: Option<f64>,
+    #[serde(default)]
+    pub exit_price: Option<f64>,
+    #[serde(default)]
+    pub mfe: Option<ReviewExcursion>,
+    #[serde(default)]
+    pub mae: Option<ReviewExcursion>,
     pub risk_points: Option<f64>,
     pub risk_amount: Option<f64>,
     pub gross_amount: Option<f64>,
@@ -158,6 +180,8 @@ pub struct ReviewQueryResponse {
     pub expires_at: String,
     pub raw_count: usize,
     pub deduplicated_count: usize,
+    pub scored: usize,
+    pub unscored: usize,
     pub overview: ReviewStatistics,
     pub groups: BTreeMap<String, Vec<ReviewGroup>>,
     pub equity: Vec<ReviewEquityPoint>,

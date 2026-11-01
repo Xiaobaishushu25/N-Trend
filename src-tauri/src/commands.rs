@@ -55,11 +55,11 @@ pub async fn review_aggregate(
 pub async fn review_detail(
     state: State<'_, Arc<AppState>>,
     event_id: i64,
-    version: String,
+    version: Option<String>,
 ) -> Result<ReviewResultDetail, String> {
     state
         .api
-        .review_detail(event_id, &version)
+        .review_detail(event_id, version.as_deref())
         .await
         .map_err(|e| e.message)
 }

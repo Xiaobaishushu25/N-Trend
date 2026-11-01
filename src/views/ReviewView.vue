@@ -27,8 +27,11 @@ import {
 import { notify } from '../utils/notify'
 import { ChevronDown, ChevronUp } from '@vicons/tabler'
 import type { GroupStat, V2ModelRow } from '../types'
+import { usePublishedReviewStore } from '../stores/publishedReview'
+import { onReviewChanged } from '../services/api'
 
 const review = useReviewStore()
+const published = usePublishedReviewStore()
 const v2Columns: any = [
   { title: "event", key: "event_id", width: 90 },
   { title: "model", key: "model_id", width: 160, ellipsis: { tooltip: true } },
@@ -264,22 +267,24 @@ function onScoreRangeInput() {
 }
 
 let unlisten: (() => void) | null = null
+let unlistenReview: (() => void) | null = null
 
 onMounted(async () => {
   try {
     unlisten = await onScanCompleted(() => {
-      void review.loadReviewPage()
       if (showLegacyStats.value) void load()
     })
   } catch {
     // 旧构建/权限缺失时监听失败不应阻塞数据加载
   }
+  try { unlistenReview = await onReviewChanged(change => { if (change.status === 'completed') void published.loadReviewPage() }) } catch { /* manual refresh remains available */ }
   // 形态工作台自行只读加载；旧统计在展开时再请求。
 })
 
 onBeforeUnmount(() => {
   if (scoreTimer) clearTimeout(scoreTimer)
   unlisten?.()
+  unlistenReview?.()
 })
 </script>
 
@@ -287,7 +292,7 @@ onBeforeUnmount(() => {
   <div class="page review-workspace">
     <header class="workspace-header">
       <div><div class="workspace-eyebrow">SIGNAL REVIEW</div><h1>形态与评分复盘</h1><p>按评分挑选信号，逐条对照形态与评分分项。</p></div>
-      <div class="workspace-actions"><span>v1基线 · v2研究候选</span><n-button secondary type="primary" :loading="review.browserLoading" @click="review.loadReviewPage()">刷新评分与明细</n-button></div>
+      <div class="workspace-actions"><span>已发布复盘 · v2研究候选评分</span><n-button secondary type="primary" :loading="published.browserLoading" @click="published.loadReviewPage()">刷新评分与明细</n-button></div>
     </header>
     <ReviewWorkbench />
     <section class="legacy-section">

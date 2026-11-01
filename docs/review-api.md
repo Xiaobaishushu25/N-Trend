@@ -1,6 +1,6 @@
 # 复盘接口：固定一手、5分钟回放
 
-发布版本：3.0.3；HTTP 协议仍为 `/api/v2`。客户端与服务端需同时升级，沿用已有版本头及设备认证。不改变 UI、旧接口返回结构、原始信号或生产交易规则。
+发布版本：3.0.4；HTTP 协议仍为 `/api/v2`。客户端与服务端需同时升级，沿用已有版本头及设备认证。主复盘列表与独立图表已接入新接口；旧历史统计独立保留，不改变原始信号或生产交易规则。
 
 ## 使用顺序
 
@@ -17,12 +17,16 @@
 | `POST /review/query` | `ReviewQuery` → `ReviewQueryResponse` |
 | `GET /review/queries/{snapshot_id}/items?cursor=100&limit=100` | `ReviewItemsPage` |
 | `POST /review/aggregate` | `ReviewAggregateRequest` → `ReviewAggregateResponse` |
-| `GET /review/signals/{id}/detail?version={result_version}` | `ReviewResultDetail`，版本必填 |
+| `GET /review/signals/{id}/detail?version={result_version}` | `ReviewResultDetail`；有版本时精确读取该不可变结果；省略版本时解析该事件当前已发布结果，无发布结果返回404 |
 | `GET /review/signals/{id}/holding?version={result_version}&cursor=0&limit=100` | `ReviewHoldingPage`，版本必填 |
 | `POST /review/rebuild` | `{"symbols":["RB0","SA0"]}`；空对象表示全部；202 + `ReviewJob` |
 | `GET /review/jobs/{id}` | 管理员读取 `ReviewJob` |
 
 完整协议在 `crates/n-protocol/src/review.rs`，TypeScript 镜像在 `src/types/review.ts`。`src/services/api.ts` 提供 `reviewMetadata/Query/Items/Aggregate/Detail/Holding/Rebuild/Job`，对应同名 snake_case 桌面命令；`onReviewChanged` 订阅轻量变化通知。
+
+3.0.4摘要新增 `plan`（计划入场、初始止损、原始参考目标、计划风险、到S1空间R）、模拟开平价格、评分解释及带精度/上下界的 `mfe`/`mae`。查询响应新增所选评分指标的全匹配 `scored`/`unscored` 覆盖计数。分页和详情必须沿用同一快照及真实结果版本，profile不是result_version。
+
+`filters.outcomes` 可选 `win/loss/flat`，仅按已平仓且净R可计算的结果筛选。缺乘数不补造金额。`bars_held`始终按15分钟交易K计数，`holding_count`是5分钟逐K持有记录条数。极值精度为bounded时显示上下界，未知值不补零。
 
 ## 筛选、样本与排序
 

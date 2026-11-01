@@ -70,6 +70,11 @@ fn one_lot_really_closes_at_one_r_and_does_not_double_charge_slippage() {
     assert_eq!(r.summary.risk_amount, Some(110.));
     assert_eq!(r.mfe.r, Some(1.));
     assert_eq!(r.holding.len(), 2);
+    assert_eq!(r.summary.bars_held, 1);
+    assert_eq!(r.summary.plan.entry, Some(100.));
+    assert_eq!(r.summary.entry_price, Some(101.));
+    assert_eq!(r.summary.exit_price, Some(111.));
+    assert_eq!(r.summary.mfe.as_ref().unwrap().r, r.mfe.r);
     assert_eq!(serde_json::to_value(&e).unwrap(), before);
 }
 #[test]
@@ -458,6 +463,10 @@ async fn transactional_outbox_atomic_publication_resume_and_immutable_details() 
     assert_eq!(detail.summary.net_amount, Some(95.));
     assert_eq!(detail.origin, "historical_rebuild");
     assert_eq!(detail.holding_count, 2);
+    let resolved = engine.current_detail(old.event_id).await.unwrap();
+    assert_eq!(resolved.summary.result_version, old.result_version);
+    assert!(engine.current_detail(999999).await.is_err());
+    assert!(engine.detail(old.event_id, PROFILE).await.is_err());
     assert!(detail.lifecycle.iter().any(|n| n.stage == "exit"));
     let holding = engine.holding(1, &old.result_version, 0, 1).await.unwrap();
     assert_eq!(holding.next_cursor, Some(1));
@@ -502,6 +511,7 @@ async fn transactional_outbox_atomic_publication_resume_and_immutable_details() 
         .await
         .unwrap();
     assert_eq!(new.page.revision, 2);
+    assert_eq!(resumed.current_detail(1).await.unwrap().summary.state, "open");
     assert_eq!(
         new.page
             .items
@@ -686,6 +696,7 @@ async fn seed_summaries(db: &sea_orm::DatabaseConnection, n: usize) -> Vec<Revie
             wait_bars: 1,
             coverage: vec![],
             diagnostics: BTreeMap::new(),
+            ..Default::default()
         };
         for key in [
             "retracement",
@@ -781,6 +792,8 @@ async fn filters_sort_counts_groups_snapshot_expiry_and_paging_share_one_populat
         .collect();
     let response = engine.query("device", q).await.unwrap();
     assert_eq!(response.page.total, expected.len());
+    assert_eq!(response.scored + response.unscored, response.page.total);
+    assert_eq!(response.scored, expected.len());
     assert_eq!(response.overview.count, expected.len());
     for groups in response.groups.values() {
         assert_eq!(
@@ -884,6 +897,25 @@ async fn filters_sort_counts_groups_snapshot_expiry_and_paging_share_one_populat
             .code,
         "SNAPSHOT_EXPIRED"
     );
+}
+
+#[tokio::test]
+async fn published_outcome_filter_uses_only_closed_net_results() {
+    let db = db().await;
+    let all = seed_summaries(&db, 40).await;
+    let engine = ReviewEngine::new(db);
+    for outcome in ["win", "loss", "flat"] {
+        let mut q = ReviewQuery::default();
+        q.filters.sample_scope = Some("all".into());
+        q.filters.outcomes = vec![outcome.into()];
+        let expected = all.iter().filter(|r| r.state == "closed" && r.net_r.is_some_and(|v| match outcome { "win" => v > 0., "loss" => v < 0., _ => v == 0. })).count();
+        let page = engine.query("outcome-device", q).await.unwrap();
+        assert_eq!(page.page.total, expected);
+        assert_eq!(page.scored + page.unscored, expected);
+    }
+    let mut invalid = ReviewQuery::default();
+    invalid.filters.outcomes = vec!["anything".into()];
+    assert!(engine.query("outcome-device", invalid).await.is_err());
 }
 
 #[tokio::test]

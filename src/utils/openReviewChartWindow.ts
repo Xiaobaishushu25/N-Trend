@@ -3,23 +3,33 @@ import { isTauri } from '@tauri-apps/api/core'
 import { emit } from '@tauri-apps/api/event'
 import router from '../router'
 import { notify } from './notify'
+import type { ReviewQuery, ReviewScoreMetric } from '../types/review'
 
 export interface OpenReviewChartParams {
   symbol: string
   eventId: number
   version?: string
   snapshotId?: string
+  query?: ReviewQuery
+  cursor?: number
+  metric?: ReviewScoreMetric
 }
 
 export async function openReviewChartWindow(params: OpenReviewChartParams) {
   const { symbol, eventId, version, snapshotId } = params
   const sym = symbol || 'FG0'
+  const contextQuery = {
+    ...(params.query ? { context: JSON.stringify(params.query) } : {}),
+    ...(params.cursor != null ? { cursor: String(params.cursor) } : {}),
+    ...(params.metric ? { metric: params.metric } : {}),
+  }
 
   if (!isTauri()) {
     void router.push({
       name: 'review-chart',
       params: { symbol: sym },
       query: {
+        ...contextQuery,
         eventId: String(eventId),
         ...(version ? { version } : {}),
         ...(snapshotId ? { snapshotId } : {}),
@@ -42,6 +52,7 @@ export async function openReviewChartWindow(params: OpenReviewChartParams) {
     const queryParts = [`eventId=${encodeURIComponent(eventId)}`]
     if (version) queryParts.push(`version=${encodeURIComponent(version)}`)
     if (snapshotId) queryParts.push(`snapshotId=${encodeURIComponent(snapshotId)}`)
+    for (const [key, value] of Object.entries(contextQuery)) queryParts.push(`${key}=${encodeURIComponent(value)}`)
     const queryString = queryParts.join('&')
 
     const webview = new WebviewWindow('review-chart', {
@@ -69,6 +80,7 @@ export async function openReviewChartWindow(params: OpenReviewChartParams) {
       name: 'review-chart',
       params: { symbol: sym },
       query: {
+        ...contextQuery,
         eventId: String(eventId),
         ...(version ? { version } : {}),
         ...(snapshotId ? { snapshotId } : {}),

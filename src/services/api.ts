@@ -74,7 +74,7 @@ export const api = {
   reviewQuery: (request: ReviewQuery = {}) => invoke<ReviewQueryResponse>('review_query', { request }),
   reviewItems: (snapshotId: string, request: ReviewPageRequest = {}) => invoke<ReviewItemsPage>('review_items', { snapshotId, request }),
   reviewAggregate: (request: ReviewAggregateRequest) => invoke<ReviewAggregateResponse>('review_aggregate', { request }),
-  reviewDetail: (eventId: number, version: string) => invoke<ReviewResultDetail>('review_detail', { eventId, version }),
+  reviewDetail: (eventId: number, version?: string) => invoke<ReviewResultDetail>('review_detail', { eventId, version: version ?? null }),
   reviewHolding: (eventId: number, version: string, request: ReviewPageRequest = {}) => invoke<ReviewHoldingPage>('review_holding', { eventId, version, request }),
   reviewRebuild: (request: ReviewRebuildRequest = {}) => invoke<ReviewJob>('review_rebuild', { request }),
   reviewJob: (jobId: string) => invoke<ReviewJob>('review_job', { jobId }),

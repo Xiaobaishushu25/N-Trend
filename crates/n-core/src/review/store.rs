@@ -32,6 +32,9 @@ fn implementation_version() -> String {
         include_str!("../quality/mod.rs"),
         include_str!("../quality/review.rs"),
         include_str!("../quality/score_scan.rs"),
+        include_str!("../quality/structure.rs"),
+        include_str!("../quality/blind.rs"),
+        include_str!("../quality/research.rs"),
         include_str!("../precision.rs"),
         include_str!("../session/calendar.rs"),
         include_str!("../session/spec.rs"),
@@ -463,6 +466,19 @@ impl ReviewEngine {
         Ok(detail)
     }
 
+    /// Resolve a legacy event-only link to a published immutable head, never to a profile name.
+    pub async fn current_detail(&self, event_id: i64) -> Result<ReviewResultDetail> {
+        let row = self.db
+            .query_one(sql(
+                "SELECT result_version FROM review_current WHERE event_id=?",
+                vec![event_id.into()],
+            ))
+            .await?
+            .ok_or_else(|| super::error("NOT_FOUND", "该信号尚无已发布复盘结果，请检查复盘任务状态"))?;
+        self.detail(event_id, &row.try_get::<String>("", "result_version")?)
+            .await
+    }
+
     pub async fn holding(
         &self,
         event_id: i64,
@@ -585,6 +601,7 @@ fn build_batch(
         );
         let candidate = crate::quality::review::score(&event, window, &quality, tick.unwrap_or(0.));
         output.summary.score_status = candidate.status.clone();
+        output.summary.score_explanations = candidate.explanations.clone();
         for (key, value) in [
             ("quality_v1", quality.quality_score),
             ("morphology_v1", quality.morphology_score),
