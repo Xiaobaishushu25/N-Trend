@@ -1314,6 +1314,8 @@ pub struct Services {
     pub pipeline: RawPipeline,
     /// 活跃单K（上影锤/下影锤）形态缓存
     pub active_single_bars: Arc<RwLock<HashMap<String, crate::analyze::model::SingleBarAlert>>>,
+    /// 最近一次单K形态全量检测时间，避免冷启动空结果时频繁重扫全量K线
+    last_single_bar_detect: Arc<RwLock<Option<std::time::Instant>>>,
     /// 仅供图表读取的后台实时快照，不进入正式库和策略。
     pub live_chart: Arc<live_chart::LiveChartCache>,
     review_score_cache: RwLock<HashMap<String, n_protocol::quality::ReviewScoreDto>>,
@@ -1431,6 +1433,7 @@ impl Services {
             data_cycle_lock: Mutex::new(()),
             pipeline,
             active_single_bars: Arc::new(RwLock::new(HashMap::new())),
+            last_single_bar_detect: Arc::new(RwLock::new(None)),
             live_chart: Arc::new(live_chart::LiveChartCache::default()),
             review_score_cache: RwLock::new(HashMap::new()),
         })
@@ -4363,6 +4366,7 @@ impl Services {
             }
             let now_str = crate::analyze::time::now_display();
             cache.retain(|_, v| v.expire_bar_ts > now_str);
+            *self.last_single_bar_detect.write().await = Some(std::time::Instant::now());
         }
 
         let quality_by_event = crate::quality::store::display(&self.db, &signals).await;
@@ -4391,8 +4395,15 @@ impl Services {
                 return Ok(cache.values().cloned().collect());
             }
         }
+        if let Some(last) = *self.last_single_bar_detect.read().await {
+            if last.elapsed() < std::time::Duration::from_secs(60) {
+                let cache = self.active_single_bars.read().await;
+                return Ok(cache.values().cloned().collect());
+            }
+        }
 
-        // 缓存为空时（例如服务刚重启），尝试从已启用品种的最新15m K线直接检测
+        // 缓存为空且距上次检测超过 60 秒时（例如服务刚重启），尝试从已启用品种的最新15m K线直接检测
+        *self.last_single_bar_detect.write().await = Some(std::time::Instant::now());
         let symbols = repo::list_symbols(&self.db, true).await?;
         let mut results = Vec::new();
         for sym in symbols {

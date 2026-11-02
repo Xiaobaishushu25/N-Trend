@@ -5,7 +5,7 @@ import {
   requestPermission,
   sendNotification,
 } from '@tauri-apps/plugin-notification'
-import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, api } from '../services/api'
+import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, onServerDelay, api } from '../services/api'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import { useGroupsStore } from './groups'
@@ -113,6 +113,9 @@ export const useAppStore = defineStore('app', {
       this.listeners.push(
         await onConnectionStatusChanged(async (status) => {
           this.connectionStatus = status
+          if (status !== 'connected') {
+            this.quoteDelayMs = null
+          }
           if (status === 'connected') {
             await useSymbolsStore().load().catch(() => {})
             await useGroupsStore().load().catch(() => {})
@@ -126,6 +129,11 @@ export const useAppStore = defineStore('app', {
           if (status.quote_delay_ms != null) {
             this.quoteDelayMs = status.quote_delay_ms
           }
+        }),
+      )
+      this.listeners.push(
+        await onServerDelay((delay) => {
+          this.quoteDelayMs = delay
         }),
       )
       this.listeners.push(

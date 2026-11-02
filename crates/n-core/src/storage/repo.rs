@@ -1192,6 +1192,16 @@ pub async fn all_pattern_events(db: &DatabaseConnection) -> Result<Vec<pattern_e
         .context("查询信号事件失败")?)
 }
 
+/// 活跃信号事件（状态为 pending 或 triggered，仪表盘与实时展示用）。
+pub async fn active_pattern_events(db: &DatabaseConnection) -> Result<Vec<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::State.is_in(["pending", "triggered"]))
+        .order_by_asc(pattern_events::Column::Id)
+        .all(db)
+        .await
+        .context("查询活跃信号事件失败")?)
+}
+
 /// 按 id 查询单条信号事件。
 pub async fn pattern_event_by_id(
     db: &DatabaseConnection,

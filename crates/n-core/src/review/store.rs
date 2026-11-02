@@ -665,7 +665,10 @@ pub fn resolve_events_for_replay(
             let s2_price = if is_long { bars[c.s2_index].low } else { bars[c.s2_index].high };
             let hash_key = format!("{symbol}:{dir_str}:{warning_ts}:{s0_ts}:{s1_ts}:{s2_ts}");
             let hash = blake3::hash(hash_key.as_bytes());
-            let id = (u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap()) & 0x7FFF_FFFF_FFFF_FFFF) as i64;
+            let raw_id = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
+            // Limit to JavaScript Number.MAX_SAFE_INTEGER (2^53 - 1 = 9_007_199_254_740_991)
+            // so JSON serialization to web clients preserves full integer precision and satisfies Number.isSafeInteger.
+            let id = ((raw_id & 0x001F_FFFF_FFFF_FFFE) + 1) as i64;
             let dims = json!({
                 "dim_a": c.dim_a,
                 "dim_b": c.dim_b,

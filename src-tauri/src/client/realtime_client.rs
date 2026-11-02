@@ -231,6 +231,10 @@ impl RealtimeClient {
         let mut lock = self.status.write().await;
         if *lock != new_status {
             *lock = new_status.clone();
+            if new_status != ConnectionStatus::Connected {
+                self.quote_delay_ms.store(0, Ordering::Relaxed);
+                let _ = self.app.emit("server-delay", Option::<u64>::None);
+            }
             let _ = self.app.emit("connection-status-changed", &new_status);
         }
     }
@@ -333,7 +337,10 @@ impl RealtimeClient {
                         }
                     }
 
-                    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+                    let mut ping_interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                        Duration::from_secs(30),
+                    );
                     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     let mut last_received = tokio::time::Instant::now();
 
@@ -453,6 +460,7 @@ impl RealtimeClient {
                     let now = chrono::Utc::now().timestamp_millis();
                     let rtt = (now - client_time).max(0) as u64;
                     self.quote_delay_ms.store(rtt, Ordering::Relaxed);
+                    let _ = self.app.emit("server-delay", Some(rtt));
                     let _ = self.app.emit("server-pong", server_time);
                 }
                 WsServerMessage::Subscribed {
@@ -574,6 +582,7 @@ impl RealtimeClient {
                                 payload.get("quoteDelayMs").and_then(|v| v.as_u64())
                             {
                                 self.quote_delay_ms.store(delay, Ordering::Relaxed);
+                                let _ = self.app.emit("server-delay", Some(delay));
                             }
                             let _ = self.app.emit("server-status", &payload);
                         }

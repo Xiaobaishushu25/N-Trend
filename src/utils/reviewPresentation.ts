@@ -48,8 +48,15 @@ export function publishedQuery(f: RecentOutcomeFilters, size: number): ReviewQue
   }
 }
 export function validatePublishedPage(page: ReviewItemsPage): void {
-  if (!page || !Array.isArray(page.items) || !page.snapshot_id || !Number.isSafeInteger(page.total) || page.total < 0 || !Number.isSafeInteger(page.revision)
-    || !page.items.every(r => Number.isSafeInteger(r.event_id) && typeof r.result_version === 'string' && !!r.result_version && r.scores && r.plan && Array.isArray(r.coverage))) {
+  if (!page || !Array.isArray(page.items) || !page.snapshot_id || !Number.isSafeInteger(page.total) || page.total < 0 || !Number.isSafeInteger(page.revision)) {
     throw new Error('新复盘响应不完整，请将客户端和服务端升级到同一版本。')
+  }
+  for (const r of page.items) {
+    if (!Number.isSafeInteger(r.event_id)) {
+      throw new Error(`复盘信号存在无效或溢出的事件编号 (${r.event_id})，请重新触发复盘计算。`)
+    }
+    if (typeof r.result_version !== 'string' || !r.result_version || !r.scores || !r.plan || !Array.isArray(r.coverage)) {
+      throw new Error('新复盘响应不完整，请将客户端和服务端升级到同一版本。')
+    }
   }
 }

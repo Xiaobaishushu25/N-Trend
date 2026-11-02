@@ -35,12 +35,8 @@ pub async fn get_active_events(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
-    match n_core::storage::repo::all_pattern_events(&ctx.db).await {
-        Ok(events) => {
-            let active: Vec<_> = events
-                .into_iter()
-                .filter(|e| e.state == "pending" || e.state == "triggered")
-                .collect();
+    match n_core::storage::repo::active_pattern_events(&ctx.db).await {
+        Ok(active) => {
             let qualities = n_core::quality::store::display(&ctx.db, &active).await;
             let decorated: Vec<_> = active
                 .iter()

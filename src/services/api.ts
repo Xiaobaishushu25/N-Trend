@@ -269,6 +269,10 @@ export function onServerStatus(cb: (status: ServerStatusDto) => void) {
   return listen<ServerStatusDto>('server-status', (e) => cb(e.payload))
 }
 
+export function onServerDelay(cb: (delay: number | null) => void) {
+  return listen<number | null>('server-delay', (e) => cb(e.payload))
+}
+
 export function onKlinePartial(cb: (payload: { symbol: string; timeframe: string; bar: any }) => void) {
   return listen<{ symbol: string; timeframe: string; bar: any }>('kline-partial', (e) => cb(e.payload))
 }

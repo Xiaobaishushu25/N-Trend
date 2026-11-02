@@ -1193,6 +1193,7 @@ fn test_p0_4_empty_pattern_events_produces_identical_review_candidates() {
     assert_eq!(resolved_from_raw.len(), resolved_from_existing.len());
     for (a, b) in resolved_from_raw.iter().zip(resolved_from_existing.iter()) {
         assert_eq!(a.id, b.id, "Event ID must be deterministically identical");
+        assert!(a.id > 0 && a.id <= 9_007_199_254_740_991, "Event ID must be within JS MAX_SAFE_INTEGER");
         assert_eq!(a.symbol, b.symbol);
         assert_eq!(a.direction, b.direction);
         assert_eq!(a.warning_ts, b.warning_ts);
