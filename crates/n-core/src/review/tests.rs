@@ -1,6 +1,6 @@
 use super::*;
 use crate::{fetch::kline::Kline, storage::entities::pattern_events};
-use replay::{run, CalendarInput};
+use replay::{run, run_with_policy, CalendarInput, EligibilityPolicy};
 use std::collections::{BTreeMap, HashSet};
 
 fn event() -> pattern_events::Model {
@@ -882,7 +882,7 @@ async fn filters_sort_counts_groups_snapshot_expiry_and_paging_share_one_populat
             .unwrap(),
     )
     .unwrap()
-    .created = std::time::Instant::now() - std::time::Duration::from_secs(601);
+    .created = std::time::Instant::now() - std::time::Duration::from_secs(super::SNAPSHOT_TTL_SECS + 1);
     assert_eq!(
         engine
             .items(
@@ -1067,3 +1067,139 @@ async fn midnight_multiple_sessions_exit_filters_and_custom_buckets_roundtrip() 
         "INVALID_QUERY"
     );
 }
+
+#[test]
+fn test_p0_2_v2_high_score_not_filtered_by_legacy_score() {
+    let mut e = event();
+    e.entry_score = 2.2; // < 2.5, would be filtered under legacy
+    e.entry = 100.;
+    e.stop = 90.;
+    e.risk = 10.; // 10 / 0.5 = 20 ticks >= min_risk_ticks(10)
+
+    let bars = [
+        bar("09:45", 95., 99., 94., 98.),
+        bar("09:50", 100., 105., 99., 104.),
+        bar("09:55", 105., 115., 104., 114.),
+    ];
+
+    let mut scores = BTreeMap::new();
+    scores.insert("quality_v2".to_string(), Some(75.0));
+
+    let r = run_with_policy(
+        &e,
+        &bars,
+        &HashSet::new(),
+        &calendar(),
+        Some(0.5),
+        Some(10.),
+        "historical_rebuild",
+        "2026-01-06T00:00:00Z",
+        &EligibilityPolicy::TradeEligibleV2 { min_v2_score: Some(60.0), min_risk_ticks: 10.0 },
+        &scores,
+        Some("scored"),
+        &[],
+    );
+    // Under TradeEligibleV2, legacy score 2.2 is ignored, V2=75 and risk 20 ticks >= 10 ticks.
+    // It should NOT be filtered! It should enter trade and simulate execution.
+    assert_ne!(r.summary.state, "filtered");
+    assert_eq!(r.summary.state, "closed");
+    assert_eq!(r.summary.scores.get("quality_v2").copied().flatten(), Some(75.0));
+}
+
+#[test]
+fn test_p0_2_v2_low_risk_filtered_preserves_score_and_reason() {
+    let mut e = event();
+    e.entry_score = 4.0;
+    e.entry = 100.;
+    e.stop = 98.;
+    e.risk = 2.; // 2 / 0.5 = 4 ticks < min_risk_ticks(10)
+
+    let bars = [
+        bar("09:45", 95., 99., 94., 98.),
+        bar("09:50", 100., 105., 99., 104.),
+    ];
+
+    let mut scores = BTreeMap::new();
+    scores.insert("quality_v2".to_string(), Some(80.0));
+
+    let r = run_with_policy(
+        &e,
+        &bars,
+        &HashSet::new(),
+        &calendar(),
+        Some(0.5),
+        Some(10.),
+        "historical_rebuild",
+        "2026-01-06T00:00:00Z",
+        &EligibilityPolicy::TradeEligibleV2 { min_v2_score: Some(60.0), min_risk_ticks: 10.0 },
+        &scores,
+        Some("scored"),
+        &[],
+    );
+    // Under TradeEligibleV2, risk 4 ticks < 10 ticks => filtered_risk_too_small
+    assert_eq!(r.summary.state, "filtered");
+    assert_eq!(
+        r.summary.terminal_reason.as_deref(),
+        Some("风控未通过：风险距离不足最小跳数门槛")
+    );
+    // scores["quality_v2"] is preserved as 80.0
+    assert_eq!(r.summary.scores.get("quality_v2").copied().flatten(), Some(80.0));
+
+    // Check reason_codes
+    let last_node = r.nodes.last().unwrap();
+    let reason_codes: Vec<String> = last_node
+        .evidence
+        .get("reason_codes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    assert!(reason_codes.contains(&"filtered_risk_too_small".to_string()));
+    assert!(!reason_codes.contains(&"filtered_low_score".to_string()));
+}
+
+#[test]
+fn test_p0_4_empty_pattern_events_produces_identical_review_candidates() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../quality/fixtures/four-signals.json")).unwrap();
+    let case = &fixture["cases"][0];
+    let tick = case["tick"].as_f64().unwrap_or(1.0);
+    let bars: Vec<crate::analyze::model::Bar> = case["bars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| {
+            let ts = b[0].as_str().unwrap();
+            crate::analyze::model::Bar {
+                dt: crate::analyze::model::DT::from_bar_ts(ts).unwrap(),
+                rollover: b[7].as_bool().unwrap_or(false),
+                open: b[1].as_f64().unwrap(),
+                high: b[2].as_f64().unwrap(),
+                low: b[3].as_f64().unwrap(),
+                close: b[4].as_f64().unwrap(),
+                volume: b[5].as_f64().unwrap(),
+                hold: b[6].as_f64().unwrap(),
+            }
+        })
+        .collect();
+
+    // 1. With empty pattern_events table
+    let resolved_from_raw = store::resolve_events_for_replay("L0", Vec::new(), &bars, tick);
+    assert!(!resolved_from_raw.is_empty(), "Should extract candidate warnings from raw bars");
+
+    // 2. With populated pattern_events table (using the extracted candidates as existing)
+    let resolved_from_existing = store::resolve_events_for_replay("L0", resolved_from_raw.clone(), &bars, tick);
+
+    // 3. Both must produce identical counts and deterministic attributes
+    assert_eq!(resolved_from_raw.len(), resolved_from_existing.len());
+    for (a, b) in resolved_from_raw.iter().zip(resolved_from_existing.iter()) {
+        assert_eq!(a.id, b.id, "Event ID must be deterministically identical");
+        assert_eq!(a.symbol, b.symbol);
+        assert_eq!(a.direction, b.direction);
+        assert_eq!(a.warning_ts, b.warning_ts);
+        assert_eq!(a.entry, b.entry);
+        assert_eq!(a.stop, b.stop);
+        assert_eq!(a.target, b.target);
+        assert_eq!(a.risk, b.risk);
+    }
+}
+

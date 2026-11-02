@@ -155,7 +155,9 @@ pub fn reason_label(reason: &str) -> &'static str {
         "target_1r" => "达到1R止盈，固定一手全部退出",
         "no_follow" => "持有第5根15分钟K线时最大有利变动不足0.5R",
         "time_exit" => "达到60根15分钟K线持有期限",
-        "filtered" => "未满足原始入场分或最小风险门槛",
+        "filtered" => "未满足准入门槛（评分或最小风险门槛）",
+        "filtered_risk_too_small" => "风控未通过：风险距离不足最小跳数门槛",
+        "filtered_low_score" => "评分未达到准入门槛",
         "untriggered" => "等待12根15分钟K线后仍未触发",
         "invalidated" => "入场前结构止损失效",
         "unfilled" => "跳空或滑点超过追价上限",
@@ -165,6 +167,41 @@ pub fn reason_label(reason: &str) -> &'static str {
         "missing_calendar" => "交易日历未覆盖所需日期",
         "missing_parameters" => "缺少有效的合约参数",
         _ => "等待后续行情",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EligibilityPolicy {
+    /// 兼容旧版 5 分制门槛
+    Legacy {
+        min_score: f64,
+        min_risk_ticks: f64,
+    },
+    /// V2 交易资格策略：
+    /// 不使用旧 5 分制！
+    /// 如果 min_v2_score 为 Some(th)，则要求 quality_v2 >= th；
+    /// 风险距离约束：min_risk_ticks（默认 10.0 tick）。
+    TradeEligibleV2 {
+        min_v2_score: Option<f64>,
+        min_risk_ticks: f64,
+    },
+    /// 自动策略（默认）：如果有 quality_v2，采用 TradeEligibleV2；如果只有旧分且未计算 V2，采用 Legacy 保护
+    Auto {
+        min_v2_score: Option<f64>,
+        min_legacy_score: f64,
+        min_risk_ticks: f64,
+    },
+    /// 观察全部模式：无论风控或评分如何，都执行模拟（保留反事实走势并记录过滤原因）
+    ObserveAll,
+}
+
+impl Default for EligibilityPolicy {
+    fn default() -> Self {
+        EligibilityPolicy::Auto {
+            min_v2_score: None,
+            min_legacy_score: 2.5,
+            min_risk_ticks: 10.0,
+        }
     }
 }
 
@@ -180,6 +217,36 @@ pub fn run(
     recorded_at: &str,
 ) -> ReplayOutput {
     let scores = BTreeMap::from([("old".into(), Some(event.entry_score))]);
+    run_with_policy(
+        event,
+        raw,
+        rollovers,
+        calendar,
+        tick,
+        multiplier,
+        origin,
+        recorded_at,
+        &EligibilityPolicy::default(),
+        &scores,
+        None,
+        &[],
+    )
+}
+
+pub fn run_with_policy(
+    event: &pattern_events::Model,
+    raw: &[Kline],
+    rollovers: &HashSet<String>,
+    calendar: &CalendarInput,
+    tick: Option<f64>,
+    multiplier: Option<f64>,
+    origin: &str,
+    recorded_at: &str,
+    policy: &EligibilityPolicy,
+    scores: &BTreeMap<String, Option<f64>>,
+    score_status: Option<&str>,
+    score_explanations: &[String],
+) -> ReplayOutput {
     let mut out = ReplayOutput {
         summary: ReviewSummary {
             event_id: event.id,
@@ -190,7 +257,7 @@ pub fn run(
             level: event.level.clone(),
             grade: event.grade.clone(),
             warning_ts: event.warning_ts.clone(),
-            scores,
+            scores: scores.clone(),
             plan: ReviewPlan {
                 entry: event.entry.is_finite().then_some(event.entry),
                 stop: event.stop.is_finite().then_some(event.stop),
@@ -199,7 +266,8 @@ pub fn run(
                 rr: event.rr.is_finite().then_some(event.rr),
             },
             state: "pending".into(),
-            score_status: "unscored".into(),
+            score_status: score_status.unwrap_or("unscored").into(),
+            score_explanations: score_explanations.to_vec(),
             ..Default::default()
         },
         entry_price: None,
@@ -283,8 +351,76 @@ pub fn run(
         terminal = Some(("missing_parameters", event.warning_ts.clone()));
     }
     let tick = tick.unwrap_or(1.);
-    if terminal.is_none() && (event.entry_score < 2.5 || event.risk / tick + 1e-6 < 10.) {
-        terminal = Some(("filtered", event.warning_ts.clone()));
+    let risk_ticks = event.risk / tick;
+    let mut reason_codes: Vec<String> = Vec::new();
+    let mut filter_reason_label: Option<&'static str> = None;
+
+    if terminal.is_none() {
+        match policy {
+            EligibilityPolicy::Legacy { min_score, min_risk_ticks } => {
+                if event.entry_score < *min_score {
+                    reason_codes.push("filtered_low_score".into());
+                    filter_reason_label = Some("未满足原始入场分门槛");
+                }
+                if risk_ticks + 1e-6 < *min_risk_ticks {
+                    reason_codes.push("filtered_risk_too_small".into());
+                    filter_reason_label = Some("风控未通过：风险距离不足最小跳数门槛");
+                }
+                if !reason_codes.is_empty() {
+                    terminal = Some(("filtered", event.warning_ts.clone()));
+                }
+            }
+            EligibilityPolicy::TradeEligibleV2 { min_v2_score, min_risk_ticks } => {
+                if let Some(min_v2) = min_v2_score {
+                    let v2 = scores.get("quality_v2").copied().flatten();
+                    if let Some(v2_val) = v2 {
+                        if v2_val < *min_v2 {
+                            reason_codes.push("filtered_low_score".into());
+                            filter_reason_label = Some("未满足V2质量分门槛");
+                        }
+                    }
+                }
+                if risk_ticks + 1e-6 < *min_risk_ticks {
+                    reason_codes.push("filtered_risk_too_small".into());
+                    if filter_reason_label.is_none() {
+                        filter_reason_label = Some("风控未通过：风险距离不足最小跳数门槛");
+                    }
+                }
+                if !reason_codes.is_empty() {
+                    terminal = Some(("filtered", event.warning_ts.clone()));
+                }
+            }
+            EligibilityPolicy::Auto { min_v2_score, min_legacy_score, min_risk_ticks } => {
+                if scores.contains_key("quality_v2") {
+                    if let Some(min_v2) = min_v2_score {
+                        let v2 = scores.get("quality_v2").copied().flatten();
+                        if let Some(v2_val) = v2 {
+                            if v2_val < *min_v2 {
+                                reason_codes.push("filtered_low_score".into());
+                                filter_reason_label = Some("未满足V2质量分门槛");
+                            }
+                        }
+                    }
+                } else if event.entry_score < *min_legacy_score {
+                    reason_codes.push("filtered_low_score".into());
+                    filter_reason_label = Some("未满足原始入场分门槛");
+                }
+                if risk_ticks + 1e-6 < *min_risk_ticks {
+                    reason_codes.push("filtered_risk_too_small".into());
+                    if filter_reason_label.is_none() {
+                        filter_reason_label = Some("风控未通过：风险距离不足最小跳数门槛");
+                    }
+                }
+                if !reason_codes.is_empty() {
+                    terminal = Some(("filtered", event.warning_ts.clone()));
+                }
+            }
+            EligibilityPolicy::ObserveAll => {
+                if risk_ticks + 1e-6 < 10.0 {
+                    reason_codes.push("risk_suboptimal".into());
+                }
+            }
+        }
     }
     let warning = NaiveDateTime::parse_from_str(&event.warning_ts, FMT).ok();
     if warning.is_none() {
@@ -533,7 +669,12 @@ pub fn run(
             x => x,
         }
         .into();
-        out.summary.terminal_reason = Some(reason.into());
+        let comment = filter_reason_label.unwrap_or_else(|| reason_label(reason));
+        out.summary.terminal_reason = if reason == "filtered" && filter_reason_label.is_some() {
+            filter_reason_label.map(String::from)
+        } else {
+            Some(reason.into())
+        };
         out.summary.coverage.push(reason.into());
         node(
             &mut out.nodes,
@@ -542,11 +683,36 @@ pub fn run(
             &at,
             recorded_at,
             origin,
-            reason_label(reason).into(),
-            json!({"reason":reason,"wait_bars":out.summary.wait_bars,"bars_held":out.summary.bars_held,"exit":false,
-                "bar":raw.iter().find(|b|b.datetime==at),"planned_entry":event.entry,"stop":event.stop,
-                "min_entry_score":2.5,"actual_entry_score":event.entry_score,"min_risk_ticks":10,"planned_risk_ticks":event.risk/tick,
-                "pending_bars":outcome::PENDING_BARS,"max_entry_overshoot_points":(event.risk*0.2).max(2.*tick)}),
+            comment.into(),
+            json!({
+                "reason": reason,
+                "filter_reason": comment,
+                "reason_codes": reason_codes,
+                "policy": match policy {
+                    EligibilityPolicy::Legacy { .. } => "legacy",
+                    EligibilityPolicy::TradeEligibleV2 { .. } => "trade_eligible_v2",
+                    EligibilityPolicy::Auto { .. } => "auto",
+                    EligibilityPolicy::ObserveAll => "observe_all",
+                },
+                "wait_bars": out.summary.wait_bars,
+                "bars_held": out.summary.bars_held,
+                "exit": false,
+                "bar": raw.iter().find(|b| b.datetime == at),
+                "planned_entry": event.entry,
+                "stop": event.stop,
+                "min_entry_score": 2.5,
+                "actual_entry_score": event.entry_score,
+                "quality_v2": scores.get("quality_v2").copied().flatten(),
+                "min_risk_ticks": match policy {
+                    EligibilityPolicy::Legacy { min_risk_ticks, .. } => *min_risk_ticks,
+                    EligibilityPolicy::TradeEligibleV2 { min_risk_ticks, .. } => *min_risk_ticks,
+                    EligibilityPolicy::Auto { min_risk_ticks, .. } => *min_risk_ticks,
+                    EligibilityPolicy::ObserveAll => 0.0,
+                },
+                "planned_risk_ticks": risk_ticks,
+                "pending_bars": outcome::PENDING_BARS,
+                "max_entry_overshoot_points": (event.risk * 0.2).max(2. * tick),
+            }),
         );
     } else if out.entry_price.is_some() && out.summary.state != "closed" {
         out.summary.state = "open".into();

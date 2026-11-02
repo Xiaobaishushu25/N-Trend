@@ -33,6 +33,8 @@ const plannedTarget = computed(() => effectiveSummary.value?.plan?.reference_tar
 const fillPrice = computed(() => effectiveSummary.value?.entry_ts ? matchedDetail.value?.entry_price ?? effectiveSummary.value.entry_price : null)
 const exitPriceVal = computed(() => effectiveSummary.value?.exit_ts ? matchedDetail.value?.exit_price ?? effectiveSummary.value.exit_price : null)
 const netRVal = computed(() => effectiveSummary.value?.net_r)
+const terminalNode = computed(() => matchedDetail.value?.lifecycle.find(n => n.stage === 'terminal'))
+const terminalEvidence = computed(() => (terminalNode.value?.evidence ?? {}) as Record<string, any>)
 const riskPoints = computed(() => effectiveSummary.value?.risk_points)
 const costStatusExplanation = computed(() => costExplanation(matchedDetail.value))
 const slippageLabel = computed(() => {
@@ -73,7 +75,32 @@ function diagnosticText(v: number | null) { return v == null ? '未知' : Number
                   <div class="node-field"><span class="field-lbl">原始参考目标</span><span class="field-val">{{ fmtPrice(plannedTarget) }}</span></div>
                 </div>
               </div>
-              <div class="timeline-node node-open">
+              <div v-if="effectiveSummary?.state === 'filtered'" class="timeline-node node-filtered">
+                <div class="node-title"><span class="node-badge" style="background: #eab308; color: #fff;">2. 准入与风控决策</span><span class="node-ts">{{ terminalNode?.occurred_at || effectiveSummary?.warning_ts || '—' }}</span></div>
+                <div class="node-content">
+                  <div class="node-field"><span class="field-lbl">准入判定</span><span class="field-val" style="color: #ca8a04; font-weight: 600;">未通过（已过滤）</span></div>
+                  <div class="node-field"><span class="field-lbl">决策原因</span><span class="field-val">{{ terminalEvidence.filter_reason || terminalNode?.comment || '未满足准入门槛或风控限制' }}</span></div>
+                  <div class="node-field"><span class="field-lbl">v2 综合分</span><span class="field-val">{{ qualityText(publishedScore(effectiveSummary, 'quality_v2')) }}</span></div>
+                  <div class="node-field"><span class="field-lbl">计划风险跳数</span><span class="field-val">{{ terminalEvidence.planned_risk_ticks != null ? `${Number(terminalEvidence.planned_risk_ticks).toFixed(1)} tick` : '—' }} <template v-if="terminalEvidence.min_risk_ticks != null">（门槛 {{ terminalEvidence.min_risk_ticks }} tick）</template></span></div>
+                  <div class="node-field"><span class="field-lbl">模拟成交价</span><span class="field-val">—</span></div>
+                </div>
+              </div>
+              <div v-else-if="effectiveSummary?.state === 'expired'" class="timeline-node node-expired">
+                <div class="node-title"><span class="node-badge" style="background: #64748b; color: #fff;">2. 等待触发</span><span class="node-ts">{{ terminalNode?.occurred_at || effectiveSummary?.warning_ts || '—' }}</span></div>
+                <div class="node-content">
+                  <div class="node-field"><span class="field-lbl">等待状态</span><span class="field-val">已到期未触发</span></div>
+                  <div class="node-field"><span class="field-lbl">到期原因</span><span class="field-val">{{ terminalNode?.comment || '等待12根15分钟K线未触发或结构失效' }}</span></div>
+                  <div class="node-field"><span class="field-lbl">模拟成交价</span><span class="field-val">—</span></div>
+                </div>
+              </div>
+              <div v-else-if="effectiveSummary?.state === 'unfilled'" class="timeline-node node-unfilled">
+                <div class="node-title"><span class="node-badge" style="background: #f97316; color: #fff;">2. 触价未成交</span><span class="node-ts">{{ terminalNode?.occurred_at || effectiveSummary?.warning_ts || '—' }}</span></div>
+                <div class="node-content">
+                  <div class="node-field"><span class="field-lbl">拒单原因</span><span class="field-val">{{ terminalNode?.comment || '跳空或滑点超过追价上限' }}</span></div>
+                  <div class="node-field"><span class="field-lbl">模拟成交价</span><span class="field-val">—</span></div>
+                </div>
+              </div>
+              <div v-else class="timeline-node node-open">
                 <div class="node-title"><span class="node-badge">2. 模拟入场</span><span class="node-ts">{{ effectiveSummary?.entry_ts || '未成交' }}</span></div>
                 <div class="node-content">
                   <div class="node-field"><span class="field-lbl">模拟成交价</span><span class="field-val">{{ fmtPrice(fillPrice) }}</span></div>
@@ -83,7 +110,16 @@ function diagnosticText(v: number | null) { return v == null ? '未知' : Number
                   <div class="node-field"><span class="field-lbl">本次固定1R目标</span><span class="field-val">{{ fmtPrice(nodeNumber('holding', 'target_1r')) }}</span></div>
                 </div>
               </div>
-              <div class="timeline-node node-exit">
+
+              <div v-if="effectiveSummary?.state === 'filtered' || effectiveSummary?.state === 'expired' || effectiveSummary?.state === 'unfilled'" class="timeline-node node-terminal-end">
+                <div class="node-title"><span class="node-badge" style="background: #64748b; color: #fff;">3. 信号终态</span><span class="node-ts">{{ terminalNode?.occurred_at || effectiveSummary?.warning_ts || '—' }}</span></div>
+                <div class="node-content">
+                  <div class="node-field"><span class="field-lbl">终态结果</span><span class="field-val">{{ reviewState(effectiveSummary).text }}</span></div>
+                  <div class="node-field"><span class="field-lbl">终态说明</span><span class="field-val">{{ terminalNode?.comment || '信号已终止，不进入模拟持仓与平仓' }}</span></div>
+                  <div class="node-field"><span class="field-lbl">模拟平仓价</span><span class="field-val">—</span></div>
+                </div>
+              </div>
+              <div v-else class="timeline-node node-exit">
                 <div class="node-title"><span class="node-badge">3. 模拟退出</span><span class="node-ts">{{ effectiveSummary?.exit_ts || '未平仓' }}</span></div>
                 <div class="node-content">
                   <div class="node-field"><span class="field-lbl">模拟平仓价</span><span class="field-val">{{ fmtPrice(exitPriceVal) }}</span></div>

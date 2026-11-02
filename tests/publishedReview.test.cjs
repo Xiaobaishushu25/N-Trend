@@ -191,3 +191,37 @@ test('chart opens matching immutable details and replaces reused-window context 
   pools[0].resolve(response([row(1)], { snapshot_id: 'a' })); requests[0].resolve(detail(row(1))); await a
   assert.equal(h.currentSnapshotId.value, 'b'); assert.equal(h.currentEventId.value, 2); assert.equal(h.activeDetail.value.summary.event_id, 2); assert.equal(h.signalList.value[0].event_id, 2)
 })
+test('chart automatically recovers from expired snapshots on pagination by requesting a new snapshot at requested offset', async () => {
+  const requests = [], pools = [], queries = []
+  const api = {
+    reviewDetail: (id, version) => { const p = deferred(); requests.push({ id, version, ...p }); return p.promise },
+    reviewItems: (id, req) => { const p = deferred(); pools.push({ id, req, ...p }); return p.promise },
+    reviewQuery: q => { const p = deferred(); queries.push({ q, ...p }); return p.promise }
+  }
+  const h = sfc('src/views/ReviewChartView.vue', {}, api, ['applyContext', 'changePoolPage', 'signalList', 'currentSnapshotId', 'cursor', 'total', 'poolError'])
+  const a = h.applyContext({ symbol: 'SM0', eventId: 1, version: 'v1', snapshotId: 'snap-old', query: { page_size: 120 }, cursor: 0 })
+  pools[0].resolve(response([row(1)], { snapshot_id: 'snap-old', total: 200 })); requests[0].resolve(detail(row(1))); await a
+  assert.equal(h.currentSnapshotId.value, 'snap-old')
+
+  const pageNav = h.changePoolPage(120); await tick()
+  assert.equal(pools[1].id, 'snap-old'); assert.equal(pools[1].req.cursor, 120)
+  pools[1].reject(new Error('SNAPSHOT_EXPIRED: query snapshot expired or unavailable'))
+  await tick()
+
+  assert.equal(queries.length, 1)
+  queries[0].resolve(response([row(1)], { snapshot_id: 'snap-fresh', total: 200 }))
+  await tick()
+
+  assert.equal(pools.length, 3)
+  assert.equal(pools[2].id, 'snap-fresh'); assert.equal(pools[2].req.cursor, 120)
+  pools[2].resolve(response([row(121)], { snapshot_id: 'snap-fresh', total: 200 }))
+  await tick()
+  if (requests[1]) requests[1].resolve(detail(row(121)))
+  await pageNav
+
+  assert.equal(h.currentSnapshotId.value, 'snap-fresh')
+  assert.equal(h.signalList.value[0].event_id, 121)
+  assert.equal(h.cursor.value, 120)
+  assert.equal(h.poolError.value, '')
+})
+

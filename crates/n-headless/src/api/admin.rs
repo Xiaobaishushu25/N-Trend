@@ -141,12 +141,20 @@ pub async fn download_database_backup(
             Ok((headers, Body::from(bytes)))
         }
         Err(e) => {
+            let msg = e.to_string();
+            let (status, code) = if msg.contains("正在执行") {
+                tracing::warn!("⚠️ [备份下载] 拒绝并发快照请求: {msg}");
+                (StatusCode::CONFLICT, "BACKUP_BUSY")
+            } else {
+                tracing::error!("❌ [备份下载] 生成一致性快照失败: {msg}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+            };
             let err = ApiErrorResponse::new(
-                "INTERNAL_ERROR",
-                format!("生成一致性快照备份失败: {e}"),
+                code,
+                format!("生成一致性快照备份失败: {msg}"),
                 "",
             );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
+            Err((status, Json(err)))
         }
     }
 }

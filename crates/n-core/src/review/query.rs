@@ -275,7 +275,7 @@ impl ReviewEngine {
         let key = serde_json::to_string(&q)?;
         let cached = {
             let mut snapshots = self.snapshots.lock().await;
-            snapshots.retain(|_, s| s.created.elapsed().as_secs() < 600);
+            snapshots.retain(|_, s| s.created.elapsed().as_secs() < super::SNAPSHOT_TTL_SECS);
             snapshots
                 .iter()
                 .find(|(_, s)| s.owner == owner && s.key == key && s.revision == rev)
@@ -328,7 +328,7 @@ impl ReviewEngine {
             Ok(Snapshot {
                 owner,
                 created: Instant::now(),
-                expires_at: (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+                expires_at: (Utc::now() + chrono::Duration::seconds(super::SNAPSHOT_TTL_SECS as i64)).to_rfc3339(),
                 revision: rev,
                 key,
                 rows,

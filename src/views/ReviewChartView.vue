@@ -98,15 +98,30 @@ async function loadSignalPool(snapshotId = '', offset = cursor.value) {
   try {
     let snapshot = snapshotId
     let page
-    if (snapshot) page = await api.reviewItems(snapshot, { cursor: offset, limit: pageSize.value })
-    else {
+    if (snapshot) {
+      try {
+        page = await api.reviewItems(snapshot, { cursor: offset, limit: pageSize.value })
+      } catch (err: any) {
+        const msg = String(err?.message || err)
+        if (msg.includes('SNAPSHOT_EXPIRED') || msg.includes('expired') || msg.includes('410')) {
+          console.warn('复盘快照已失效，正在按原筛选条件自动续期重建快照...')
+          snapshot = ''
+        } else {
+          throw err
+        }
+      }
+    }
+    if (!snapshot) {
       const result = await api.reviewQuery(query.value)
       if (ticket !== poolRequest) return
       validatePublishedPage(result)
       snapshot = result.snapshot_id
+      if (offset >= result.total) {
+        offset = Math.max(0, Math.floor(Math.max(0, result.total - 1) / pageSize.value) * pageSize.value)
+      }
       page = offset ? await api.reviewItems(snapshot, { cursor: offset, limit: pageSize.value }) : result
     }
-    if (ticket !== poolRequest) return
+    if (ticket !== poolRequest || !page) return
     validatePublishedPage(page)
     if (page.snapshot_id !== snapshot) throw new Error('复盘快照不一致')
     signalList.value = page.items; total.value = page.total; cursor.value = offset; currentSnapshotId.value = snapshot

@@ -1360,6 +1360,13 @@ pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()
         .exec(db)
         .await
         .context("删除信号开仓记录失败")?;
+    let _ = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM signal_snapshots WHERE event_id = ?",
+            vec![id.into()],
+        ))
+        .await;
     let res = pattern_events::Entity::delete_by_id(id)
         .exec(db)
         .await

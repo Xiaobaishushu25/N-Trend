@@ -5,7 +5,7 @@ use chrono::{FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::remote_api::RemoteApiClient;
 
@@ -23,6 +23,7 @@ pub struct BackupScheduler {
     api: Arc<RemoteApiClient>,
     backup_dir: PathBuf,
     last_backup_date: RwLock<Option<String>>,
+    is_running: Mutex<()>,
 }
 
 impl BackupScheduler {
@@ -35,6 +36,7 @@ impl BackupScheduler {
             api,
             backup_dir,
             last_backup_date: RwLock::new(None),
+            is_running: Mutex::new(()),
         });
 
         // Initialize last_backup_date by inspecting existing backup files
@@ -101,7 +103,29 @@ impl BackupScheduler {
     }
 
     pub async fn trigger_backup_now(&self) -> Result<String, String> {
+        let _guard = match self.is_running.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!("⚠️ 数据库备份任务已在执行中，忽略重复触发");
+                return Err("数据库备份任务已在执行中，请勿重复触发".to_string());
+            }
+        };
+
         tracing::info!("📦 开始执行一致性数据库备份...");
+        match self.do_backup_now().await {
+            Ok(filename) => {
+                tracing::info!("✅ 备份成功已保存: {}", filename);
+                let _ = self.app.emit("backup-completed", &filename);
+                Ok(filename)
+            }
+            Err(e) => {
+                tracing::error!("❌ 数据库备份失败: {e}");
+                Err(e)
+            }
+        }
+    }
+
+    async fn do_backup_now(&self) -> Result<String, String> {
         let (bytes, expected_sha) = self.api.download_database_backup().await.map_err(|e| e.message)?;
 
         // Verify SHA-256
@@ -135,8 +159,7 @@ impl BackupScheduler {
         // Prune older backups
         self.prune_old_backups();
 
-        tracing::info!("✅ 备份成功已保存: {} (SHA256: {})", target_path.display(), actual_sha);
-        let _ = self.app.emit("backup-completed", &filename);
+        tracing::info!("📁 备份文件已持久化: {} (SHA256: {})", target_path.display(), actual_sha);
         Ok(filename)
     }
 
@@ -179,8 +202,8 @@ impl BackupScheduler {
                         tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
                     }
                     Err(e) => {
-                        tracing::warn!("⚠️ 自动数据库备份未完成: {e}");
                         let delay = retry_delays[retry_idx];
+                        tracing::warn!("⚠️ 自动数据库备份未完成 ({e})，将在 {delay} 秒后重试");
                         if retry_idx + 1 < retry_delays.len() {
                             retry_idx += 1;
                         }

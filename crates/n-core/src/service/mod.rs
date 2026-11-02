@@ -1099,6 +1099,10 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
         e.state = result.status;
         e.outcome = None;
         e.r_multiple = None;
+        if matches!(e.state.as_str(), "filtered" | "unfilled" | "invalidated" | "expired") {
+            e.trigger_ts = None;
+            e.trigger_price = None;
+        }
     }
     e.updated_at = now_ts();
     serde_json::to_string(e).unwrap_or_default() != before
@@ -1573,7 +1577,7 @@ impl Services {
         let mut notified = self.entry_notified.write().await;
         let mut hits = Vec::new();
         for row in rows {
-            if row.state != "pending" || row.trigger_ts.is_some() || row.entry_score < min_score {
+            if row.state != "pending" || row.trigger_ts.is_some() {
                 continue;
             }
             let Some(latest) = by_code.get(row.symbol.as_str()).copied() else {
@@ -1586,6 +1590,64 @@ impl Services {
             if !crossed {
                 continue;
             }
+
+            let bars = match self.bars_for(&row.symbol, "15m").await {
+                Ok(bars) => Some(bars),
+                Err(e) => {
+                    tracing::warn!("实时触发读取15m K线失败 {} {}: {e}", row.symbol, row.id);
+                    None
+                }
+            };
+
+            let now = now_ts();
+
+            let is_stale_or_expired = if let Some(bars) = bars.as_deref() {
+                if let Some(w) = bars.iter().position(|b| bar_ts(b) == row.warning_ts) {
+                    if bars.len() > w + outcome::PENDING_BARS {
+                        true
+                    } else {
+                        let scan_end = (w + 1 + outcome::PENDING_BARS).min(bars.len());
+                        let mut invalid = false;
+                        for j in w + 1..scan_end {
+                            if bars[j].rollover {
+                                invalid = true;
+                                break;
+                            }
+                            let stop_hit = match event_dir(&row) {
+                                Dir::Up => bars[j].low <= row.stop,
+                                Dir::Down => bars[j].high >= row.stop,
+                            };
+                            if stop_hit {
+                                invalid = true;
+                                break;
+                            }
+                        }
+                        invalid
+                    }
+                } else {
+                    true
+                }
+            } else {
+                if let Ok(w_dt) = chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M:%S")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M"))
+                {
+                    let now_dt = chrono::Utc::now().naive_utc() + chrono::Duration::hours(8);
+                    (now_dt - w_dt).num_hours() > 48
+                } else {
+                    false
+                }
+            };
+
+            if is_stale_or_expired {
+                let mut expired_ev = row.clone();
+                expired_ev.state = "expired".to_string();
+                expired_ev.outcome = Some("no_trigger".to_string());
+                expired_ev.exit_reason = Some("no_trigger".to_string());
+                expired_ev.updated_at = now;
+                let _ = repo::update_pattern_event(&self.db, expired_ev).await;
+                continue;
+            }
+
             let name = name_by_code.get(&row.symbol).cloned().unwrap_or_default();
             let key = (
                 row.symbol.clone(),
@@ -1594,50 +1656,48 @@ impl Services {
                 row.entry.to_bits(),
             );
             if notified.insert(key) {
-                let now = now_ts();
                 let mut next = row.clone();
                 next.state = "triggered".to_string();
                 next.trigger_ts = Some(now.clone());
                 next.trigger_price = Some(row.entry);
                 next.updated_at = now;
-                // The quote path can be the first path that confirms a
-                // trigger.  Advance the event against the latest closed 15m
-                // bars so trigger features are frozen consistently with the
-                // scan path, then score it immediately when a trigger bar is
-                // available.  If the current 15m bar is not closed yet, the
-                // next closed-bar scan retries the missing prediction.
-                let bars = match self.bars_for(&row.symbol, "15m").await {
-                    Ok(bars) => Some(bars),
-                    Err(e) => {
-                        tracing::warn!("实时触发读取15m K线失败 {} {}: {e}", row.symbol, row.id);
-                        None
-                    }
-                };
+
                 if let Some(bars) = bars.as_deref() {
                     let _ = advance_event_model(&mut next, bars);
                 }
+                if next.state == "filtered" || next.state == "unfilled" {
+                    next.trigger_ts = None;
+                    next.trigger_price = None;
+                }
                 next.updated_at = now_ts();
-                if let Err(e) = repo::update_pattern_event(&self.db, next.clone()).await {
-                    tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
-                } else if let Some(bars) = bars.as_deref() {
-                    if next.trigger_bar_ts.is_some() {
-                        if let Err(e) =
-                            crate::v2::prediction::predict_event(&self.db, &next, bars).await
-                        {
-                            tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {e:#}");
+                match repo::update_pattern_event(&self.db, next.clone()).await {
+                    Ok(_) => {
+                        if let Some(bars) = bars.as_deref() {
+                            if next.trigger_bar_ts.is_some() {
+                                if let Err(e) =
+                                    crate::v2::prediction::predict_event(&self.db, &next, bars).await
+                                {
+                                    tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {e:#}");
+                                }
+                            }
+                        }
+                        if next.state == "triggered" && row.entry_score >= min_score {
+                            hits.push(EntryTriggerHit {
+                                event_id: row.id,
+                                symbol: row.symbol,
+                                name,
+                                direction: row.direction,
+                                level: row.level,
+                                grade: row.grade,
+                                entry: row.entry,
+                                latest,
+                            });
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
+                    }
                 }
-                hits.push(EntryTriggerHit {
-                    event_id: row.id,
-                    symbol: row.symbol,
-                    name,
-                    direction: row.direction,
-                    level: row.level,
-                    grade: row.grade,
-                    entry: row.entry,
-                    latest,
-                });
             }
         }
         Ok(hits)
@@ -6002,6 +6062,63 @@ mod tests {
         let (interval_ms, budget) = coordinator_limits_from_config(&cfg);
         assert_eq!(interval_ms, 200); // min(400, 200)
         assert_eq!(budget, 240); // 60 + 120 + 60 = 240
+    }
+
+    #[tokio::test]
+    async fn stale_pending_signal_expires_and_never_triggers() {
+        use sea_orm::ConnectionTrait;
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        config.notify.in_app_entry_trigger = true;
+        let services = Services::new(
+            db.clone(),
+            config,
+            std::env::temp_dir().join(format!("test-stale-pending-{}.json", std::process::id())),
+        )
+        .await
+        .unwrap();
+        services.seed_symbols("RB0").await.unwrap();
+
+        let sixty_days_ago = (chrono::Utc::now().naive_utc() + chrono::Duration::hours(8) - chrono::Duration::days(60))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        db.execute_unprepared(&format!(
+            "INSERT INTO pattern_events (
+                id, symbol, direction, grade, level, s0_ts, s0_price, s1_ts, s1_price,
+                s2_ts, s2_price, a_move, b_move, a_bars, b_bars, retracement,
+                warning_ts, detected_at, warning_kind, entry_score, entry_score_dims,
+                entry, stop, target, risk, rr, state, last_advance_ts,
+                hold_score_history, created_at, updated_at
+             ) VALUES (
+                201, 'RB0', 'up', 'A级', 'fine', '2025-01-01 09:15:00', 3000,
+                '2025-01-01 09:30:00', 3050, '2025-01-01 09:45:00', 3020,
+                50, 30, 1, 1, 0.6, '{sixty_days_ago}', '{sixty_days_ago}',
+                'wick', 4.0, '{{}}', 3100, 3020, 3200, 80, 1.25, 'pending',
+                '{sixty_days_ago}', '[]', '{sixty_days_ago}', '{sixty_days_ago}'
+             )"
+        ))
+        .await
+        .unwrap();
+
+        let snapshots = vec![MarketSnapshot {
+            code: "RB0".into(),
+            latest: Some(3150.0),
+            change_pct: Some(1.0),
+        }];
+
+        let hits = services.entry_trigger_hits(&snapshots).await.unwrap();
+        assert!(hits.is_empty(), "过期pending信号不得产生trigger hits");
+
+        let updated = repo::pattern_event_by_id(&db, 201).await.unwrap().unwrap();
+        assert_eq!(updated.state, "expired");
+        assert_eq!(updated.outcome.as_deref(), Some("no_trigger"));
+        assert_eq!(updated.exit_reason.as_deref(), Some("no_trigger"));
+        assert!(updated.trigger_ts.is_none());
+        assert!(updated.trigger_price.is_none());
     }
 }
 

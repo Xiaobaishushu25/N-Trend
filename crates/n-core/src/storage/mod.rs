@@ -1,10 +1,13 @@
 //! SQLite connection and schema migration.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use sea_orm::{
-    ConnectionTrait, Database as SeaDatabase, DatabaseConnection, DbBackend, Schema, Statement,
+    ConnectionTrait, DatabaseConnection, DbBackend, Schema, Statement,
+    SqlxSqliteConnector,
 };
 use tracing::info;
 
@@ -12,24 +15,29 @@ pub mod entities;
 pub mod repo;
 
 pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
-    let url = if path.to_string_lossy() == ":memory:" {
-        "sqlite::memory:".to_string()
+    let is_memory = path.to_string_lossy() == ":memory:";
+    let connect_opts = if is_memory {
+        sea_orm::sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
+            .map_err(|e| anyhow!("SQLite 连接配置解析失败: {e}"))?
     } else {
         let path_str = path.to_string_lossy().replace('\\', "/");
-        format!("sqlite://{path_str}?mode=rwc")
-    };
-    // WAL allows a chart reader to observe the last committed snapshot while a
-    // candle update is being committed.
-    let mut options = sea_orm::ConnectOptions::new(url.clone());
-    options.max_connections(if path.to_string_lossy() == ":memory:" { 1 } else { 8 });
-    options.acquire_timeout(std::time::Duration::from_secs(30));
-    let db = SeaDatabase::connect(options)
+        sea_orm::sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{path_str}"))
+            .map_err(|e| anyhow!("SQLite 连接配置解析失败: {e}"))?
+            .create_if_missing(true)
+            .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Normal)
+    }
+    .busy_timeout(Duration::from_millis(15000))
+    .foreign_keys(true);
+
+    let pool = sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(if is_memory { 1 } else { 8 })
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(connect_opts)
         .await
-        .map_err(|e| anyhow!("连接 SQLite 失败 ({}): {e}", url))?;
-    let _ = db.execute_unprepared("PRAGMA journal_mode = WAL;").await;
-    let _ = db.execute_unprepared("PRAGMA synchronous = NORMAL;").await;
-    let _ = db.execute_unprepared("PRAGMA busy_timeout = 15000;").await;
-    let _ = db.execute_unprepared("PRAGMA foreign_keys = ON;").await;
+        .map_err(|e| anyhow!("连接 SQLite 失败 ({:?}): {e}", path))?;
+
+    let db = SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
     migrate_with_path(&db, Some(path)).await?;
     Ok(db)
 }
@@ -52,6 +60,33 @@ mod pool_tests {
         assert_eq!(row.try_get::<i64>("","n").unwrap(),1);
         db.close().await.unwrap();
         let _=std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn pragmas_are_set_on_pool_connections() {
+        let path = std::env::temp_dir().join(format!("ntrend-pragma-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = connect(&path).await.unwrap();
+
+        let conn1 = db.begin().await.unwrap();
+        let row1 = conn1.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA busy_timeout;".to_string())).await.unwrap().unwrap();
+        let timeout1: i64 = row1.try_get("", "timeout").unwrap();
+        let row1_fk = conn1.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA foreign_keys;".to_string())).await.unwrap().unwrap();
+        let fk1: i64 = row1_fk.try_get("", "foreign_keys").unwrap();
+
+        let conn2 = db.begin().await.unwrap();
+        let row2 = conn2.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA busy_timeout;".to_string())).await.unwrap().unwrap();
+        let timeout2: i64 = row2.try_get("", "timeout").unwrap();
+        let row2_fk = conn2.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA foreign_keys;".to_string())).await.unwrap().unwrap();
+        let fk2: i64 = row2_fk.try_get("", "foreign_keys").unwrap();
+
+        assert_eq!(timeout1, 15000);
+        assert_eq!(timeout2, 15000);
+        assert_eq!(fk1, 1);
+        assert_eq!(fk2, 1);
+        conn1.rollback().await.unwrap();
+        conn2.rollback().await.unwrap();
+        db.close().await.unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -224,6 +259,11 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     create_v2_tables(db).await?;
     crate::quality::store::ensure(db).await?;
     crate::review::store::ensure(db).await?;
+    db.execute_unprepared(
+        "DELETE FROM signal_snapshots WHERE event_id NOT IN (SELECT id FROM pattern_events)",
+    )
+    .await
+    .ok();
     info!("数据库表结构已就绪");
     Ok(())
 }
@@ -544,6 +584,7 @@ async fn ensure_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::Database as SeaDatabase;
 
     #[tokio::test]
     async fn migrate_is_idempotent_and_has_pattern_events() {
@@ -701,6 +742,95 @@ mod tests {
 
         migrate_with_path(&db, Some(&db_path)).await.unwrap();
         migrate_with_path(&db, Some(&db_path)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_pattern_event_removes_signal_snapshots() {
+        let db = SeaDatabase::connect("sqlite::memory:").await.unwrap();
+        migrate(&db).await.unwrap();
+
+        // Insert a pattern event
+        db.execute_unprepared(
+            "INSERT INTO pattern_events (
+                id, symbol, direction, grade, level, s0_ts, s0_price, s1_ts, s1_price,
+                s2_ts, s2_price, a_move, b_move, a_bars, b_bars, retracement,
+                warning_ts, detected_at, warning_kind, entry_score, entry_score_dims,
+                entry, stop, target, risk, rr, state, last_advance_ts,
+                hold_score_history, created_at, updated_at
+             ) VALUES (
+                101, 'RB0', 'up', 'A级', 'fine', '2026-08-14 09:15:00', 4128,
+                '2026-08-14 09:30:00', 4150, '2026-08-14 09:45:00', 4137,
+                22, 13, 1, 1, 0.59, '2026-08-14 11:30:00', '2026-08-14 11:30:00',
+                'wick', 3.6, '{}', 4216, 4152, 4298, 64, 1.28, 'pending',
+                '2026-08-14 11:30:00', '[]', '2026-08-15 16:09:10', '2026-08-15 16:09:10'
+             )",
+        )
+        .await
+        .unwrap();
+
+        // Insert a corresponding signal_snapshot
+        db.execute_unprepared(
+            "INSERT INTO signal_snapshots (event_id, generation, origin, decision_at, feature_hash, features_json, created_at)
+             VALUES (101, 'g1', 'live', '2026-08-14 11:30:00', 'h1', '{}', '2026-08-14 11:30:00')",
+        )
+        .await
+        .unwrap();
+
+        let count_before = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) as cnt FROM signal_snapshots WHERE event_id = 101",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "cnt")
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // Call delete_pattern_event
+        repo::delete_pattern_event(&db, 101).await.unwrap();
+
+        let count_after = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) as cnt FROM signal_snapshots WHERE event_id = 101",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "cnt")
+            .unwrap();
+        assert_eq!(count_after, 0, "signal_snapshots 应已被级联删除");
+    }
+
+    #[tokio::test]
+    async fn migration_cleans_orphan_signal_snapshots() {
+        let db = SeaDatabase::connect("sqlite::memory:").await.unwrap();
+        migrate(&db).await.unwrap();
+
+        // Insert an orphan snapshot (no matching pattern_events)
+        db.execute_unprepared(
+            "INSERT INTO signal_snapshots (event_id, generation, origin, decision_at, feature_hash, features_json, created_at)
+             VALUES (9999, 'g1', 'live', '2026-08-14 11:30:00', 'h1', '{}', '2026-08-14 11:30:00')",
+        )
+        .await
+        .unwrap();
+
+        // Run migrate
+        migrate(&db).await.unwrap();
+
+        let count = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT count(*) as cnt FROM signal_snapshots WHERE event_id = 9999",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "cnt")
+            .unwrap();
+        assert_eq!(count, 0, "孤立的 signal_snapshots 应在迁移时被清理");
     }
 }
 

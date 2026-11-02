@@ -58,6 +58,7 @@ mod version_tests {
 
 pub struct RemoteApiClient {
     client: Client,
+    download_client: Client,
     credentials: Arc<CredentialStore>,
 }
 
@@ -75,8 +76,20 @@ impl RemoteApiClient {
             .pool_max_idle_per_host(10)
             .build()
             .unwrap_or_default();
+
+        let download_client = Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(600))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
         Self {
             client,
+            download_client,
             credentials,
         }
     }
@@ -92,9 +105,10 @@ impl RemoteApiClient {
         format!("{base}/api/{}/{path}", n_protocol::API_VERSION)
     }
 
-    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+    fn build_request(&self, client: &Client, method: Method, path: &str) -> RequestBuilder {
         let full_url = self.url(path);
-        let mut builder = self.client.request(method, &full_url)
+        let mut builder = client
+            .request(method, &full_url)
             .header(n_protocol::version::RELEASE_HEADER, n_protocol::CURRENT_SERVER_VERSION)
             .header(n_protocol::version::API_HEADER, n_protocol::API_VERSION);
 
@@ -109,6 +123,14 @@ impl RemoteApiClient {
         }
 
         builder
+    }
+
+    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+        self.build_request(&self.client, method, path)
+    }
+
+    fn download_request(&self, method: Method, path: &str) -> RequestBuilder {
+        self.build_request(&self.download_client, method, path)
     }
 
     async fn execute<T: DeserializeOwned>(
@@ -1112,7 +1134,7 @@ impl RemoteApiClient {
 
     pub async fn download_database_backup(&self) -> Result<(Bytes, String), ApiErrorResponse> {
         let resp = self
-            .request(Method::GET, "admin/database-backup")
+            .download_request(Method::GET, "admin/database-backup")
             .send()
             .await
             .map_err(|e| {
@@ -1121,11 +1143,12 @@ impl RemoteApiClient {
 
         require_current_server(&resp)?;
         if !resp.status().is_success() {
-            return Err(ApiErrorResponse::new(
-                "BACKUP_ERROR",
-                format!("备份接口返回错误: {}", resp.status()),
-                "",
-            ));
+            let status = resp.status();
+            let err_body = resp.json::<ApiErrorResponse>().await.ok();
+            let msg = err_body
+                .map(|b| b.message)
+                .unwrap_or_else(|| format!("备份接口返回错误: {status}"));
+            return Err(ApiErrorResponse::new("BACKUP_ERROR", msg, ""));
         }
 
         let sha256 = resp

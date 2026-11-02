@@ -47,6 +47,8 @@ struct Snapshot {
     bytes: usize,
 }
 
+pub const SNAPSHOT_TTL_SECS: u64 = 3600;
+
 pub struct ReviewEngine {
     pub(crate) db: DatabaseConnection,
     pub(crate) worker: Mutex<()>,
@@ -64,7 +66,7 @@ impl ReviewEngine {
     }
     async fn snapshot(&self, owner: &str, id: &str) -> Result<Arc<Snapshot>> {
         let mut snapshots = self.snapshots.lock().await;
-        snapshots.retain(|_, s| s.created.elapsed().as_secs() < 600);
+        snapshots.retain(|_, s| s.created.elapsed().as_secs() < SNAPSHOT_TTL_SECS);
         snapshots
             .get(id)
             .filter(|s| s.owner == owner)
