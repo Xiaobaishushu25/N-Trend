@@ -24,11 +24,12 @@ import {
   useReviewStore,
   type StatsScopeKey,
 } from '../stores/review'
+import { AlertTriangle, ChevronDown, ChevronUp } from '@vicons/tabler'
 import { notify } from '../utils/notify'
-import { ChevronDown, ChevronUp } from '@vicons/tabler'
 import type { GroupStat, V2ModelRow } from '../types'
 import { usePublishedReviewStore } from '../stores/publishedReview'
 import { onReviewChanged } from '../services/api'
+import { isRebuildingAllSignals, runRebuildAllSignals } from '../utils/reviewRebuild'
 
 const review = useReviewStore()
 const published = usePublishedReviewStore()
@@ -237,24 +238,10 @@ async function refresh() {
   }
 }
 
-async function rebuildAll() {
-  const ok = await confirmAction({
-    title: '重建全部识别',
-    content: '将清空所有旧信号记录，并用当前K线重新识别一遍，结果不可撤销。确定继续吗？',
-    positiveText: '重建并重新识别',
-  })
-  if (!ok) return
-  rebuilding.value = true
-  try {
-    const result = await api.rebuildEventsNow()
-    await review.load()
-    notify.success(
-      `重建完成：${result.scanned} 个品种，当前 ${result.active_count} 个信号`,
-    )
-  } catch (e) {
-    notify.error(String(e))
-  } finally {
-    rebuilding.value = false
+async function handleRebuildAll() {
+  const success = await runRebuildAllSignals()
+  if (success && showLegacyStats.value) {
+    void load()
   }
 }
 
@@ -292,13 +279,26 @@ onBeforeUnmount(() => {
   <div class="page review-workspace">
     <header class="workspace-header">
       <div><div class="workspace-eyebrow">SIGNAL REVIEW</div><h1>形态与评分复盘</h1><p>按评分挑选信号，逐条对照形态与评分分项。</p></div>
-      <div class="workspace-actions"><span>已发布复盘 · v2研究候选评分</span><n-button secondary type="primary" :loading="published.browserLoading" @click="published.loadReviewPage()">刷新评分与明细</n-button></div>
+      <div class="workspace-actions">
+        <span>已发布复盘 · v2研究候选评分</span>
+        <n-button
+          type="warning"
+          secondary
+          :loading="isRebuildingAllSignals"
+          @click="handleRebuildAll"
+        >
+          <template #icon>
+            <n-icon :component="AlertTriangle" />
+          </template>
+          重建全部信号
+        </n-button>
+      </div>
     </header>
     <ReviewWorkbench />
     <section class="legacy-section">
       <button class="legacy-toggle" @click="toggleLegacyStats">{{ showLegacyStats ? '收起' : '展开' }}历史交易统计与概率模型 <span>旧入场分口径，独立于上方形态筛选</span></button>
       <div v-if="showLegacyStats" class="legacy-body">
-        <n-space align="center"><n-select v-model:value="review.statsScope" :options="REVIEW_STATS_SCOPES.map(s => ({ label: s.label, value: s.key }))" style="width:140px" @update:value="(v: string) => load(undefined, v as StatsScopeKey)" /><n-select v-model:value="review.dimension" :options="REVIEW_DIMENSIONS.map(d => ({ label: d.label, value: d.key }))" style="width:180px" @update:value="() => load()" /><n-button :loading="review.refreshing" @click="refresh">刷新结局统计</n-button><n-button :loading="rebuilding" @click="rebuildAll">重建全部识别</n-button></n-space>
+        <n-space align="center"><n-select v-model:value="review.statsScope" :options="REVIEW_STATS_SCOPES.map(s => ({ label: s.label, value: s.key }))" style="width:140px" @update:value="(v: string) => load(undefined, v as StatsScopeKey)" /><n-select v-model:value="review.dimension" :options="REVIEW_DIMENSIONS.map(d => ({ label: d.label, value: d.key }))" style="width:180px" @update:value="() => load()" /><n-button :loading="review.refreshing" @click="refresh">刷新结局统计</n-button><n-button :loading="isRebuildingAllSignals" @click="handleRebuildAll">重建全部识别</n-button></n-space>
         <n-text v-if="error" type="error">{{ error }}</n-text>
     <n-card size="small" class="v2-card">
       <template #header>

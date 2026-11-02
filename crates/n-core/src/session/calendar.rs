@@ -206,9 +206,10 @@ pub fn classify_night_session(symbol_or_prefix: &str) -> NightSessionType {
             NightSessionType::Close0100
         }
 
-        // 无夜盘品种（农产品、部分化工、金融期货等）
+        // 无夜盘品种（农产品、部分化工、铁合金、航运指数、金融期货等）
         "AP" | "CJ" | "JD" | "LH" | "PK" | "SI" | "LC" | "UR" | "WH" | "PM" | "RI" | "JR"
-        | "LR" | "BB" | "FB" | "IF" | "IH" | "IC" | "IM" | "TF" | "T" | "TS" | "TL" => {
+        | "LR" | "BB" | "FB" | "IF" | "IH" | "IC" | "IM" | "TF" | "T" | "TS" | "TL" | "SF"
+        | "SM" | "WR" | "EC" => {
             NightSessionType::None
         }
 
@@ -233,6 +234,8 @@ mod tests {
         assert_eq!(classify_night_session("SS0"), NightSessionType::Close0100);
         assert_eq!(classify_night_session("AU"), NightSessionType::Close0230);
         assert_eq!(classify_night_session("CJ"), NightSessionType::None);
+        assert_eq!(classify_night_session("SF0"), NightSessionType::None);
+        assert_eq!(classify_night_session("SM0"), NightSessionType::None);
         assert_eq!(classify_night_session("FG0"), NightSessionType::Close2300);
         assert_eq!(classify_night_session("SA0"), NightSessionType::Close2300);
     }

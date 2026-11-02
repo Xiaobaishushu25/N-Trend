@@ -11,9 +11,10 @@ import {
   NSpace,
   NTag,
   NText,
+  NTooltip,
   type DataTableColumns,
 } from 'naive-ui'
-import { ArrowDown, ArrowUp, Refresh, Search } from '@vicons/tabler'
+import { AlertTriangle, ArrowDown, ArrowUp, Refresh, Search } from '@vicons/tabler'
 import { api } from '../services/api'
 import { fmtR } from '../stores/review'
 import { usePublishedReviewStore } from '../stores/publishedReview'
@@ -24,6 +25,7 @@ import { reviewScoreOptions } from '../utils/reviewFilters'
 import { publishedScore as reviewScore, reviewState, excursionText } from '../utils/reviewPresentation'
 import { notify } from '../utils/notify'
 import { openReviewChartWindow } from '../utils/openReviewChartWindow'
+import { isRebuildingAllSignals, runRebuildAllSignals } from '../utils/reviewRebuild'
 import PublishedReviewDetail from './PublishedReviewDetail.vue'
 
 const review = usePublishedReviewStore()
@@ -140,8 +142,27 @@ const columns = computed<DataTableColumns<ReviewSummary>>(() => [
   {
     title: 'ID',
     key: 'event_id',
-    width: 68,
-    render: (r) => h('span', { class: 'font-num text-muted' }, `#${r.event_id}`),
+    width: 76,
+    render: (r) => {
+      const isLong = r.event_id > 99999999
+      if (!isLong) {
+        return h('span', { class: 'font-num text-muted', style: 'white-space: nowrap' }, `#${r.event_id}`)
+      }
+      const shortStr = `#${String(r.event_id).slice(0, 4)}…${String(r.event_id).slice(-3)}`
+      return h(
+        NTooltip,
+        { trigger: 'hover' },
+        {
+          trigger: () =>
+            h(
+              'span',
+              { class: 'font-num text-muted', style: 'white-space: nowrap; cursor: help' },
+              shortStr,
+            ),
+          default: () => `完整事件编号: #${r.event_id} (历史回放重构)`,
+        },
+      )
+    },
   },
   {
     title: '品种 / 名称',
@@ -546,19 +567,29 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="filter-actions">
-          <n-button size="small" secondary @click="reset">重置</n-button>
-          <n-button
-            size="small"
-            secondary
-            type="primary"
-            :loading="review.browserLoading"
-            @click="review.loadReviewPage()"
-          >
-            <template #icon>
-              <n-icon :component="Refresh" />
+          <n-tooltip trigger="hover">
+            <template #trigger>
+              <n-button size="small" secondary @click="reset">重置</n-button>
             </template>
-            刷新
-          </n-button>
+            重置所有筛选条件到默认值
+          </n-tooltip>
+          <n-tooltip trigger="hover">
+            <template #trigger>
+              <n-button
+                size="small"
+                secondary
+                type="primary"
+                :loading="review.browserLoading"
+                @click="review.loadReviewPage()"
+              >
+                <template #icon>
+                  <n-icon :component="Refresh" />
+                </template>
+                刷新列表
+              </n-button>
+            </template>
+            根据当前筛选条件重新查询并刷新信号列表
+          </n-tooltip>
         </div>
       </div>
     </div>
@@ -613,15 +644,19 @@ onBeforeUnmount(() => {
             <template #extra>
               <n-space justify="center" size="small">
                 <n-button
-                  v-if="review.metadata?.jobs?.[0]?.status === 'failed'"
+                  v-if="review.browserError || review.metadata?.jobs?.[0]?.status === 'failed'"
                   size="small"
-                  type="primary"
-                  :loading="rebuilding"
-                  @click="handleRetryRebuild"
+                  type="warning"
+                  secondary
+                  :loading="isRebuildingAllSignals"
+                  @click="runRebuildAllSignals"
                 >
-                  重试复盘任务
+                  <template #icon>
+                    <n-icon :component="AlertTriangle" />
+                  </template>
+                  重建全部信号
                 </n-button>
-                <n-button size="small" @click="reset">清除全部筛选</n-button>
+                <n-button size="small" secondary @click="reset">清除全部筛选</n-button>
               </n-space>
             </template>
           </n-empty>
