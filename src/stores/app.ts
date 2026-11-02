@@ -66,7 +66,7 @@ export const useAppStore = defineStore('app', {
     statusBadge: (state) => {
       switch (state.connectionStatus) {
         case 'connected':
-          return { color: '#10b981', text: '在线', delay: state.quoteDelayMs ? `${state.quoteDelayMs}ms` : undefined }
+          return { color: '#10b981', text: '在线', delay: state.quoteDelayMs != null ? `${state.quoteDelayMs}ms` : undefined }
         case 'reconnecting':
           return { color: '#f59e0b', text: '连接中...', delay: undefined }
         case 'unauthorized':
@@ -117,6 +117,11 @@ export const useAppStore = defineStore('app', {
             this.quoteDelayMs = null
           }
           if (status === 'connected') {
+            api.getConnectionStatus().then((conn) => {
+              if (conn.quote_delay_ms != null) {
+                this.quoteDelayMs = conn.quote_delay_ms
+              }
+            }).catch(() => {})
             await useSymbolsStore().load().catch(() => {})
             await useGroupsStore().load().catch(() => {})
             useSettingsStore().refreshStatus().catch(() => {})

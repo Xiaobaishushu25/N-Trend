@@ -338,8 +338,8 @@ impl RealtimeClient {
                     }
 
                     let mut ping_interval = tokio::time::interval_at(
-                        tokio::time::Instant::now() + Duration::from_secs(5),
-                        Duration::from_secs(30),
+                        tokio::time::Instant::now() + Duration::from_millis(300),
+                        Duration::from_secs(15),
                     );
                     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     let mut last_received = tokio::time::Instant::now();
@@ -458,7 +458,7 @@ impl RealtimeClient {
                     server_time,
                 } => {
                     let now = chrono::Utc::now().timestamp_millis();
-                    let rtt = (now - client_time).max(0) as u64;
+                    let rtt = (now - client_time).max(1) as u64;
                     self.quote_delay_ms.store(rtt, Ordering::Relaxed);
                     let _ = self.app.emit("server-delay", Some(rtt));
                     let _ = self.app.emit("server-pong", server_time);

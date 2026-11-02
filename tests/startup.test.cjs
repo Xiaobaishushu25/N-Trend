@@ -64,7 +64,7 @@ test('all live listeners register even if notification history never responds; l
   }
   const services = { api }
   for (const name of ['onDataUpdated', 'onScanCompleted', 'onEntryTrigger', 'onManualLevelAlert',
-    'onConnectionStatusChanged', 'onServerStatus']) services[name] = register(name)
+    'onConnectionStatusChanged', 'onServerStatus', 'onServerDelay']) services[name] = register(name)
   const { useAppStore } = loadStore('src/stores/app.ts', {
     '../services/api': services,
     '@tauri-apps/api/event': { listen: async (name, cb) => register(name)(cb) },
