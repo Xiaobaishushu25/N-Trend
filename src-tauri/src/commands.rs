@@ -581,8 +581,12 @@ pub async fn get_chart_klines(
     let fetch_fut = async {
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            state.api.get_chart_klines(&symbol, &timeframe, limit, None, &trace_id),
-        ).await {
+            state
+                .api
+                .get_chart_klines(&symbol, &timeframe, limit, None, &trace_id),
+        )
+        .await
+        {
             Ok(res) => res.map_err(|e| e.message),
             Err(_) => Err("获取K线超时，请检查网络或服务端状态".to_string()),
         }
@@ -838,9 +842,16 @@ pub async fn get_recent_outcomes(
 // LEGACY_REVIEW_API: current store/chart -> review_query/review_items.
 // Delete only after UI migration and usage validation; docs/review-api.md, tests/reviewBrowser.test.cjs.
 pub async fn get_review_page(
-    state: State<'_, Arc<AppState>>, limit: usize, offset: usize, filters: RecentOutcomeFilters,
+    state: State<'_, Arc<AppState>>,
+    limit: usize,
+    offset: usize,
+    filters: RecentOutcomeFilters,
 ) -> Result<Value, String> {
-    state.api.get_review_page(limit, offset, &filters).await.map_err(|e| e.message)
+    state
+        .api
+        .get_review_page(limit, offset, &filters)
+        .await
+        .map_err(|e| e.message)
 }
 
 #[tauri::command]

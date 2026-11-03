@@ -256,7 +256,8 @@ pub async fn set_last_group(
     match ctx.services.set_last_group(payload.group_id).await {
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("设置最后选中的分组失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("设置最后选中的分组失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }

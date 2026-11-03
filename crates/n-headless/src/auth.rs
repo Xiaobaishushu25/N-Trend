@@ -86,7 +86,8 @@ impl FromRequestParts<Arc<ServerContext>> for AuthDevice {
                 let db_clone = state.db.clone();
                 let id_for_touch = id.clone();
                 tokio::spawn(async move {
-                    let _ = n_core::storage::repo::touch_device_last_seen(&db_clone, &id_for_touch).await;
+                    let _ = n_core::storage::repo::touch_device_last_seen(&db_clone, &id_for_touch)
+                        .await;
                 });
                 Ok(AuthDevice { id, name, role })
             }

@@ -258,7 +258,10 @@ mod tests {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
-            .header(n_protocol::version::RELEASE_HEADER, n_protocol::CURRENT_SERVER_VERSION)
+            .header(
+                n_protocol::version::RELEASE_HEADER,
+                n_protocol::CURRENT_SERVER_VERSION,
+            )
             .header(n_protocol::version::API_HEADER, n_protocol::API_VERSION)
             .header("content-type", "application/json");
         if let Some(t) = token {

@@ -135,7 +135,9 @@ async fn filtered_signal_keeps_display_evidence_after_restart_without_orders() {
     assert!(e.list_orders().await.is_empty());
     let revision = e.definition().await.revision;
     let diagnostics = e.strategy_diagnostics().await;
-    let decisions = diagnostics["states"][&revision]["decisions"].as_object().unwrap();
+    let decisions = diagnostics["states"][&revision]["decisions"]
+        .as_object()
+        .unwrap();
     let decision = decisions.values().next().unwrap();
     assert_eq!(decision["reason"], "score_below_min");
     assert_eq!(decision["values"]["snapshot"]["instrument"], "pb2611");
@@ -144,14 +146,18 @@ async fn filtered_signal_keeps_display_evidence_after_restart_without_orders() {
     assert_eq!(decision["values"]["warning"]["direction"], "up");
     drop(e);
     let mut restored = ExecutionEngine::with_config_path(
-        BrokerClient::Paper(p.clone()), config(),
+        BrokerClient::Paper(p.clone()),
+        config(),
         Some(root.join("audit/trader_config.json")),
     );
     restored.registry = registry();
     restored.bind("audit", "audit").await.unwrap();
     send(&restored, payload).await;
     tick(&restored, &p, 1002.).await;
-    assert_eq!(restored.strategy_diagnostics().await["states"], diagnostics["states"]);
+    assert_eq!(
+        restored.strategy_diagnostics().await["states"],
+        diagnostics["states"]
+    );
     assert!(restored.list_conditions().await.is_empty());
     assert!(restored.list_orders().await.is_empty());
 }

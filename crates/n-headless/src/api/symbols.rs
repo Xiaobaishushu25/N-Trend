@@ -181,11 +181,26 @@ pub async fn set_symbol_flags(
     _device: AuthDevice,
     Json(payload): Json<SetFlagsReq>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
-    match n_core::storage::repo::set_symbol_flags(&ctx.db, &payload.code, payload.watchlist, payload.enabled).await {
+    match n_core::storage::repo::set_symbol_flags(
+        &ctx.db,
+        &payload.code,
+        payload.watchlist,
+        payload.enabled,
+    )
+    .await
+    {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "symbols", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "symbols", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -202,9 +217,17 @@ pub async fn set_symbol_tick(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::set_symbol_tick(&ctx.db, &payload.code, payload.tick).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "symbols", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "symbols", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -219,11 +242,20 @@ pub async fn set_symbol_followed(
     _device: AuthDevice,
     Json(payload): Json<SetFollowedReq>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
-    match n_core::storage::repo::set_symbol_followed(&ctx.db, &payload.code, payload.followed).await {
+    match n_core::storage::repo::set_symbol_followed(&ctx.db, &payload.code, payload.followed).await
+    {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "symbols", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "symbols", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -239,9 +271,17 @@ pub async fn refresh_symbol_list(
 ) -> Result<Json<usize>, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.refresh_symbol_list().await {
         Ok(n) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "symbols", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "symbols", "revision": rev }),
+                )
+                .await;
             Ok(Json(n))
         }
         Err(e) => {
@@ -257,9 +297,17 @@ pub async fn enrich_symbol_names(
 ) -> Result<Json<usize>, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.enrich_existing_symbols().await {
         Ok(n) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "symbols")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "symbols", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "symbols", "revision": rev }),
+                )
+                .await;
             Ok(Json(n))
         }
         Err(e) => {
@@ -329,9 +377,17 @@ pub async fn create_group(
 ) -> Result<Json<GroupDto>, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::create_group(&ctx.db, &payload.name).await {
         Ok(g) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(Json(GroupDto {
                 id: g.id,
                 name: g.name,
@@ -353,9 +409,17 @@ pub async fn rename_group(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::rename_group(&ctx.db, id, &payload.name).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -372,9 +436,17 @@ pub async fn delete_group(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::delete_group(&ctx.db, id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -394,12 +466,23 @@ pub async fn reorder_groups(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)));
     }
     let mut map = std::collections::HashMap::new();
-    map.insert("group_all_position".to_string(), payload.all_position.to_string());
+    map.insert(
+        "group_all_position".to_string(),
+        payload.all_position.to_string(),
+    );
     let _ = n_core::storage::repo::set_settings(&ctx.db, &map).await;
 
-    let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+    let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+        .await
+        .unwrap_or(1);
     let seq = ctx.next_event_seq();
-    ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+    ctx.realtime_hub
+        .broadcast(
+            seq,
+            "state.changed",
+            serde_json::json!({ "scope": "groups", "revision": rev }),
+        )
+        .await;
     Ok(StatusCode::OK)
 }
 
@@ -455,13 +538,22 @@ pub async fn add_symbol_to_group(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::add_symbol_to_group(&ctx.db, &payload.code, id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("添加品种到分组失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("添加品种到分组失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }
@@ -474,9 +566,17 @@ pub async fn remove_symbol_from_group(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::remove_symbol_from_group(&ctx.db, &code, id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -494,13 +594,22 @@ pub async fn reorder_group_symbols(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match n_core::storage::repo::reorder_group_symbols(&ctx.db, id, &payload.codes).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "groups")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "groups", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "groups", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("分组品种重排序失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("分组品种重排序失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }
@@ -524,7 +633,8 @@ pub async fn get_symbol_groups(
             Ok(Json(dtos))
         }
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取品种所属分组失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("获取品种所属分组失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }

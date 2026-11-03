@@ -69,6 +69,8 @@ pub struct InstanceManager {
     root: PathBuf,
     catalog: Mutex<Catalog>,
     runtimes: RwLock<BTreeMap<String, Arc<InstanceRuntime>>>,
+    // Cache only successful samples; SQLite remains the source of truth.
+    equity_sampled_minutes: RwLock<HashMap<String, i64>>,
     pub registry: Arc<StrategyRegistry>,
 }
 
@@ -178,6 +180,7 @@ impl InstanceManager {
             root,
             catalog: Mutex::new(catalog),
             runtimes: RwLock::new(BTreeMap::new()),
+            equity_sampled_minutes: RwLock::new(HashMap::new()),
             registry,
         });
         let c = m.catalog.lock().await.clone();
@@ -671,9 +674,13 @@ impl InstanceManager {
             return Ok(());
         }
         let now = wall / 60 * 60;
+        if self.equity_sampled_minutes.read().await.get(id).copied() == Some(now) {
+            return Ok(());
+        }
         let margin = s["account"]["curr_margin"].as_f64().unwrap_or(0.0);
         let fees = s["account"]["commission"].as_f64();
         self.db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT OR IGNORE INTO trader_equity(instance_id,timestamp,equity,margin,fees,quality,trading_day) VALUES(?,?,?,?,?,?,?)",[id.into(),now.into(),equity.into(),margin.into(),fees.into(),if fees.is_some(){"ok"}else{"fees_unconfirmed"}.into(),s["health"]["trading_day"].as_str().unwrap_or("").into()])).await?;
+        self.equity_sampled_minutes.write().await.insert(id.to_owned(), now);
         Ok(())
     }
     pub async fn comparison(&self, from: i64, to: i64) -> Result<Value> {
@@ -761,9 +768,22 @@ impl InstanceManager {
                 grouped
                     .values()
                     .filter(|v| !v.3.is_empty() && quote_gaps == 0)
-                    .map(|v| ((if matches!(v.2.as_str(),super::candidates::P2|super::candidates::P3) {
-                        "n_candidate".into()
-                    } else {v.2.clone()}, v.3.clone()), v.0))
+                    .map(|v| {
+                        (
+                            (
+                                if matches!(
+                                    v.2.as_str(),
+                                    super::candidates::P2 | super::candidates::P3
+                                ) {
+                                    "n_candidate".into()
+                                } else {
+                                    v.2.clone()
+                                },
+                                v.3.clone(),
+                            ),
+                            v.0,
+                        )
+                    })
                     .collect(),
             );
             let fees_confirmed = !samples.is_empty() && !quality.contains(&"fees_unconfirmed");

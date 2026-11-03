@@ -49,7 +49,10 @@ impl AppState {
         }
     }
 
-    pub fn record_local_notification(&self, input: NewNotificationHistoryItem) -> NotificationHistoryItem {
+    pub fn record_local_notification(
+        &self,
+        input: NewNotificationHistoryItem,
+    ) -> NotificationHistoryItem {
         let id = self
             .next_notification_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

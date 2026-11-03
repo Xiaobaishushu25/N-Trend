@@ -21,7 +21,8 @@ pub async fn check_integrity(
         match n_core::integrity::RawDataIntegrityChecker::inspect_symbol(&ctx.db, &s, 1000).await {
             Ok(report) => Ok(Json(serde_json::to_value(report).unwrap_or_default())),
             Err(e) => {
-                let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("检查完整性失败: {e}"), "");
+                let err =
+                    ApiErrorResponse::new("INTERNAL_ERROR", format!("检查完整性失败: {e}"), "");
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
             }
         }
@@ -29,7 +30,8 @@ pub async fn check_integrity(
         match ctx.services.check_all_symbols_integrity().await {
             Ok(reports) => Ok(Json(serde_json::to_value(reports).unwrap_or_default())),
             Err(e) => {
-                let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("检查完整性失败: {e}"), "");
+                let err =
+                    ApiErrorResponse::new("INTERNAL_ERROR", format!("检查完整性失败: {e}"), "");
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
             }
         }
@@ -45,7 +47,8 @@ pub async fn repair_integrity(
         match ctx.services.repair_symbol_integrity(&s).await {
             Ok(res) => Ok(Json(serde_json::to_value(res).unwrap_or_default())),
             Err(e) => {
-                let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("修复完整性失败: {e}"), "");
+                let err =
+                    ApiErrorResponse::new("INTERNAL_ERROR", format!("修复完整性失败: {e}"), "");
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
             }
         }
@@ -53,7 +56,8 @@ pub async fn repair_integrity(
         match ctx.services.repair_all_symbols_integrity().await {
             Ok(results) => Ok(Json(serde_json::to_value(results).unwrap_or_default())),
             Err(e) => {
-                let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("修复完整性失败: {e}"), "");
+                let err =
+                    ApiErrorResponse::new("INTERNAL_ERROR", format!("修复完整性失败: {e}"), "");
                 Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
             }
         }

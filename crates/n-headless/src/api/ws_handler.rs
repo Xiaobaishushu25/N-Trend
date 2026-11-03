@@ -17,8 +17,12 @@ pub async fn ws_handler(
 ) -> impl IntoResponse {
     let trader_delta = headers
         .get("X-Ntrend-Trader-Delta")
-        .and_then(|v| v.to_str().ok()) == Some("1");
-    let gzip = headers.get("X-Ntrend-Ws-Gzip").and_then(|v| v.to_str().ok()) == Some("1");
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
+    let gzip = headers
+        .get("X-Ntrend-Ws-Gzip")
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
     ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, trader_delta, gzip))
 }
 
@@ -41,9 +45,12 @@ async fn handle_socket(
     {
         let snapshot = ctx.trader_snapshot.read().await;
         if !snapshot.is_null() {
-            let event = WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot);
+            let event =
+                WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot);
             if let Ok(text) = serde_json::to_string(&event) {
-                ctx.realtime_hub.send_to(client_id, Message::Text(text)).await;
+                ctx.realtime_hub
+                    .send_to(client_id, Message::Text(text))
+                    .await;
             }
         }
     }
@@ -68,7 +75,9 @@ async fn handle_socket(
                     Ok(msg) => msg,
                     Err(_) => break,
                 }
-            } else { msg };
+            } else {
+                msg
+            };
             match tokio::time::timeout(Duration::from_secs(10), sender.send(msg)).await {
                 Ok(Ok(())) => {}
                 _ => break,
@@ -156,11 +165,15 @@ async fn handle_socket(
 
 fn gzip_message(msg: Message) -> Message {
     use std::io::Write;
-    let Message::Text(text) = msg else { return msg; };
+    let Message::Text(text) = msg else {
+        return msg;
+    };
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     if encoder.write_all(text.as_bytes()).is_ok() {
         if let Ok(bytes) = encoder.finish() {
-            if bytes.len() < text.len() { return Message::Binary(bytes); }
+            if bytes.len() < text.len() {
+                return Message::Binary(bytes);
+            }
         }
     }
     Message::Text(text)
@@ -199,12 +212,19 @@ mod tests {
     fn gzip_snapshot_keeps_all_fields_without_sending_megabytes_of_text() {
         use std::io::Read;
         let text=serde_json::json!({"topic":"trader.updated","payload":{"conditions":vec!["历史条件及完整信息";10000],"active":true}}).to_string();
-        let Message::Binary(bytes)=gzip_message(Message::Text(text.clone())) else { panic!("large snapshot should compress") };
-        assert!(bytes.len()<text.len()/10);
-        let mut restored=String::new();
-        flate2::read::GzDecoder::new(bytes.as_slice()).read_to_string(&mut restored).unwrap();
-        assert_eq!(restored,text);
-        assert!(matches!(gzip_message(Message::Ping(vec![])),Message::Ping(_)));
+        let Message::Binary(bytes) = gzip_message(Message::Text(text.clone())) else {
+            panic!("large snapshot should compress")
+        };
+        assert!(bytes.len() < text.len() / 10);
+        let mut restored = String::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_string(&mut restored)
+            .unwrap();
+        assert_eq!(restored, text);
+        assert!(matches!(
+            gzip_message(Message::Ping(vec![])),
+            Message::Ping(_)
+        ));
     }
 
     struct Dropped(Arc<AtomicUsize>);

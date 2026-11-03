@@ -229,10 +229,15 @@ impl ReviewEngine {
                     }
                     Err(e) => {
                         let err_str = format!("{e:#}");
-                        let is_busy = err_str.contains("locked") || err_str.contains("busy") || err_str.contains("code 5");
+                        let is_busy = err_str.contains("locked")
+                            || err_str.contains("busy")
+                            || err_str.contains("code 5");
                         if is_busy && attempt < 3 {
                             tracing::warn!(symbol=%symbol, attempt, "复盘品种计算遇到数据库锁冲突，退避重试: {err_str}");
-                            tokio::time::sleep(std::time::Duration::from_millis(150 * (1 << attempt))).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                150 * (1 << attempt),
+                            ))
+                            .await;
                             continue;
                         }
                         build_res = Some(Err(e));
@@ -257,10 +262,15 @@ impl ReviewEngine {
                                     "UPDATE review_job_symbols SET done=1 WHERE job_id=? AND symbol=?",
                                     vec![job.id.clone().into(), symbol.clone().into()],
                                 )).await;
-                                let r2 = tx.execute(sql(
-                                    "UPDATE review_jobs SET data=? WHERE id=?",
-                                    vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
-                                )).await;
+                                let r2 = tx
+                                    .execute(sql(
+                                        "UPDATE review_jobs SET data=? WHERE id=?",
+                                        vec![
+                                            serde_json::to_string(&job)?.into(),
+                                            job.id.clone().into(),
+                                        ],
+                                    ))
+                                    .await;
                                 if r1.is_ok() && r2.is_ok() {
                                     if tx.commit().await.is_ok() {
                                         break;
@@ -285,7 +295,13 @@ impl ReviewEngine {
                             vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
                         ))
                         .await?;
-                    let _ = self.db.execute(sql("DELETE FROM review_staging WHERE job_id=?", vec![job.id.clone().into()])).await;
+                    let _ = self
+                        .db
+                        .execute(sql(
+                            "DELETE FROM review_staging WHERE job_id=?",
+                            vec![job.id.clone().into()],
+                        ))
+                        .await;
                     // Keep durable dirty entries for an explicit retry; avoid an endless failed-job loop.
                     return Ok(Some(job));
                 }
@@ -350,7 +366,9 @@ impl ReviewEngine {
                     }
                     Err(e) => {
                         let s = format!("{e:#}");
-                        if (s.contains("locked") || s.contains("busy") || s.contains("code 5")) && attempt < 4 {
+                        if (s.contains("locked") || s.contains("busy") || s.contains("code 5"))
+                            && attempt < 4
+                        {
                             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                             backoff *= 2;
                             continue;
@@ -360,11 +378,18 @@ impl ReviewEngine {
                         job.status = "failed".into();
                         job.updated_at = now();
                         job.errors.push(format!("publish: {e:#}"));
-                        self.db.execute(sql(
-                            "UPDATE review_jobs SET status='failed',data=? WHERE id=?",
-                            vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
-                        )).await?;
-                        self.db.execute(sql("DELETE FROM review_staging WHERE job_id=?", vec![job.id.clone().into()])).await?;
+                        self.db
+                            .execute(sql(
+                                "UPDATE review_jobs SET status='failed',data=? WHERE id=?",
+                                vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
+                            ))
+                            .await?;
+                        self.db
+                            .execute(sql(
+                                "DELETE FROM review_staging WHERE job_id=?",
+                                vec![job.id.clone().into()],
+                            ))
+                            .await?;
                         return Ok(Some(job));
                     }
                 }
@@ -475,7 +500,9 @@ impl ReviewEngine {
                     Ok(tx) => {
                         let mut chunk_err = None;
                         for (detail, holding) in chunk {
-                            if let Err(e) = Self::save_result_tx(&tx, &job.id, detail, holding).await {
+                            if let Err(e) =
+                                Self::save_result_tx(&tx, &job.id, detail, holding).await
+                            {
                                 chunk_err = Some(e);
                                 break;
                             }
@@ -483,7 +510,9 @@ impl ReviewEngine {
                         if let Some(e) = chunk_err {
                             let _ = tx.rollback().await;
                             let s = format!("{e:#}");
-                            if (s.contains("locked") || s.contains("busy") || s.contains("code 5")) && attempt < 4 {
+                            if (s.contains("locked") || s.contains("busy") || s.contains("code 5"))
+                                && attempt < 4
+                            {
                                 tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                                 backoff *= 2;
                                 continue;
@@ -502,8 +531,13 @@ impl ReviewEngine {
                             }
                             Err(e) => {
                                 let s = format!("{e:#}");
-                                if (s.contains("locked") || s.contains("busy") || s.contains("code 5")) && attempt < 4 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                                if (s.contains("locked")
+                                    || s.contains("busy")
+                                    || s.contains("code 5"))
+                                    && attempt < 4
+                                {
+                                    tokio::time::sleep(std::time::Duration::from_millis(backoff))
+                                        .await;
                                     backoff *= 2;
                                     continue;
                                 }
@@ -513,7 +547,9 @@ impl ReviewEngine {
                     }
                     Err(e) => {
                         let s = format!("{e:#}");
-                        if (s.contains("locked") || s.contains("busy") || s.contains("code 5")) && attempt < 4 {
+                        if (s.contains("locked") || s.contains("busy") || s.contains("code 5"))
+                            && attempt < 4
+                        {
                             tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
                             backoff *= 2;
                             continue;
@@ -756,13 +792,16 @@ impl ReviewEngine {
 
     /// Resolve a legacy event-only link to a published immutable head, never to a profile name.
     pub async fn current_detail(&self, event_id: i64) -> Result<ReviewResultDetail> {
-        let row = self.db
+        let row = self
+            .db
             .query_one(sql(
                 "SELECT result_version FROM review_current WHERE event_id=?",
                 vec![event_id.into()],
             ))
             .await?
-            .ok_or_else(|| super::error("NOT_FOUND", "该信号尚无已发布复盘结果，请检查复盘任务状态"))?;
+            .ok_or_else(|| {
+                super::error("NOT_FOUND", "该信号尚无已发布复盘结果，请检查复盘任务状态")
+            })?;
         self.detail(event_id, &row.try_get::<String>("", "result_version")?)
             .await
     }
@@ -822,9 +861,21 @@ pub fn resolve_events_for_replay(
             let s0_ts = bars[c.s0_index].dt.to_bar_ts();
             let s1_ts = bars[c.s1_index].dt.to_bar_ts();
             let s2_ts = bars[c.s2_index].dt.to_bar_ts();
-            let s0_price = if is_long { bars[c.s0_index].low } else { bars[c.s0_index].high };
-            let s1_price = if is_long { bars[c.s1_index].high } else { bars[c.s1_index].low };
-            let s2_price = if is_long { bars[c.s2_index].low } else { bars[c.s2_index].high };
+            let s0_price = if is_long {
+                bars[c.s0_index].low
+            } else {
+                bars[c.s0_index].high
+            };
+            let s1_price = if is_long {
+                bars[c.s1_index].high
+            } else {
+                bars[c.s1_index].low
+            };
+            let s2_price = if is_long {
+                bars[c.s2_index].low
+            } else {
+                bars[c.s2_index].high
+            };
             let hash_key = format!("{symbol}:{dir_str}:{warning_ts}:{s0_ts}:{s1_ts}:{s2_ts}");
             let hash = blake3::hash(hash_key.as_bytes());
             let raw_id = u64::from_le_bytes(hash.as_bytes()[0..8].try_into().unwrap());
@@ -888,7 +939,11 @@ pub fn resolve_events_for_replay(
     for (_, remaining) in by_key {
         resolved.push(remaining);
     }
-    resolved.sort_by(|a, b| a.warning_ts.cmp(&b.warning_ts).then_with(|| a.id.cmp(&b.id)));
+    resolved.sort_by(|a, b| {
+        a.warning_ts
+            .cmp(&b.warning_ts)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     resolved
 }
 
@@ -977,13 +1032,34 @@ pub fn build_batch(
         );
         let candidate = crate::quality::review::score(&event, window, &quality, tick.unwrap_or(0.));
         let scores = BTreeMap::from([
-            ("old".into(), Some(event.entry_score).filter(|v| v.is_finite())),
-            ("quality_v1".into(), quality.quality_score.filter(|v| v.is_finite())),
-            ("morphology_v1".into(), quality.morphology_score.filter(|v| v.is_finite())),
-            ("quality_v2".into(), candidate.quality_score.filter(|v| v.is_finite())),
-            ("morphology_v2".into(), candidate.morphology_score.filter(|v| v.is_finite())),
-            ("a_score".into(), candidate.a_score.filter(|v| v.is_finite())),
-            ("b_score".into(), candidate.b_score.filter(|v| v.is_finite())),
+            (
+                "old".into(),
+                Some(event.entry_score).filter(|v| v.is_finite()),
+            ),
+            (
+                "quality_v1".into(),
+                quality.quality_score.filter(|v| v.is_finite()),
+            ),
+            (
+                "morphology_v1".into(),
+                quality.morphology_score.filter(|v| v.is_finite()),
+            ),
+            (
+                "quality_v2".into(),
+                candidate.quality_score.filter(|v| v.is_finite()),
+            ),
+            (
+                "morphology_v2".into(),
+                candidate.morphology_score.filter(|v| v.is_finite()),
+            ),
+            (
+                "a_score".into(),
+                candidate.a_score.filter(|v| v.is_finite()),
+            ),
+            (
+                "b_score".into(),
+                candidate.b_score.filter(|v| v.is_finite()),
+            ),
         ]);
         let policy = replay::EligibilityPolicy::ObserveAll;
         let start = raw.partition_point(|b| b.datetime < event.warning_ts);

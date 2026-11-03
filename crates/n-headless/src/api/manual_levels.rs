@@ -61,7 +61,8 @@ pub async fn list_manual_levels(
             Ok(Json(dtos))
         }
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取手动画线列表失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("获取手动画线列表失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }
@@ -86,9 +87,17 @@ pub async fn create_manual_level(
 
     match ctx.services.create_manual_level(core_input).await {
         Ok(l) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "manual_levels", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "manual_levels", "revision": rev }),
+                )
+                .await;
 
             Ok(Json(ManualLevelDto {
                 id: l.id,
@@ -137,9 +146,17 @@ pub async fn update_manual_level(
 
     match ctx.services.update_manual_level(id, core_input).await {
         Ok(l) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "manual_levels", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "manual_levels", "revision": rev }),
+                )
+                .await;
 
             Ok(Json(ManualLevelDto {
                 id: l.id,
@@ -174,11 +191,23 @@ pub async fn set_manual_level_monitoring(
     Path(id): Path<i64>,
     Json(payload): Json<SetMonitoringReq>,
 ) -> Result<Json<ManualLevelDto>, (StatusCode, Json<ApiErrorResponse>)> {
-    match ctx.services.set_manual_level_monitoring(id, payload.enabled).await {
+    match ctx
+        .services
+        .set_manual_level_monitoring(id, payload.enabled)
+        .await
+    {
         Ok(l) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "manual_levels", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "manual_levels", "revision": rev }),
+                )
+                .await;
 
             Ok(Json(ManualLevelDto {
                 id: l.id,
@@ -214,9 +243,17 @@ pub async fn archive_manual_level(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.archive_manual_level(id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "manual_levels", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "manual_levels", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::OK)
         }
         Err(e) => {
@@ -233,9 +270,17 @@ pub async fn delete_manual_level(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.delete_manual_level(id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "manual_levels")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "manual_levels", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "manual_levels", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -273,7 +318,8 @@ pub async fn get_manual_level_events(
             Ok(Json(dtos))
         }
         Err(e) => {
-            let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("获取画线事件历史失败: {e}"), "");
+            let err =
+                ApiErrorResponse::new("INTERNAL_ERROR", format!("获取画线事件历史失败: {e}"), "");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)))
         }
     }

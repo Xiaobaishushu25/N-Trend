@@ -52,9 +52,17 @@ pub struct ChartKlineResponse {
     pub rows: Vec<KlineDto>,
     pub status: String,
     pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "latestClosedTs")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "latestClosedTs"
+    )]
     pub latest_closed_ts: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "seriesRevision")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "seriesRevision"
+    )]
     pub series_revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "serverTime")]
     pub server_time: Option<i64>,
@@ -62,7 +70,11 @@ pub struct ChartKlineResponse {
     pub has_more: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "nextBefore")]
     pub next_before: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "fullReloadRequired")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "fullReloadRequired"
+    )]
     pub full_reload_required: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "partialBar")]
     pub partial_bar: Option<KlineDto>,

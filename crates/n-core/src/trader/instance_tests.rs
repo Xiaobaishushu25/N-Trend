@@ -679,9 +679,15 @@ async fn instance_rename_updates_catalog_and_persists() {
     let m = InstanceManager::open(db.clone(), root.clone(), e.clone(), registry())
         .await
         .unwrap();
-    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "现有 N 字形策略");
+    assert_eq!(
+        m.list().await["instances"][0]["instance"]["name"],
+        "现有 N 字形策略"
+    );
     m.rename("default", "螺纹实盘1号".into()).await.unwrap();
-    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "螺纹实盘1号");
+    assert_eq!(
+        m.list().await["instances"][0]["instance"]["name"],
+        "螺纹实盘1号"
+    );
     drop(m);
     drop(e);
     let e = Arc::new(ExecutionEngine::with_config_path(
@@ -692,5 +698,8 @@ async fn instance_rename_updates_catalog_and_persists() {
     let m = InstanceManager::open(db, root, e, registry())
         .await
         .unwrap();
-    assert_eq!(m.list().await["instances"][0]["instance"]["name"], "螺纹实盘1号");
+    assert_eq!(
+        m.list().await["instances"][0]["instance"]["name"],
+        "螺纹实盘1号"
+    );
 }

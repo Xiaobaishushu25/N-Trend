@@ -367,7 +367,18 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         // Event-only links resolve a published head; missing heads are an explicit 404.
-        assert_eq!(call(&router, "GET", "/api/v2/review/signals/1/detail", Some("review-read-test"), Value::Null).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(
+                &router,
+                "GET",
+                "/api/v2/review/signals/1/detail",
+                Some("review-read-test"),
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
         let (status, h, b) = call(
             &router,
             "GET",

@@ -99,9 +99,17 @@ impl SimnowLogin {
             "AppID": self.app_id.trim(),
             "AuthCode": auth,
         });
-        if let Some(md) = self.md_front.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(md) = self
+            .md_front
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             result["MdFront"] = json!(md);
-        } else if let Some(prev_md) = previous.and_then(|p| p.get("MdFront")).and_then(Value::as_str) {
+        } else if let Some(prev_md) = previous
+            .and_then(|p| p.get("MdFront"))
+            .and_then(Value::as_str)
+        {
             result["MdFront"] = json!(prev_md);
         }
         Ok(result)
@@ -244,7 +252,11 @@ pub async fn login(ctx: &ServerContext, id: &str, input: SimnowLogin) -> Result<
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(if broker_id.is_empty() { "9999" } else { broker_id });
+        .unwrap_or(if broker_id.is_empty() {
+            "9999"
+        } else {
+            broker_id
+        });
     ensure!(
         broker_id.is_empty() || broker_id == target_broker,
         "不能更换实例绑定的券商编号，请创建新实例"

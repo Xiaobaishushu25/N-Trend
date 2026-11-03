@@ -130,8 +130,12 @@ mod tests {
         raw["account"]["balance"] = serde_json::json!(2);
         let (snapshot, delta) = publisher.update(raw);
         hub.broadcast_trader(2, &delta.unwrap(), &snapshot).await;
-        let (Message::Text(new), _) = modern.recv().await.unwrap().into_parts() else { panic!() };
-        let (Message::Text(old), _) = legacy.recv().await.unwrap().into_parts() else { panic!() };
+        let (Message::Text(new), _) = modern.recv().await.unwrap().into_parts() else {
+            panic!()
+        };
+        let (Message::Text(old), _) = legacy.recv().await.unwrap().into_parts() else {
+            panic!()
+        };
         let new: serde_json::Value = serde_json::from_str(&new).unwrap();
         let old: serde_json::Value = serde_json::from_str(&old).unwrap();
         assert_eq!(new["topic"], "trader.delta");
@@ -195,16 +199,25 @@ impl RealtimeHub {
     ) {
         let delta = WsServerMessage::new_event(event_seq, "trader.delta", delta);
         let legacy = WsServerMessage::new_event(event_seq, "trader.updated", snapshot);
-        let (Ok(delta), Ok(legacy)) = (serde_json::to_string(&delta), serde_json::to_string(&legacy)) else {
+        let (Ok(delta), Ok(legacy)) = (
+            serde_json::to_string(&delta),
+            serde_json::to_string(&legacy),
+        ) else {
             return;
         };
         tracing::debug!(
-            delta_bytes = delta.len(), baseline_bytes = legacy.len(), "交易状态增量推送"
+            delta_bytes = delta.len(),
+            baseline_bytes = legacy.len(),
+            "交易状态增量推送"
         );
         let mut map = self.clients.write().await;
         map.retain(|id, session| {
             // Older clients still get a light baseline, without historical orders.
-            let text = if session.trader_delta { &delta } else { &legacy };
+            let text = if session.trader_delta {
+                &delta
+            } else {
+                &legacy
+            };
             Self::enqueue(*id, session, Message::Text(text.clone()))
         });
     }
@@ -320,7 +333,10 @@ impl RealtimeHub {
     }
 
     pub async fn chart_symbols(&self) -> HashSet<String> {
-        self.clients.read().await.values()
+        self.clients
+            .read()
+            .await
+            .values()
             .flat_map(|session| session.subscribed_symbols.iter().cloned())
             .collect()
     }

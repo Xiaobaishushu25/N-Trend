@@ -200,7 +200,11 @@ pub struct ClientLocalSettings {
     pub theme: String,
     #[serde(alias = "chart_display_bars")]
     pub chart_display_bars: usize,
-    #[serde(default = "default_mobile_chart_fullscreen_bars", alias = "mobile_chart_fullscreen_bars", alias = "mobileChartFullscreenBars")]
+    #[serde(
+        default = "default_mobile_chart_fullscreen_bars",
+        alias = "mobile_chart_fullscreen_bars",
+        alias = "mobileChartFullscreenBars"
+    )]
     pub mobile_chart_fullscreen_bars: usize,
     #[serde(alias = "chart_right_gap")]
     pub chart_right_gap: usize,
@@ -211,13 +215,29 @@ pub struct ClientLocalSettings {
     pub last_group_id: Option<i64>,
     #[serde(alias = "desktop_notification_enabled")]
     pub desktop_notification_enabled: bool,
-    #[serde(default = "default_true", alias = "in_app_notification_enabled", alias = "inAppNotificationEnabled")]
+    #[serde(
+        default = "default_true",
+        alias = "in_app_notification_enabled",
+        alias = "inAppNotificationEnabled"
+    )]
     pub in_app_notification_enabled: bool,
-    #[serde(default = "default_zero_f64", alias = "notification_min_score", alias = "notificationMinScore")]
+    #[serde(
+        default = "default_zero_f64",
+        alias = "notification_min_score",
+        alias = "notificationMinScore"
+    )]
     pub notification_min_score: f64,
-    #[serde(default = "default_true", alias = "entry_trigger_notification_enabled", alias = "entryTriggerNotificationEnabled")]
+    #[serde(
+        default = "default_true",
+        alias = "entry_trigger_notification_enabled",
+        alias = "entryTriggerNotificationEnabled"
+    )]
     pub entry_trigger_notification_enabled: bool,
-    #[serde(default = "default_manual_level_events", alias = "manual_level_events", alias = "manualLevelEvents")]
+    #[serde(
+        default = "default_manual_level_events",
+        alias = "manual_level_events",
+        alias = "manualLevelEvents"
+    )]
     pub manual_level_events: Vec<String>,
     #[serde(alias = "backup_dir")]
     pub backup_dir: Option<String>,

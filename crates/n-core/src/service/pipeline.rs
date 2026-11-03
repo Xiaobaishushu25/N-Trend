@@ -91,7 +91,9 @@ impl RawPipeline {
         let lock = self.symbol_locks.get(symbol);
         let _guard = lock.lock().await;
 
-        if incoming_bars.is_empty() { return Ok(0); }
+        if incoming_bars.is_empty() {
+            return Ok(0);
+        }
         let mut incoming = BTreeMap::new();
         for row in incoming_bars {
             NaiveDateTime::parse_from_str(&row.datetime, "%Y-%m-%d %H:%M:%S")
@@ -102,21 +104,45 @@ impl RawPipeline {
         let end = *incoming.keys().next_back().unwrap();
         let previous = repo::raw_klines_window(&self.db, symbol, start, end).await?;
         let previous: HashMap<_, _> = previous.iter().map(|row| (row.ts.as_str(), row)).collect();
-        let changed: Vec<Kline> = incoming.values().filter(|row| {
-            !previous.get(row.datetime.as_str()).is_some_and(|old| {
-                old.open == row.open && old.high == row.high && old.low == row.low
-                    && old.close == row.close && old.volume == row.volume && old.hold == row.hold
+        let changed: Vec<Kline> = incoming
+            .values()
+            .filter(|row| {
+                !previous.get(row.datetime.as_str()).is_some_and(|old| {
+                    old.open == row.open
+                        && old.high == row.high
+                        && old.low == row.low
+                        && old.close == row.close
+                        && old.volume == row.volume
+                        && old.hold == row.hold
+                })
             })
-        }).map(|row| (*row).clone()).collect();
-        let initialize = repo::klines(&self.db, symbol, "15m", Some(1), None).await?.is_empty()
-            || repo::klines(&self.db, symbol, "60m", Some(1), None).await?.is_empty();
-        if changed.is_empty() && !initialize { return Ok(0); }
+            .map(|row| (*row).clone())
+            .collect();
+        let initialize = repo::klines(&self.db, symbol, "15m", Some(1), None)
+            .await?
+            .is_empty()
+            || repo::klines(&self.db, symbol, "60m", Some(1), None)
+                .await?
+                .is_empty();
+        if changed.is_empty() && !initialize {
+            return Ok(0);
+        }
         let existing = if initialize {
             repo::raw_klines(&self.db, symbol).await?
         } else {
-            let first = NaiveDateTime::parse_from_str(&changed[0].datetime, "%Y-%m-%d %H:%M:%S")? - chrono::Duration::minutes(60);
-            let last = NaiveDateTime::parse_from_str(&changed.last().unwrap().datetime, "%Y-%m-%d %H:%M:%S")? + chrono::Duration::minutes(60);
-            repo::raw_klines_window(&self.db, symbol, &first.format("%Y-%m-%d %H:%M:%S").to_string(), &last.format("%Y-%m-%d %H:%M:%S").to_string()).await?
+            let first = NaiveDateTime::parse_from_str(&changed[0].datetime, "%Y-%m-%d %H:%M:%S")?
+                - chrono::Duration::minutes(60);
+            let last = NaiveDateTime::parse_from_str(
+                &changed.last().unwrap().datetime,
+                "%Y-%m-%d %H:%M:%S",
+            )? + chrono::Duration::minutes(60);
+            repo::raw_klines_window(
+                &self.db,
+                symbol,
+                &first.format("%Y-%m-%d %H:%M:%S").to_string(),
+                &last.format("%Y-%m-%d %H:%M:%S").to_string(),
+            )
+            .await?
         };
         let mut merged_bars: Vec<Kline> = existing.iter().map(model_to_fetch).collect();
         merge_klines(&mut merged_bars, &changed);
@@ -135,10 +161,16 @@ impl RawPipeline {
         let mut derived_models = Vec::new();
         if (initialize && merged_bars.len() >= 3) || (!initialize && !merged_bars.is_empty()) {
             for tf in [Timeframe::M15, Timeframe::M60] {
-                let affected: HashSet<_> = changed.iter().map(|row| {
-                    crate::derive::current_bucket_end_ts(
-                        NaiveDateTime::parse_from_str(&row.datetime, "%Y-%m-%d %H:%M:%S").unwrap(), tf)
-                }).collect();
+                let affected: HashSet<_> = changed
+                    .iter()
+                    .map(|row| {
+                        crate::derive::current_bucket_end_ts(
+                            NaiveDateTime::parse_from_str(&row.datetime, "%Y-%m-%d %H:%M:%S")
+                                .unwrap(),
+                            tf,
+                        )
+                    })
+                    .collect();
                 for k in aggregate(&merged_bars, tf) {
                     if initialize || affected.contains(&k.datetime) {
                         derived_models.push(fetch_to_model(symbol, tf.as_str(), "derived", &k));
@@ -148,7 +180,10 @@ impl RawPipeline {
         }
 
         let derived_count = derived_models.len();
-        let raw_models = changed.iter().map(|k| fetch_to_model(symbol, "5m", "raw", k)).collect();
+        let raw_models = changed
+            .iter()
+            .map(|k| fetch_to_model(symbol, "5m", "raw", k))
+            .collect();
         repo::atomically_upsert_raw_and_derived(&self.db, symbol, raw_models, derived_models)
             .await
             .context("RawPipeline::process_raw_batch 原子事务写入失败")?;
@@ -250,73 +285,145 @@ mod tests {
     use super::*;
 
     fn sample(ts: &str, price: f64) -> Kline {
-        Kline { datetime: ts.into(), open: price, high: price+1., low: price-1., close: price,
-            volume: 10., hold: 50. }
+        Kline {
+            datetime: ts.into(),
+            open: price,
+            high: price + 1.,
+            low: price - 1.,
+            close: price,
+            volume: 10.,
+            hold: 50.,
+        }
     }
 
     async fn assert_full_aggregation(db: &DatabaseConnection, raw: &[Kline]) {
         for tf in [Timeframe::M15, Timeframe::M60] {
             let expected = aggregate(raw, tf);
             // Match SQL upsert semantics for session fragments with the same endpoint.
-            let expected: BTreeMap<_, _> = expected.iter().map(|b| (b.datetime.as_str(), b)).collect();
-            let actual = repo::klines(db, "RB0", tf.as_str(), None, None).await.unwrap();
+            let expected: BTreeMap<_, _> =
+                expected.iter().map(|b| (b.datetime.as_str(), b)).collect();
+            let actual = repo::klines(db, "RB0", tf.as_str(), None, None)
+                .await
+                .unwrap();
             assert_eq!(actual.len(), expected.len());
             for bar in actual {
                 let want = expected[bar.ts.as_str()];
-                assert_eq!((bar.open,bar.high,bar.low,bar.close,bar.volume,bar.hold),
-                    (want.open,want.high,want.low,want.close,want.volume,want.hold), "{} {}", tf.as_str(),bar.ts);
+                assert_eq!(
+                    (bar.open, bar.high, bar.low, bar.close, bar.volume, bar.hold),
+                    (
+                        want.open,
+                        want.high,
+                        want.low,
+                        want.close,
+                        want.volume,
+                        want.hold
+                    ),
+                    "{} {}",
+                    tf.as_str(),
+                    bar.ts
+                );
             }
         }
     }
 
     #[tokio::test]
     async fn incremental_updates_match_full_rebuild_across_breaks_midnight_and_corrections() {
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
         let p = RawPipeline::new(db.clone(), SymbolLocks::new());
-        let stamps = ["2026-10-29 23:50:00","2026-10-29 23:55:00","2026-10-30 00:00:00",
-            "2026-10-30 00:05:00","2026-10-30 09:05:00","2026-10-30 09:15:00",
-            "2026-10-30 11:20:00","2026-10-30 11:25:00","2026-10-30 11:30:00",
-            "2026-10-30 13:35:00","2026-10-30 13:40:00"];
-        let mut raw=Vec::new();
-        for (i,stamp) in stamps.iter().enumerate() {
-            let bar=sample(stamp,100.+i as f64);
-            p.process_final_bar("RB0",&bar).await.unwrap();
+        let stamps = [
+            "2026-10-29 23:50:00",
+            "2026-10-29 23:55:00",
+            "2026-10-30 00:00:00",
+            "2026-10-30 00:05:00",
+            "2026-10-30 09:05:00",
+            "2026-10-30 09:15:00",
+            "2026-10-30 11:20:00",
+            "2026-10-30 11:25:00",
+            "2026-10-30 11:30:00",
+            "2026-10-30 13:35:00",
+            "2026-10-30 13:40:00",
+        ];
+        let mut raw = Vec::new();
+        for (i, stamp) in stamps.iter().enumerate() {
+            let bar = sample(stamp, 100. + i as f64);
+            p.process_final_bar("RB0", &bar).await.unwrap();
             raw.push(bar);
-            if raw.len()>=3 { assert_full_aggregation(&db,&raw).await; }
+            if raw.len() >= 3 {
+                assert_full_aggregation(&db, &raw).await;
+            }
         }
-        let changes=vec![sample("2026-10-30 09:10:00",150.),sample("2026-10-30 11:30:00",160.)];
-        p.process_raw_batch("RB0",&changes).await.unwrap();
-        merge_klines(&mut raw,&changes);
-        assert_full_aggregation(&db,&raw).await;
+        let changes = vec![
+            sample("2026-10-30 09:10:00", 150.),
+            sample("2026-10-30 11:30:00", 160.),
+        ];
+        p.process_raw_batch("RB0", &changes).await.unwrap();
+        merge_klines(&mut raw, &changes);
+        assert_full_aggregation(&db, &raw).await;
         // A correction whose surrounding hour has only one raw bar still updates its buckets.
-        let change=sample("2026-10-30 09:05:00",180.);
-        p.process_final_bar("RB0",&change).await.unwrap();
-        merge_klines(&mut raw,&[change]);
-        assert_full_aggregation(&db,&raw).await;
+        let change = sample("2026-10-30 09:05:00", 180.);
+        p.process_final_bar("RB0", &change).await.unwrap();
+        merge_klines(&mut raw, &[change]);
+        assert_full_aggregation(&db, &raw).await;
         p.rebuild_derived("RB0").await.unwrap();
-        assert_full_aggregation(&db,&raw).await;
+        assert_full_aggregation(&db, &raw).await;
     }
 
     #[tokio::test]
     async fn duplicate_refresh_writes_nothing_and_one_new_bar_touches_only_two_derived_buckets() {
         use sea_orm::ConnectionTrait;
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
         let p = RawPipeline::new(db.clone(), SymbolLocks::new());
-        let start = NaiveDateTime::parse_from_str("2026-10-01 09:00:00","%Y-%m-%d %H:%M:%S").unwrap();
-        let raw:Vec<_>=(1..=2000).map(|i| sample(&(start+chrono::Duration::minutes(i*5)).format("%Y-%m-%d %H:%M:%S").to_string(),100.)).collect();
-        p.process_raw_batch("RB0",&raw).await.unwrap();
-        db.execute_unprepared("CREATE TABLE candle_write_audit (kind TEXT, tf TEXT, ts TEXT)").await.unwrap();
-        for (kind,reference) in [("INSERT","NEW"),("UPDATE","NEW"),("DELETE","OLD")] {
+        let start =
+            NaiveDateTime::parse_from_str("2026-10-01 09:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let raw: Vec<_> = (1..=2000)
+            .map(|i| {
+                sample(
+                    &(start + chrono::Duration::minutes(i * 5))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string(),
+                    100.,
+                )
+            })
+            .collect();
+        p.process_raw_batch("RB0", &raw).await.unwrap();
+        db.execute_unprepared("CREATE TABLE candle_write_audit (kind TEXT, tf TEXT, ts TEXT)")
+            .await
+            .unwrap();
+        for (kind, reference) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
             db.execute_unprepared(&format!("CREATE TRIGGER audit_{kind} AFTER {kind} ON klines BEGIN INSERT INTO candle_write_audit VALUES ('{kind}',{reference}.timeframe,{reference}.ts); END")).await.unwrap();
         }
-        assert_eq!(p.process_raw_batch("RB0",&raw[1990..]).await.unwrap(),0);
-        let count=db.query_one(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Sqlite,"SELECT COUNT(*) AS n FROM candle_write_audit".to_string())).await.unwrap().unwrap();
-        assert_eq!(count.try_get::<i64>("","n").unwrap(),0);
-        let next=sample(&(start+chrono::Duration::minutes(2001*5)).format("%Y-%m-%d %H:%M:%S").to_string(),120.);
-        assert_eq!(p.process_final_bar("RB0",&next).await.unwrap(),2);
-        let writes=db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Sqlite,"SELECT kind,tf,ts FROM candle_write_audit".to_string())).await.unwrap();
-        assert_eq!(writes.len(),3);
-        assert!(writes.iter().all(|row| row.try_get::<String>("","kind").unwrap()!="DELETE"));
+        assert_eq!(p.process_raw_batch("RB0", &raw[1990..]).await.unwrap(), 0);
+        let count = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM candle_write_audit".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.try_get::<i64>("", "n").unwrap(), 0);
+        let next = sample(
+            &(start + chrono::Duration::minutes(2001 * 5))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+            120.,
+        );
+        assert_eq!(p.process_final_bar("RB0", &next).await.unwrap(), 2);
+        let writes = db
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT kind,tf,ts FROM candle_write_audit".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(writes.len(), 3);
+        assert!(writes
+            .iter()
+            .all(|row| row.try_get::<String>("", "kind").unwrap() != "DELETE"));
     }
 
     #[tokio::test]

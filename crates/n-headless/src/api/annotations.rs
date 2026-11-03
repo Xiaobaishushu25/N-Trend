@@ -45,9 +45,17 @@ pub async fn add_annotation(
         .await
     {
         Ok(a) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "signals", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "signals", "revision": rev }),
+                )
+                .await;
             Ok(Json(a))
         }
         Err(e) => {
@@ -64,9 +72,17 @@ pub async fn delete_annotation(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.delete_signal_annotation(id).await {
         Ok(_) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "signals", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "signals", "revision": rev }),
+                )
+                .await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -87,9 +103,17 @@ pub async fn set_decision(
         .await
     {
         Ok(d) => {
-            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals").await.unwrap_or(1);
+            let rev = n_core::storage::repo::bump_revision(&ctx.db, "signals")
+                .await
+                .unwrap_or(1);
             let seq = ctx.next_event_seq();
-            ctx.realtime_hub.broadcast(seq, "state.changed", serde_json::json!({ "scope": "signals", "revision": rev })).await;
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "state.changed",
+                    serde_json::json!({ "scope": "signals", "revision": rev }),
+                )
+                .await;
             Ok(Json(d))
         }
         Err(e) => {

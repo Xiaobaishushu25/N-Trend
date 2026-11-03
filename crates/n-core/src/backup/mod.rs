@@ -52,7 +52,9 @@ pub async fn generate_database_snapshot(
     let _guard = match BACKUP_LOCK.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
-            return Err(anyhow!("服务端当前已有数据库快照生成任务正在执行，请勿重复请求"));
+            return Err(anyhow!(
+                "服务端当前已有数据库快照生成任务正在执行，请勿重复请求"
+            ));
         }
     };
     std::fs::create_dir_all(temp_dir).context("创建快照临时目录失败")?;

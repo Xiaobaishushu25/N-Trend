@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
 use chrono::{FixedOffset, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex, RwLock};
 
@@ -68,7 +68,10 @@ impl BackupScheduler {
     fn shanghai_today() -> String {
         // Asia/Shanghai is UTC+8
         let offset = FixedOffset::east_opt(8 * 3600).unwrap();
-        Utc::now().with_timezone(&offset).format("%Y-%m-%d").to_string()
+        Utc::now()
+            .with_timezone(&offset)
+            .format("%Y-%m-%d")
+            .to_string()
     }
 
     fn refresh_last_backup_date(&self) {
@@ -126,7 +129,11 @@ impl BackupScheduler {
     }
 
     async fn do_backup_now(&self) -> Result<String, String> {
-        let (bytes, expected_sha) = self.api.download_database_backup().await.map_err(|e| e.message)?;
+        let (bytes, expected_sha) = self
+            .api
+            .download_database_backup()
+            .await
+            .map_err(|e| e.message)?;
 
         // Verify SHA-256
         let mut hasher = Sha256::new();
@@ -151,7 +158,8 @@ impl BackupScheduler {
 
         std::fs::write(&part_path, &bytes).map_err(|e| format!("写入临时备份文件失败: {e}"))?;
         std::fs::rename(&part_path, &target_path).map_err(|e| format!("保存备份文件失败: {e}"))?;
-        std::fs::write(&sha_path, format!("{actual_sha}  {filename}\n")).map_err(|e| format!("写入校验文件失败: {e}"))?;
+        std::fs::write(&sha_path, format!("{actual_sha}  {filename}\n"))
+            .map_err(|e| format!("写入校验文件失败: {e}"))?;
 
         let today = Self::shanghai_today();
         *self.last_backup_date.write().await = Some(today);
@@ -159,7 +167,11 @@ impl BackupScheduler {
         // Prune older backups
         self.prune_old_backups();
 
-        tracing::info!("📁 备份文件已持久化: {} (SHA256: {})", target_path.display(), actual_sha);
+        tracing::info!(
+            "📁 备份文件已持久化: {} (SHA256: {})",
+            target_path.display(),
+            actual_sha
+        );
         Ok(filename)
     }
 

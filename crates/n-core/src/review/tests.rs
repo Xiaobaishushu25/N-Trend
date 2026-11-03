@@ -511,7 +511,10 @@ async fn transactional_outbox_atomic_publication_resume_and_immutable_details() 
         .await
         .unwrap();
     assert_eq!(new.page.revision, 2);
-    assert_eq!(resumed.current_detail(1).await.unwrap().summary.state, "open");
+    assert_eq!(
+        resumed.current_detail(1).await.unwrap().summary.state,
+        "open"
+    );
     assert_eq!(
         new.page
             .items
@@ -607,27 +610,79 @@ async fn orphan_review_artifacts_are_pruned_on_new_versions() {
     let engine = ReviewEngine::new(db.clone());
 
     // 1st run
-    let j1 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    let j1 = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &j1.id).await;
     engine.worker_step().await.unwrap();
-    let count1 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+    let count1 = db
+        .query_one(store::sql(
+            "SELECT count(*) AS n FROM review_results",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
     assert_eq!(count1, 1);
 
     // 2nd run with modified data
-    db.execute(store::sql("UPDATE klines SET high=110,close=109 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![])).await.unwrap();
-    let j2 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    db.execute(store::sql(
+        "UPDATE klines SET high=110,close=109 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'",
+        vec![],
+    ))
+    .await
+    .unwrap();
+    let j2 = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &j2.id).await;
     engine.worker_step().await.unwrap();
-    let count2 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
-    assert_eq!(count2, 2, "1 current + 1 historical fallback version retained");
+    let count2 = db
+        .query_one(store::sql(
+            "SELECT count(*) AS n FROM review_results",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(
+        count2, 2,
+        "1 current + 1 historical fallback version retained"
+    );
 
     // 3rd run with further modified data -> version 1 should be pruned, retaining max 2 versions
-    db.execute(store::sql("UPDATE klines SET high=108,close=107 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![])).await.unwrap();
-    let j3 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    db.execute(store::sql(
+        "UPDATE klines SET high=108,close=107 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'",
+        vec![],
+    ))
+    .await
+    .unwrap();
+    let j3 = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &j3.id).await;
     engine.worker_step().await.unwrap();
-    let count3 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
-    assert_eq!(count3, 2, "excess orphan versions are automatically pruned, capped at 2 versions per event");
+    let count3 = db
+        .query_one(store::sql(
+            "SELECT count(*) AS n FROM review_results",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(
+        count3, 2,
+        "excess orphan versions are automatically pruned, capped at 2 versions per event"
+    );
 }
 
 #[tokio::test]
@@ -913,7 +968,8 @@ async fn filters_sort_counts_groups_snapshot_expiry_and_paging_share_one_populat
             .unwrap(),
     )
     .unwrap()
-    .created = std::time::Instant::now() - std::time::Duration::from_secs(super::SNAPSHOT_TTL_SECS + 1);
+    .created =
+        std::time::Instant::now() - std::time::Duration::from_secs(super::SNAPSHOT_TTL_SECS + 1);
     assert_eq!(
         engine
             .items(
@@ -939,7 +995,17 @@ async fn published_outcome_filter_uses_only_closed_net_results() {
         let mut q = ReviewQuery::default();
         q.filters.sample_scope = Some("all".into());
         q.filters.outcomes = vec![outcome.into()];
-        let expected = all.iter().filter(|r| r.state == "closed" && r.net_r.is_some_and(|v| match outcome { "win" => v > 0., "loss" => v < 0., _ => v == 0. })).count();
+        let expected = all
+            .iter()
+            .filter(|r| {
+                r.state == "closed"
+                    && r.net_r.is_some_and(|v| match outcome {
+                        "win" => v > 0.,
+                        "loss" => v < 0.,
+                        _ => v == 0.,
+                    })
+            })
+            .count();
         let page = engine.query("outcome-device", q).await.unwrap();
         assert_eq!(page.page.total, expected);
         assert_eq!(page.scored + page.unscored, expected);
@@ -1125,7 +1191,10 @@ fn test_p0_2_v2_high_score_not_filtered_by_legacy_score() {
         Some(10.),
         "historical_rebuild",
         "2026-01-06T00:00:00Z",
-        &EligibilityPolicy::TradeEligibleV2 { min_v2_score: Some(60.0), min_risk_ticks: 10.0 },
+        &EligibilityPolicy::TradeEligibleV2 {
+            min_v2_score: Some(60.0),
+            min_risk_ticks: 10.0,
+        },
         &scores,
         Some("scored"),
         &[],
@@ -1134,7 +1203,10 @@ fn test_p0_2_v2_high_score_not_filtered_by_legacy_score() {
     // It should NOT be filtered! It should enter trade and simulate execution.
     assert_ne!(r.summary.state, "filtered");
     assert_eq!(r.summary.state, "closed");
-    assert_eq!(r.summary.scores.get("quality_v2").copied().flatten(), Some(75.0));
+    assert_eq!(
+        r.summary.scores.get("quality_v2").copied().flatten(),
+        Some(75.0)
+    );
 }
 
 #[test]
@@ -1162,7 +1234,10 @@ fn test_p0_2_v2_low_risk_filtered_preserves_score_and_reason() {
         Some(10.),
         "historical_rebuild",
         "2026-01-06T00:00:00Z",
-        &EligibilityPolicy::TradeEligibleV2 { min_v2_score: Some(60.0), min_risk_ticks: 10.0 },
+        &EligibilityPolicy::TradeEligibleV2 {
+            min_v2_score: Some(60.0),
+            min_risk_ticks: 10.0,
+        },
         &scores,
         Some("scored"),
         &[],
@@ -1174,7 +1249,10 @@ fn test_p0_2_v2_low_risk_filtered_preserves_score_and_reason() {
         Some("风控未通过：风险距离不足最小跳数门槛")
     );
     // scores["quality_v2"] is preserved as 80.0
-    assert_eq!(r.summary.scores.get("quality_v2").copied().flatten(), Some(80.0));
+    assert_eq!(
+        r.summary.scores.get("quality_v2").copied().flatten(),
+        Some(80.0)
+    );
 
     // Check reason_codes
     let last_node = r.nodes.last().unwrap();
@@ -1182,7 +1260,11 @@ fn test_p0_2_v2_low_risk_filtered_preserves_score_and_reason() {
         .evidence
         .get("reason_codes")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     assert!(reason_codes.contains(&"filtered_risk_too_small".to_string()));
     assert!(!reason_codes.contains(&"filtered_low_score".to_string()));
@@ -1215,16 +1297,23 @@ fn test_p0_4_empty_pattern_events_produces_identical_review_candidates() {
 
     // 1. With empty pattern_events table
     let resolved_from_raw = store::resolve_events_for_replay("L0", Vec::new(), &bars, tick);
-    assert!(!resolved_from_raw.is_empty(), "Should extract candidate warnings from raw bars");
+    assert!(
+        !resolved_from_raw.is_empty(),
+        "Should extract candidate warnings from raw bars"
+    );
 
     // 2. With populated pattern_events table (using the extracted candidates as existing)
-    let resolved_from_existing = store::resolve_events_for_replay("L0", resolved_from_raw.clone(), &bars, tick);
+    let resolved_from_existing =
+        store::resolve_events_for_replay("L0", resolved_from_raw.clone(), &bars, tick);
 
     // 3. Both must produce identical counts and deterministic attributes
     assert_eq!(resolved_from_raw.len(), resolved_from_existing.len());
     for (a, b) in resolved_from_raw.iter().zip(resolved_from_existing.iter()) {
         assert_eq!(a.id, b.id, "Event ID must be deterministically identical");
-        assert!(a.id > 0 && a.id <= 9_007_199_254_740_991, "Event ID must be within JS MAX_SAFE_INTEGER");
+        assert!(
+            a.id > 0 && a.id <= 9_007_199_254_740_991,
+            "Event ID must be within JS MAX_SAFE_INTEGER"
+        );
         assert_eq!(a.symbol, b.symbol);
         assert_eq!(a.direction, b.direction);
         assert_eq!(a.warning_ts, b.warning_ts);
@@ -1235,39 +1324,81 @@ fn test_p0_4_empty_pattern_events_produces_identical_review_candidates() {
     }
 }
 
-
-
 #[tokio::test]
 async fn cleanup_preserves_versions_staged_by_an_unfinished_job() {
     use sea_orm::ConnectionTrait;
     let db = db().await;
     seed(&db, "RB0", 1).await;
     let engine = ReviewEngine::new(db.clone());
-    let first = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    let first = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &first.id).await;
     engine.worker_step().await.unwrap();
-    let version: String = db.query_one(store::sql("SELECT result_version FROM review_current", vec![]))
-        .await.unwrap().unwrap().try_get("", "result_version").unwrap();
-    let pending = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
-    db.execute(store::sql("INSERT INTO review_staging(job_id,event_id,result_version) VALUES (?,1,?)", vec![pending.id.clone().into(),version.clone().into()])).await.unwrap();
+    let version: String = db
+        .query_one(store::sql(
+            "SELECT result_version FROM review_current",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "result_version")
+        .unwrap();
+    let pending = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
+    db.execute(store::sql(
+        "INSERT INTO review_staging(job_id,event_id,result_version) VALUES (?,1,?)",
+        vec![pending.id.clone().into(), version.clone().into()],
+    ))
+    .await
+    .unwrap();
     // Create two newer versions so the staged version is neither current nor
     // the one retained historical version, exactly the interrupted-job case.
     for high in [110, 108] {
-        db.execute(store::sql("UPDATE klines SET high=?,close=? WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![high.into(),(high-1).into()])).await.unwrap();
-        let job = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+        db.execute(store::sql(
+            "UPDATE klines SET high=?,close=? WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'",
+            vec![high.into(), (high - 1).into()],
+        ))
+        .await
+        .unwrap();
+        let job = engine
+            .rebuild(ReviewRebuildRequest::default())
+            .await
+            .unwrap();
         install_job_calendar(&db, &job.id).await;
         // Skip pending while publishing the later job (simulates resume order).
-        db.execute(store::sql("UPDATE review_jobs SET status='paused' WHERE id=?",vec![pending.id.clone().into()])).await.unwrap();
+        db.execute(store::sql(
+            "UPDATE review_jobs SET status='paused' WHERE id=?",
+            vec![pending.id.clone().into()],
+        ))
+        .await
+        .unwrap();
         engine.worker_step().await.unwrap();
-        db.execute(store::sql("UPDATE review_jobs SET status='queued' WHERE id=?",vec![pending.id.clone().into()])).await.unwrap();
+        db.execute(store::sql(
+            "UPDATE review_jobs SET status='queued' WHERE id=?",
+            vec![pending.id.clone().into()],
+        ))
+        .await
+        .unwrap();
     }
     engine.prune_all_orphans().await.unwrap();
     let saved = engine.detail(1, &version).await.unwrap();
     assert!(!saved.lifecycle.is_empty());
-    assert!(!engine.holding(1, &version, 0, 100).await.unwrap().items.is_empty());
+    assert!(!engine
+        .holding(1, &version, 0, 100)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     // The source can disappear after the input snapshot without invalidating
     // artifacts still needed by an atomic publication.
-    db.execute(store::sql("DELETE FROM pattern_events WHERE id=1",vec![])).await.unwrap();
+    db.execute(store::sql("DELETE FROM pattern_events WHERE id=1", vec![]))
+        .await
+        .unwrap();
     engine.prune_all_orphans().await.unwrap();
     assert!(engine.detail(1, &version).await.is_ok());
 }
@@ -1279,26 +1410,62 @@ async fn missing_staged_result_fails_once_without_replacing_published_heads() {
     seed(&db, "RB0", 1).await;
     seed(&db, "SA0", 2).await;
     let engine = ReviewEngine::new(db.clone());
-    let initial = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    let initial = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &initial.id).await;
     engine.worker_step().await.unwrap();
     engine.worker_step().await.unwrap();
-    let heads = db.query_all(store::sql("SELECT result_version FROM review_current ORDER BY event_id",vec![]))
-        .await.unwrap().into_iter().map(|r| r.try_get::<String>("", "result_version").unwrap()).collect::<Vec<_>>();
-    let job = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    let heads = db
+        .query_all(store::sql(
+            "SELECT result_version FROM review_current ORDER BY event_id",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get::<String>("", "result_version").unwrap())
+        .collect::<Vec<_>>();
+    let job = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &job.id).await;
     engine.worker_step().await.unwrap();
-    db.execute(store::sql("UPDATE review_staging SET result_version='missing-result' WHERE job_id=?",vec![job.id.clone().into()])).await.unwrap();
+    db.execute(store::sql(
+        "UPDATE review_staging SET result_version='missing-result' WHERE job_id=?",
+        vec![job.id.clone().into()],
+    ))
+    .await
+    .unwrap();
     let failed = engine.worker_step().await.unwrap().unwrap();
     assert_eq!(failed.status, "failed");
     assert!(failed.errors.iter().any(|s| s.contains("missing results")));
     assert_eq!(store::revision(&db).await.unwrap(), 1);
-    let after = db.query_all(store::sql("SELECT result_version FROM review_current ORDER BY event_id",vec![]))
-        .await.unwrap().into_iter().map(|r| r.try_get::<String>("", "result_version").unwrap()).collect::<Vec<_>>();
-    assert_eq!(after, heads, "failed publication preserves the entire previously published snapshot");
+    let after = db
+        .query_all(store::sql(
+            "SELECT result_version FROM review_current ORDER BY event_id",
+            vec![],
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get::<String>("", "result_version").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, heads,
+        "failed publication preserves the entire previously published snapshot"
+    );
     assert!(engine.worker_step().await.unwrap().is_none());
-    let retry = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    let retry = engine
+        .rebuild(ReviewRebuildRequest::default())
+        .await
+        .unwrap();
     install_job_calendar(&db, &retry.id).await;
     engine.worker_step().await.unwrap();
-    assert_eq!(engine.worker_step().await.unwrap().unwrap().status, "completed");
+    assert_eq!(
+        engine.worker_step().await.unwrap().unwrap().status,
+        "completed"
+    );
 }

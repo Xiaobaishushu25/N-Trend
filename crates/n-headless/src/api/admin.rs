@@ -20,9 +20,19 @@ pub async fn get_scheduler_status(
     State(ctx): State<Arc<ServerContext>>,
     _device: AuthDevice,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<ApiErrorResponse>)> {
-    let last_refresh = ctx.last_refresh.read().await.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
-    let last_scan = ctx.last_scan.read().await.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
-    let running = ctx.scheduler_running.load(std::sync::atomic::Ordering::Relaxed);
+    let last_refresh = ctx
+        .last_refresh
+        .read()
+        .await
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+    let last_scan = ctx
+        .last_scan
+        .read()
+        .await
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+    let running = ctx
+        .scheduler_running
+        .load(std::sync::atomic::Ordering::Relaxed);
     let active_data_source = if ctx.services.data_source.tq_is_available() {
         "天勤".to_string()
     } else {
@@ -41,9 +51,18 @@ pub async fn set_scheduler_running(
     RequireAdmin(_): RequireAdmin,
     Json(payload): Json<SetRunningPayload>,
 ) -> Result<Json<SchedulerStatus>, (StatusCode, Json<ApiErrorResponse>)> {
-    ctx.scheduler_running.store(payload.running, std::sync::atomic::Ordering::SeqCst);
-    let last_refresh = ctx.last_refresh.read().await.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
-    let last_scan = ctx.last_scan.read().await.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+    ctx.scheduler_running
+        .store(payload.running, std::sync::atomic::Ordering::SeqCst);
+    let last_refresh = ctx
+        .last_refresh
+        .read()
+        .await
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
+    let last_scan = ctx
+        .last_scan
+        .read()
+        .await
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string());
     let active_data_source = if ctx.services.data_source.tq_is_available() {
         "天勤".to_string()
     } else {
@@ -112,7 +131,8 @@ pub async fn download_database_backup(
             let bytes = match tokio::fs::read(&snapshot.file_path).await {
                 Ok(b) => b,
                 Err(e) => {
-                    let err = ApiErrorResponse::new("INTERNAL_ERROR", format!("读取快照失败: {e}"), "");
+                    let err =
+                        ApiErrorResponse::new("INTERNAL_ERROR", format!("读取快照失败: {e}"), "");
                     return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(err)));
                 }
             };
@@ -149,11 +169,7 @@ pub async fn download_database_backup(
                 tracing::error!("❌ [备份下载] 生成一致性快照失败: {msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
             };
-            let err = ApiErrorResponse::new(
-                code,
-                format!("生成一致性快照备份失败: {msg}"),
-                "",
-            );
+            let err = ApiErrorResponse::new(code, format!("生成一致性快照备份失败: {msg}"), "");
             Err((status, Json(err)))
         }
     }

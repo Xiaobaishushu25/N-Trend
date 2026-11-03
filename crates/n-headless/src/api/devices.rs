@@ -23,9 +23,8 @@ pub async fn register_device(
         .await
         .unwrap_or_default();
     let name_lower = payload.device_name.to_lowercase();
-    let is_pc_or_admin_name = name_lower.contains("pc")
-        || name_lower.contains("desktop")
-        || name_lower.contains("admin");
+    let is_pc_or_admin_name =
+        name_lower.contains("pc") || name_lower.contains("desktop") || name_lower.contains("admin");
     let has_active_admin = existing
         .iter()
         .any(|d| d.role == "admin" && d.revoked_at.is_none());
@@ -44,9 +43,14 @@ pub async fn register_device(
     );
     let token_hash = hash_token(&raw_token);
 
-    if let Err(e) =
-        n_core::storage::repo::create_device(&ctx.db, &device_id, &payload.device_name, &token_hash, role)
-            .await
+    if let Err(e) = n_core::storage::repo::create_device(
+        &ctx.db,
+        &device_id,
+        &payload.device_name,
+        &token_hash,
+        role,
+    )
+    .await
     {
         tracing::error!("注册设备落库失败: {e}");
         let err = ApiErrorResponse::new("INTERNAL_ERROR", "设备注册落库失败", "");

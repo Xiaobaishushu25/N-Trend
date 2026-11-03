@@ -325,7 +325,10 @@ pub const DEFAULT_MULTIPLIERS: &[(&str, f64)] = &[
 /// 品种默认乘数：优先按品种中文名匹配，其次按代码前缀（大写），未收录兜底 10.0。
 pub fn default_multiplier(code: &str, variety: &str) -> f64 {
     if !variety.is_empty() {
-        if let Some((_, mult)) = DEFAULT_MULTIPLIERS.iter().find(|(name, _)| *name == variety) {
+        if let Some((_, mult)) = DEFAULT_MULTIPLIERS
+            .iter()
+            .find(|(name, _)| *name == variety)
+        {
             return *mult;
         }
     }

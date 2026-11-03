@@ -1099,7 +1099,10 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
         e.state = result.status;
         e.outcome = None;
         e.r_multiple = None;
-        if matches!(e.state.as_str(), "filtered" | "unfilled" | "invalidated" | "expired") {
+        if matches!(
+            e.state.as_str(),
+            "filtered" | "unfilled" | "invalidated" | "expired"
+        ) {
             e.trigger_ts = None;
             e.trigger_price = None;
         }
@@ -2283,7 +2286,8 @@ impl Services {
             let replay_bars = bars.clone();
             let candidates = tokio::task::spawn_blocking(move || {
                 event::selected_warnings(&replay_symbol, &replay_bars, tick, false, last_index)
-            }).await?;
+            })
+            .await?;
             let close_ts = close.format("%Y-%m-%d %H:%M:%S").to_string();
             for candidate in candidates
                 .into_iter()
@@ -2954,7 +2958,7 @@ impl Services {
         }
 
         let latest = repo::latest_ts(&self.db, code, "5m").await?;
-        let stored = repo::raw_klines(&self.db, code).await?.len();
+        let stored = repo::raw_kline_count(&self.db, code).await?;
 
         // 按“最新已存K线 → 当前时间”的间隔估算需要补的根数（5分钟一根），
         // 保底增量根数、上限回填根数；避免每次都整段重抓再去重插入。
@@ -3451,7 +3455,9 @@ impl Services {
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
-        let cutoff = repo::latest_raw_ts(&self.db, symbol).await?.unwrap_or_default();
+        let cutoff = repo::latest_raw_ts(&self.db, symbol)
+            .await?
+            .unwrap_or_default();
         let rows = repo::klines(&self.db, symbol, timeframe, None, Some(&cutoff)).await?;
         let mut bars: Vec<Bar> = rows
             .iter()
@@ -4653,7 +4659,8 @@ impl Services {
         });
         let mut outcome = outcome_detail_from(&row, tick);
         let bars = self.bars_for(&row.symbol, "15m").await?;
-        self.fill_review_scores(&row, &bars, tick.unwrap_or(0.), &mut outcome).await;
+        self.fill_review_scores(&row, &bars, tick.unwrap_or(0.), &mut outcome)
+            .await;
         let atr20 = crate::analyze::indicators::atr(&bars, ATR_PERIOD);
         let index_by_ts: HashMap<String, usize> = bars
             .iter()
@@ -6141,9 +6148,10 @@ mod tests {
         .unwrap();
         services.seed_symbols("RB0").await.unwrap();
 
-        let sixty_days_ago = (chrono::Utc::now().naive_utc() + chrono::Duration::hours(8) - chrono::Duration::days(60))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        let sixty_days_ago = (chrono::Utc::now().naive_utc() + chrono::Duration::hours(8)
+            - chrono::Duration::days(60))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
         db.execute_unprepared(&format!(
             "INSERT INTO pattern_events (

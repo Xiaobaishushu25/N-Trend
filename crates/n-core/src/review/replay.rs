@@ -173,10 +173,7 @@ pub fn reason_label(reason: &str) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EligibilityPolicy {
     /// 兼容旧版 5 分制门槛
-    Legacy {
-        min_score: f64,
-        min_risk_ticks: f64,
-    },
+    Legacy { min_score: f64, min_risk_ticks: f64 },
     /// V2 交易资格策略：
     /// 不使用旧 5 分制！
     /// 如果 min_v2_score 为 Some(th)，则要求 quality_v2 >= th；
@@ -357,7 +354,10 @@ pub fn run_with_policy(
 
     if terminal.is_none() {
         match policy {
-            EligibilityPolicy::Legacy { min_score, min_risk_ticks } => {
+            EligibilityPolicy::Legacy {
+                min_score,
+                min_risk_ticks,
+            } => {
                 if event.entry_score < *min_score {
                     reason_codes.push("filtered_low_score".into());
                     filter_reason_label = Some("未满足原始入场分门槛");
@@ -370,7 +370,10 @@ pub fn run_with_policy(
                     terminal = Some(("filtered", event.warning_ts.clone()));
                 }
             }
-            EligibilityPolicy::TradeEligibleV2 { min_v2_score, min_risk_ticks } => {
+            EligibilityPolicy::TradeEligibleV2 {
+                min_v2_score,
+                min_risk_ticks,
+            } => {
                 if let Some(min_v2) = min_v2_score {
                     let v2 = scores.get("quality_v2").copied().flatten();
                     if let Some(v2_val) = v2 {
@@ -390,7 +393,11 @@ pub fn run_with_policy(
                     terminal = Some(("filtered", event.warning_ts.clone()));
                 }
             }
-            EligibilityPolicy::Auto { min_v2_score, min_legacy_score, min_risk_ticks } => {
+            EligibilityPolicy::Auto {
+                min_v2_score,
+                min_legacy_score,
+                min_risk_ticks,
+            } => {
                 if scores.contains_key("quality_v2") {
                     if let Some(min_v2) = min_v2_score {
                         let v2 = scores.get("quality_v2").copied().flatten();

@@ -1501,8 +1501,8 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
         let mut is_first = true;
         let mut after_id = 0u64;
         let mut stream_id = String::new();
+        let mut poll_backoff_ms = 500u64;
         loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
             if ctx
                 .is_shutting_down
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -1514,6 +1514,8 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
             if cfg.data_source.primary_source != "tqsdk"
                 || !ctx.services.data_source.tq_is_available()
             {
+                // A missing source is not a long-poll response: avoid a busy loop.
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
             }
 
@@ -1523,19 +1525,36 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
             }
 
             let tq = ctx.services.data_source.tq_client().await;
-            if let Ok(response) = tq.poll_closed_bar_events(after_id, 25).await {
+            let poll_started = Instant::now();
+            let response = match tq.poll_closed_bar_events(after_id, 25).await {
+                Ok(response) => {
+                    poll_backoff_ms = 500;
+                    response
+                }
+                Err(error) => {
+                    tracing::warn!("天勤闭合事件长轮询失败: {error:#}");
+                    tokio::time::sleep(Duration::from_millis(poll_backoff_ms)).await;
+                    poll_backoff_ms = (poll_backoff_ms * 2).min(5_000);
+                    continue;
+                }
+            };
+            let empty_response = response.events.is_empty();
+            let mut persist_failed = false;
+            {
                 if stream_id.is_empty() {
                     stream_id = response.stream_id.clone();
                 } else if stream_id != response.stream_id {
                     stream_id = response.stream_id;
                     after_id = 0;
                     // Replay the new stream from the beginning after a bridge restart.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 let enabled = match n_core::storage::repo::list_symbols(&ctx.db, true).await {
                     Ok(symbols) => symbols,
                     Err(error) => {
                         tracing::warn!("读取闭合事件启用品种失败: {error:#}");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                 };
@@ -1546,12 +1565,18 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                     }
                     // A closure notification is a commitment that the final bar
                     // and its derived candles are already readable in the DB.
+                    let store_started = Instant::now();
                     if let Err(error) = ctx.services.store_tq_closed_bar_event(&ev).await {
                         tracing::warn!(symbol = %ev.symbol, bar_end = %ev.bar_end, "闭合K线入库失败，将重试: {error:#}");
+                        persist_failed = true;
                         break;
                     }
                     after_id = after_id.max(ev.event_id);
                     tracing::info!(
+                        source_emitted_at = %ev.emitted_at,
+                        proof = ?ev.proof,
+                        event_id = ev.event_id,
+                        received_to_store_ms = store_started.elapsed().as_millis(),
                         "🔔 [FAST_PATH] 收到天勤闭合K线: {} {} {}",
                         ev.symbol,
                         ev.period,
@@ -1607,6 +1632,13 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                     }
                 }
             }
+            if persist_failed {
+                // Keep after_id at the preceding committed event and retry the failed one.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            } else if empty_response && poll_started.elapsed() < Duration::from_millis(200) {
+                // Defensive throttle for a misconfigured endpoint that immediately returns empty.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
         }
     });
 }
@@ -1615,23 +1647,54 @@ fn spawn_tq_warmup(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) { break; }
-            if ctx.services.config().await.data_source.primary_source != "tqsdk" { break; }
-            if !ctx.services.data_source.tq_available_or_probe().await { continue; }
-            let Ok(symbols) = n_core::storage::repo::list_symbols(&ctx.db, true).await else { continue; };
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            if ctx.services.config().await.data_source.primary_source != "tqsdk" {
+                break;
+            }
+            if !ctx.services.data_source.tq_available_or_probe().await {
+                continue;
+            }
+            let Ok(symbols) = n_core::storage::repo::list_symbols(&ctx.db, true).await else {
+                continue;
+            };
             let codes: Vec<String> = symbols.into_iter().map(|s| s.code).collect();
-            if codes.is_empty() { break; }
+            if codes.is_empty() {
+                break;
+            }
             let tq = ctx.services.data_source.tq_client().await;
             match tq.subscribe_klines(&codes, "5m", 300).await {
-                Ok(response) if response.failed.is_empty() && response.subscribed.len() == codes.len() => {
+                Ok(response)
+                    if response.failed.is_empty() && response.subscribed.len() == codes.len() =>
+                {
                     // Also works when the server starts during a break: no trading
                     // tick or scheduler refresh is required to recover the last bar.
                     let stats = ctx.services.reconcile_tq_finality(&codes).await;
-                    tracing::info!("收盘订阅预热及补偿完成: 成功 {} 失败 {}", stats.succeeded, stats.failures);
-                    ctx.realtime_hub.broadcast(ctx.next_event_seq(), "data.updated", serde_json::to_value(&stats).unwrap_or_default()).await;
-                    if stats.failures == 0 { break; }
+                    tracing::info!(
+                        "收盘订阅预热及补偿完成: 成功 {} 失败 {}",
+                        stats.succeeded,
+                        stats.failures
+                    );
+                    ctx.realtime_hub
+                        .broadcast(
+                            ctx.next_event_seq(),
+                            "data.updated",
+                            serde_json::to_value(&stats).unwrap_or_default(),
+                        )
+                        .await;
+                    if stats.failures == 0 {
+                        break;
+                    }
                 }
-                Ok(response) => tracing::warn!("收盘订阅尚未就绪: 已订阅 {} 失败 {:?}", response.subscribed.len(), response.failed),
+                Ok(response) => tracing::warn!(
+                    "收盘订阅尚未就绪: 已订阅 {} 失败 {:?}",
+                    response.subscribed.len(),
+                    response.failed
+                ),
                 Err(error) => tracing::warn!("收盘订阅失败，将重试: {error:#}"),
             }
         }

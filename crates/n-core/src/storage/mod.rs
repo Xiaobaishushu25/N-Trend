@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, Schema, Statement,
-    SqlxSqliteConnector,
+    ConnectionTrait, DatabaseConnection, DbBackend, Schema, SqlxSqliteConnector, Statement,
 };
 use tracing::info;
 
@@ -49,34 +48,81 @@ mod pool_tests {
 
     #[tokio::test]
     async fn file_read_does_not_wait_for_an_uncommitted_writer() {
-        let path=std::env::temp_dir().join(format!("ntrend-reader-{}.sqlite",uuid::Uuid::new_v4()));
-        let db=connect(&path).await.unwrap();
-        db.execute_unprepared("CREATE TABLE snapshot_probe (n INTEGER); INSERT INTO snapshot_probe VALUES (1)").await.unwrap();
-        let writer=db.begin().await.unwrap();
-        writer.execute_unprepared("UPDATE snapshot_probe SET n=2").await.unwrap();
-        let result=tokio::time::timeout(std::time::Duration::from_secs(1),db.query_one(Statement::from_string(DbBackend::Sqlite,"SELECT n FROM snapshot_probe".to_string()))).await;
+        let path =
+            std::env::temp_dir().join(format!("ntrend-reader-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = connect(&path).await.unwrap();
+        db.execute_unprepared(
+            "CREATE TABLE snapshot_probe (n INTEGER); INSERT INTO snapshot_probe VALUES (1)",
+        )
+        .await
+        .unwrap();
+        let writer = db.begin().await.unwrap();
+        writer
+            .execute_unprepared("UPDATE snapshot_probe SET n=2")
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            db.query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT n FROM snapshot_probe".to_string(),
+            )),
+        )
+        .await;
         writer.rollback().await.unwrap();
-        let row=result.expect("a chart reader must not queue behind the writer").unwrap().unwrap();
-        assert_eq!(row.try_get::<i64>("","n").unwrap(),1);
+        let row = result
+            .expect("a chart reader must not queue behind the writer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
         db.close().await.unwrap();
-        let _=std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn pragmas_are_set_on_pool_connections() {
-        let path = std::env::temp_dir().join(format!("ntrend-pragma-{}.sqlite", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("ntrend-pragma-{}.sqlite", uuid::Uuid::new_v4()));
         let db = connect(&path).await.unwrap();
 
         let conn1 = db.begin().await.unwrap();
-        let row1 = conn1.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA busy_timeout;".to_string())).await.unwrap().unwrap();
+        let row1 = conn1
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA busy_timeout;".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         let timeout1: i64 = row1.try_get("", "timeout").unwrap();
-        let row1_fk = conn1.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA foreign_keys;".to_string())).await.unwrap().unwrap();
+        let row1_fk = conn1
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys;".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         let fk1: i64 = row1_fk.try_get("", "foreign_keys").unwrap();
 
         let conn2 = db.begin().await.unwrap();
-        let row2 = conn2.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA busy_timeout;".to_string())).await.unwrap().unwrap();
+        let row2 = conn2
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA busy_timeout;".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         let timeout2: i64 = row2.try_get("", "timeout").unwrap();
-        let row2_fk = conn2.query_one(Statement::from_string(DbBackend::Sqlite, "PRAGMA foreign_keys;".to_string())).await.unwrap().unwrap();
+        let row2_fk = conn2
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys;".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
         let fk2: i64 = row2_fk.try_get("", "foreign_keys").unwrap();
 
         assert_eq!(timeout1, 15000);
@@ -373,7 +419,10 @@ async fn create_pattern_events(db: &DatabaseConnection) -> Result<()> {
         ),
         ("idx_pattern_events_warning_ts", "(warning_ts)"),
         ("idx_pattern_events_entry_score", "(entry_score)"),
-        ("idx_pattern_events_pending_entry", "(state, trigger_ts, id)"),
+        (
+            "idx_pattern_events_pending_entry",
+            "(state, trigger_ts, id)",
+        ),
     ] {
         db.execute_unprepared(&format!(
             "CREATE INDEX IF NOT EXISTS {name} ON pattern_events {cols}"

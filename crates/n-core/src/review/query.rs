@@ -165,7 +165,9 @@ pub(crate) fn validate(q: &ReviewQuery) -> Result<()> {
         "unknown direction"
     );
     anyhow::ensure!(
-        f.outcomes.iter().all(|s| matches!(s.as_str(), "win" | "loss" | "flat")),
+        f.outcomes
+            .iter()
+            .all(|s| matches!(s.as_str(), "win" | "loss" | "flat")),
         "unknown outcome"
     );
     Ok(())
@@ -183,12 +185,19 @@ pub(crate) fn selection(q: &ReviewQuery) -> (String, Vec<sea_orm::Value>) {
     let mut conditions = vec!["1=1".into()];
     let mut values = vec![];
     if !f.outcomes.is_empty() {
-        let predicates: Vec<_> = f.outcomes.iter().map(|s| match s.as_str() {
-            "win" => "r.net_r>0",
-            "loss" => "r.net_r<0",
-            _ => "r.net_r=0",
-        }).collect();
-        conditions.push(format!("(r.state='closed' AND ({}))", predicates.join(" OR ")));
+        let predicates: Vec<_> = f
+            .outcomes
+            .iter()
+            .map(|s| match s.as_str() {
+                "win" => "r.net_r>0",
+                "loss" => "r.net_r<0",
+                _ => "r.net_r=0",
+            })
+            .collect();
+        conditions.push(format!(
+            "(r.state='closed' AND ({}))",
+            predicates.join(" OR ")
+        ));
     }
     for (column, list) in [
         ("symbol", &f.symbols),
@@ -328,7 +337,9 @@ impl ReviewEngine {
             Ok(Snapshot {
                 owner,
                 created: Instant::now(),
-                expires_at: (Utc::now() + chrono::Duration::seconds(super::SNAPSHOT_TTL_SECS as i64)).to_rfc3339(),
+                expires_at: (Utc::now()
+                    + chrono::Duration::seconds(super::SNAPSHOT_TTL_SECS as i64))
+                .to_rfc3339(),
                 revision: rev,
                 key,
                 rows,
@@ -499,7 +510,11 @@ fn page(id: &str, s: &Snapshot, cursor: usize, limit: usize) -> ReviewItemsPage 
     }
 }
 fn response(id: &str, s: &Snapshot, limit: usize) -> ReviewQueryResponse {
-    let scored = s.rows.iter().filter(|r| r.scores.get(&s.metric).copied().flatten().is_some()).count();
+    let scored = s
+        .rows
+        .iter()
+        .filter(|r| r.scores.get(&s.metric).copied().flatten().is_some())
+        .count();
     ReviewQueryResponse {
         page: page(id, s, 0, limit),
         expires_at: s.expires_at.clone(),

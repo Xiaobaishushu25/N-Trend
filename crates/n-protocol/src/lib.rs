@@ -4,9 +4,9 @@ pub mod dto;
 pub mod error;
 pub mod quality;
 pub mod review;
-pub mod ws;
 pub mod trader_stream;
 pub mod version;
+pub mod ws;
 
 pub use auth::*;
 pub use config::*;

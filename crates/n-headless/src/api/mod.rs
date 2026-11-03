@@ -9,13 +9,13 @@ pub mod manual_levels;
 pub mod meta;
 pub mod notifications;
 pub mod quotes;
+pub mod review;
 pub mod settings;
 pub mod signals;
-pub mod review;
 pub mod symbols;
 pub mod trader;
-pub mod ws_handler;
 mod version;
+pub mod ws_handler;
 
 use crate::state::ServerContext;
 use axum::extract::DefaultBodyLimit;

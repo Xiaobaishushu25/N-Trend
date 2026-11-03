@@ -10,7 +10,11 @@ pub struct ApiErrorResponse {
 }
 
 impl ApiErrorResponse {
-    pub fn new(code: impl Into<String>, message: impl Into<String>, request_id: impl Into<String>) -> Self {
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -21,7 +25,11 @@ impl ApiErrorResponse {
 
 impl std::fmt::Display for ApiErrorResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {} (requestId: {})", self.code, self.message, self.request_id)
+        write!(
+            f,
+            "[{}] {} (requestId: {})",
+            self.code, self.message, self.request_id
+        )
     }
 }
 
