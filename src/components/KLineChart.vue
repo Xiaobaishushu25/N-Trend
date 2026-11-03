@@ -820,12 +820,13 @@ const levelDrag = ref<{
 let levelDragPointerTarget: (Element & { releasePointerCapture?: (pointerId: number) => void }) | null = null
 let focusIndex = -1
 let focusFollowsLatest = true
-/** 键盘或复盘定位后，鼠标移出图表时仍把十字光标留在焦点K线上 */
-let focusPinnedByKeys = false
+/** 显式固定的焦点K线时间戳（通过点击、键盘方向键或复盘定位），即使行情跳动或鼠标移开也保持固定 */
+let pinnedTs: string | null = null
 let pendingFocusTs: string | null = null
-/** 鼠标悬停在历史K线时，实时行情刷新不应把焦点拉回最新K线 */
+/** 鼠标悬停在K线上的时间戳 */
 let hoveredTime: Time | null = null
 let isHovering = false
+let isPointerInside = false
 let patternLines: ISeriesApi<'Line'>[] = []
 let trendSeries: ISeriesApi<'Line'> | null = null
 let priceExtent = 1
@@ -1539,10 +1540,11 @@ function restoreView(): { from: number; to: number } | null {
   let to = lastView.to
   if (total > 0) {
     const maxTo = total - 0.5 + rightGapBars(Math.min(span, total))
+    const wasMaxToCapture = lastView.totalAtCapture - 0.5 + rightGapBars(Math.min(span, lastView.totalAtCapture))
     const wasAtLatest =
       lastView.totalAtCapture > 0 &&
-      lastView.to >= lastView.totalAtCapture - 1 - rightGapBars(Math.min(span, total)) - 1e-3
-    if (wasAtLatest || span >= total) {
+      lastView.to >= wasMaxToCapture - 1.5
+    if (wasAtLatest) {
       to = maxTo
       from = Math.max(-0.5, to - span)
     } else {
@@ -1606,13 +1608,17 @@ function renderFocusLegend() {
       time,
     )
   }
-  emit('crosshair-candle', {
-    time: row.ts,
-    open: row.open,
-    high: row.high,
-    low: row.low,
-    close: row.close,
-  })
+  if (pinnedTs) {
+    emit('crosshair-candle', {
+      time: row.ts,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+    })
+  } else {
+    emit('crosshair-candle', null)
+  }
 }
 
 /** 更新焦点K线的十字光标与图例；数据尚未就绪时清除光标 */
@@ -1658,10 +1664,12 @@ function ensureFocusVisible(pendingRange?: { from: number; to: number }) {
 /** 手动拖动/缩放离开最新K线后停止自动跟随；回到最新区域时再恢复跟随 */
 function syncFocusFollowWithView() {
   if (!chart || props.rows.length === 0) return
-  if (focusIndex !== props.rows.length - 1) return
+  if (pinnedTs) return
   const logical = chart.timeScale().getVisibleLogicalRange()
   if (!logical) return
-  focusFollowsLatest = Number(logical.to) >= props.rows.length - 1
+  const span = logical.to - logical.from
+  const maxTo = props.rows.length - 0.5 + rightGapBars(Math.min(span, props.rows.length))
+  focusFollowsLatest = Number(logical.to) >= maxTo - 1.5
 }
 
 /** 定位复盘形态：优先精确匹配，匹配不到时取时间上最接近的K线 */
@@ -1745,8 +1753,8 @@ function tryApplyPendingFocus(): boolean {
   pendingFocusTs = null
   focusRetryCount = 0
   focusIndex = idx
+  pinnedTs = props.rows[idx].ts
   focusFollowsLatest = false
-  focusPinnedByKeys = true
   syncFocus()
   centerFocusView(focusIndex)
   nextTick(() => {
@@ -1779,6 +1787,13 @@ function focusAtTs(ts: string | null) {
   focusRetryCount = 0
   if (!pendingFocusTs) {
     if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
+    pinnedTs = null
+    focusFollowsLatest = true
+    chart?.clearCrosshairPosition()
+    if (props.rows.length) {
+      focusIndex = props.rows.length - 1
+      renderFocusLegend()
+    }
     return
   }
   if (tryApplyPendingFocus()) {
@@ -1795,8 +1810,8 @@ function stepCandles(dir: number) {
   const next = focusIndex + (dir < 0 ? -1 : 1)
   if (next < 0 || next >= props.rows.length) return
   focusIndex = next
-  focusFollowsLatest = false
-  focusPinnedByKeys = true
+  pinnedTs = props.rows[next].ts
+  focusFollowsLatest = next === props.rows.length - 1
   syncFocus()
   ensureFocusVisible()
 }
@@ -2178,10 +2193,11 @@ function renderData() {
 
       // 追加新K线后：如果用户之前处于最右侧最新K线，平滑推进1格并保留用户的缩放跨度
       const span = lastView ? Math.max(1, lastView.to - lastView.from) : Math.min(displayKNum.value, rowsLen)
+      const wasMaxToCapture = (lastView?.totalAtCapture ?? 0) - 0.5 + rightGapBars(Math.min(span, lastView?.totalAtCapture ?? rowsLen))
       const wasAtLatest =
         lastView != null &&
         lastView.totalAtCapture > 0 &&
-        lastView.to >= lastView.totalAtCapture - 1 - rightGapBars(Math.min(span, rowsLen)) - 1e-3
+        lastView.to >= wasMaxToCapture - 1.5
       if (wasAtLatest) {
         const maxTo = rowsLen - 0.5 + rightGapBars(Math.min(span, rowsLen))
         const to = maxTo
@@ -2218,17 +2234,26 @@ function renderData() {
     }
     isRestoringView = false
   }
-  const lastTsForHover = props.rows.length ? (toTs(props.rows[props.rows.length - 1].ts) as Time) : null
-  const hoveringOnHistory = isHovering && hoveredTime != null && lastTsForHover != null && hoveredTime !== lastTsForHover
-  const shouldAutoFollow = focusFollowsLatest && !hoveringOnHistory
-  if (isSwitch) {
+
+  // 维护焦点K线：若用户显式固定了K线，按时间戳稳定追踪，绝不抢焦
+  if (pinnedTs) {
+    const idx = props.rows.findIndex((r) => r.ts === pinnedTs)
+    if (idx >= 0) {
+      focusIndex = idx
+    } else {
+      // 找不到原时间戳（如跨品种切换），解除固定
+      pinnedTs = null
+      focusFollowsLatest = true
+      focusIndex = props.rows.length - 1
+    }
+  } else if (isSwitch || focusFollowsLatest || focusIndex < 0 || focusIndex >= props.rows.length) {
     focusIndex = props.rows.length - 1
-    focusFollowsLatest = true
-  } else if (shouldAutoFollow) {
-    focusIndex = props.rows.length - 1
-  } else if (focusIndex < 0 || focusIndex >= props.rows.length) {
-    focusIndex = props.rows.length - 1
+    if (isSwitch) {
+      focusFollowsLatest = true
+      pinnedTs = null
+    }
   }
+
   let focusNeedsCenter = false
   let focusIdxForCenter = -1
   if (pendingFocusTs) {
@@ -2238,33 +2263,47 @@ function renderData() {
       focusRetryCount = 0
       if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
       focusIndex = idx
+      pinnedTs = props.rows[idx].ts
       focusFollowsLatest = false
-      focusPinnedByKeys = true
       focusNeedsCenter = true
       focusIdxForCenter = idx
     }
   }
-  if (hoveringOnHistory) {
-    const hoveredRow = hoveredTime != null ? props.rows.find((r) => (toTs(r.ts) as Time) === hoveredTime) : undefined
-    if (hoveredRow && hoveredTime != null) {
+
+  // 状态同步：
+  // 1. 若鼠标正在悬停：保持该K线图例与顶栏更新，决不调用 setCrosshairPosition 抢夺鼠标十字坐标！
+  // 2. 若焦点已固定：保持固定K线的十字光标与图例
+  // 3. 既无悬停也无固定（日常行情跳动）：仅刷新图例文字，不强加十字光标
+  if (isHovering && hoveredTime != null) {
+    const hoveredRow = props.rows.find((r) => (toTs(r.ts) as Time) === hoveredTime)
+    if (hoveredRow) {
       if (legend.value) {
-        legend.value.innerHTML = formatLegend({ time: hoveredTime, open: hoveredRow.open, high: hoveredRow.high, low: hoveredRow.low, close: hoveredRow.close } as CandlestickData, hoveredTime)
+        legend.value.innerHTML = formatLegend(
+          { time: hoveredTime, open: hoveredRow.open, high: hoveredRow.high, low: hoveredRow.low, close: hoveredRow.close } as CandlestickData,
+          hoveredTime,
+        )
       }
-      chart.setCrosshairPosition(hoveredRow.close, hoveredTime, candleSeries)
-    } else {
-      syncFocus()
+      emit('crosshair-candle', {
+        time: hoveredRow.ts,
+        open: hoveredRow.open,
+        high: hoveredRow.high,
+        low: hoveredRow.low,
+        close: hoveredRow.close,
+      })
     }
-  } else {
+  } else if (pinnedTs) {
     syncFocus()
+  } else {
+    renderFocusLegend()
   }
+
   if (focusNeedsCenter) {
     centerFocusView(focusIdxForCenter)
     const savedIdx = focusIdxForCenter
     nextTick(() => {
       if (focusIndex === savedIdx && chart) centerFocusView(savedIdx)
     })
-  } else if (shouldAutoFollow && !isIncrementalUpdate) ensureFocusVisible(targetRange ?? undefined)
-  else if (pendingFocusTs) {
+  } else if (pendingFocusTs) {
     // 数据已就绪但仍有未消耗的 pending（极端时序），再约一次
     scheduleFocusRetry()
   }
@@ -2288,6 +2327,38 @@ function renderOverlays() {
   syncEventLabels()
   syncManualLevels()
   refreshManualLevelOverlay()
+}
+
+function handlePointerEnter() {
+  isPointerInside = true
+}
+
+function handlePointerLeave() {
+  isPointerInside = false
+  isHovering = false
+  hoveredTime = null
+  crosshairY.value = null
+  crosshairPrice.value = null
+  innerPricePrimitive?.update()
+  if (pinnedTs) {
+    syncFocus()
+  } else {
+    chart?.clearCrosshairPosition()
+    renderFocusLegend()
+    emit('crosshair-candle', null)
+  }
+}
+
+function handleDblClick() {
+  if (drawMode.value || levelDrag.value) return
+  pinnedTs = null
+  focusFollowsLatest = true
+  chart?.clearCrosshairPosition()
+  if (props.rows.length) {
+    focusIndex = props.rows.length - 1
+    renderFocusLegend()
+  }
+  emit('crosshair-candle', null)
 }
 
 /** Ctrl+滚轮缩放：向上(deltaY<0)放大、向下(deltaY>0)缩小；时间轴与价格轴按光标位置同步缩放。
@@ -2729,6 +2800,18 @@ function handleManualLevelKeydown(event: KeyboardEvent) {
   if (selectedManualLevelId.value != null) {
     selectedManualLevelId.value = null
     event.preventDefault()
+    return
+  }
+  if (pinnedTs) {
+    pinnedTs = null
+    focusFollowsLatest = true
+    chart?.clearCrosshairPosition()
+    if (props.rows.length) {
+      focusIndex = props.rows.length - 1
+      renderFocusLegend()
+    }
+    emit('crosshair-candle', null)
+    event.preventDefault()
   }
 }
 
@@ -2758,9 +2841,10 @@ onMounted(() => {
   prevTimeframe = null
   focusIndex = -1
   focusFollowsLatest = true
-  focusPinnedByKeys = false
+  pinnedTs = null
   hoveredTime = null
   isHovering = false
+  isPointerInside = false
   chart = createChart(container.value, {
     layout: {
       background: { type: ColorType.Solid, color: '#ffffff' },
@@ -2845,34 +2929,35 @@ onMounted(() => {
     volumeSeries.attachPrimitive(innerVolumePrimitive)
   }
 
+  container.value.addEventListener('pointerenter', handlePointerEnter)
+  container.value.addEventListener('pointerleave', handlePointerLeave)
+  container.value.addEventListener('dblclick', handleDblClick)
+
   chart.subscribeCrosshairMove((param) => {
     if (!candleSeries) return
     if (!param.time || !param.point) {
-      isHovering = false
-      hoveredTime = null
-      crosshairY.value = null
-      crosshairPrice.value = null
-      innerPricePrimitive?.update()
-      if (focusPinnedByKeys) syncFocus()
-      else renderFocusLegend()
-      emit('crosshair-candle', null)
-      return
-    }
-    crosshairY.value = param.point.y
-    crosshairPrice.value = candleSeries.coordinateToPrice(param.point.y)
-    innerPricePrimitive?.update()
-    const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
-    if (!d) {
-      isHovering = false
-      hoveredTime = null
-      innerPricePrimitive?.update()
-      renderFocusLegend()
-      emit('crosshair-candle', null)
+      if (!isPointerInside) {
+        isHovering = false
+        hoveredTime = null
+        crosshairY.value = null
+        crosshairPrice.value = null
+        innerPricePrimitive?.update()
+        if (pinnedTs) syncFocus()
+        else {
+          chart?.clearCrosshairPosition()
+          renderFocusLegend()
+          emit('crosshair-candle', null)
+        }
+      }
       return
     }
     isHovering = true
     hoveredTime = param.time as Time
-    focusPinnedByKeys = false
+    crosshairY.value = param.point.y
+    crosshairPrice.value = candleSeries.coordinateToPrice(param.point.y)
+    innerPricePrimitive?.update()
+    const d = param.seriesData.get(candleSeries) as CandlestickData | undefined
+    if (!d) return
     if (legend.value) {
       legend.value.innerHTML = formatLegend(d, param.time as Time)
     }
@@ -2883,6 +2968,44 @@ onMounted(() => {
       low: d.low,
       close: d.close,
     })
+  })
+
+  chart.subscribeClick((param) => {
+    if (!candleSeries) return
+    if (drawMode.value || levelDrag.value) return
+    if (param.time) {
+      const row = props.rows.find((r) => (toTs(r.ts) as Time) === param.time)
+      if (row) {
+        if (pinnedTs === row.ts) {
+          // 再次点击同一根已固定K线：解除固定
+          pinnedTs = null
+          focusFollowsLatest = true
+          chart?.clearCrosshairPosition()
+          if (props.rows.length) {
+            focusIndex = props.rows.length - 1
+            renderFocusLegend()
+          }
+          emit('crosshair-candle', null)
+          return
+        }
+        pinnedTs = row.ts
+        focusIndex = props.rows.indexOf(row)
+        focusFollowsLatest = focusIndex === props.rows.length - 1
+        syncFocus()
+        return
+      }
+    }
+    // 点击空白处/非K线区域：解除固定焦点，恢复跟随最新
+    if (pinnedTs) {
+      pinnedTs = null
+      focusFollowsLatest = true
+      chart?.clearCrosshairPosition()
+      if (props.rows.length) {
+        focusIndex = props.rows.length - 1
+        renderFocusLegend()
+      }
+      emit('crosshair-candle', null)
+    }
   })
 
   container.value.addEventListener('wheel', handleWheel, { passive: false })
@@ -3026,6 +3149,9 @@ onBeforeUnmount(() => {
   levelDrag.value = null
   dragPreview.value = null
   container.value?.removeEventListener('wheel', handleWheel)
+  container.value?.removeEventListener('pointerenter', handlePointerEnter)
+  container.value?.removeEventListener('pointerleave', handlePointerLeave)
+  container.value?.removeEventListener('dblclick', handleDblClick)
   resizeObserver?.disconnect()
   if (gapPrimitive && candleSeries) {
     candleSeries.detachPrimitive(gapPrimitive)
@@ -3044,12 +3170,13 @@ onBeforeUnmount(() => {
     manualLevelPrimitive = null
   }
   focusIndex = -1
-  focusPinnedByKeys = false
+  pinnedTs = null
   pendingFocusTs = null
   focusRetryCount = 0
   if (focusRetryTimer) { clearTimeout(focusRetryTimer); focusRetryTimer = null }
   hoveredTime = null
   isHovering = false
+  isPointerInside = false
   chart?.timeScale().unsubscribeVisibleLogicalRangeChange(onVisibleRangeChange)
   if (countdownTimer) {
     clearInterval(countdownTimer)
@@ -3091,6 +3218,14 @@ function toggleTrendVisible() {
 }
 
 function resetView() {
+  pinnedTs = null
+  focusFollowsLatest = true
+  chart?.clearCrosshairPosition()
+  if (props.rows.length) {
+    focusIndex = props.rows.length - 1
+    renderFocusLegend()
+  }
+  emit('crosshair-candle', null)
   if (props.isFullscreen) {
     return applyDefaultView()
   }
