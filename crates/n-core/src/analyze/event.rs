@@ -466,6 +466,30 @@ mod tests {
     }
 
     #[test]
+    fn last_warning_scan_matches_full_forward_replay() {
+        let bars = bu0_series();
+        let mut warnings = 0;
+        for end in ATR_PERIOD + 2..=bars.len() {
+            let prefix = &bars[..end];
+            let expected: Vec<_> = replay_warnings("BU0", prefix, 1.0)
+                .into_iter()
+                .filter(|c| c.warning_index == end - 1)
+                .collect();
+            let actual = selected_warnings("BU0", prefix, 1.0, false, end - 1);
+            warnings += actual.len();
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "cutoff {end}"
+            );
+        }
+        assert!(
+            warnings > 0,
+            "fixture must exercise actual warning candidates"
+        );
+    }
+
+    #[test]
     fn replay_keeps_same_warning_bar_but_does_not_reference_future() {
         let dt = DT {
             year: 2026,

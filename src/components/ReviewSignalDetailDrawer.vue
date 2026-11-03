@@ -72,7 +72,7 @@ function diagnosticText(v: number | null) { return v == null ? '未知' : Number
                 <div class="node-content">
                   <div class="node-field"><span class="field-lbl">计划入场</span><span class="field-val">{{ fmtPrice(plannedEntry) }}</span></div>
                   <div class="node-field"><span class="field-lbl">初始止损</span><span class="field-val">{{ fmtPrice(plannedStop) }}</span></div>
-                  <div class="node-field"><span class="field-lbl">原始参考目标</span><span class="field-val">{{ fmtPrice(plannedTarget) }}</span></div>
+                  <div class="node-field"><span class="field-lbl">止盈参考</span><span class="field-val">{{ fmtPrice(plannedTarget) }}</span></div>
                 </div>
               </div>
               <div v-if="effectiveSummary?.state === 'filtered'" class="timeline-node node-filtered">

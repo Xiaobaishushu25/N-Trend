@@ -373,6 +373,7 @@ async fn create_pattern_events(db: &DatabaseConnection) -> Result<()> {
         ),
         ("idx_pattern_events_warning_ts", "(warning_ts)"),
         ("idx_pattern_events_entry_score", "(entry_score)"),
+        ("idx_pattern_events_pending_entry", "(state, trigger_ts, id)"),
     ] {
         db.execute_unprepared(&format!(
             "CREATE INDEX IF NOT EXISTS {name} ON pattern_events {cols}"

@@ -1567,7 +1567,7 @@ impl Services {
             return Ok(Vec::new());
         }
         let min_score = cfg.notify.new_pattern_min_score;
-        let rows = repo::all_pattern_events(&self.db).await?;
+        let rows = repo::pending_entry_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
         let name_by_code: HashMap<String, String> = symbols
             .iter()
@@ -1577,7 +1577,7 @@ impl Services {
             .iter()
             .filter_map(|s| s.latest.map(|v| (s.code.as_str(), v)))
             .collect();
-        let mut notified = self.entry_notified.write().await;
+        let mut bars_by_symbol: HashMap<String, Option<Vec<Bar>>> = HashMap::new();
         let mut hits = Vec::new();
         for row in rows {
             if row.state != "pending" || row.trigger_ts.is_some() {
@@ -1594,17 +1594,21 @@ impl Services {
                 continue;
             }
 
-            let bars = match self.bars_for(&row.symbol, "15m").await {
-                Ok(bars) => Some(bars),
-                Err(e) => {
-                    tracing::warn!("实时触发读取15m K线失败 {} {}: {e}", row.symbol, row.id);
-                    None
-                }
-            };
+            if !bars_by_symbol.contains_key(&row.symbol) {
+                let bars = match self.bars_for(&row.symbol, "15m").await {
+                    Ok(bars) => Some(bars),
+                    Err(e) => {
+                        tracing::warn!("实时触发读取15m K线失败 {} {}: {e}", row.symbol, row.id);
+                        None
+                    }
+                };
+                bars_by_symbol.insert(row.symbol.clone(), bars);
+            }
+            let bars = bars_by_symbol.get(&row.symbol).and_then(Option::as_deref);
 
             let now = now_ts();
 
-            let is_stale_or_expired = if let Some(bars) = bars.as_deref() {
+            let is_stale_or_expired = if let Some(bars) = bars {
                 if let Some(w) = bars.iter().position(|b| bar_ts(b) == row.warning_ts) {
                     if bars.len() > w + outcome::PENDING_BARS {
                         true
@@ -1631,8 +1635,11 @@ impl Services {
                     true
                 }
             } else {
-                if let Ok(w_dt) = chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M"))
+                if let Ok(w_dt) =
+                    chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| {
+                            chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M")
+                        })
                 {
                     let now_dt = chrono::Utc::now().naive_utc() + chrono::Duration::hours(8);
                     (now_dt - w_dt).num_hours() > 48
@@ -1658,14 +1665,14 @@ impl Services {
                 row.level.clone(),
                 row.entry.to_bits(),
             );
-            if notified.insert(key) {
+            if self.entry_notified.write().await.insert(key.clone()) {
                 let mut next = row.clone();
                 next.state = "triggered".to_string();
                 next.trigger_ts = Some(now.clone());
                 next.trigger_price = Some(row.entry);
                 next.updated_at = now;
 
-                if let Some(bars) = bars.as_deref() {
+                if let Some(bars) = bars {
                     let _ = advance_event_model(&mut next, bars);
                 }
                 if next.state == "filtered" || next.state == "unfilled" {
@@ -1675,12 +1682,16 @@ impl Services {
                 next.updated_at = now_ts();
                 match repo::update_pattern_event(&self.db, next.clone()).await {
                     Ok(_) => {
-                        if let Some(bars) = bars.as_deref() {
+                        if let Some(bars) = bars {
                             if next.trigger_bar_ts.is_some() {
                                 if let Err(e) =
-                                    crate::v2::prediction::predict_event(&self.db, &next, bars).await
+                                    crate::v2::prediction::predict_event(&self.db, &next, bars)
+                                        .await
                                 {
-                                    tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {e:#}");
+                                    tracing::warn!(
+                                        event_id = next.id,
+                                        "V2 实时触发预测写入失败: {e:#}"
+                                    );
                                 }
                             }
                         }
@@ -1698,6 +1709,7 @@ impl Services {
                         }
                     }
                     Err(e) => {
+                        self.entry_notified.write().await.remove(&key);
                         tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
                     }
                 }
@@ -1710,7 +1722,7 @@ impl Services {
         &self,
         row: manual_levels::Model,
     ) -> Result<manual_levels::Model> {
-        let bars = self.bars_for(&row.symbol, &row.timeframe).await?;
+        let bars = self.manual_level_bars(&row.symbol, &row.timeframe).await?;
         if bars.is_empty() {
             return Ok(row);
         }
@@ -1886,23 +1898,29 @@ impl Services {
         &self,
         snapshots: &[MarketSnapshot],
     ) -> Result<Vec<ManualLevelAlert>> {
-        let levels = repo::manual_levels(&self.db, None, None, false).await?;
+        let levels = repo::monitored_manual_levels(&self.db).await?;
         let latest: HashMap<&str, f64> = snapshots
             .iter()
             .filter_map(|s| s.latest.map(|v| (s.code.as_str(), v)))
             .collect();
         let mut alerts = Vec::new();
+        let mut bars_by_group: HashMap<(String, String), Vec<Bar>> = HashMap::new();
         for row in levels {
             if !row.monitor_enabled || row.status != "active" {
                 continue;
             }
-            let bars = match self.bars_for(&row.symbol, &row.timeframe).await {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::debug!(level_id = row.id, "读取关键区域K线失败: {error:#}");
-                    continue;
-                }
-            };
+            let group = (row.symbol.clone(), row.timeframe.clone());
+            if !bars_by_group.contains_key(&group) {
+                let bars = match self.manual_level_bars(&row.symbol, &row.timeframe).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::debug!(level_id = row.id, "读取关键区域K线失败: {error:#}");
+                        continue;
+                    }
+                };
+                bars_by_group.insert(group.clone(), bars);
+            }
+            let bars = &bars_by_group[&group];
             if bars.is_empty() {
                 continue;
             }
@@ -1920,14 +1938,7 @@ impl Services {
                 &row.role_override,
             );
             let event = evaluation.event;
-            // 拖拽编辑可能与本轮行情轮询并发发生。重新读取最新行，
-            // 只把分析状态写回，避免用轮询开始时的旧区域边界覆盖用户刚保存的修改。
-            let Some(mut persisted) = repo::manual_level_by_id(&self.db, row.id).await? else {
-                continue;
-            };
-            if !persisted.monitor_enabled || persisted.status != "active" {
-                continue;
-            }
+            let mut persisted = row.clone();
             persisted.current_phase = evaluation.phase.clone();
             let effective_role = if persisted.role_override == "auto" {
                 evaluation.role.as_str().to_string()
@@ -1940,10 +1951,14 @@ impl Services {
             } else {
                 1.0
             };
-            persisted.updated_at = now_ts();
-            if event.is_some() {
-                persisted.last_event_ts = Some(persisted.updated_at.clone());
+            if event.is_none()
+                && persisted.current_phase == row.current_phase
+                && persisted.role == row.role
+                && persisted.role_confidence == row.role_confidence
+            {
+                continue;
             }
+            persisted.updated_at = now_ts();
             if let Some(event_kind) = event {
                 let event_type = event_kind.as_str().to_string();
                 let bar_ts = bars.last().map(bar_ts);
@@ -1962,9 +1977,13 @@ impl Services {
                     volume_ratio: Set(evaluation.volume_ratio),
                     created_at: Set(persisted.updated_at.clone()),
                 };
-                if repo::insert_manual_level_event(&self.db, event_row)
-                    .await?
-                    .is_some()
+                if repo::record_manual_level_evaluation(
+                    &self.db,
+                    row,
+                    persisted.clone(),
+                    Some(event_row),
+                )
+                .await?
                 {
                     alerts.push(ManualLevelAlert {
                         level_id: persisted.id,
@@ -1981,8 +2000,9 @@ impl Services {
                         volume_ratio: evaluation.volume_ratio,
                     });
                 }
+            } else {
+                repo::record_manual_level_evaluation(&self.db, row, persisted, None).await?;
             }
-            repo::update_manual_level(&self.db, persisted).await?;
         }
         Ok(alerts)
     }
@@ -2024,7 +2044,7 @@ impl Services {
         }
 
         let min_score = cfg.notify.new_pattern_min_score;
-        let events = repo::all_pattern_events(&self.db).await?;
+        let events = repo::pending_entry_events(&self.db).await?;
         let mut selected: HashMap<(String, String), pattern_events::Model> = HashMap::new();
         for event in events.into_iter().filter(|e| {
             e.state == "pending" && e.trigger_ts.is_none() && e.entry_score >= min_score
@@ -2259,7 +2279,11 @@ impl Services {
                 &symbol_row.code,
                 &symbol_row.variety,
             );
-            let candidates = event::replay_warnings(&symbol_row.code, &bars, tick);
+            let replay_symbol = symbol_row.code.clone();
+            let replay_bars = bars.clone();
+            let candidates = tokio::task::spawn_blocking(move || {
+                event::selected_warnings(&replay_symbol, &replay_bars, tick, false, last_index)
+            }).await?;
             let close_ts = close.format("%Y-%m-%d %H:%M:%S").to_string();
             for candidate in candidates
                 .into_iter()
@@ -3427,12 +3451,11 @@ impl Services {
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
-        let raw = repo::raw_klines(&self.db, symbol).await?;
-        let cutoff = raw.last().map(|r| r.ts.as_str()).unwrap_or("");
-        let rows = repo::klines(&self.db, symbol, timeframe, None, None).await?;
+        let cutoff = repo::latest_raw_ts(&self.db, symbol).await?.unwrap_or_default();
+        let rows = repo::klines(&self.db, symbol, timeframe, None, Some(&cutoff)).await?;
         let mut bars: Vec<Bar> = rows
             .iter()
-            .filter(|r| r.ts.as_str() <= cutoff)
+            .filter(|r| r.ts.as_str() <= cutoff.as_str())
             .filter_map(model_to_bar)
             .collect();
         let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
@@ -3445,13 +3468,38 @@ impl Services {
         let fetch_bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let fallback: Vec<Bar> = aggregate(&fetch_bars, tf)
             .iter()
-            .filter(|r| r.datetime.as_str() <= cutoff)
+            .filter(|r| r.datetime.as_str() <= cutoff.as_str())
             .filter_map(fetch_to_bar)
             .collect();
         if fallback.len() > bars.len() {
             bars = fallback;
             mark_rollover_bars(&mut bars, &rollovers, timeframe);
         }
+        Ok(bars)
+    }
+
+    /// Manual levels use at most the last 30 bars (role, ATR20 and volume21).
+    /// Keep the existing derived-data fallback when there are too few rows.
+    async fn manual_level_bars(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
+        let cutoff = repo::latest_raw_ts(&self.db, symbol)
+            .await?
+            .unwrap_or_default();
+        let rows = repo::klines(
+            &self.db,
+            symbol,
+            timeframe,
+            Some(crate::analyze::manual_level::ROLE_WINDOW),
+            Some(&cutoff),
+        )
+        .await?;
+        if rows.len() >= ATR_PERIOD + 2 {
+            return Ok(rows.iter().filter_map(model_to_bar).collect());
+        }
+        let mut bars = self.bars_for(symbol, timeframe).await?;
+        let excess = bars
+            .len()
+            .saturating_sub(crate::analyze::manual_level::ROLE_WINDOW);
+        bars.drain(..excess);
         Ok(bars)
     }
 
@@ -4588,7 +4636,7 @@ impl Services {
         limit: usize,
         filter: &OutcomeFilter,
     ) -> Result<Vec<OutcomeDetail>> {
-        Ok(self.review_page(limit, 0, filter).await?.items)
+        self.recent_review_rows(limit, filter).await
     }
 
     /// 复盘跳转K线图：按 event_id 返回完整事件 + 真实结局。

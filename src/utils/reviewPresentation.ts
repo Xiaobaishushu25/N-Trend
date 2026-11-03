@@ -17,11 +17,92 @@ export function excursionText(value: ReviewExcursion | null | undefined, fallbac
   if (value) return finite(value.r) ? text(value.r) : '未知'
   return finite(fallback) ? text(fallback) : '未知'
 }
-export function reviewState(row: ReviewSummary | null | undefined): { text: string; type: 'default' | 'error' | 'success' | 'warning' | 'info' } {
+export function reviewState(row: ReviewSummary | null | undefined): {
+  text: string
+  type: 'default' | 'error' | 'success' | 'warning' | 'info'
+  color?: { color: string; textColor: string; borderColor?: string }
+} {
   if (!row) return { text: '尚未加载', type: 'default' }
   const reason = row.state === 'closed' ? row.exit_reason : row.terminal_reason || row.state
-  const labels: Record<string, string> = { target_1r: '止盈 1R', target: '目标止盈', stop: '止损', no_follow: '无跟随', time_exit: '时间退出', pending: '等待触发', open: '持仓中', closed: '已平仓', expired: '已到期', untriggered: '未触发', invalidated: '入场前失效', filtered: '已过滤', unfilled: '未成交', ambiguous: '同根价格歧义', rollover: '换月终结', missing_data: '行情不足', missing_calendar: '缺交易日历', missing_parameters: '缺合约参数' }
-  return { text: labels[reason || ''] || reason || '状态未知', type: row.state === 'closed' ? 'info' : row.state === 'pending' ? 'default' : 'warning' }
+  const labels: Record<string, string> = {
+    target_1r: '止盈 1R',
+    target: '目标止盈',
+    stop: '止损',
+    no_follow: '无跟随',
+    time_exit: '时间退出',
+    pending: '等待触发',
+    open: '持仓中',
+    closed: '已平仓',
+    expired: '已到期',
+    untriggered: '未触发',
+    invalidated: '入场前失效',
+    filtered: '已过滤',
+    unfilled: '未成交',
+    ambiguous: '同根价格歧义',
+    rollover: '换月终结',
+    missing_data: '行情不足',
+    missing_calendar: '缺交易日历',
+    missing_parameters: '缺合约参数',
+  }
+  const text = labels[reason || ''] || reason || '状态未知'
+
+  if (row.state === 'closed') {
+    const netR = row.net_r
+    if (netR != null) {
+      if (netR > 0) {
+        return {
+          text,
+          type: 'error',
+          color: { color: '#fef2f2', textColor: '#dc2626', borderColor: '#fecaca' },
+        }
+      }
+      if (netR < 0) {
+        return {
+          text,
+          type: 'success',
+          color: { color: '#ecfdf5', textColor: '#16a34a', borderColor: '#a7f3d0' },
+        }
+      }
+      return {
+        text,
+        type: 'default',
+        color: { color: '#f1f5f9', textColor: '#64748b', borderColor: '#e2e8f0' },
+      }
+    }
+    if (reason === 'target_1r' || reason === 'target') {
+      return {
+        text,
+        type: 'error',
+        color: { color: '#fef2f2', textColor: '#dc2626', borderColor: '#fecaca' },
+      }
+    }
+    if (reason === 'stop') {
+      return {
+        text,
+        type: 'success',
+        color: { color: '#ecfdf5', textColor: '#16a34a', borderColor: '#a7f3d0' },
+      }
+    }
+    return {
+      text,
+      type: 'info',
+      color: { color: '#eff6ff', textColor: '#2563eb', borderColor: '#bfdbfe' },
+    }
+  }
+
+  if (row.state === 'open') {
+    return {
+      text,
+      type: 'warning',
+      color: { color: '#fffbeb', textColor: '#d97706', borderColor: '#fde68a' },
+    }
+  }
+
+  return {
+    text,
+    type: 'default',
+    color: { color: '#f8fafc', textColor: '#64748b', borderColor: '#e2e8f0' },
+  }
 }
 export function costExplanation(detail: ReviewResultDetail | null | undefined) {
   if (!detail) return { type: 'info', title: '尚未取得成本明细', desc: '加载同一结果版本的详情后才能核对成本。' }

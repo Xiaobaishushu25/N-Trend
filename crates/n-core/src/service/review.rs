@@ -179,6 +179,13 @@ fn validate(f: &OutcomeFilter) -> Result<()> {
     Ok(())
 }
 
+fn can_limit_before_scoring(filter: &OutcomeFilter) -> bool {
+    filter.quality_min.is_none()
+        && filter.quality_max.is_none()
+        && !matches!(filter.quality_status.as_deref(), Some("scored" | "unscored"))
+        && !filter.sort_by.as_deref().unwrap_or("").starts_with("score_")
+}
+
 fn select_page(
     mut rows: Vec<OutcomeDetail>,
     limit: usize,
@@ -270,6 +277,24 @@ impl Services {
         offset: usize,
         filter: &OutcomeFilter,
     ) -> Result<ReviewPage> {
+        self.review_rows(limit, offset, filter, false).await
+    }
+
+    pub(super) async fn recent_review_rows(
+        &self,
+        limit: usize,
+        filter: &OutcomeFilter,
+    ) -> Result<Vec<OutcomeDetail>> {
+        Ok(self.review_rows(limit, 0, filter, true).await?.items)
+    }
+
+    async fn review_rows(
+        &self,
+        limit: usize,
+        offset: usize,
+        filter: &OutcomeFilter,
+        recent_only: bool,
+    ) -> Result<ReviewPage> {
         validate(filter)?;
         let events = repo::all_pattern_events(&self.db).await?;
         let symbols = repo::list_symbols(&self.db, false).await?;
@@ -297,7 +322,7 @@ impl Services {
             .map(|s| s.trim().to_ascii_uppercase())
             .filter(|s| !s.is_empty())
             .collect();
-        let selected: Vec<_> = events
+        let mut selected: Vec<_> = events
             .iter()
             .filter(|e| matches_outcome_filter(e, filter))
             .filter(|e| allowed.is_empty() || allowed.contains(&e.symbol.to_ascii_uppercase()))
@@ -313,6 +338,15 @@ impl Services {
                 )
             })
             .collect();
+        // The chart needs only items, with no global score counts. When scores
+        // cannot affect selection, paginate before loading bars or scoring.
+        // Score filters/sorts and the paged review API still inspect all rows.
+        if recent_only && can_limit_before_scoring(filter) {
+            let candidates = selected.iter().map(|e| outcome_detail_from(e, None)).collect();
+            let ids: HashSet<_> = select_page(candidates, limit, offset, filter, vec![])
+                .items.into_iter().map(|r| r.event_id).collect();
+            selected.retain(|e| ids.contains(&e.id));
+        }
         let mut rows = Vec::new();
         let mut bars_by_symbol = HashMap::new();
         for event in selected {
@@ -466,4 +500,62 @@ mod tests {
         })
         .is_err());
     }
+
+    #[tokio::test]
+    async fn recent_items_match_full_review_without_scoring_every_event() {
+        use sea_orm::{EntityTrait, IntoActiveModel};
+        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(db.clone(), config, std::env::temp_dir().join("recent-review-test.json")).await.unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../quality/fixtures/four-signals.json")).unwrap();
+        let case = &fixture["cases"][0];
+        let mut event: pattern_events::Model = serde_json::from_value(case["event"].clone()).unwrap();
+        services.seed_symbols(&event.symbol).await.unwrap();
+        let warning_start = NaiveDateTime::parse_from_str(&event.warning_ts, "%Y-%m-%d %H:%M:%S").unwrap();
+        let mut all_bars = case["bars"].as_array().unwrap().clone();
+        for id in 1..=24 {
+            let mut bar = all_bars.last().unwrap().clone();
+            bar[0] = (warning_start + ChronoDuration::minutes(15 * id)).format("%Y-%m-%d %H:%M:%S").to_string().into();
+            all_bars.push(bar);
+        }
+        let mut bars = vec![];
+        for b in &all_bars {
+            for tf in ["5m", "15m"] {
+                bars.push(klines::ActiveModel {
+                    symbol: Set(event.symbol.clone()), timeframe: Set(tf.into()), ts: Set(b[0].as_str().unwrap().into()),
+                    open: Set(b[1].as_f64().unwrap()), high: Set(b[2].as_f64().unwrap()), low: Set(b[3].as_f64().unwrap()),
+                    close: Set(b[4].as_f64().unwrap()), volume: Set(b[5].as_f64().unwrap()), hold: Set(b[6].as_f64().unwrap()),
+                    source: Set(if tf == "5m" { "raw" } else { "derived" }.into()),
+                });
+            }
+        }
+        repo::upsert_klines(&db, bars).await.unwrap();
+        for id in 1..=24 {
+            event.id = id;
+            event.warning_ts = (warning_start + ChronoDuration::minutes(15 * id)).format("%Y-%m-%d %H:%M:%S").to_string();
+            event.entry_score = id as f64;
+            pattern_events::Entity::insert(event.clone().into_active_model()).exec(&db).await.unwrap();
+        }
+        // Every event has a distinct quality key, so cache size counts evaluated rows.
+        let filter = OutcomeFilter { symbol: Some(event.symbol.clone()), ..Default::default() };
+        let recent = services.recent_outcomes(5, &filter).await.unwrap();
+        assert_eq!(recent.iter().map(|r| r.event_id).collect::<Vec<_>>(), vec![24,23,22,21,20]);
+        let scored = services.review_score_cache.read().await.len();
+        assert_eq!(scored, 5, "recent query must evaluate only requested events");
+        let full = services.review_page(5, 0, &filter).await.unwrap();
+        assert_eq!(full.total, 24);
+        assert_eq!(serde_json::to_value(&recent).unwrap(), serde_json::to_value(&full.items).unwrap());
+        for filter in [
+            OutcomeFilter { sort_by: Some("time_asc".into()), ..filter.clone() },
+            OutcomeFilter { sort_by: Some("score_desc".into()), quality_metric: Some("old".into()), ..filter.clone() },
+            OutcomeFilter { quality_min: Some(0.), quality_status: Some("scored".into()), ..filter.clone() },
+            OutcomeFilter { quality_status: Some("unscored".into()), ..filter.clone() },
+        ] {
+            let actual = services.recent_outcomes(5, &filter).await.unwrap();
+            let expected = services.review_page(5, 0, &filter).await.unwrap().items;
+            assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
+        }
+    }
+
 }

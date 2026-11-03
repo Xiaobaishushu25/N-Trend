@@ -18,6 +18,7 @@ import {
   Award,
   ChevronDown,
   ChevronUp,
+  Clock,
   Eye,
   EyeOff,
   Filter,
@@ -186,7 +187,11 @@ function toggleDetail(signal: ReviewSummary, e: MouseEvent) {
 }
 
 function selectRow(s: ReviewSummary) {
-  emit('select-signal', s)
+  if (s.event_id === props.selectedId) {
+    emit('toggle-visibility')
+  } else {
+    emit('select-signal', s)
+  }
 }
 
 function onEyeClick(e: MouseEvent) {
@@ -247,7 +252,9 @@ function onEyeClick(e: MouseEvent) {
             :class="[
               s.direction === 'up' ? 'is-up' : 'is-down',
               { 'is-active': s.event_id === selectedId },
+              { 'is-hidden-pattern': s.event_id === selectedId && isSignalHidden },
             ]"
+            :title="s.event_id === selectedId ? (isSignalHidden ? '形态绘制已隐藏，点击卡片在K线图上显示绘制' : '点击卡片在K线图上隐藏形态绘制') : '点击选择并在K线图上显示形态绘制'"
             @click="selectRow(s)"
           >
             <!-- 卡片顶行：品种名称+代码、方向、等级、ID、眼睛展示切换 -->
@@ -274,7 +281,7 @@ function onEyeClick(e: MouseEvent) {
                   class="eye-btn"
                   :class="{ 'is-hidden-eye': isSignalHidden }"
                   :title="isSignalHidden ? '点击在K线图上显示该形态打点' : '点击在K线图上隐藏该形态打点'"
-                  @click="onEyeClick"
+                  @click.stop="onEyeClick"
                 >
                   <n-icon :component="isSignalHidden ? EyeOff : Eye" :size="14" />
                 </button>
@@ -306,6 +313,7 @@ function onEyeClick(e: MouseEvent) {
                   size="tiny"
                   :bordered="false"
                   :type="reviewState(s).type"
+                  :color="reviewState(s).color"
                   class="outcome-tag"
                 >
                   {{ reviewState(s).text }}
@@ -313,35 +321,47 @@ function onEyeClick(e: MouseEvent) {
               </div>
             </div>
 
-            <!-- 关键价位阶梯：入场 -> 止损 -> 目标 与 风险点数 -->
+            <!-- 关键价位阶梯：入场 -> 止盈参考 -> 止损 与 风险点数 -->
             <div class="card-row-prices font-num">
               <span class="p-step">入 <b>{{ fmtPrice(s.plan.entry) }}</b></span>
               <span class="p-arrow">→</span>
-              <span class="p-step p-stop">止 <b>{{ fmtPrice(s.plan.stop) }}</b></span>
+              <span class="p-step p-target">止盈 <b>{{ fmtPrice(s.plan.reference_target) }}</b></span>
               <span class="p-arrow">→</span>
-              <span class="p-step p-target">参考目标 <b>{{ fmtPrice(s.plan.reference_target) }}</b></span>
+              <span class="p-step p-stop">止损 <b>{{ fmtPrice(s.plan.stop) }}</b></span>
               <span v-if="s.plan.risk" class="p-risk text-muted">
                 (风险 {{ Number(s.plan.risk).toFixed(1) }}点)
               </span>
             </div>
 
-            <!-- 卡片时间、量能与持仓极值摘要 -->
+            <!-- 卡片时间、量能与持仓极值摘要（结构化两行排版，时间独立药丸徽章绝不挤折） -->
             <div class="card-row-meta">
-              <span class="meta-time font-num">
-                {{ (s.entry_ts || s.warning_ts || '').slice(5, 16) }}
-              </span>
-              <span v-if="s.diagnostics.vol_ratio != null" class="meta-vol font-num">
-                量比 {{ Number(s.diagnostics.vol_ratio).toFixed(1) }}x（5m）
-              </span>
-              <span v-if="s.bars_held != null" class="meta-bars font-num">
-                持仓 {{ s.bars_held }}根（15m）
-              </span>
-              <span class="meta-excursion font-num text-long">
-                MFE {{ excursionText(s.mfe, s.mfe_r) }}
-              </span>
-              <span class="meta-excursion font-num text-short">
-                MAE {{ excursionText(s.mae, s.mae_r) }}
-              </span>
+              <div class="meta-line-primary">
+                <span
+                  class="meta-time-badge font-num"
+                  :title="s.entry_ts ? ('入场触发时间: ' + s.entry_ts + (s.warning_ts ? '\n预警拟定时间: ' + s.warning_ts : '')) : ('预警拟定时间: ' + (s.warning_ts || '未记录'))"
+                >
+                  <n-icon :component="Clock" :size="12" />
+                  <span>{{ (s.entry_ts || s.warning_ts || '').slice(5, 16) }}</span>
+                </span>
+
+                <div class="meta-chips font-num">
+                  <span v-if="s.diagnostics.vol_ratio != null" class="meta-chip">
+                    量比 <b>{{ Number(s.diagnostics.vol_ratio).toFixed(1) }}x</b>
+                  </span>
+                  <span v-if="s.bars_held != null" class="meta-chip">
+                    持仓 <b>{{ s.bars_held }}根</b>
+                  </span>
+                </div>
+              </div>
+
+              <div class="meta-line-excursion font-num">
+                <span class="meta-excursion text-long">
+                  MFE <b>{{ excursionText(s.mfe, s.mfe_r) }}</b>
+                </span>
+                <span class="meta-excursion text-short">
+                  MAE <b>{{ excursionText(s.mae, s.mae_r) }}</b>
+                </span>
+              </div>
             </div>
 
             <!-- 一键展开/收起平仓流水与细则按钮 -->
@@ -350,7 +370,7 @@ function onEyeClick(e: MouseEvent) {
                 type="button"
                 class="expand-btn"
                 :class="{ 'is-expanded': expandedId === s.event_id }"
-                @click="toggleDetail(s, $event)"
+                @click.stop="toggleDetail(s, $event)"
               >
                 <span>{{ expandedId === s.event_id ? '收起平仓流水与细则' : '展开平仓流水与 A/B段细则' }}</span>
                 <n-icon :component="expandedId === s.event_id ? ChevronUp : ChevronDown" :size="12" />
@@ -484,6 +504,14 @@ function onEyeClick(e: MouseEvent) {
   border-left-color: #2563eb;
   background: #f8fbff;
   box-shadow: 0 2px 8px rgba(37, 99, 235, 0.12);
+}
+.pool-card.is-active.is-hidden-pattern {
+  border-style: dashed;
+  background: #fbfcfe;
+  opacity: 0.92;
+}
+.pool-card.is-active.is-hidden-pattern:hover {
+  background: #f1f5f9;
 }
 
 .card-row-top {
@@ -628,10 +656,10 @@ function onEyeClick(e: MouseEvent) {
   font-weight: 600;
 }
 .p-stop b {
-  color: #dc2626;
+  color: #16a34a;
 }
 .p-target b {
-  color: #16a34a;
+  color: #dc2626;
 }
 .p-arrow {
   color: #cbd5e1;
@@ -644,16 +672,65 @@ function onEyeClick(e: MouseEvent) {
 
 .card-row-meta {
   display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-top: 1px dashed #f1f5f9;
+  padding-top: 6px;
+}
+
+.meta-line-primary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.meta-time-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #334155;
+  background: #f1f5f9;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  letter-spacing: 0.2px;
+}
+.meta-time-badge .n-icon {
+  color: #64748b;
+}
+
+.meta-chips {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 11px;
   color: #64748b;
-  border-top: 1px dashed #f1f5f9;
-  padding-top: 4px;
+  white-space: nowrap;
 }
-.meta-time {
-  flex: 1;
-  color: #64748b;
+.meta-chip b {
+  color: #1e293b;
+  font-weight: 600;
+}
+
+.meta-line-excursion {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.meta-excursion {
+  display: inline-flex;
+  gap: 4px;
+  white-space: nowrap;
+}
+.meta-excursion b {
+  font-weight: 600;
 }
 
 .card-row-actions {
@@ -691,6 +768,7 @@ function onEyeClick(e: MouseEvent) {
   flex-direction: column;
   border-radius: 6px;
   overflow: hidden;
+  cursor: default;
 }
 
 /* 现代清晰表格字体 */

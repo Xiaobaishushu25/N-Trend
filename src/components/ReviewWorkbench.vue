@@ -243,18 +243,18 @@ const columns = computed<DataTableColumns<ReviewSummary>>(() => [
     render: (r) => h('span', { class: 'font-num' }, r.plan.entry?.toFixed(1) ?? '—'),
   },
   {
+    title: '止盈参考',
+    key: 'target',
+    width: 88,
+    align: 'right',
+    render: (r) => h('span', { class: 'font-num text-danger' }, r.plan.reference_target?.toFixed(1) ?? '—'),
+  },
+  {
     title: '止损价',
     key: 'stop',
     width: 88,
     align: 'right',
-    render: (r) => h('span', { class: 'font-num text-danger' }, r.plan.stop?.toFixed(1) ?? '—'),
-  },
-  {
-    title: '原始参考目标',
-    key: 'target',
-    width: 88,
-    align: 'right',
-    render: (r) => h('span', { class: 'font-num text-success' }, r.plan.reference_target?.toFixed(1) ?? '—'),
+    render: (r) => h('span', { class: 'font-num text-success' }, r.plan.stop?.toFixed(1) ?? '—'),
   },
   {
     title: () =>
@@ -283,7 +283,11 @@ const columns = computed<DataTableColumns<ReviewSummary>>(() => [
     width: 84,
     render: (row) => {
       const meta = reviewState(row)
-      return h(NTag, { size: 'small', bordered: false, type: meta.type }, { default: () => meta.text })
+      return h(
+        NTag,
+        { size: 'small', bordered: false, type: meta.type, color: meta.color },
+        { default: () => meta.text },
+      )
     },
   },
   {
@@ -826,14 +830,19 @@ onBeforeUnmount(() => {
 :deep(.symbol-cell) {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
+  justify-content: center;
 }
 :deep(.sym-code) {
-  font-size: 12px;
+  font-size: 14px;
+  font-weight: 700;
   color: #0f172a;
+  line-height: 1.2;
 }
 :deep(.sym-name) {
-  font-size: 10px;
+  font-size: 11.5px;
+  color: #64748b;
+  line-height: 1.2;
 }
 
 :deep(.dir-pill) {

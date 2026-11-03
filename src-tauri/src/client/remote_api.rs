@@ -775,7 +775,7 @@ impl RemoteApiClient {
     }
 
     pub async fn rebuild_events_now(&self) -> Result<Value, ApiErrorResponse> {
-        self.execute(self.request(Method::POST, "actions/rebuild-events"))
+        self.execute(self.download_request(Method::POST, "actions/rebuild-events"))
             .await
     }
 

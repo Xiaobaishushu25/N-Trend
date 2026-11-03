@@ -1183,6 +1183,16 @@ pub async fn pending_execution_signals(
         .await?)
 }
 
+/// Quote detection does not need historical or already-triggered events.
+pub async fn pending_entry_events(db: &DatabaseConnection) -> Result<Vec<pattern_events::Model>> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::State.eq("pending"))
+        .filter(pattern_events::Column::TriggerTs.is_null())
+        .order_by_asc(pattern_events::Column::Id)
+        .all(db)
+        .await?)
+}
+
 /// 全部信号事件（复盘统计用）。
 pub async fn all_pattern_events(db: &DatabaseConnection) -> Result<Vec<pattern_events::Model>> {
     Ok(pattern_events::Entity::find()
@@ -1416,6 +1426,15 @@ pub async fn manual_level_by_id(
         .context("查询关键区域失败")?)
 }
 
+pub async fn monitored_manual_levels(db: &DatabaseConnection) -> Result<Vec<manual_levels::Model>> {
+    Ok(manual_levels::Entity::find()
+        .filter(manual_levels::Column::Status.eq("active"))
+        .filter(manual_levels::Column::MonitorEnabled.eq(true))
+        .order_by_asc(manual_levels::Column::CreatedAt)
+        .all(db)
+        .await?)
+}
+
 pub async fn insert_manual_level(
     db: &DatabaseConnection,
     row: manual_levels::ActiveModel,
@@ -1431,30 +1450,83 @@ pub async fn update_manual_level(
     db: &DatabaseConnection,
     row: manual_levels::Model,
 ) -> Result<manual_levels::Model> {
-    db.transaction::<_, manual_levels::Model, anyhow::Error>(|txn| {
+    let active: manual_levels::ActiveModel = row.into();
+    // Model conversion marks every field Unchanged, including fields edited by
+    // the caller. Persist them explicitly instead of executing a no-op update.
+    active
+        .reset_all()
+        .update(db)
+        .await
+        .context("更新关键区域失败")
+}
+
+/// Publish only analysis fields, conditional on the definition we evaluated.
+/// Start with UPDATE (not SELECT) to avoid a deferred read-to-write upgrade.
+pub async fn record_manual_level_evaluation(
+    db: &DatabaseConnection,
+    observed: manual_levels::Model,
+    next: manual_levels::Model,
+    event: Option<manual_level_events::ActiveModel>,
+) -> Result<bool> {
+    use sea_orm::sea_query::Expr;
+    db.transaction::<_, bool, anyhow::Error>(|txn| {
         Box::pin(async move {
-            let level_id = row.id;
-            let role_override = row.role_override.clone();
-            let active: manual_levels::ActiveModel = row.clone().into();
-            let _ = active.update(txn).await?;
-            // role_override was added to existing installations after the original
-            // table definition.  Write it explicitly as well as through the
-            // generated ActiveModel so old SQLite schemas cannot silently retain
-            // the default `auto` value.
-            txn.execute(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "UPDATE manual_levels SET role_override=?1 WHERE id=?2",
-                vec![role_override.into(), level_id.into()],
-            ))
-            .await?;
-            manual_levels::Entity::find_by_id(level_id)
-                .one(txn)
+            let changed = manual_levels::Entity::update_many()
+                .col_expr(
+                    manual_levels::Column::CurrentPhase,
+                    Expr::value(next.current_phase),
+                )
+                .col_expr(manual_levels::Column::Role, Expr::value(next.role))
+                .col_expr(
+                    manual_levels::Column::RoleConfidence,
+                    Expr::value(next.role_confidence),
+                )
+                .col_expr(
+                    manual_levels::Column::UpdatedAt,
+                    Expr::value(next.updated_at.clone()),
+                )
+                .filter(manual_levels::Column::Id.eq(observed.id))
+                .filter(manual_levels::Column::Status.eq("active"))
+                .filter(manual_levels::Column::MonitorEnabled.eq(true))
+                .filter(manual_levels::Column::UpdatedAt.eq(observed.updated_at))
+                .filter(manual_levels::Column::Symbol.eq(observed.symbol))
+                .filter(manual_levels::Column::Timeframe.eq(observed.timeframe))
+                .filter(manual_levels::Column::Name.eq(observed.name))
+                .filter(manual_levels::Column::StartTs.eq(observed.start_ts))
+                .filter(manual_levels::Column::ZoneLow.eq(observed.zone_low))
+                .filter(manual_levels::Column::ZoneHigh.eq(observed.zone_high))
+                .filter(manual_levels::Column::RoleOverride.eq(observed.role_override))
+                .filter(manual_levels::Column::CurrentPhase.eq(observed.current_phase))
+                .filter(manual_levels::Column::Role.eq(observed.role))
+                .filter(manual_levels::Column::RoleConfidence.eq(observed.role_confidence))
+                .exec(txn)
+                .await?;
+            if changed.rows_affected == 0 {
+                return Ok(false);
+            }
+            let Some(event) = event else {
+                return Ok(false);
+            };
+            let inserted = manual_level_events::Entity::insert(event)
+                .on_conflict(OnConflict::new().do_nothing().to_owned())
+                .exec_without_returning(txn)
                 .await?
-                .ok_or_else(|| anyhow!("更新后的关键区域不存在: {level_id}"))
+                > 0;
+            if inserted {
+                manual_levels::Entity::update_many()
+                    .col_expr(
+                        manual_levels::Column::LastEventTs,
+                        Expr::value(next.updated_at),
+                    )
+                    .filter(manual_levels::Column::Id.eq(observed.id))
+                    .exec(txn)
+                    .await?;
+            }
+            Ok(inserted)
         })
     })
     .await
-    .context("更新关键区域失败")
+    .context("保存关键区域分析状态失败")
 }
 
 pub async fn set_manual_level_monitoring(

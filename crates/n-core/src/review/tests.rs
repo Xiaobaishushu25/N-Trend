@@ -600,6 +600,37 @@ async fn transactional_outbox_atomic_publication_resume_and_immutable_details() 
 }
 
 #[tokio::test]
+async fn orphan_review_artifacts_are_pruned_on_new_versions() {
+    use sea_orm::ConnectionTrait;
+    let db = db().await;
+    seed(&db, "RB0", 1).await;
+    let engine = ReviewEngine::new(db.clone());
+
+    // 1st run
+    let j1 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &j1.id).await;
+    engine.worker_step().await.unwrap();
+    let count1 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+    assert_eq!(count1, 1);
+
+    // 2nd run with modified data
+    db.execute(store::sql("UPDATE klines SET high=110,close=109 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![])).await.unwrap();
+    let j2 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &j2.id).await;
+    engine.worker_step().await.unwrap();
+    let count2 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+    assert_eq!(count2, 2, "1 current + 1 historical fallback version retained");
+
+    // 3rd run with further modified data -> version 1 should be pruned, retaining max 2 versions
+    db.execute(store::sql("UPDATE klines SET high=108,close=107 WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![])).await.unwrap();
+    let j3 = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &j3.id).await;
+    engine.worker_step().await.unwrap();
+    let count3 = db.query_one(store::sql("SELECT count(*) AS n FROM review_results", vec![])).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+    assert_eq!(count3, 2, "excess orphan versions are automatically pruned, capped at 2 versions per event");
+}
+
+#[tokio::test]
 async fn rollback_does_not_enqueue_or_leave_a_partial_signal() {
     use sea_orm::{ConnectionTrait, TransactionTrait};
     let db = db().await;
@@ -1204,3 +1235,70 @@ fn test_p0_4_empty_pattern_events_produces_identical_review_candidates() {
     }
 }
 
+
+
+#[tokio::test]
+async fn cleanup_preserves_versions_staged_by_an_unfinished_job() {
+    use sea_orm::ConnectionTrait;
+    let db = db().await;
+    seed(&db, "RB0", 1).await;
+    let engine = ReviewEngine::new(db.clone());
+    let first = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &first.id).await;
+    engine.worker_step().await.unwrap();
+    let version: String = db.query_one(store::sql("SELECT result_version FROM review_current", vec![]))
+        .await.unwrap().unwrap().try_get("", "result_version").unwrap();
+    let pending = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    db.execute(store::sql("INSERT INTO review_staging(job_id,event_id,result_version) VALUES (?,1,?)", vec![pending.id.clone().into(),version.clone().into()])).await.unwrap();
+    // Create two newer versions so the staged version is neither current nor
+    // the one retained historical version, exactly the interrupted-job case.
+    for high in [110, 108] {
+        db.execute(store::sql("UPDATE klines SET high=?,close=? WHERE symbol='RB0' AND ts='2026-01-05 09:55:00'", vec![high.into(),(high-1).into()])).await.unwrap();
+        let job = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+        install_job_calendar(&db, &job.id).await;
+        // Skip pending while publishing the later job (simulates resume order).
+        db.execute(store::sql("UPDATE review_jobs SET status='paused' WHERE id=?",vec![pending.id.clone().into()])).await.unwrap();
+        engine.worker_step().await.unwrap();
+        db.execute(store::sql("UPDATE review_jobs SET status='queued' WHERE id=?",vec![pending.id.clone().into()])).await.unwrap();
+    }
+    engine.prune_all_orphans().await.unwrap();
+    let saved = engine.detail(1, &version).await.unwrap();
+    assert!(!saved.lifecycle.is_empty());
+    assert!(!engine.holding(1, &version, 0, 100).await.unwrap().items.is_empty());
+    // The source can disappear after the input snapshot without invalidating
+    // artifacts still needed by an atomic publication.
+    db.execute(store::sql("DELETE FROM pattern_events WHERE id=1",vec![])).await.unwrap();
+    engine.prune_all_orphans().await.unwrap();
+    assert!(engine.detail(1, &version).await.is_ok());
+}
+
+#[tokio::test]
+async fn missing_staged_result_fails_once_without_replacing_published_heads() {
+    use sea_orm::ConnectionTrait;
+    let db = db().await;
+    seed(&db, "RB0", 1).await;
+    seed(&db, "SA0", 2).await;
+    let engine = ReviewEngine::new(db.clone());
+    let initial = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &initial.id).await;
+    engine.worker_step().await.unwrap();
+    engine.worker_step().await.unwrap();
+    let heads = db.query_all(store::sql("SELECT result_version FROM review_current ORDER BY event_id",vec![]))
+        .await.unwrap().into_iter().map(|r| r.try_get::<String>("", "result_version").unwrap()).collect::<Vec<_>>();
+    let job = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &job.id).await;
+    engine.worker_step().await.unwrap();
+    db.execute(store::sql("UPDATE review_staging SET result_version='missing-result' WHERE job_id=?",vec![job.id.clone().into()])).await.unwrap();
+    let failed = engine.worker_step().await.unwrap().unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.errors.iter().any(|s| s.contains("missing results")));
+    assert_eq!(store::revision(&db).await.unwrap(), 1);
+    let after = db.query_all(store::sql("SELECT result_version FROM review_current ORDER BY event_id",vec![]))
+        .await.unwrap().into_iter().map(|r| r.try_get::<String>("", "result_version").unwrap()).collect::<Vec<_>>();
+    assert_eq!(after, heads, "failed publication preserves the entire previously published snapshot");
+    assert!(engine.worker_step().await.unwrap().is_none());
+    let retry = engine.rebuild(ReviewRebuildRequest::default()).await.unwrap();
+    install_job_calendar(&db, &retry.id).await;
+    engine.worker_step().await.unwrap();
+    assert_eq!(engine.worker_step().await.unwrap().unwrap().status, "completed");
+}

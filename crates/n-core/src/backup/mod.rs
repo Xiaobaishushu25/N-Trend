@@ -25,6 +25,26 @@ pub struct SnapshotResult {
 /// 3. 对副本执行 PRAGMA integrity_check 校验物理一致性
 /// 4. 将副本使用 gzip 进行流式压缩
 /// 5. 计算 gzip 文件的 SHA-256 校验和并返回
+fn cleanup_raw_sqlite_artifacts(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let path_str = path.to_string_lossy();
+    let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    let _ = std::fs::remove_file(format!("{path_str}-wal"));
+}
+
+fn cleanup_stale_temp_snapshots(temp_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("ntrend-snapshot-") {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
 pub async fn generate_database_snapshot(
     db: &DatabaseConnection,
     temp_dir: &Path,
@@ -36,6 +56,7 @@ pub async fn generate_database_snapshot(
         }
     };
     std::fs::create_dir_all(temp_dir).context("创建快照临时目录失败")?;
+    cleanup_stale_temp_snapshots(temp_dir);
 
     let unique_id = uuid::Uuid::new_v4().to_string();
     let raw_temp_path = temp_dir.join(format!("ntrend-snapshot-{unique_id}.sqlite"));
@@ -49,7 +70,7 @@ pub async fn generate_database_snapshot(
         raw_path_str
     );
     if let Err(e) = db.execute_unprepared(&vacuum_sql).await {
-        let _ = std::fs::remove_file(&raw_temp_path);
+        cleanup_raw_sqlite_artifacts(&raw_temp_path);
         return Err(anyhow!("VACUUM INTO 执行失败: {e}"));
     }
 
@@ -64,7 +85,7 @@ pub async fn generate_database_snapshot(
         {
             Ok(db) => db,
             Err(e) => {
-                let _ = std::fs::remove_file(&raw_temp_path);
+                cleanup_raw_sqlite_artifacts(&raw_temp_path);
                 return Err(anyhow!("打开快照校验连接失败: {e}"));
             }
         };
@@ -83,8 +104,11 @@ pub async fn generate_database_snapshot(
             .map(|val| val == "ok")
             .unwrap_or(false);
 
+        // 关闭连接后清理可能的 shm/wal
+        drop(snapshot_db);
+
         if !is_ok {
-            let _ = std::fs::remove_file(&raw_temp_path);
+            cleanup_raw_sqlite_artifacts(&raw_temp_path);
             return Err(anyhow!("SQLite 快照完整性校验未通过！"));
         }
         tracing::info!("✓ 快照完整性校验通过 (ok)");
@@ -139,19 +163,19 @@ pub async fn generate_database_snapshot(
         let sha256_hex = format!("{:x}", hashing_writer.hasher.finalize());
         let total_size = hashing_writer.bytes_written;
 
-        // 成功压缩后删除未压缩的原始 sqlite 文件
-        let _ = std::fs::remove_file(&raw_path_clone);
+        // 成功压缩后删除未压缩的原始 sqlite 文件及其关联 shm/wal 副本
+        cleanup_raw_sqlite_artifacts(&raw_path_clone);
 
         Ok((total_size, sha256_hex))
     })
     .await
     .map_err(|e| {
-        let _ = std::fs::remove_file(&raw_temp_path);
+        cleanup_raw_sqlite_artifacts(&raw_temp_path);
         let _ = std::fs::remove_file(&gz_temp_path);
         anyhow!("快照压缩任务执行失败: {e}")
     })?
     .map_err(|e| {
-        let _ = std::fs::remove_file(&raw_temp_path);
+        cleanup_raw_sqlite_artifacts(&raw_temp_path);
         let _ = std::fs::remove_file(&gz_temp_path);
         e
     })?;

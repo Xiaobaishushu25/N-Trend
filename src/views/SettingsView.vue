@@ -630,11 +630,14 @@ async function loadBackupStatus() {
 
 async function triggerBackup() {
   backingUp.value = true
+  const msgReactive = message.loading('正在由云端生成数据库快照并下载，请稍候...', { duration: 0 })
   try {
     const filename = await api.triggerDatabaseBackup()
+    msgReactive.destroy()
     message.success(`一致性数据库备份成功！文件: ${filename}`)
     await loadBackupStatus()
   } catch (e: any) {
+    msgReactive.destroy()
     message.error(`备份失败: ${e?.message || e}`)
   } finally {
     backingUp.value = false
@@ -1351,7 +1354,7 @@ onMounted(async () => {
                   <n-space>
                     <n-button type="primary" size="small" :loading="backingUp" @click="triggerBackup">
                       <template #icon><n-icon :component="Database" /></template>
-                      立即执行快照备份
+                      {{ backingUp ? '正在备份与下载...' : '立即执行快照备份' }}
                     </n-button>
                     <n-button size="small" @click="openBackupDir">
                       <template #icon><n-icon :component="Folder" /></template>

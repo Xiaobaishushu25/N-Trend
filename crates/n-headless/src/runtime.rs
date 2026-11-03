@@ -1262,11 +1262,153 @@ fn spawn_live_chart_publisher(ctx: Arc<ServerContext>) {
     });
 }
 
-fn spawn_quote_poller(ctx: Arc<ServerContext>) {
+type SnapshotBatch = (Instant, Vec<n_core::service::MarketSnapshot>);
+
+/// One ordered, bounded entry worker preserves every sampled crossing. Slow
+/// closed-bar analysis consumes the latest frame, with at most one scan active.
+fn spawn_quote_detectors(
+    ctx: Arc<ServerContext>,
+) -> (
+    tokio::sync::mpsc::Sender<SnapshotBatch>,
+    tokio::sync::watch::Sender<Option<SnapshotBatch>>,
+) {
+    let (entry_tx, mut entry_rx) = tokio::sync::mpsc::channel::<SnapshotBatch>(8);
+    let (slow_tx, mut slow_rx) = tokio::sync::watch::channel::<Option<SnapshotBatch>>(None);
+    let entry_ctx = ctx.clone();
     tokio::spawn(async move {
+        let ctx = entry_ctx;
+        while let Some((received_at, snapshots)) = entry_rx.recv().await {
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            let queue_ms = received_at.elapsed().as_millis();
+            let stage = Instant::now();
+            // 检测入场价命中
+            if let Ok(hits) = ctx
+                .services
+                .entry_trigger_hits(&snapshots)
+                .await
+                .map_err(|error| tracing::warn!("入场检测失败: {error:#}"))
+            {
+                if !hits.is_empty() {
+                    let seq = ctx.next_event_seq();
+                    ctx.realtime_hub
+                        .broadcast(
+                            seq,
+                            "entry.triggered",
+                            serde_json::to_value(&hits).unwrap_or_default(),
+                        )
+                        .await;
+                }
+            }
+
+            tracing::info!(
+                queue_ms,
+                entry_ms = stage.elapsed().as_millis(),
+                "入场检测完成"
+            );
+        }
+    });
+    tokio::spawn(async move {
+        while slow_rx.changed().await.is_ok() {
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            let Some((received_at, snapshots)) = slow_rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let queue_ms = received_at.elapsed().as_millis();
+            let stage = Instant::now();
+            // 检测关键区域手工画线
+            if let Ok(alerts) = ctx
+                .services
+                .manual_level_alerts(&snapshots)
+                .await
+                .map_err(|error| tracing::warn!("关键区域检测失败: {error:#}"))
+            {
+                if !alerts.is_empty() {
+                    let seq = ctx.next_event_seq();
+                    ctx.realtime_hub
+                        .broadcast(
+                            seq,
+                            "manual_level.triggered",
+                            serde_json::to_value(&alerts).unwrap_or_default(),
+                        )
+                        .await;
+                }
+            }
+
+            let manual_ms = stage.elapsed().as_millis();
+            let stage = Instant::now();
+            // 收盘前预检测 (机制一)
+            match ctx.services.preclose_tick(&snapshots).await {
+                Ok(updates) if !updates.is_empty() => {
+                    let seq = ctx.next_event_seq();
+                    ctx.realtime_hub
+                        .broadcast(
+                            seq,
+                            "preclose-signal",
+                            serde_json::to_value(&updates).unwrap_or_default(),
+                        )
+                        .await;
+                    spawn_preclose_emails(ctx.clone(), updates);
+                }
+                Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
+                _ => {}
+            }
+
+            let preclose_ms = stage.elapsed().as_millis();
+            let stage = Instant::now();
+            // 临时未收盘推演扫描 (机制二)
+            match ctx.services.preclose_candidate_tick(&snapshots).await {
+                Ok(updates) if !updates.is_empty() => {
+                    let seq = ctx.next_event_seq();
+                    ctx.realtime_hub
+                        .broadcast(
+                            seq,
+                            "preclose-candidate",
+                            serde_json::to_value(&updates).unwrap_or_default(),
+                        )
+                        .await;
+                    spawn_preclose_candidate_emails(ctx.clone(), updates);
+                }
+                Err(error) => tracing::warn!("临时未收盘推演轮询失败: {error:#}"),
+                _ => {}
+            }
+            tracing::info!(
+                queue_ms,
+                manual_ms,
+                preclose_ms,
+                candidate_ms = stage.elapsed().as_millis(),
+                "行情后台检测完成"
+            );
+        }
+    });
+    (entry_tx, slow_tx)
+}
+
+fn spawn_quote_poller(ctx: Arc<ServerContext>) {
+    let (entry_tx, slow_tx) = spawn_quote_detectors(ctx.clone());
+    tokio::spawn(async move {
+        let mut period =
+            Duration::from_millis(ctx.services.config().await.quote.poll_interval_ms.max(100));
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let interval_ms = ctx.services.config().await.quote.poll_interval_ms;
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            let configured = Duration::from_millis(interval_ms.max(100));
+            if configured != period {
+                period = configured;
+                ticker = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            }
+            ticker.tick().await;
             if ctx
                 .is_shutting_down
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -1279,6 +1421,7 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                 continue;
             }
 
+            let cycle_started = Instant::now();
             let contracts: Vec<String> = ctx.trader_snapshot.read().await["broker_positions"]
                 .as_array()
                 .into_iter()
@@ -1293,6 +1436,7 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                 .await
             {
                 Ok((snapshots, held_quotes)) => {
+                    let fetch_ms = cycle_started.elapsed().as_millis();
                     // Normal price updates maintain all seeded periods without SQL or bridge reads.
                     let cfg = ctx.services.config().await;
                     let updated_bars = if cfg.data_source.primary_source == "tqsdk"
@@ -1315,6 +1459,12 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                         )
                         .await;
 
+                    tracing::info!(
+                        fetch_ms,
+                        cycle_ms = cycle_started.elapsed().as_millis(),
+                        interval_ms,
+                        "行情采集与推送完成"
+                    );
                     for bar in updated_bars {
                         let sym = bar.symbol.clone();
                         let tf = bar.timeframe.clone();
@@ -1329,66 +1479,13 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
                             .await;
                     }
 
-                    // 检测入场价命中
-                    if let Ok(hits) = ctx.services.entry_trigger_hits(&snapshots).await {
-                        if !hits.is_empty() {
-                            let seq = ctx.next_event_seq();
-                            ctx.realtime_hub
-                                .broadcast(
-                                    seq,
-                                    "entry.triggered",
-                                    serde_json::to_value(&hits).unwrap_or_default(),
-                                )
-                                .await;
-                        }
+                    let received_at = Instant::now();
+                    slow_tx.send_replace(Some((received_at, snapshots.clone())));
+                    if entry_tx.capacity() == 0 {
+                        tracing::warn!("入场检测队列已满，行情采集等待有界背压");
                     }
-
-                    // 检测关键区域手工画线
-                    if let Ok(alerts) = ctx.services.manual_level_alerts(&snapshots).await {
-                        if !alerts.is_empty() {
-                            let seq = ctx.next_event_seq();
-                            ctx.realtime_hub
-                                .broadcast(
-                                    seq,
-                                    "manual_level.triggered",
-                                    serde_json::to_value(&alerts).unwrap_or_default(),
-                                )
-                                .await;
-                        }
-                    }
-
-                    // 收盘前预检测 (机制一)
-                    match ctx.services.preclose_tick(&snapshots).await {
-                        Ok(updates) if !updates.is_empty() => {
-                            let seq = ctx.next_event_seq();
-                            ctx.realtime_hub
-                                .broadcast(
-                                    seq,
-                                    "preclose-signal",
-                                    serde_json::to_value(&updates).unwrap_or_default(),
-                                )
-                                .await;
-                            spawn_preclose_emails(ctx.clone(), updates);
-                        }
-                        Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
-                        _ => {}
-                    }
-
-                    // 临时未收盘推演扫描 (机制二)
-                    match ctx.services.preclose_candidate_tick(&snapshots).await {
-                        Ok(updates) if !updates.is_empty() => {
-                            let seq = ctx.next_event_seq();
-                            ctx.realtime_hub
-                                .broadcast(
-                                    seq,
-                                    "preclose-candidate",
-                                    serde_json::to_value(&updates).unwrap_or_default(),
-                                )
-                                .await;
-                            spawn_preclose_candidate_emails(ctx.clone(), updates);
-                        }
-                        Err(error) => tracing::warn!("临时未收盘推演轮询失败: {error:#}"),
-                        _ => {}
+                    if entry_tx.send((received_at, snapshots)).await.is_err() {
+                        break;
                     }
                 }
                 Err(e) => {

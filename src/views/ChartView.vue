@@ -42,6 +42,7 @@ import { notify } from '../utils/notify'
 import { manualLevelEventLabel, manualLevelPhaseLabel, manualLevelRoleLabel } from '../utils/manualLevel'
 import { openSymbolContextMenu } from '../utils/symbolMenu'
 import { usePlatform } from '../utils/platform'
+import { reportPerformance } from '../utils/performanceLog'
 import type {
   GroupRow,
   KlineRow,
@@ -663,6 +664,8 @@ const signals = computed<PatternDto[]>(() => {
 const recentSignals = ref<PatternDto[]>([])
 const recentLoading = ref(false)
 let recentSeq = 0
+let recentSymbol = ''
+let recentRequest: { symbol: string; promise: Promise<void> } | null = null
 
 /** 该品种最近 5 个历史信号：排除仍在途的信号，按识别、触发时间倒序。 */
 const recentHistorySignals = computed<PatternDto[]>(() => {
@@ -674,9 +677,21 @@ const recentHistorySignals = computed<PatternDto[]>(() => {
     .slice(0, 5)
 })
 
-async function loadRecentPatterns() {
+function loadRecentPatterns(): Promise<void> {
   const sym = symbol.value
+  if (recentRequest?.symbol === sym) return recentRequest.promise
+  const promise = fetchRecentPatterns(sym)
+  const request = { symbol: sym, promise }
+  recentRequest = request
+  void promise.finally(() => { if (recentRequest === request) recentRequest = null })
+  return promise
+}
+
+async function fetchRecentPatterns(sym: string) {
+  const started = performance.now()
   const seq = ++recentSeq
+  if (recentSymbol !== sym) recentSignals.value = []
+  recentSymbol = sym
   if (!sym) {
     recentSignals.value = []
     recentLoading.value = false
@@ -685,10 +700,12 @@ async function loadRecentPatterns() {
   recentLoading.value = true
   try {
     const rows = await api.getRecentOutcomes(20, { symbol: sym })
-    if (seq !== recentSeq) return
+    if (seq !== recentSeq || sym !== symbol.value) return
     recentSignals.value = rows.map(toChartSignalFromOutcome).sort((a,b) => qualitySort.value && qualityDisplay.enabled ? compareQuality(a.quality,b.quality) || compareSignalTime(a,b) : compareSignalTime(a,b))
+    reportPerformance('chart_recent_signals_finished', performance.now() - started, { symbol: sym, rows: rows.length })
   } catch {
-    if (seq === recentSeq) recentSignals.value = []
+    if (seq === recentSeq && sym === symbol.value) recentSignals.value = []
+    reportPerformance('chart_recent_signals_failed', performance.now() - started, { symbol: sym })
   } finally {
     if (seq === recentSeq) recentLoading.value = false
   }
@@ -2165,13 +2182,13 @@ watch([symbol, timeframe], async () => {
   trendPoints.value = []
   if (sym) {
     void manualLevelsStore.load(sym, tf)
+    void scansStore.refreshLatestSignals()
     await klinesStore.load(sym, tf, chartLoadLimit.value)
     if (seq !== chartLoadSeq || sym !== symbol.value || tf !== timeframe.value) return
     if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
       liveBars.value = [klinesStore.partialBar]
     }
     void loadTrendLine()
-    void scansStore.refreshLatestSignals()
   }
 }, { immediate: true })
 

@@ -103,6 +103,9 @@ impl ReviewEngine {
             tx.commit().await?;
         }
         self.db.execute(sql("INSERT OR IGNORE INTO review_dirty(symbol,revision) SELECT DISTINCT p.symbol,1 FROM pattern_events p WHERE NOT EXISTS(SELECT 1 FROM review_current c WHERE c.event_id=p.id)",vec![])).await?;
+        if let Err(e) = self.prune_all_orphans().await {
+            tracing::warn!("启动清理孤立复盘历史工件失败: {e}");
+        }
         Ok(())
     }
 
@@ -282,6 +285,7 @@ impl ReviewEngine {
                             vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
                         ))
                         .await?;
+                    let _ = self.db.execute(sql("DELETE FROM review_staging WHERE job_id=?", vec![job.id.clone().into()])).await;
                     // Keep durable dirty entries for an explicit retry; avoid an endless failed-job loop.
                     return Ok(Some(job));
                 }
@@ -303,6 +307,11 @@ impl ReviewEngine {
                     }
                 };
                 let res = async {
+                    let missing = tx.query_one(sql(
+                        "SELECT COUNT(*) AS n FROM review_staging s LEFT JOIN review_results r ON r.result_version=s.result_version WHERE s.job_id=? AND r.result_version IS NULL",
+                        vec![job.id.clone().into()],
+                    )).await?.unwrap().try_get::<i64>("", "n")?;
+                    anyhow::ensure!(missing == 0, "review staging has {missing} missing results; rebuild required");
                     tx.execute(sql("DELETE FROM review_current WHERE event_id IN (SELECT c.event_id FROM review_current c JOIN review_results r ON r.result_version=c.result_version WHERE r.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?))",vec![job.id.clone().into()])).await?;
                     tx.execute(sql("INSERT INTO review_current(event_id,result_version) SELECT event_id,result_version FROM review_staging WHERE job_id=?",vec![job.id.clone().into()])).await?;
                     tx.execute(sql("DELETE FROM review_dirty WHERE EXISTS(SELECT 1 FROM review_job_symbols j WHERE j.job_id=? AND j.symbol=review_dirty.symbol AND j.dirty_revision=review_dirty.revision)",vec![job.id.clone().into()])).await?;
@@ -329,6 +338,7 @@ impl ReviewEngine {
                         vec![job.id.clone().into()],
                     ))
                     .await?;
+                    Self::prune_job_orphan_artifacts(&tx, &job.id).await?;
                     tx.commit().await?;
                     Ok::<i64, anyhow::Error>(rev)
                 }.await;
@@ -345,7 +355,17 @@ impl ReviewEngine {
                             backoff *= 2;
                             continue;
                         }
-                        return Err(e);
+                        // A permanent publication failure must not retry the
+                        // same broken staging set every worker tick.
+                        job.status = "failed".into();
+                        job.updated_at = now();
+                        job.errors.push(format!("publish: {e:#}"));
+                        self.db.execute(sql(
+                            "UPDATE review_jobs SET status='failed',data=? WHERE id=?",
+                            vec![serde_json::to_string(&job)?.into(), job.id.clone().into()],
+                        )).await?;
+                        self.db.execute(sql("DELETE FROM review_staging WHERE job_id=?", vec![job.id.clone().into()])).await?;
+                        return Ok(Some(job));
                     }
                 }
             }
@@ -564,6 +584,148 @@ impl ReviewEngine {
     ) -> Result<()> {
         let tx = self.db.begin().await?;
         Self::save_result_tx(&tx, job_id, detail, holding).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn prune_job_orphan_artifacts(
+        tx: &sea_orm::DatabaseTransaction,
+        job_id: &str,
+    ) -> Result<()> {
+        // 保留当前版本、其他任务仍待发布的版本，以及每个事件最近的旧版本。
+        tx.execute(sql(
+            "DELETE FROM review_holding WHERE result_version IN (
+                SELECT r.result_version FROM review_results r
+                WHERE r.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_current)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_staging)
+                  AND r.rowid NOT IN (
+                      SELECT MAX(r2.rowid) FROM review_results r2
+                      WHERE r2.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+                        AND r2.result_version NOT IN (SELECT result_version FROM review_current)
+                      GROUP BY r2.event_id
+                  )
+            )",
+            vec![job_id.into(), job_id.into()],
+        ))
+        .await?;
+
+        tx.execute(sql(
+            "DELETE FROM review_nodes WHERE result_version IN (
+                SELECT r.result_version FROM review_results r
+                WHERE r.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_current)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_staging)
+                  AND r.rowid NOT IN (
+                      SELECT MAX(r2.rowid) FROM review_results r2
+                      WHERE r2.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+                        AND r2.result_version NOT IN (SELECT result_version FROM review_current)
+                      GROUP BY r2.event_id
+                  )
+            )",
+            vec![job_id.into(), job_id.into()],
+        ))
+        .await?;
+
+        tx.execute(sql(
+            "DELETE FROM review_results
+            WHERE symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+              AND result_version NOT IN (SELECT result_version FROM review_current)
+              AND result_version NOT IN (SELECT result_version FROM review_staging)
+              AND rowid NOT IN (
+                  SELECT MAX(r2.rowid) FROM review_results r2
+                  WHERE r2.symbol IN (SELECT symbol FROM review_job_symbols WHERE job_id=?)
+                    AND r2.result_version NOT IN (SELECT result_version FROM review_current)
+                  GROUP BY r2.event_id
+              )",
+            vec![job_id.into(), job_id.into()],
+        ))
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn prune_all_orphans(&self) -> Result<()> {
+        let tx = self.db.begin().await?;
+
+        // 1. 清理已结束/已失败任务在 review_staging 中的残留
+        tx.execute(sql(
+            "DELETE FROM review_staging WHERE job_id NOT IN (SELECT id FROM review_jobs WHERE status IN ('queued', 'running'))",
+            vec![],
+        ))
+        .await?;
+
+        // 2. 清理已被删除的事件相关的复盘数据 (event_id NOT IN pattern_events)
+        // 注意外键约束：必须先删除 review_current 中的引用
+        tx.execute(sql(
+            "DELETE FROM review_current WHERE event_id NOT IN (SELECT id FROM pattern_events)",
+            vec![],
+        ))
+        .await?;
+        tx.execute(sql(
+            "DELETE FROM review_holding WHERE result_version IN (
+                SELECT result_version FROM review_results WHERE event_id NOT IN (SELECT id FROM pattern_events) AND result_version NOT IN (SELECT result_version FROM review_staging)
+            )",
+            vec![],
+        ))
+        .await?;
+        tx.execute(sql(
+            "DELETE FROM review_nodes WHERE result_version IN (
+                SELECT result_version FROM review_results WHERE event_id NOT IN (SELECT id FROM pattern_events) AND result_version NOT IN (SELECT result_version FROM review_staging)
+            )",
+            vec![],
+        ))
+        .await?;
+        tx.execute(sql(
+            "DELETE FROM review_results WHERE event_id NOT IN (SELECT id FROM pattern_events) AND result_version NOT IN (SELECT result_version FROM review_staging)",
+            vec![],
+        ))
+        .await?;
+
+        // 3. 清理多余历史版本；review_staging 中的在途版本仍然有效，不能回收。
+        tx.execute(sql(
+            "DELETE FROM review_holding WHERE result_version IN (
+                SELECT r.result_version FROM review_results r
+                WHERE r.result_version NOT IN (SELECT result_version FROM review_current)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_staging)
+                  AND r.rowid NOT IN (
+                      SELECT MAX(r2.rowid) FROM review_results r2
+                      WHERE r2.result_version NOT IN (SELECT result_version FROM review_current)
+                      GROUP BY r2.event_id
+                  )
+            )",
+            vec![],
+        ))
+        .await?;
+
+        tx.execute(sql(
+            "DELETE FROM review_nodes WHERE result_version IN (
+                SELECT r.result_version FROM review_results r
+                WHERE r.result_version NOT IN (SELECT result_version FROM review_current)
+                  AND r.result_version NOT IN (SELECT result_version FROM review_staging)
+                  AND r.rowid NOT IN (
+                      SELECT MAX(r2.rowid) FROM review_results r2
+                      WHERE r2.result_version NOT IN (SELECT result_version FROM review_current)
+                      GROUP BY r2.event_id
+                  )
+            )",
+            vec![],
+        ))
+        .await?;
+
+        tx.execute(sql(
+            "DELETE FROM review_results
+            WHERE result_version NOT IN (SELECT result_version FROM review_current)
+              AND result_version NOT IN (SELECT result_version FROM review_staging)
+              AND rowid NOT IN (
+                  SELECT MAX(r2.rowid) FROM review_results r2
+                  WHERE r2.result_version NOT IN (SELECT result_version FROM review_current)
+                  GROUP BY r2.event_id
+              )",
+            vec![],
+        ))
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }

@@ -89,6 +89,7 @@ async function loadDetail(eventId: number, version?: string) {
 async function selectSignal(sig: ReviewSummary) {
   currentEventId.value = sig.event_id
   currentVersion.value = sig.result_version
+  isSignalHidden.value = false
   if (currentSymbol.value !== sig.symbol) { currentSymbol.value = sig.symbol; void loadKlines(sig.symbol) }
   await loadDetail(sig.event_id, sig.result_version)
 }
@@ -143,7 +144,47 @@ async function changePoolPage(offset: number) {
   if (context !== contextRequest || ticket !== poolRequest) return
   if (signalList.value[0]) await selectSignal(signalList.value[0])
 }
-function navigateSignal(offset: number) { const row = signalList.value[currentIndex.value + offset]; if (row) void selectSignal(row) }
+async function navigateSignal(offset: number) {
+  if (poolLoading.value) return
+  const nextIdx = currentIndex.value + offset
+  if (nextIdx >= 0 && nextIdx < signalList.value.length) {
+    const row = signalList.value[nextIdx]
+    if (row) void selectSignal(row)
+    return
+  }
+  // 滚动跨越当前分页末尾，自动加载下一页
+  if (offset > 0 && cursor.value + pageSize.value < total.value) {
+    await changePoolPage(cursor.value + pageSize.value)
+    return
+  }
+  // 滚动跨越当前分页起始，自动返回上一页并聚焦上一页尾条
+  if (offset < 0 && cursor.value > 0) {
+    const prevCursor = Math.max(0, cursor.value - pageSize.value)
+    await changePoolPage(prevCursor)
+    if (signalList.value.length > 0) {
+      await selectSignal(signalList.value[signalList.value.length - 1])
+    }
+    return
+  }
+}
+
+/** 鼠标滚轮在K线图区域平滑累积滚动量切换信号池信号（按住Ctrl时交给图表缩放） */
+const wheelAcc = ref(0)
+let lastSwitchAt = 0
+const WHEEL_SWITCH_THRESHOLD = 20
+const WHEEL_SWITCH_INTERVAL = 120
+
+function handleChartWheel(e: WheelEvent) {
+  if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return
+  const now = Date.now()
+  if (now - lastSwitchAt < WHEEL_SWITCH_INTERVAL) return
+  wheelAcc.value += e.deltaY
+  if (Math.abs(wheelAcc.value) < WHEEL_SWITCH_THRESHOLD) return
+  const dir = wheelAcc.value > 0 ? 1 : -1
+  wheelAcc.value = 0
+  lastSwitchAt = now
+  void navigateSignal(dir)
+}
 function focusCurrentSignal() {
   const s = activeDetail.value?.summary
   if (s && s.event_id === currentEventId.value) { focusTs.value = s.entry_ts || s.warning_ts; focusKey.value = Date.now() }
@@ -151,8 +192,8 @@ function focusCurrentSignal() {
 function handleKeydown(e: KeyboardEvent) {
   const target = e.target as HTMLElement | null
   if (target?.closest('input,textarea,[contenteditable="true"]')) return
-  if (['p', 'P', 'ArrowUp'].includes(e.key)) { e.preventDefault(); navigateSignal(-1) }
-  else if (['n', 'N', 'ArrowDown'].includes(e.key)) { e.preventDefault(); navigateSignal(1) }
+  if (['p', 'P', 'ArrowUp'].includes(e.key)) { e.preventDefault(); void navigateSignal(-1) }
+  else if (['n', 'N', 'ArrowDown'].includes(e.key)) { e.preventDefault(); void navigateSignal(1) }
   else if (e.key === 'Escape' && isTauri()) void getCurrentWindow().close()
 }
 async function applyContext(params: OpenReviewChartParams) {
@@ -189,7 +230,7 @@ onBeforeUnmount(() => { ++contextRequest; ++poolRequest; detailRequest.cancel();
 <template>
   <div class="review-chart-page">
     <!-- 顶部极简操作工具条（注意：不再渲染 TitleBar，避免与 AppLayout 原生窗口控制栏产生双套按钮） -->
-    <header class="chart-header-subbar">
+    <header class="chart-header-subbar" @wheel.prevent="handleChartWheel">
       <div class="ch-left">
         <!-- 信号前后切换漫游 -->
         <div class="tb-signal-nav">
@@ -269,14 +310,14 @@ onBeforeUnmount(() => { ++contextRequest; ++poolRequest; detailRequest.cancel();
           刷新K线
         </n-button>
 
-        <span class="shortcut-tip text-muted">快捷键: P 上一条 · N 下一条 · Esc 关闭</span>
+        <span class="shortcut-tip text-muted">快捷键: P 上一条 · N 下一条 · 滚轮 切换 · Esc 关闭</span>
       </div>
     </header>
 
     <!-- 两栏核心主体：左侧满屏K线（无左侧品种树） + 右侧复盘信号池 -->
     <div class="chart-content-row">
       <!-- K线视口区域 -->
-      <section class="chart-viewport-box">
+      <section class="chart-viewport-box" @wheel.prevent="handleChartWheel">
         <div class="chart-canvas-wrap">
           <KLineChart
             v-if="currentSymbol && (klinesStore.rows.length || klinesStore.loading)"
