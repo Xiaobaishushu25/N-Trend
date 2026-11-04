@@ -71,11 +71,15 @@ fn registered_event_ids(
 }
 
 pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
+    // Scan work is isolated from the HTTP long-poll consumer, so a slow pattern
+    // replay cannot delay the next closed-bar event or chart broadcast.
+    let (scan_tx, scan_rx) = tokio::sync::mpsc::channel(512);
+    spawn_tq_closed_scan_worker(ctx.clone(), scan_rx);
     spawn_review_worker(ctx.clone());
     spawn_scheduler(ctx.clone());
     spawn_quote_poller(ctx.clone());
     spawn_live_chart_publisher(ctx.clone());
-    spawn_tq_bar_event_consumer(ctx.clone());
+    spawn_tq_bar_event_consumer(ctx.clone(), scan_tx);
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
@@ -922,7 +926,6 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
     let t0 = Instant::now();
     tracing::info!("🔍 扫描触发 | {}", Local::now().format("%H:%M:%S"));
     let res = ctx.services.run_scan().await?;
-    register_execution_signals(ctx, &res.new_warnings).await;
     *ctx.last_scan.write().await = Some(Local::now().naive_local());
 
     tracing::info!(
@@ -933,7 +936,14 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
         res.new_warnings.len(),
         res.newly_triggered.len()
     );
+    publish_scan_signals(ctx, &res, true).await;
+    Ok(res)
+}
 
+/// One publisher for both scheduled and closed-bar scans. The scheduled path
+/// continues to own preclose reconciliation, which must not run per symbol.
+async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconcile: bool) {
+    register_execution_signals(ctx, &res.new_warnings).await;
     // 将新预警和新触发持久化到服务端的 notification_history 并广播
     for w in &res.new_warnings {
         let item = NewNotificationHistoryItem {
@@ -1054,6 +1064,9 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
         }
     }
 
+    if !reconcile {
+        return;
+    }
     // 收盘后对账结算 (机制一与机制二)
     let now_naive = Local::now().naive_local();
     match ctx.services.reconcile_preclose_signals(now_naive).await {
@@ -1084,8 +1097,6 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
         Err(error) => tracing::warn!("临时未收盘候选结算失败: {error:#}"),
         _ => {}
     }
-
-    Ok(res)
 }
 
 fn spawn_preclose_emails(
@@ -1496,7 +1507,111 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
     });
 }
 
-fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
+#[derive(Debug)]
+struct ClosedScanTask {
+    symbol: String,
+    bar_end: String,
+    event_id: u64,
+    queued_at: Instant,
+}
+
+fn ends_fifteen_minute_bar(bar_end: &str) -> bool {
+    use chrono::Timelike;
+    chrono::NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")
+        .is_ok_and(|dt| dt.minute() % 15 == 0 && dt.second() == 0)
+}
+
+fn spawn_tq_closed_scan_worker(
+    ctx: Arc<ServerContext>,
+    mut rx: tokio::sync::mpsc::Receiver<ClosedScanTask>,
+) {
+    let worker = async move {
+        while let Some(task) = rx.recv().await {
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let queued_ms = task.queued_at.elapsed().as_millis() as u64;
+            let started = Instant::now();
+            let mut outcome = None;
+            // Transient SQLite lock/refresh contention should not lose a scan.
+            // After bounded retries, the existing scheduled scan is the fallback.
+            for attempt in 0..3u64 {
+                match ctx.services.scan_tq_closed_15m_symbol(&task.symbol, &task.bar_end).await {
+                    Ok(result) => {
+                        outcome = Some(result);
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            symbol = %task.symbol, bar_end = %task.bar_end,
+                            event_id = task.event_id, attempt = attempt + 1,
+                            "[R2_FAST_SCAN] 事件扫描失败: {error:#}"
+                        );
+                        if attempt < 2 {
+                            tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                        }
+                    }
+                }
+            }
+            let scan_ms = started.elapsed().as_millis() as u64;
+            match outcome {
+                Some((Some(res), false)) => {
+                    let publish_started = Instant::now();
+                    publish_scan_signals(&ctx, &res, false).await;
+                    let publish_ms = publish_started.elapsed().as_millis() as u64;
+                    ctx.realtime_hub.broadcast(
+                        ctx.next_event_seq(), "scan.completed",
+                        serde_json::to_value(&res).unwrap_or_default(),
+                    ).await;
+                    tracing::info!(
+                        symbol = %task.symbol, bar_end = %task.bar_end,
+                        event_id = task.event_id, queued_ms, scan_ms, publish_ms,
+                        warnings = res.new_warnings.len(), triggered = res.newly_triggered.len(),
+                        "[R2_FAST_SCAN] 闭合事件扫描及信号发布完成"
+                    );
+                }
+                Some((None, true)) => {
+                    tracing::debug!(
+                        symbol = %task.symbol, bar_end = %task.bar_end,
+                        event_id = task.event_id, queued_ms, scan_ms,
+                        "[R2_FAST_SCAN] 已由定时扫描或先前事件处理"
+                    );
+                }
+                Some(_) => {
+                    tracing::warn!(symbol = %task.symbol, "[R2_FAST_SCAN] 非预期扫描结果，等待定时补偿");
+                }
+                None => {
+                    tracing::error!(
+                        symbol = %task.symbol, bar_end = %task.bar_end,
+                        event_id = task.event_id,
+                        "[R2_FAST_SCAN] 三次失败，保留定时扫描兜底；请检查日志"
+                    );
+                }
+            }
+        }
+    };
+    tokio::spawn(worker);
+}
+
+#[cfg(test)]
+mod closed_scan_boundary_tests {
+    use super::ends_fifteen_minute_bar;
+
+    #[test]
+    fn only_closed_fifteen_minute_boundaries_enqueue_scan() {
+        assert!(ends_fifteen_minute_bar("2026-11-03 21:15:00"));
+        assert!(ends_fifteen_minute_bar("2026-11-03 23:30:00"));
+        assert!(!ends_fifteen_minute_bar("2026-11-03 21:05:00"));
+        assert!(!ends_fifteen_minute_bar("2026-11-03 21:10:00"));
+        assert!(!ends_fifteen_minute_bar("2026-11-03 21:15:01"));
+        assert!(!ends_fifteen_minute_bar("invalid"));
+    }
+}
+
+fn spawn_tq_bar_event_consumer(
+    ctx: Arc<ServerContext>,
+    scan_tx: tokio::sync::mpsc::Sender<ClosedScanTask>,
+) {
     tokio::spawn(async move {
         let mut is_first = true;
         let mut after_id = 0u64;
@@ -1570,6 +1685,21 @@ fn spawn_tq_bar_event_consumer(ctx: Arc<ServerContext>) {
                         tracing::warn!(symbol = %ev.symbol, bar_end = %ev.bar_end, "闭合K线入库失败，将重试: {error:#}");
                         persist_failed = true;
                         break;
+                    }
+                    if ends_fifteen_minute_bar(&ev.bar_end) {
+                        // Backpressure instead of drop: a slow full-history scan must
+                        // never silently discard a closed-bar signal.
+                        let task = ClosedScanTask {
+                            symbol: ev.symbol.clone(),
+                            bar_end: ev.bar_end.clone(),
+                            event_id: ev.event_id,
+                            queued_at: Instant::now(),
+                        };
+                        if scan_tx.send(task).await.is_err() {
+                            // Keep chart delivery alive if the worker panics/exits;
+                            // the scheduled scanner is still the recovery path.
+                            tracing::error!("[R2_FAST_SCAN] 扫描工作队列停止，降级为定时扫描兜底");
+                        }
                     }
                     after_id = after_id.max(ev.event_id);
                     tracing::info!(

@@ -3191,7 +3191,7 @@ impl Services {
         }
         let scan_started = Instant::now();
         let (scan_result, duplicate_skipped) = self
-            .run_event_scan_symbol(&event.symbol, &event.bar_end)
+            .scan_tq_closed_15m_symbol(&event.symbol, &event.bar_end)
             .await?;
         Ok(FastPathOutcome {
             scan_result,
@@ -3201,8 +3201,21 @@ impl Services {
         })
     }
 
-    /// Persist before announcing closure. The server's existing scheduler remains
-    /// responsible for strategy scans; chart event delivery never starts a scan.
+    /// Run a scan for a previously persisted closed 15m bar. Never store the
+    /// same 5m event again: the producer has already committed raw and derived data.
+    pub async fn scan_tq_closed_15m_symbol(
+        &self,
+        symbol: &str,
+        bar_end: &str,
+    ) -> Result<(Option<ScanResult>, bool)> {
+        let dt = NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")?;
+        if dt.minute() % 15 != 0 || dt.second() != 0 {
+            return Err(anyhow!("非15分钟闭合边界: {symbol}/{bar_end}"));
+        }
+        self.run_event_scan_symbol(symbol, bar_end).await
+    }
+
+    /// Persist the final 5m bar before chart publication or scan dispatch.
     pub async fn store_tq_closed_bar_event(&self, event: &ClosedBarEvent) -> Result<()> {
         if event.source != "tqsdk" || event.event_type != "bar_closed" || event.period != "5m" {
             return Err(anyhow!("非法闭合事件来源或类型"));
@@ -4199,7 +4212,10 @@ impl Services {
         symbol: &str,
         bar_end: &str,
     ) -> Result<(Option<ScanResult>, bool)> {
+        // Match scheduled scans' lock order: scan_lock -> data_cycle_lock.
+        // Prevent refresh/rollover edits from racing a scan of the final bar.
         let _guard = self.scan_lock.lock().await;
+        let _cycle_guard = self.data_cycle_lock.lock().await;
         let bars15 = self.bars_for(symbol, "15m").await?;
         let Some(bar) = bars15.iter().find(|bar| bar.dt.to_bar_ts() == bar_end) else {
             return Err(anyhow!(
@@ -4226,7 +4242,7 @@ impl Services {
             .filter(|row| row.code == symbol)
             .collect();
         match self.run_scan_models(symbols, false, false).await {
-            Ok(result) => {
+            Ok(result) if result.scanned == 1 && result.failed.is_empty() => {
                 repo::complete_scan_watermark(
                     &self.db,
                     symbol,
@@ -4238,7 +4254,9 @@ impl Services {
                 .await?;
                 Ok((Some(result), false))
             }
-            Err(error) => {
+            other => {
+                // A successful call with insufficient bars is not a completed scan.
+                // Release the watermark so the next closed event or scheduler retries.
                 let _ = repo::release_scan_watermark(
                     &self.db,
                     symbol,
@@ -4248,7 +4266,13 @@ impl Services {
                     &fingerprint,
                 )
                 .await;
-                Err(error)
+                match other {
+                    Err(error) => Err(error),
+                    Ok(result) => Err(anyhow!(
+                        "15m事件扫描未完整完成: {symbol}/{bar_end}, scanned={}, failures={:?}",
+                        result.scanned, result.failed
+                    )),
+                }
             }
         }
     }
