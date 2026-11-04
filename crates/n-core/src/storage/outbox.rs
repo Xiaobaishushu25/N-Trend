@@ -11,27 +11,6 @@ fn sql(query: impl Into<String>, values: Vec<sea_orm::Value>) -> Statement {
 /// Set to true only for an explicit compile-time rollback after draining Outbox.
 pub const LEGACY_DIRECT_PUBLISH: bool = false;
 
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
-/// Set to true only for an explicit compile-time rollback after draining Outbox.
-pub const LEGACY_DIRECT_PUBLISH: bool = false;
-
 pub const NOTICE_WARNING: &str = "notice_warning";
 pub const NOTICE_TRIGGER: &str = "notice_trigger";
 pub const EMAIL_WARNING: &str = "email_warning";
