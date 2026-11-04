@@ -5,11 +5,12 @@ import {
   requestPermission,
   sendNotification,
 } from '@tauri-apps/plugin-notification'
-import { onDataUpdated, onScanCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, onServerDelay, api } from '../services/api'
+import { onDataUpdated, onScanCompleted, onScanSymbolCompleted, onEntryTrigger, onManualLevelAlert, onConnectionStatusChanged, onServerStatus, onServerDelay, api } from '../services/api'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
 import { useGroupsStore } from './groups'
 import { useActionsStore } from './actions'
+import { useScansStore } from './scans'
 import { isMainWindow, notify } from '../utils/notify'
 import { manualLevelPhaseLabel, manualLevelRoleLabel, isManualLevelEventAllowed } from '../utils/manualLevel'
 import type { AppInfo, ConnectionStatus, ManualLevelAlert, RecentOutcomeFilters } from '../types'
@@ -126,6 +127,9 @@ export const useAppStore = defineStore('app', {
             await useGroupsStore().load().catch(() => {})
             useSettingsStore().refreshStatus().catch(() => {})
             useActionsStore().reloadTick++
+            // A reconnect can miss multiple symbol deltas. Reconcile with the
+            // authoritative active-event table, not a stale scan cache.
+            void useScansStore().syncActiveSignals().catch(() => {})
           }
         }),
       )
@@ -156,6 +160,11 @@ export const useAppStore = defineStore('app', {
       this.listeners.push(
         await onScanCompleted((result) => {
           console.info('[scan-completed]', result)
+        }),
+      )
+      this.listeners.push(
+        await onScanSymbolCompleted((delta) => {
+          useScansStore().ingestSymbolDelta(delta)
         }),
       )
       this.listeners.push(

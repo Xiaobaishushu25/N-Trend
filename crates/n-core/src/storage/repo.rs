@@ -1226,6 +1226,50 @@ pub async fn active_pattern_events(db: &DatabaseConnection) -> Result<Vec<patter
         .context("查询活跃信号事件失败")?)
 }
 
+/// 全市场活跃信号计数：闭合事件增量广播无需反序列化所有历史事件。
+pub async fn count_active_pattern_events(db: &DatabaseConnection) -> Result<u64> {
+    Ok(pattern_events::Entity::find()
+        .filter(pattern_events::Column::State.is_in(["pending", "triggered"]))
+        .count(db)
+        .await
+        .context("统计全市场活跃信号失败")?)
+}
+
+#[cfg(test)]
+mod r4c_active_count_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn active_count_matches_full_select_across_symbols() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        for (symbol, state) in [
+            ("MA0", "pending"),
+            ("RB0", "triggered"),
+            ("BU0", "unpriced"),
+        ] {
+            db.execute_unprepared(&format!(
+                r#"INSERT INTO pattern_events(
+                    symbol,direction,grade,level,s0_ts,s0_price,s1_ts,s1_price,
+                    s2_ts,s2_price,warning_ts,detected_at,warning_kind,entry_score,
+                    entry,stop,target,risk,rr,state,created_at,updated_at
+                ) VALUES(
+                    '{symbol}','up','A','fine','2026-08-11 09:15:00',1,
+                    '2026-08-11 09:30:00',2,'2026-08-11 09:45:00',1,
+                    '2026-08-11 10:00:00','2026-08-11 10:00:00','wick',4,
+                    2,1,4,1,2,'{state}',
+                    '2026-08-11 10:00:00','2026-08-11 10:00:00'
+                )"#
+            ))
+            .await
+            .unwrap();
+        }
+        assert_eq!(count_active_pattern_events(&db).await.unwrap(), 2);
+        assert_eq!(active_pattern_events(&db).await.unwrap().len(), 2);
+    }
+}
+
 /// 按 id 查询单条信号事件。
 pub async fn pattern_event_by_id(
     db: &DatabaseConnection,

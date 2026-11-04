@@ -69,6 +69,14 @@ pub struct ScanResult {
     pub single_bars: Vec<crate::analyze::model::SingleBarAlert>,
 }
 
+/// Full snapshot and single-symbol delta share the data carrier, but must
+/// never be published on the same realtime event name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanResultMode {
+    Full,
+    SymbolDelta,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FastPathOutcome {
     pub scan_result: Option<ScanResult>,
@@ -4326,7 +4334,7 @@ impl Services {
             self.sync_rollovers_if_needed().await?;
         }
         let symbols = repo::list_symbols(&self.db, true).await?;
-        self.run_scan_models(symbols, true, true).await
+        self.run_scan_models(symbols, true, true, ScanResultMode::Full).await
     }
 
     /// 天勤闭合事件快速路径：只扫描事件涉及的品种，不等待全市场最慢品种。
@@ -4338,7 +4346,7 @@ impl Services {
             .into_iter()
             .filter(|symbol| wanted.contains(symbol.code.as_str()))
             .collect();
-        self.run_scan_models(symbols, false, false).await
+        self.run_scan_models(symbols, false, false, ScanResultMode::Full).await
     }
 
     async fn run_event_scan_symbol(
@@ -4379,7 +4387,7 @@ impl Services {
             return Ok((None, true));
         }
 
-        match self.run_scan_models(symbols, false, false).await {
+        match self.run_scan_models(symbols, false, false, ScanResultMode::SymbolDelta).await {
             Ok(result) if result.scanned == 1 && result.failed.is_empty() => {
                 repo::complete_scan_watermark(
                     &self.db,
@@ -4420,6 +4428,7 @@ impl Services {
         symbols: Vec<symbols::Model>,
         delete_fast_events: bool,
         cleanup_duplicates: bool,
+        mode: ScanResultMode,
     ) -> Result<ScanResult> {
         let started = now_ts();
         let cfg = self.config().await;
@@ -4549,6 +4558,13 @@ impl Services {
             let mut replay_skipped = 0usize;
             let mut lifecycle_updated = 0usize;
             let symbol_event_count = events.len();
+            // Only this symbol's changed events are needed by the closed-bar
+            // realtime delta. The full-scan API still returns every event.
+            let newly_inserted_ids: HashSet<i64> = if mode == ScanResultMode::SymbolDelta {
+                new_warnings.iter().map(|w| w.id).collect()
+            } else {
+                HashSet::new()
+            };
             for mut e in events {
                 let was_triggered = e.trigger_ts.is_some();
                 let had_trigger_bar = e.trigger_bar_ts.is_some();
@@ -4589,22 +4605,30 @@ impl Services {
                 } else {
                     false
                 };
+                let mut prediction_refreshed = false;
                 if e.trigger_ts.is_some()
                     && e.trigger_bar_ts.is_some()
                     && ((!was_triggered && e.trigger_ts.is_some())
                         || (!had_trigger_bar && e.trigger_bar_ts.is_some())
                         || needs_prediction)
                 {
-                    if let Err(error) =
-                        crate::v2::prediction::predict_event(&self.db, &e, &bars15).await
-                    {
-                        tracing::warn!(event_id = e.id, "V2 实时预测写入失败: {error:#}");
+                    match crate::v2::prediction::predict_event(&self.db, &e, &bars15).await {
+                        Ok(updated) => prediction_refreshed = updated > 0,
+                        Err(error) => {
+                            tracing::warn!(event_id = e.id, "V2 实时预测写入失败: {error:#}");
+                        }
                     }
                     if !was_triggered {
                         newly_triggered.push(e.clone());
                     }
                 }
-                signals.push(e);
+                if mode == ScanResultMode::Full
+                    || changed
+                    || prediction_refreshed
+                    || newly_inserted_ids.contains(&e.id)
+                {
+                    signals.push(e);
+                }
             }
             tracing::info!(
                 target: "scan_perf", symbol = %sym.code,
@@ -4638,22 +4662,31 @@ impl Services {
         if cleanup_duplicates {
             self.cleanup_duplicate_events().await?;
         }
-        signals = repo::all_pattern_events(&self.db).await?;
-
+        let result_started = Instant::now();
+        // The event-triggered 15m path is a delta, never a full-market snapshot.
+        // Manual and scheduled scans preserve the legacy full ScanResult contract.
+        if mode == ScanResultMode::Full {
+            signals = repo::all_pattern_events(&self.db).await?;
+        }
         let finished = now_ts();
-        let active_count = signals
-            .iter()
-            .filter(|e| matches!(e.state.as_str(), "pending" | "triggered"))
-            .count() as i64;
-        let summary = build_scan_summary(
-            &started,
-            &finished,
-            scanned,
-            active_count,
-            min_score,
-            &signals,
-            &failed,
-        );
+        let active_count = if mode == ScanResultMode::SymbolDelta {
+            repo::count_active_pattern_events(&self.db).await? as i64
+        } else {
+            signals
+                .iter()
+                .filter(|e| matches!(e.state.as_str(), "pending" | "triggered"))
+                .count() as i64
+        };
+        let summary = if mode == ScanResultMode::SymbolDelta {
+            format!(
+                "15m闭合事件增量扫描：扫描 {scanned} 个品种，本轮 {} 条事件变化；全市场活跃事件 {active_count} 条。",
+                signals.len()
+            )
+        } else {
+            build_scan_summary(
+                &started, &finished, scanned, active_count, min_score, &signals, &failed,
+            )
+        };
         {
             let mut cache = self.active_single_bars.write().await;
             for sb in &single_bars {
@@ -4665,6 +4698,13 @@ impl Services {
         }
 
         let quality_by_event = crate::quality::store::display(&self.db, &signals).await;
+        tracing::info!(
+            target: "scan_perf",
+            mode = if mode == ScanResultMode::SymbolDelta { "delta" } else { "full" },
+            event_rows = signals.len(), active_count,
+            result_ms = result_started.elapsed().as_millis(),
+            "[R4C_RESULT] scan result assembled"
+        );
         Ok(ScanResult {
             quality_by_event,
             scanned,

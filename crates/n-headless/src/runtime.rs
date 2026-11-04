@@ -1585,9 +1585,15 @@ fn spawn_tq_closed_scan_worker(
                     let publish_started = Instant::now();
                     publish_scan_signals(&ctx, &res, false).await;
                     let publish_ms = publish_started.elapsed().as_millis() as u64;
+                    // A symbol delta must never masquerade as the full snapshot
+                    // carried by the existing scan.completed channel.
                     ctx.realtime_hub.broadcast(
-                        ctx.next_event_seq(), "scan.completed",
-                        serde_json::to_value(&res).unwrap_or_default(),
+                        ctx.next_event_seq(), "scan.symbol_completed",
+                        serde_json::json!({
+                            "symbol": &task.symbol,
+                            "bar_end": &task.bar_end,
+                            "result": &res,
+                        }),
                     ).await;
                     tracing::info!(
                         symbol = %task.symbol, bar_end = %task.bar_end,

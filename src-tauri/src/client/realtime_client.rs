@@ -594,6 +594,9 @@ impl RealtimeClient {
                         "scan.completed" => {
                             let _ = self.app.emit("scan-completed", &payload);
                         }
+                        "scan.symbol_completed" => {
+                            let _ = self.app.emit("scan-symbol-completed", &payload);
+                        }
                         "entry.triggered" => {
                             let _ = self.app.emit("entry-trigger", &payload);
                         }

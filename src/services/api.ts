@@ -39,6 +39,7 @@ import type {
   ReviewSignalDetail,
   ReviewStats,
   ScanResult,
+  SymbolScanDelta,
   SchedulerStatus,
   SignalAnnotation,
   SignalDecision,
@@ -309,6 +310,10 @@ export function onQuotesUpdated(cb: (snapshots: MarketSnapshot[]) => void) {
 
 export function onScanCompleted(cb: (result: ScanResult) => void) {
   return listen<ScanResult>('scan-completed', (e) => cb(e.payload))
+}
+
+export function onScanSymbolCompleted(cb: (payload: SymbolScanDelta) => void) {
+  return listen<SymbolScanDelta>('scan-symbol-completed', (e) => cb(e.payload))
 }
 
 export function onEntryTrigger(cb: (hits: EntryTriggerHit[]) => void) {

@@ -369,6 +369,14 @@ export interface ScanResult {
   single_bars?: SingleBarEvent[]
 }
 
+/** Closed-bar fast-path delta. result.signals contains changed rows only, not
+ * a full market snapshot; do not feed it to applyScanResult(). */
+export interface SymbolScanDelta {
+  symbol: string
+  bar_end: string
+  result: ScanResult
+}
+
 export interface RefreshStats {
   succeeded: number
   failures: number

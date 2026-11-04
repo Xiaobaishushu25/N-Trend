@@ -3,7 +3,7 @@ import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { useSettingsStore } from './settings'
 import { useSymbolsStore } from './symbols'
-import type { PatternEvent, ScanResult, SingleBarEvent } from '../types'
+import type { PatternEvent, ScanResult, SingleBarEvent, SymbolScanDelta } from '../types'
 import { normalizeSingleBar, isExpired } from '../utils/singleBar'
 
 const ACTIVE_STATES = new Set(['pending', 'triggered'])
@@ -66,7 +66,8 @@ export const useScansStore = defineStore('scans', {
     },
     async refreshLatestSignals() {
       if (this.latest) {
-        this.latestSignals = activeSignals(this.latest.signals)
+        // applyScanResult() already initialized latestSignals. Preserve any
+        // subsequent authoritative reconnect sync and terminal-event deltas.
         if (this.singleBars.size === 0) {
           api.getActiveSingleBars().then((bars) => {
             if (bars?.length) this.upsertSingleBars(bars)
@@ -161,6 +162,49 @@ export const useScansStore = defineStore('scans', {
     },
     ingest(result: ScanResult) {
       this.applyScanResult(result)
+    },
+    /** Refresh only active signals on reconnect; keep a manually scanned
+     * full-history snapshot untouched for the review/scan page. */
+    async syncActiveSignals() {
+      const rows = await api.getActiveEvents()
+      this.latestSignals = activeSignals(rows as PatternEvent[])
+    },
+    /** Never pass a symbol delta to applyScanResult: that would erase all
+     * other symbols. Outbox handles notification delivery separately. */
+    ingestSymbolDelta(delta: SymbolScanDelta) {
+      if (!delta || !delta.result || !Array.isArray(delta.result.signals)) return
+      const changes = delta.result.signals
+        .filter(e => e.symbol === delta.symbol)
+        .map(e => ({
+          ...e,
+          quality: delta.result.quality_by_event?.[String(e.id)] ?? e.quality,
+        }))
+      const merge = (rows: PatternEvent[]): PatternEvent[] => {
+        const byId = new Map<number, PatternEvent>(rows.map(e => [e.id, e]))
+        for (const event of changes) {
+          const previous = byId.get(event.id)
+          if (!previous || previous.updated_at <= event.updated_at) {
+            byId.set(event.id, event)
+          }
+        }
+        return [...byId.values()]
+      }
+      if (this.latest) {
+        const merged = merge(this.latest.signals)
+        this.latest = {
+          ...this.latest,
+          signals: merged,
+          active_count: delta.result.active_count,
+          quality_by_event: {
+            ...this.latest.quality_by_event,
+            ...delta.result.quality_by_event,
+          },
+        }
+      }
+      this.latestSignals = activeSignals(merge(this.latestSignals))
+      if (delta.result.single_bars?.length) {
+        this.upsertSingleBars(delta.result.single_bars)
+      }
     },
     upsertSingleBars(events: SingleBarEvent[]) {
       const now = Date.now()
