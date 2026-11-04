@@ -10,6 +10,7 @@ use sea_orm::{
 };
 use tracing::info;
 
+pub mod cache_revisions;
 pub mod entities;
 pub mod outbox;
 pub mod repo;
@@ -304,6 +305,8 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     migrate_pattern_event_unique(db).await?;
     create_finality_tables(db).await?;
     outbox::ensure(db).await?;
+    // Triggers capture writes from any connection; hot-path reads use in-process epochs.
+    cache_revisions::ensure(db).await?;
     create_v2_tables(db).await?;
     crate::quality::store::ensure(db).await?;
     crate::review::store::ensure(db).await?;

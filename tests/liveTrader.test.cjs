@@ -489,6 +489,7 @@ test('actual condition-pool template shows blocked reasons and omits execution c
     conditionBadgeType: () => 'warning', conditionLabel: () => '已过滤，不开仓',
     fmtPrice: identity, formatCondTs: identity, isWarningNote: () => true,
     getNoteCategory: () => '准入过滤', formatNoteText: identity, getNoteTooltip: identity,
+    formatWaitBars: identity, isConditionRejected: () => false,
     AlertTriangle: {}, Bolt: {}, ExternalLink: {}, InfoCircle: {}, }
   const app = Vue.createSSRApp({ render() { return render(context, []) } })
   for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
@@ -506,4 +507,109 @@ test('actual condition-pool template shows blocked reasons and omits execution c
   assert.ok(!html.includes('立即确认开仓'))
   assert.ok(!html.includes('取消剩余开仓'))
   assert.ok(!html.includes('当前实例暂无条件单'))
+})
+
+test('rejected conditions with unfilled reason show readable labels, no retry text and safe wait bars', async () => {
+  const Vue = require('vue')
+  const { compile } = require('@vue/compiler-dom')
+  const { renderToString } = require('@vue/server-renderer')
+  const { store } = setup()
+  store.activeTab = 'conditions'
+  store.conditions = [
+    {
+      id: 'v2701-short-rejected',
+      symbol: 'v2701',
+      instrument_id: 'v2701',
+      direction: 'down',
+      tier: 'small',
+      volume: 1,
+      event_id: 7770,
+      score: 3.0,
+      bars_waited: 1,
+      max_wait_bars: 18446744073709552000,
+      state: 'rejected',
+      entry_price: 5117,
+      stop_price: 5138.5,
+      target_price: 5060,
+      risk: 21.5,
+      warning_bar_ts: '2026-11-03 22:45:00',
+      trigger_ts: null,
+      note: 'unfilled',
+      display_only: false,
+    },
+  ]
+
+  const source = fs.readFileSync('src/views/LiveTraderView.vue', 'utf8')
+  const template = source.match(/<section v-else-if="trader.activeTab === 'conditions'"[\s\S]*?<\/section>/)[0]
+    .replace('v-else-if', 'v-if')
+  const render = new Function('Vue', compile(template).code)(Vue)
+  const identity = value => value
+
+  // Replicate LiveTraderView functions under test
+  function conditionLabel(state) {
+    const map = { rejected: '已拒绝开仓' }
+    return map[(state || '').toLowerCase()] || state
+  }
+  function formatWaitBars(barsWaited, maxWaitBars) {
+    const waited = barsWaited ?? 0
+    if (maxWaitBars == null || maxWaitBars >= 999999 || maxWaitBars <= 0) {
+      return `已等待 ${waited} 根K线 (不限)`
+    }
+    return `已等待 ${waited} / ${maxWaitBars} 根K线`
+  }
+  function isConditionRejected(state) {
+    return (state || '').toLowerCase() === 'rejected'
+  }
+  function getNoteCategory(note) {
+    if (note === 'unfilled') return '滑点保护'
+    return '说明'
+  }
+  function formatNoteText(note) {
+    if (note === 'unfilled') return '跳空/滑点超追价上限(放弃入场)'
+    return note
+  }
+  function getNoteTooltip(note) {
+    if (note === 'unfilled') return '【滑点保护拦截】盘口突破瞬间价格超出策略允许的最大追价滑点容差'
+    return note
+  }
+
+  const context = {
+    trader: store,
+    getInstrumentName: () => 'PVC 2701',
+    dirLabel: (d) => (d === 'up' ? '做多' : '做空'),
+    conditionBadgeType: () => 'error',
+    conditionLabel,
+    fmtPrice: (v) => (v != null ? String(v) : '—'),
+    formatCondTs: identity,
+    isWarningNote: () => true,
+    getNoteCategory,
+    formatNoteText,
+    getNoteTooltip,
+    formatWaitBars,
+    isConditionRejected,
+    isConditionClosing: () => false,
+    AlertTriangle: {},
+    Bolt: {},
+    ExternalLink: {},
+    InfoCircle: {},
+  }
+
+  const app = Vue.createSSRApp({ render() { return render(context, []) } })
+  for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
+    app.component(name, {
+      setup(_, { slots }) {
+        return () => Vue.h('span', slots.trigger ? slots.trigger() : slots.default?.())
+      },
+    })
+  }
+
+  const html = await renderToString(app)
+  assert.match(html, /PVC 2701/)
+  assert.match(html, /已拒绝开仓/)
+  assert.ok(!html.includes('等待重试'), 'Should not display misleading 等待重试')
+  assert.match(html, /已等待 1 根K线 \(不限\)/)
+  assert.ok(!html.includes('18446744073709552000'), 'Should not leak overflowed usize::MAX')
+  assert.match(html, /滑点保护/)
+  assert.match(html, /跳空\/滑点超追价上限\(放弃入场\)/)
+  assert.match(html, /触价后被拒/)
 })

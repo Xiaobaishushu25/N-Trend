@@ -1,5 +1,6 @@
 //! 应用服务层：把抓取、存储、派生、分析串成完整业务流程。
 
+mod market_cache;
 mod review;
 
 use anyhow::{anyhow, Result};
@@ -1439,6 +1440,8 @@ pub struct Services {
     config: Arc<RwLock<Config>>,
     /// 配置文件路径（保存配置用）
     config_path: std::path::PathBuf,
+    /// R5a: quotes and entry detection share two revision-aware memory snapshots.
+    market_cache: market_cache::MarketCache,
     /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
     /// 收盘前检测节流：复用3秒行情快照，但最多每10秒扫描一次候选事件。
@@ -1568,6 +1571,7 @@ impl Services {
             data_source,
             config: config_arc,
             config_path,
+            market_cache: market_cache::MarketCache::default(),
             entry_notified: RwLock::new(HashSet::new()),
             preclose_last_tick: Mutex::new(None),
             preclose_candidate_last_tick: Mutex::new(None),
@@ -1712,8 +1716,10 @@ impl Services {
             return Ok(Vec::new());
         }
         let min_score = cfg.notify.new_pattern_min_score;
-        let rows = repo::pending_entry_events(&self.db).await?;
-        let symbols = repo::list_symbols(&self.db, false).await?;
+        // No SQLite read on ordinary price ticks. New local signals invalidate
+        // synchronously; an occasional revision probe catches external writers.
+        let rows = self.market_cache.pending(&self.db).await?;
+        let symbols = self.market_cache.symbols(&self.db).await?;
         let name_by_code: HashMap<String, String> = symbols
             .iter()
             .map(|s| (s.code.clone(), s.name.clone()))
@@ -1724,7 +1730,7 @@ impl Services {
             .collect();
         let mut bars_by_symbol: HashMap<String, Option<Vec<Bar>>> = HashMap::new();
         let mut hits = Vec::new();
-        for row in rows {
+        for row in rows.iter().cloned() {
             if row.state != "pending" || row.trigger_ts.is_some() {
                 continue;
             }
@@ -4245,8 +4251,10 @@ impl Services {
         &self,
         contracts: &[String],
     ) -> Result<(Vec<MarketSnapshot>, Vec<MarketSnapshot>)> {
-        let symbols = repo::list_symbols(&self.db, true).await?;
-        let mut codes: Vec<String> = symbols.iter().map(|s| s.code.clone()).collect();
+        // R5a: enabled symbols are read from the same cache as entry detection.
+        let symbols = self.market_cache.symbols(&self.db).await?;
+        let mut codes: Vec<String> = symbols.iter().filter(|s| s.enabled)
+            .map(|s| s.code.clone()).collect();
         for code in contracts {
             if !codes.iter().any(|c| c.eq_ignore_ascii_case(code)) {
                 codes.push(code.clone());
@@ -4269,7 +4277,8 @@ impl Services {
                 change_pct: q.and_then(|q| q.change_pct),
             }
         };
-        let enabled = symbols.into_iter().map(|s| snapshot(s.code)).collect();
+        let enabled = symbols.iter().filter(|s| s.enabled)
+            .map(|s| snapshot(s.code.clone())).collect();
         let held = contracts.iter().cloned().map(snapshot).collect();
         Ok((enabled, held))
     }

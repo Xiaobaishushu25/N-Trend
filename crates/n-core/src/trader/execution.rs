@@ -1714,6 +1714,12 @@ impl ExecutionEngine {
                     q.last <= cond.entry_price
                 };
                 if hit {
+                    if let Some(o) = s.conditions.get_mut(&cond.id) {
+                        if o.trigger_ts.is_none() {
+                            o.trigger_ts =
+                                Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                        }
+                    }
                     if constraints.one_per_symbol {
                         match self.portfolio_decision(&s, &cond, chrono::Utc::now().timestamp()) {
                             EntryDecision::Allow => {}

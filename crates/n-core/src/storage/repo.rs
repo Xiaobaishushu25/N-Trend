@@ -1,12 +1,34 @@
 //! Repository layer over the SeaORM entities.
 
 use anyhow::{anyhow, Context, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::ConnectionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
+
+// Process-local fast invalidation complements durable SQLite revision triggers.
+// Reads of these atomics are lock-free and never touch SQLite on a quote tick.
+static R5A_SIGNAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+static R5A_SYMBOL_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn r5a_signal_epoch() -> u64 {
+    R5A_SIGNAL_EPOCH.load(Ordering::Acquire)
+}
+
+pub(crate) fn r5a_symbol_epoch() -> u64 {
+    R5A_SYMBOL_EPOCH.load(Ordering::Acquire)
+}
+
+fn r5a_mark_signals_dirty() {
+    R5A_SIGNAL_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+fn r5a_mark_symbols_dirty() {
+    R5A_SYMBOL_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
 
 use crate::finality::model::{FinalityTrial, ObservationRecord};
 use crate::storage::entities::{
@@ -586,6 +608,7 @@ pub async fn upsert_symbols(
         .exec(db)
         .await
         .context("upsert品种失败")?;
+    r5a_mark_symbols_dirty();
     Ok(())
 }
 
@@ -606,6 +629,7 @@ pub async fn set_symbol_flags(
     model.enabled = Set(enabled);
     model.updated_at = Set(crate::analyze::time::now_display());
     model.save(db).await.context("更新品种失败")?;
+    r5a_mark_symbols_dirty();
     Ok(())
 }
 
@@ -620,6 +644,7 @@ pub async fn set_symbol_tick(db: &DatabaseConnection, code: &str, tick: f64) -> 
     model.tick_size = Set(tick.max(0.0));
     model.updated_at = Set(crate::analyze::time::now_display());
     model.save(db).await.context("更新品种精度失败")?;
+    r5a_mark_symbols_dirty();
     Ok(())
 }
 
@@ -638,6 +663,7 @@ pub async fn set_symbol_followed(
     model.is_followed = Set(is_followed);
     model.updated_at = Set(crate::analyze::time::now_display());
     model.save(db).await.context("更新品种关注状态失败")?;
+    r5a_mark_symbols_dirty();
     Ok(())
 }
 
@@ -653,6 +679,7 @@ pub async fn remove_symbol(db: &DatabaseConnection, code: &str) -> Result<()> {
         .exec(db)
         .await
         .context("删除品种失败")?;
+    r5a_mark_symbols_dirty();
     Ok(())
 }
 
@@ -917,6 +944,7 @@ pub async fn insert_pattern_event(
         .exec(db)
         .await
         .context("写入信号事件失败")?;
+    r5a_mark_signals_dirty();
     Ok(res.last_insert_id)
 }
 
@@ -1377,6 +1405,7 @@ pub async fn update_pattern_event(
             res.rows_affected()
         ));
     }
+    r5a_mark_signals_dirty();
     Ok(())
 }
 
@@ -1386,6 +1415,7 @@ pub async fn clear_pattern_events(db: &DatabaseConnection) -> Result<()> {
         .exec(db)
         .await
         .context("清空信号事件失败")?;
+    r5a_mark_signals_dirty();
     db.execute_unprepared("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'pattern_events'")
         .await
         .context("重置信号事件编号失败")?;
@@ -1411,6 +1441,7 @@ pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> 
         .exec(db)
         .await
         .context("清理快速路径信号失败")?;
+    if res.rows_affected > 0 { r5a_mark_signals_dirty(); }
     Ok(res.rows_affected)
 }
 
@@ -1424,6 +1455,7 @@ pub async fn delete_fast_pattern_events_by_symbol(
         .exec(db)
         .await
         .context("删除品种快速形态事件失败")?;
+    if result.rows_affected > 0 { r5a_mark_signals_dirty(); }
     Ok(result.rows_affected)
 }
 
@@ -1452,6 +1484,7 @@ pub async fn delete_pattern_event(db: &DatabaseConnection, id: i64) -> Result<()
     if res.rows_affected != 1 {
         return Err(anyhow!("删除信号事件失败: 影响行数 {}", res.rows_affected));
     }
+    r5a_mark_signals_dirty();
     Ok(())
 }
 

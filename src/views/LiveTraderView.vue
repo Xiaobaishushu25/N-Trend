@@ -202,7 +202,7 @@ function conditionLabel(state: string): string {
     part_filled: '部分成交',
     closing: '自动平仓处理中',
     filled: '已成交',
-    rejected: '提交失败，等待重试',
+    rejected: '已拒绝开仓',
     filtered: '已过滤，不开仓',
     canceled: '已取消后续开仓',
     closed: '已平仓',
@@ -213,7 +213,7 @@ function conditionLabel(state: string): string {
   return map[key] || ({
     Pending: '等待突破', WaitingConfirm: '等待确认开仓', Triggered: '已触发，尚未提交',
     Unknown: '提交结果待核实', Working: '委托中，尚未成交', PartFilled: '部分成交',
-    Closing: '自动平仓处理中', Filled: '已成交', Rejected: '提交失败，等待重试',
+    Closing: '自动平仓处理中', Filled: '已成交', Rejected: '已拒绝开仓',
     Canceled: '已取消后续开仓', Closed: '已平仓', Expired: '已过期', Invalidated: '已失效'
   } as Record<string, string>)[state] || state
 }
@@ -249,24 +249,132 @@ function orderLabel(phase: string): string {
     Terminal: '委托已结束', Rejected: '提交失败' } as Record<string, string>)[phase] || phase
 }
 
+interface StrategyNoteMeta {
+  category: string
+  text: string
+  tooltip: string
+}
+
+const STRATEGY_NOTE_MAP: Record<string, StrategyNoteMeta> = {
+  unfilled: {
+    category: '滑点保护',
+    text: '跳空/滑点超追价上限(放弃入场)',
+    tooltip: '【滑点保护拦截】盘口突破瞬间价格超出策略允许的最大追价滑点容差（例如超20%计划风险或2 tick），系统主动放弃追单，避免在不利价位追单接盘。',
+  },
+  blocked_symbol_slot: {
+    category: '品种风控',
+    text: '同品种持仓或条件单槽位已占用',
+    tooltip: '【品种槽位互斥】当前品种已有活跃条件单、在手持仓或尚未完成结算的委托，为防同一品种过度暴露风险，系统限制单品种并发入场。',
+  },
+  score_below_min: {
+    category: '准入过滤',
+    text: '信号评分低于入场门槛',
+    tooltip: '【评分门槛过滤】预警形态的质量综合评分低于策略设定的入场门槛，不予开仓。',
+  },
+  risk_ticks_below_min: {
+    category: '入场筛选',
+    text: '止损保护距离过窄(<10 tick)',
+    tooltip: '【入场空间筛选】当前信号计算出的止损保护距离小于最小保护阈值（10 tick），极易被盘口随机噪音频繁扫损，系统主动过滤该信号以减少磨损。',
+  },
+  filtered_net_rr_plan: {
+    category: '盈亏比筛选',
+    text: '计划净盈亏比不足',
+    tooltip: '【计划盈亏比不足】扣除双边手续费与预估滑点摩擦后，计划净盈亏比低于门槛要求，期望收益不足以覆盖风险。',
+  },
+  filtered_net_rr_fill: {
+    category: '盈亏比筛选',
+    text: '实际对价净盈亏比不足',
+    tooltip: '【对价盈亏比不足】结合盘口当前真实可成交对手价计算，扣除摩擦后的净空间不足，性价比过低，系统拒绝开仓。',
+  },
+  filtered_actual_risk: {
+    category: '风控拦截',
+    text: '盘口真实止损空间过窄(<10 tick)',
+    tooltip: '【真实风险不足】以当前盘口对手价入场计算，到止损线的真实空间小于10 tick，不满足安全防守要求。',
+  },
+  invalid_target: {
+    category: '风控拦截',
+    text: '目标止盈位已无效或已被越过',
+    tooltip: '【目标位失效】入场对价已超出或贴近目标止盈点位，丧失盈利空间，系统拒绝开仓。',
+  },
+  invalidated: {
+    category: '形态失效',
+    text: '入场前价格已越过止损线(失效)',
+    tooltip: '【极速反向失效】在触及突破入场价前，行情已先反向击穿止损保护线，形态完全破坏，系统作废该条件单。',
+  },
+  unavailable_quote: {
+    category: '行情异常',
+    text: '盘口行情缺失或无效',
+    tooltip: '【盘口不可用】当前合约盘口买卖价无效、出现倒挂或超出涨跌停板，为保障交易安全暂停报单。',
+  },
+  broker_rejected: {
+    category: '柜台拒单',
+    text: '期货公司柜台拒绝报单',
+    tooltip: '【柜台拒单】向柜台提交委托后被柜台拒绝，请检查资金、交易权限或合约是否处于非交易时间。',
+  },
+  insufficient_margin: {
+    category: '资金风控',
+    text: '可用资金不足',
+    tooltip: '【资金风控拦截】当前账户可用资金低于该合约开仓1手所需保证金与安全缓冲金，放弃报单以保障账户免于透支风险。',
+  },
+  filtered_holiday_window: {
+    category: '假期避险',
+    text: '临近长假休市窗口',
+    tooltip: '【长假避险】长假休市前限制新开仓，防范长假期间外盘剧烈异动风险。',
+  },
+  filtered_weekend_window: {
+    category: '周末避险',
+    text: '临近周末休市窗口',
+    tooltip: '【周末避险】周五夜盘收盘前限制新开仓，规避周末宏观事件跳空风险。',
+  },
+  calendar_uncovered: {
+    category: '日历缺失',
+    text: '交易日历未覆盖',
+    tooltip: '【交易日历缺失】当前时间未在系统配置的交易日历范围内，暂停报单。',
+  },
+  target_cost_above10: {
+    category: '成本筛选',
+    text: '交易摩擦成本占比过高',
+    tooltip: '【摩擦成本过高】该合约预估手续费与滑点成本占总毛利空间的比例偏高，系统主动放弃。',
+  },
+}
+
+function formatWaitBars(barsWaited?: number | null, maxWaitBars?: number | null): string {
+  const waited = barsWaited ?? 0
+  if (maxWaitBars == null || maxWaitBars >= 999999 || maxWaitBars <= 0) {
+    return `已等待 ${waited} 根K线 (不限)`
+  }
+  return `已等待 ${waited} / ${maxWaitBars} 根K线`
+}
+
 function isWarningNote(note?: string | null): boolean {
   if (!note) return false
-  return /筛选|暂缓|小于|滑点|资金不足|风控|拦截|过滤|超入场|不可用|熔断|已越过止损/i.test(note)
+  const trimmed = note.trim()
+  if (STRATEGY_NOTE_MAP[trimmed]) return true
+  return /筛选|暂缓|小于|滑点|资金不足|风控|拦截|过滤|超入场|不可用|熔断|已越过止损|拒单|拒绝/i.test(note)
 }
 
 function getNoteCategory(note?: string | null): string {
   if (!note) return '说明'
+  const trimmed = note.trim()
+  if (STRATEGY_NOTE_MAP[trimmed]) {
+    return STRATEGY_NOTE_MAP[trimmed].category
+  }
   if (/入场筛选|小于.*tick/i.test(note)) return '入场筛选'
   if (/资金不足|资金/i.test(note)) return '资金风控'
   if (/滑点/i.test(note)) return '滑点保护'
   if (/平仓|退出/i.test(note)) return '平仓说明'
   if (/超时|过期/i.test(note)) return '状态提醒'
   if (/越过止损|拦截|风控/i.test(note)) return '风控拦截'
+  if (/柜台|拒单/i.test(note)) return '柜台拒单'
   return '说明'
 }
 
 function formatNoteText(note?: string | null): string {
   if (!note) return ''
+  const trimmed = note.trim()
+  if (STRATEGY_NOTE_MAP[trimmed]) {
+    return STRATEGY_NOTE_MAP[trimmed].text
+  }
   return note.replace(/^(说明[:：]|入场筛选[:：])\s*/, '').trim()
 }
 
@@ -276,9 +384,18 @@ function isConditionClosing(state?: string | null): boolean {
   return s === 'closing' || s === 'closed'
 }
 
+function isConditionRejected(state?: string | null): boolean {
+  if (!state) return false
+  return state.toLowerCase() === 'rejected'
+}
+
 function getNoteTooltip(note?: string | null): string {
   if (!note) return ''
   const trimmed = note.trim()
+
+  if (STRATEGY_NOTE_MAP[trimmed]) {
+    return STRATEGY_NOTE_MAP[trimmed].tooltip
+  }
 
   // 1. 退出任务已锁定: [reason]
   if (/退出任务已锁定/i.test(trimmed)) {
@@ -1058,7 +1175,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
               <div class="head-right">
                 <span v-if="!cond.display_only" class="wait-progress font-num">
-                  已等待 {{ cond.bars_waited ?? 0 }} / {{ cond.max_wait_bars ?? 12 }} 根K线
+                  {{ formatWaitBars(cond.bars_waited, cond.max_wait_bars) }}
                 </span>
                 <n-tag
                   size="small"
@@ -1105,10 +1222,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                     <span class="lbl">行情触价触发</span>
                     <span
                       class="val font-num font-time"
-                      :class="cond.trigger_ts ? 'text-triggered' : 'text-muted'"
-                      :title="`触价时间: ${cond.trigger_ts || '等待突破触价'}`"
+                      :class="cond.trigger_ts ? 'text-triggered' : (isConditionRejected(cond.state) ? 'text-warning' : 'text-muted')"
+                      :title="`触价时间: ${cond.trigger_ts || (isConditionRejected(cond.state) ? '触价后被拒' : '等待突破触价')}`"
                     >
-                      {{ formatCondTs(cond.trigger_ts) || '等待突破触价' }}
+                      {{ formatCondTs(cond.trigger_ts) || (isConditionRejected(cond.state) ? '触价后被拒' : '等待突破触价') }}
                     </span>
                   </div>
                 </div>

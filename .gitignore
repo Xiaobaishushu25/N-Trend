@@ -48,3 +48,11 @@ python-bridge/flow_ctp/
 
 research-protocols/
 research-strategies/
+.s1-deps/
+
+# Temporary patches, bundles, and research output artifacts
+*.patch
+*.zip
+ntrend_r*
+artifacts/
+outputs/
