@@ -1113,8 +1113,49 @@ fn populate_trigger_features(e: &mut pattern_events::Model, bars: &[Bar]) -> boo
     changed
 }
 
-fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> bool {
-    let before = serde_json::to_string(e).unwrap_or_default();
+/// Convert the closed 15m series just once for all events in the same symbol scan.
+/// The original V3 evaluator and its input resolution remain unchanged.
+struct PreparedEventReplay {
+    raw: Vec<Kline>,
+    roll: Vec<rollover::RolloverRecord>,
+}
+
+impl PreparedEventReplay {
+    fn new(symbol: &str, bars: &[Bar]) -> Self {
+        let raw = bars
+            .iter()
+            .map(|b| Kline {
+                datetime: b.dt.to_bar_ts(),
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+                hold: b.hold,
+            })
+            .collect();
+        let roll = bars
+            .iter()
+            .filter(|b| b.rollover)
+            .map(|b| rollover::RolloverRecord {
+                symbol: symbol.to_string(),
+                ts: b.dt.to_bar_ts(),
+                from_contract: String::new(),
+                to_contract: String::new(),
+                confirmed: true,
+            })
+            .collect();
+        Self { raw, roll }
+    }
+}
+
+fn advance_triggered(
+    e: &mut pattern_events::Model,
+    bars: &[Bar],
+    w: usize,
+    prepared: Option<&PreparedEventReplay>,
+) -> bool {
+    let before = e.clone();
     let mut ev = crate::v2::replay::ReplayEvent {
         symbol: e.symbol.clone(),
         direction: e.direction.clone(),
@@ -1123,43 +1164,26 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
         stop: e.stop,
         target: e.target,
         risk: e.risk,
-        tick_size: bars
-            .iter()
-            .find(|b| b.dt.to_bar_ts().starts_with(&e.warning_ts))
-            .map(|b| (e.entry - if e.direction == "up" { b.high } else { b.low }).abs())
-            .filter(|v| *v > 0.)
-            .unwrap_or(1.),
+        tick_size: {
+            let warning_price = if e.direction == "up" {
+                bars[w].high
+            } else {
+                bars[w].low
+            };
+            let tick = (e.entry - warning_price).abs();
+            if tick > 0.0 { tick } else { 1.0 }
+        },
         ..Default::default()
     };
     ev.setup_features.setup_quality = e.entry_score;
     // This adapter has only 15m bars. It is deliberately more conservative than the raw5m research runner.
-    let raw = bars
-        .iter()
-        .map(|b| Kline {
-            datetime: b.dt.to_bar_ts(),
-            open: b.open,
-            high: b.high,
-            low: b.low,
-            close: b.close,
-            volume: b.volume,
-            hold: b.hold,
-        })
-        .collect::<Vec<_>>();
-    let roll = bars
-        .iter()
-        .filter(|b| b.rollover)
-        .map(|b| rollover::RolloverRecord {
-            symbol: e.symbol.clone(),
-            ts: b.dt.to_bar_ts(),
-            from_contract: String::new(),
-            to_contract: String::new(),
-            confirmed: true,
-        })
-        .collect::<Vec<_>>();
+    // Non-scan callers still prepare their own inputs; the hot scan path reuses one copy.
+    let owned = prepared.is_none().then(|| PreparedEventReplay::new(&e.symbol, bars));
+    let replay = prepared.or(owned.as_ref()).expect("replay inputs available");
     let result = crate::v3::replay::evaluate_at_resolution(
         &ev,
-        &raw,
-        &roll,
+        &replay.raw,
+        &replay.roll,
         false,
         1.,
         &crate::trader::ExecutionConfig::default(),
@@ -1204,14 +1228,27 @@ fn advance_triggered(e: &mut pattern_events::Model, bars: &[Bar], _w: usize) -> 
             e.trigger_price = None;
         }
     }
-    e.updated_at = now_ts();
-    serde_json::to_string(e).unwrap_or_default() != before
+    // Record which closed bar the V3 state was evaluated against. A second
+    // scheduler invocation on the identical history can now skip this replay.
+    e.last_advance_ts = bars.last().map(bar_ts);
+    // updated_at is metadata, not a business-field change. Never force a SQL
+    // UPDATE just because another wall-clock second has elapsed.
+    *e != before
 }
 
 pub(crate) fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -> bool {
     let Some(w) = bars.iter().position(|b| bar_ts(b) == e.warning_ts) else {
         return false;
     };
+    advance_event_model_indexed(e, bars, w, None)
+}
+
+fn advance_event_model_indexed(
+    e: &mut pattern_events::Model,
+    bars: &[Bar],
+    w: usize,
+    prepared: Option<&PreparedEventReplay>,
+) -> bool {
     let mut changed = false;
 
     if e.state == "pending" {
@@ -1259,9 +1296,9 @@ pub(crate) fn advance_event_model(e: &mut pattern_events::Model, bars: &[Bar]) -
             changed = true;
         }
         if triggered && e.state == "triggered" {
-            changed = advance_triggered(e, bars, w) || changed;
+            changed = advance_triggered(e, bars, w, prepared) || changed;
         }
-    } else if e.state == "triggered" && advance_triggered(e, bars, w) {
+    } else if e.state == "triggered" && advance_triggered(e, bars, w, prepared) {
         changed = true;
     } else if populate_trigger_features(e, bars) {
         changed = true;
@@ -4497,11 +4534,44 @@ impl Services {
             // The just inserted candidates are already in this vector; no
             // second SELECT of the entire symbol history is needed.
             let event_key_hash = r3_event_key_fingerprint(&events);
+            // One O(N) index for all historical events instead of one O(N)
+            // warning search per event. The cursor already proves the unchanged
+            // prefix when `from == len`, including OHLCV and rollover flags.
+            let mut bar_index: HashMap<String, usize> = HashMap::with_capacity(bars15.len());
+            for (index, bar) in bars15.iter().enumerate() {
+                // Preserve the old `.position()` behavior even if malformed
+                // historical data somehow contains a duplicate timestamp.
+                bar_index.entry(bar_ts(bar)).or_insert(index);
+            }
+            let latest_bar_ts = bars15.last().expect("bars15 length checked").dt.to_bar_ts();
+            let unchanged_history = from == bars15.len();
+            let mut prepared_replay: Option<PreparedEventReplay> = None;
+            let mut replay_skipped = 0usize;
+            let mut lifecycle_updated = 0usize;
+            let symbol_event_count = events.len();
             for mut e in events {
                 let was_triggered = e.trigger_ts.is_some();
                 let had_trigger_bar = e.trigger_bar_ts.is_some();
-                let changed = advance_event_model(&mut e, &bars15);
+                let skip_replay = unchanged_history
+                    && e.state == "triggered"
+                    && e.last_advance_ts.as_deref() == Some(latest_bar_ts.as_str());
+                let changed = if skip_replay {
+                    replay_skipped += 1;
+                    false
+                } else if let Some(&warning_index) = bar_index.get(&e.warning_ts) {
+                    if matches!(e.state.as_str(), "pending" | "triggered")
+                        && prepared_replay.is_none()
+                    {
+                        prepared_replay = Some(PreparedEventReplay::new(&sym.code, &bars15));
+                    }
+                    advance_event_model_indexed(
+                        &mut e, &bars15, warning_index, prepared_replay.as_ref(),
+                    )
+                } else {
+                    false
+                };
                 if changed {
+                    lifecycle_updated += 1;
                     repo::update_pattern_event(&self.db, e.clone()).await?;
                 }
                 // Quote-triggered events may already have trigger_ts before
@@ -4536,6 +4606,12 @@ impl Services {
                 }
                 signals.push(e);
             }
+            tracing::info!(
+                target: "scan_perf", symbol = %sym.code,
+                total_events = symbol_event_count, replay_skipped, lifecycle_updated,
+                replay_input_bars = prepared_replay.as_ref().map_or(0, |p| p.raw.len()),
+                "[R4B_LIFECYCLE] per-symbol lifecycle pass finished"
+            );
             // Never advance the cursor before event lifecycle and V2 prediction
             // attempts have finished. A failed SQL write must leave it retryable.
             let cursor = R3ScanCursor {
@@ -5695,6 +5771,37 @@ mod tests {
             failed: Vec::new(),
             single_bars: Vec::new(),
         }
+    }
+
+    #[test]
+    fn r4b_cached_replay_matches_original_event_path() {
+        let bars = vec![
+            bar_model("2026-08-11 09:45:00", 2570.0, 2582.0, 2569.0, 2574.0),
+            bar_model("2026-08-11 10:00:00", 2574.0, 2580.0, 2570.0, 2577.0),
+            bar_model("2026-08-11 10:15:00", 2577.0, 2581.0, 2572.0, 2578.0),
+        ];
+        let mut original = pattern_event(501, 4.0, "triggered");
+        original.trigger_ts = Some("2026-08-11 10:00:00".to_string());
+        let mut cached = original.clone();
+        let old_changed = advance_event_model(&mut original, &bars);
+        let replay = PreparedEventReplay::new(&cached.symbol, &bars);
+        let new_changed = advance_event_model_indexed(&mut cached, &bars, 0, Some(&replay));
+        assert_eq!(old_changed, new_changed);
+        // The two calls may straddle a wall-clock second: updated_at is metadata.
+        cached.updated_at = original.updated_at.clone();
+        assert_eq!(original, cached);
+        assert_eq!(original.last_advance_ts.as_deref(), Some("2026-08-11 10:15:00"));
+    }
+
+    #[test]
+    fn r4b_terminal_event_without_missing_features_has_no_write() {
+        let bars = vec![bar_model("2026-08-11 09:45:00", 2570.0, 2582.0, 2569.0, 2574.0)];
+        let mut terminal = pattern_event(502, 4.0, "unpriced");
+        terminal.trigger_volume_ratio = Some(1.2);
+        terminal.overshoot_r = Some(0.5);
+        let before = terminal.clone();
+        assert!(!advance_event_model_indexed(&mut terminal, &bars, 0, None));
+        assert_eq!(terminal, before);
     }
 
     #[test]
