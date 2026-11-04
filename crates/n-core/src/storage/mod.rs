@@ -11,6 +11,7 @@ use sea_orm::{
 use tracing::info;
 
 pub mod entities;
+pub mod outbox;
 pub mod repo;
 
 pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
@@ -302,6 +303,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     migrate_legacy_signal_tables(db, path).await?;
     migrate_pattern_event_unique(db).await?;
     create_finality_tables(db).await?;
+    outbox::ensure(db).await?;
     create_v2_tables(db).await?;
     crate::quality::store::ensure(db).await?;
     crate::review::store::ensure(db).await?;

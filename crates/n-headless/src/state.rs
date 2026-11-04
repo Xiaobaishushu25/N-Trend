@@ -21,6 +21,8 @@ pub struct ServerContext {
     pub is_shutting_down: AtomicBool,
     #[allow(dead_code)]
     pub trigger_email_scheduled: Mutex<HashSet<i64>>,
+    /// Serialize fallback registration and Outbox retry across instances.
+    pub execution_registration_lock: Mutex<()>,
     pub last_refresh: RwLock<Option<chrono::NaiveDateTime>>,
     pub last_scan: RwLock<Option<chrono::NaiveDateTime>>,
     pub scheduler_running: AtomicBool,
@@ -93,6 +95,7 @@ impl ServerContext {
             start_time: Instant::now(),
             is_shutting_down: AtomicBool::new(false),
             trigger_email_scheduled: Mutex::new(HashSet::new()),
+            execution_registration_lock: Mutex::new(()),
             last_refresh: RwLock::new(None),
             last_scan: RwLock::new(None),
             scheduler_running: AtomicBool::new(true),

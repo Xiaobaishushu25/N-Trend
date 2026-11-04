@@ -1,3 +1,5 @@
+mod outbox_dispatch;
+
 use crate::state::ServerContext;
 use chrono::Local;
 use n_core::notify::email::{
@@ -71,6 +73,9 @@ fn registered_event_ids(
 }
 
 pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
+    if !n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
+        outbox_dispatch::spawn(ctx.clone());
+    }
     // Scan work is isolated from the HTTP long-poll consumer, so a slow pattern
     // replay cannot delay the next closed-bar event or chart broadcast.
     let (scan_tx, scan_rx) = tokio::sync::mpsc::channel(512);
@@ -126,6 +131,9 @@ pub async fn register_execution_signals(
     ctx: &Arc<ServerContext>,
     signals: &[n_core::storage::entities::pattern_events::Model],
 ) {
+    // Covers both the periodic fallback and R4a delivery worker. It ensures
+    // both callers re-check persisted conditions before dispatching a signal.
+    let _registration_guard = ctx.execution_registration_lock.lock().await;
     // Deduplication is per instance, never global across accounts.
     let not_before =
         match n_core::storage::repo::get_setting(&ctx.db, "execution_signal_not_before").await {
@@ -942,7 +950,10 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
 
 /// One publisher for both scheduled and closed-bar scans. The scheduled path
 /// continues to own preclose reconciliation, which must not run per symbol.
+/// R4a: warning/trigger publishing is now driven by SQLite Outbox triggers.
 async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconcile: bool) {
+    // Emergency rollback switch. Never run both pathways simultaneously.
+    if n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
     register_execution_signals(ctx, &res.new_warnings).await;
     // 将新预警和新触发持久化到服务端的 notification_history 并广播
     for w in &res.new_warnings {
@@ -1061,6 +1072,21 @@ async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconc
             tokio::task::spawn_blocking(move || {
                 let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
             });
+        }
+    }
+    } // Legacy publisher, disabled while R4a Outbox is active.
+
+    // Single-bar notices are not pattern_events and remain on the old path.
+    if !n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
+        let cfg = ctx.services.config().await;
+        if cfg.email.enabled && cfg.email.sendable() {
+            for sb in &res.single_bars {
+                let (subject, body) = single_bar_email_payload(sb);
+                let email_cfg = cfg.email.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+                });
+            }
         }
     }
 
