@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
 use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
 use sea_orm::{DatabaseConnection, NotSet, Set};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -842,6 +842,103 @@ fn scan_bar_fingerprint(bar: &Bar) -> String {
         bar.volume.to_bits(),
         bar.hold.to_bits(),
     )
+}
+
+/// The cursor is committed only after every candidate and event lifecycle update
+/// has succeeded. A crash before this write replays the uncommitted suffix.
+#[derive(Debug, Serialize, Deserialize)]
+struct R3ScanCursor {
+    last_bar_end: String,
+    history_hash: String,
+    event_key_hash: String,
+}
+
+/// A full-prefix fingerprint protects against historical backfills, corrected
+/// OHLCV, rollover changes and tick-size edits. Hashing is O(N), unlike the
+/// old O(N²) prefix-by-prefix warning replay.
+fn r3_history_fingerprint(bars: &[Bar], tick: f64) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"N-Trend/R3/forward-cursor-v1");
+    hash.update(&tick.to_bits().to_le_bytes());
+    for bar in bars {
+        hash.update(bar.dt.to_bar_ts().as_bytes());
+        for value in [bar.open, bar.high, bar.low, bar.close, bar.volume, bar.hold] {
+            hash.update(&value.to_bits().to_le_bytes());
+        }
+        hash.update(&[u8::from(bar.rollover)]);
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+/// A deleted/reinserted historical event must invalidate the candidate cursor.
+/// Lifecycle transitions do not affect this hash (only stable warning identity).
+fn r3_event_key_fingerprint(events: &[pattern_events::Model]) -> String {
+    let mut keys: Vec<_> = events.iter()
+        .map(|e| (e.direction.as_str(), e.warning_ts.as_str()))
+        .collect();
+    keys.sort_unstable();
+    let mut hash = blake3::Hasher::new();
+    for (dir, ts) in keys {
+        hash.update(dir.as_bytes());
+        hash.update(&[0]);
+        hash.update(ts.as_bytes());
+        hash.update(&[0]);
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+/// Reuse the cursor only if the entire previously scanned prefix still matches.
+/// The returned index is an inclusive warning-bar start, not a K-line LIMIT.
+fn r3_scan_start_index(bars: &[Bar], old: Option<&R3ScanCursor>, tick: f64, events_hash: &str) -> usize {
+    let Some(old) = old else { return 0; };
+    let Some(index) = bars.iter().position(|b| b.dt.to_bar_ts() == old.last_bar_end) else {
+        return 0;
+    };
+    if old.event_key_hash == events_hash
+        && r3_history_fingerprint(&bars[..=index], tick) == old.history_hash {
+        index + 1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod r3_cursor_tests {
+    use super::*;
+    use crate::analyze::model::DT;
+
+    #[test]
+    fn r3_cursor_reuses_append_only_history_but_invalidates_revisions() {
+        let bars: Vec<Bar> = (0..25).map(|i| Bar {
+            dt: DT { year: 2026, month: 11, day: 4, hour: 9 + i / 4, minute: (i % 4) * 15 },
+            open: 100.0 + i as f64,
+            high: 102.0 + i as f64,
+            low: 99.0 + i as f64,
+            close: 101.0 + i as f64,
+            volume: 10.0,
+            hold: 100.0,
+            rollover: false,
+        }).collect();
+        let cursor = R3ScanCursor {
+            last_bar_end: bars[19].dt.to_bar_ts(),
+            history_hash: r3_history_fingerprint(&bars[..20], 1.0),
+            event_key_hash: "unchanged".to_string(),
+        };
+        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 1.0, "unchanged"), 20);
+        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 1.0, "deleted_event"), 0);
+        assert_eq!(r3_scan_start_index(&bars[..20], Some(&cursor), 1.0, "unchanged"), 20);
+        assert_eq!(r3_scan_start_index(&bars, None, 1.0, "unchanged"), 0);
+        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 0.5, "unchanged"), 0);
+        let mut corrected = bars.clone();
+        corrected[3].low -= 1.0;
+        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+        corrected = bars.clone();
+        corrected[3].rollover = true;
+        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+        corrected = bars.clone();
+        corrected.remove(5);
+        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+    }
 }
 
 fn provisional_5m_bucket_ts(now: NaiveDateTime) -> NaiveDateTime {
@@ -4217,12 +4314,21 @@ impl Services {
         let _guard = self.scan_lock.lock().await;
         let _cycle_guard = self.data_cycle_lock.lock().await;
         let bars15 = self.bars_for(symbol, "15m").await?;
-        let Some(bar) = bars15.iter().find(|bar| bar.dt.to_bar_ts() == bar_end) else {
+        let Some(index) = bars15.iter().position(|bar| bar.dt.to_bar_ts() == bar_end) else {
             return Err(anyhow!(
                 "闭合事件入库后未生成目标15m K线: {symbol}/{bar_end}"
             ));
         };
-        let fingerprint = scan_bar_fingerprint(bar);
+        let symbols: Vec<_> = repo::list_symbols(&self.db, true)
+            .await?
+            .into_iter()
+            .filter(|row| row.code == symbol)
+            .collect();
+        let Some(sym) = symbols.first() else {
+            return Err(anyhow!("闭合事件扫描品种未启用: {symbol}"));
+        };
+        let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
+        let fingerprint = r3_history_fingerprint(&bars15[..=index], tick);
         if !repo::claim_scan_watermark(
             &self.db,
             symbol,
@@ -4236,11 +4342,6 @@ impl Services {
             return Ok((None, true));
         }
 
-        let symbols = repo::list_symbols(&self.db, true)
-            .await?
-            .into_iter()
-            .filter(|row| row.code == symbol)
-            .collect();
         match self.run_scan_models(symbols, false, false).await {
             Ok(result) if result.scanned == 1 && result.failed.is_empty() => {
                 repo::complete_scan_watermark(
@@ -4320,10 +4421,14 @@ impl Services {
                     low: sig.low,
                 });
             }
+            let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
+            let history_hash = r3_history_fingerprint(&bars15, tick);
             let watermark = if delete_fast_events {
                 let latest = bars15.last().expect("bars15 length checked");
                 let bar_end = latest.dt.to_bar_ts();
-                let fingerprint = scan_bar_fingerprint(latest);
+                // Include ALL historical 15m OHLCV and rollover flags in the
+                // watermark; an older corrected bar must invalidate the scan.
+                let fingerprint = history_hash.clone();
                 if !repo::claim_scan_watermark(
                     &self.db,
                     &sym.code,
@@ -4347,25 +4452,51 @@ impl Services {
                 None
             };
             scanned += 1;
-            let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
-            let candidates = event::replay_warnings(&sym.code, &bars15, tick);
+            // The persisted cursor skips already-scanned warning positions while
+            // retaining the ENTIRE historical prefix for ATR/swings/N geometry.
+            // A missing, malformed or invalidated cursor triggers a full replay.
+            let cursor_key = format!("r3_scan_cursor_v1:{}:{}", EVENT_LOGIC_VERSION, sym.code);
             let mut events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            let existing_event_hash = r3_event_key_fingerprint(&events);
+            let saved = repo::get_setting(&self.db, &cursor_key)
+                .await?
+                .and_then(|raw| serde_json::from_str::<R3ScanCursor>(&raw).ok());
+            let from = r3_scan_start_index(&bars15, saved.as_ref(), tick, &existing_event_hash);
+            tracing::info!(
+                target: "scan_perf", symbol = %sym.code,
+                total_bars = bars15.len(), replayed_warning_bars = bars15.len() - from,
+                mode = if from == 0 { "full" } else { "incremental" },
+                "[R3_SCAN] forward-only candidate range"
+            );
+            let replay_symbol = sym.code.clone();
+            let replay_bars = bars15.clone();
+            let replay_started = Instant::now();
+            let candidates = tokio::task::spawn_blocking(move || {
+                event::selected_warnings(&replay_symbol, &replay_bars, tick, false, from)
+            }).await?;
+            tracing::info!(
+                target: "scan_perf", symbol = %sym.code,
+                candidate_ms = replay_started.elapsed().as_millis(),
+                "[R3_SCAN] candidate replay finished"
+            );
+            let mut seen: HashSet<(String, String)> = events.iter()
+                .map(|e| (e.direction.clone(), e.warning_ts.clone())).collect();
             for c in candidates {
                 let direction = if c.direction == Dir::Up { "up" } else { "down" };
                 let warning_ts = bar_ts(&bars15[c.warning_index]);
-                if repo::pattern_event_by_warning(&self.db, &sym.code, direction, &warning_ts)
-                    .await?
-                    .is_some()
-                    || has_similar_warning(&bars15, &c, &events)?
-                {
+                let key = (direction.to_string(), warning_ts);
+                if seen.contains(&key) || has_similar_warning(&bars15, &c, &events)? {
                     continue;
                 }
                 let model = insert_warning_event(&self.db, &sym.code, &bars15, &c).await?;
+                seen.insert(key);
                 events.push(model.clone());
                 new_warnings.push(model);
             }
 
-            let events = repo::pattern_events_by_symbol(&self.db, &sym.code, None).await?;
+            // The just inserted candidates are already in this vector; no
+            // second SELECT of the entire symbol history is needed.
+            let event_key_hash = r3_event_key_fingerprint(&events);
             for mut e in events {
                 let was_triggered = e.trigger_ts.is_some();
                 let had_trigger_bar = e.trigger_bar_ts.is_some();
@@ -4405,6 +4536,16 @@ impl Services {
                 }
                 signals.push(e);
             }
+            // Never advance the cursor before event lifecycle and V2 prediction
+            // attempts have finished. A failed SQL write must leave it retryable.
+            let cursor = R3ScanCursor {
+                last_bar_end: bars15.last().expect("bars15 length checked").dt.to_bar_ts(),
+                history_hash,
+                event_key_hash,
+            };
+            let mut settings = HashMap::new();
+            settings.insert(cursor_key, serde_json::to_string(&cursor)?);
+            repo::set_settings(&self.db, &settings).await?;
             if let Some((bar_end, fingerprint)) = watermark {
                 repo::complete_scan_watermark(
                     &self.db,

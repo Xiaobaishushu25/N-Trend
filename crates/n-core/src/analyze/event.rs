@@ -212,16 +212,24 @@ fn scan_warnings(
         std::collections::HashMap::new();
     let mut candidates = Vec::new();
 
+    // ATR and trend flags are prefix-stable: their value at index i never
+    // depends on a bar after i. Computing them once preserves the exact
+    // forward-only decisions while eliminating repeated O(prefix) allocation.
+    let atr_all = indicators::atr(bars, ATR_PERIOD);
+    let trend_all = indicators::trend_flags(bars, &atr_all);
+    let relaxed_all = indicators::trend_flags_relaxed(bars, &atr_all);
     for w in from..bars.len() {
         let prefix = &bars[..=w];
         if prefix.len() < ATR_PERIOD + 2 {
             continue;
         }
-        let atr20 = indicators::atr(prefix, ATR_PERIOD);
-        let trend_k = indicators::trend_flags(prefix, &atr20);
-        let trend_k_relaxed = indicators::trend_flags_relaxed(prefix, &atr20);
-        let swings_fine = indicators::find_swings(prefix, &atr20, 2, if nearest { 0 } else { 8 });
-        let swings_large = indicators::find_swings(prefix, &atr20, 5, if nearest { 0 } else { 10 });
+        let atr20 = &atr_all[..=w];
+        let trend_k = &trend_all[..=w];
+        let trend_k_relaxed = &relaxed_all[..=w];
+        // Swings intentionally remain prefix-local: precomputing them over
+        // future candles would introduce lookahead and change historical signals.
+        let swings_fine = indicators::find_swings(prefix, atr20, 2, if nearest { 0 } else { 8 });
+        let swings_large = indicators::find_swings(prefix, atr20, 5, if nearest { 0 } else { 10 });
 
         let mut patterns: Vec<NPattern> = Vec::new();
         for dir in [Dir::Up, Dir::Down] {
@@ -487,6 +495,19 @@ mod tests {
             warnings > 0,
             "fixture must exercise actual warning candidates"
         );
+    }
+
+    #[test]
+    fn incremental_suffix_matches_full_replay_after_restart_and_catchup() {
+        let bars = bu0_series();
+        let cutoff = bars.len() / 2;
+        let prefix = &bars[..cutoff];
+        let mut incremental = replay_warnings("BU0", prefix, 1.0);
+        // Catch up multiple closed bars in a single pass (including a restart
+        // that persisted the previous cursor at cutoff-1).
+        incremental.extend(selected_warnings("BU0", &bars, 1.0, false, cutoff));
+        let full = replay_warnings("BU0", &bars, 1.0);
+        assert_eq!(format!("{incremental:?}"), format!("{full:?}"));
     }
 
     #[test]
