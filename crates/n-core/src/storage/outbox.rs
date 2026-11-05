@@ -88,35 +88,58 @@ pub async fn ensure(db: &DatabaseConnection) -> Result<()> {
 /// second worker/restart safe: an abandoned claim is retried after 60 seconds.
 pub async fn claim_next(db: &DatabaseConnection, emails: bool) -> Result<Option<Delivery>> {
     let now = chrono::Utc::now().timestamp();
-    let row = db.query_one(sql(
-        "SELECT event_id,action,attempts FROM signal_delivery_outbox \
+    let row = db
+        .query_one(sql(
+            "SELECT event_id,action,attempts FROM signal_delivery_outbox \
          WHERE ((state='pending' AND retry_at<=?) \
             OR (state='processing' AND lease_until<=?)) \
            AND (action IN ('email_warning','email_trigger'))=? \
          ORDER BY created_at,event_id,action LIMIT 1",
-        vec![now.into(), now.into(), (emails as i64).into()],
-    )).await?;
-    let Some(row) = row else { return Ok(None); };
+            vec![now.into(), now.into(), (emails as i64).into()],
+        ))
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let event_id: i64 = row.try_get("", "event_id")?;
     let action: String = row.try_get("", "action")?;
     let attempts: i64 = row.try_get("", "attempts")?;
-    let res = db.execute(sql(
-        "UPDATE signal_delivery_outbox SET state='processing',attempts=attempts+1, \
+    let res = db
+        .execute(sql(
+            "UPDATE signal_delivery_outbox SET state='processing',attempts=attempts+1, \
          lease_until=?,updated_at=? WHERE event_id=? AND action=? AND \
          ((state='pending' AND retry_at<=?) OR (state='processing' AND lease_until<=?))",
-        vec![(now+60).into(), now.into(), event_id.into(), action.clone().into(),
-             now.into(), now.into()],
-    )).await?;
-    if res.rows_affected() == 0 { return Ok(None); }
-    Ok(Some(Delivery { event_id, action, attempts: attempts + 1 }))
+            vec![
+                (now + 60).into(),
+                now.into(),
+                event_id.into(),
+                action.clone().into(),
+                now.into(),
+                now.into(),
+            ],
+        ))
+        .await?;
+    if res.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Delivery {
+        event_id,
+        action,
+        attempts: attempts + 1,
+    }))
 }
 
 pub async fn complete(db: &DatabaseConnection, task: &Delivery, state: &str) -> Result<()> {
     db.execute(sql(
         "UPDATE signal_delivery_outbox SET state=?,lease_until=0,updated_at=unixepoch(), \
          last_error=NULL WHERE event_id=? AND action=? AND state='processing'",
-        vec![state.into(), task.event_id.into(), task.action.clone().into()],
-    )).await?;
+        vec![
+            state.into(),
+            task.event_id.into(),
+            task.action.clone().into(),
+        ],
+    ))
+    .await?;
     Ok(())
 }
 
@@ -128,8 +151,14 @@ pub async fn retry(db: &DatabaseConnection, task: &Delivery, message: &str) -> R
         "UPDATE signal_delivery_outbox SET state='pending',retry_at=unixepoch()+?, \
          lease_until=0,updated_at=unixepoch(),last_error=? \
          WHERE event_id=? AND action=? AND state='processing'",
-        vec![delay.into(), error.into(), task.event_id.into(), task.action.clone().into()],
-    )).await?;
+        vec![
+            delay.into(),
+            error.into(),
+            task.event_id.into(),
+            task.action.clone().into(),
+        ],
+    ))
+    .await?;
     Ok(())
 }
 
@@ -142,46 +171,83 @@ pub async fn persist_notice(
     item: &n_protocol::NewNotificationHistoryItem,
 ) -> Result<Option<n_protocol::NotificationHistoryItem>> {
     let tx = db.begin().await?;
-    if tx.query_one(sql(
-        "SELECT notification_id FROM signal_delivery_receipts WHERE event_id=? AND kind=?",
-        vec![task.event_id.into(), item.kind.clone().into()],
-    )).await?.is_some() {
+    if tx
+        .query_one(sql(
+            "SELECT notification_id FROM signal_delivery_receipts WHERE event_id=? AND kind=?",
+            vec![task.event_id.into(), item.kind.clone().into()],
+        ))
+        .await?
+        .is_some()
+    {
         tx.execute(sql(
             "UPDATE signal_delivery_outbox SET state='done',lease_until=0,updated_at=unixepoch() \
              WHERE event_id=? AND action=?",
             vec![task.event_id.into(), task.action.clone().into()],
-        )).await?;
+        ))
+        .await?;
         tx.commit().await?;
         return Ok(None);
     }
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let signal_json = item.signal.as_ref().map(serde_json::to_string).transpose()?;
-    let entry_json = item.entry_trigger.as_ref().map(serde_json::to_string).transpose()?;
-    let single_json = item.single_bar.as_ref().map(serde_json::to_string).transpose()?;
-    let manual_json = item.manual_level.as_ref().map(serde_json::to_string).transpose()?;
-    let inserted = tx.execute(sql(
-        "INSERT INTO notification_history \
+    let signal_json = item
+        .signal
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let entry_json = item
+        .entry_trigger
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let single_json = item
+        .single_bar
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let manual_json = item
+        .manual_level
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let inserted = tx
+        .execute(sql(
+            "INSERT INTO notification_history \
          (created_at,kind,title,content,signal_json,entry_trigger_json, \
           single_bar_json,manual_level_json,read_at) VALUES(?,?,?,?,?,?,?,?,NULL)",
-        vec![now.clone().into(), item.kind.clone().into(),item.title.clone().into(),
-             item.content.clone().into(),signal_json.into(),entry_json.into(),
-             single_json.into(),manual_json.into()],
-    )).await?;
+            vec![
+                now.clone().into(),
+                item.kind.clone().into(),
+                item.title.clone().into(),
+                item.content.clone().into(),
+                signal_json.into(),
+                entry_json.into(),
+                single_json.into(),
+                manual_json.into(),
+            ],
+        ))
+        .await?;
     let notice_id = inserted.last_insert_id() as i64;
     tx.execute(sql(
         "INSERT INTO signal_delivery_receipts(event_id,kind,notification_id) VALUES(?,?,?)",
-        vec![task.event_id.into(),item.kind.clone().into(),notice_id.into()],
-    )).await?;
+        vec![
+            task.event_id.into(),
+            item.kind.clone().into(),
+            notice_id.into(),
+        ],
+    ))
+    .await?;
     tx.execute(sql(
         "UPDATE signal_delivery_outbox SET state='done',lease_until=0,updated_at=unixepoch() \
          WHERE event_id=? AND action=?",
-        vec![task.event_id.into(),task.action.clone().into()],
-    )).await?;
+        vec![task.event_id.into(), task.action.clone().into()],
+    ))
+    .await?;
     tx.execute(sql(
         "UPDATE sync_revisions SET revision=revision+1,updated_at=datetime('now','localtime') \
          WHERE scope='notifications'",
         vec![],
-    )).await?;
+    ))
+    .await?;
     tx.commit().await?;
     Ok(Some(n_protocol::NotificationHistoryItem {
         id: notice_id as u64,
@@ -203,7 +269,9 @@ mod tests {
     use sea_orm::ConnectionTrait;
     #[tokio::test]
     async fn outbox_captures_recent_warning_and_trigger_atomically() {
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
         db.execute_unprepared(
             "INSERT INTO pattern_events(symbol,direction,grade,level,s0_ts,s0_price,s1_ts,s1_price,\
              s2_ts,s2_price,a_move,b_move,a_bars,b_bars,retracement,warning_ts,detected_at,\
@@ -216,42 +284,89 @@ mod tests {
         ).await.unwrap();
         // This fixture has a recent created_at relative to warning_ts and does
         // not rely on wall-clock time, so it remains deterministic.
-        let count = db.query_one(sql(
-            "SELECT COUNT(*) AS n FROM signal_delivery_outbox", vec![]
-        )).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
-        assert_eq!(count,3);
+        let count = db
+            .query_one(sql(
+                "SELECT COUNT(*) AS n FROM signal_delivery_outbox",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(count, 3);
         db.execute_unprepared(
             "UPDATE pattern_events SET trigger_ts='2026-11-04 09:46:00',\
-             updated_at='2026-11-04 09:46:00' WHERE symbol='RB0'"
-        ).await.unwrap();
-        let count = db.query_one(sql(
-            "SELECT COUNT(*) AS n FROM signal_delivery_outbox", vec![]
-        )).await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
-        assert_eq!(count,5);
+             updated_at='2026-11-04 09:46:00' WHERE symbol='RB0'",
+        )
+        .await
+        .unwrap();
+        let count = db
+            .query_one(sql(
+                "SELECT COUNT(*) AS n FROM signal_delivery_outbox",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(count, 5);
     }
 
     #[tokio::test]
     async fn history_notice_and_receipt_commit_together_once() {
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
-        let task = Delivery { event_id: 123, action: NOTICE_WARNING.into(), attempts: 1 };
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let task = Delivery {
+            event_id: 123,
+            action: NOTICE_WARNING.into(),
+            attempts: 1,
+        };
         let item = n_protocol::NewNotificationHistoryItem {
-            kind: "warning".into(), title: Some("R4a test".into()), content: "once".into(),
-            signal: None, entry_trigger: None, single_bar: None, manual_level: None,
+            kind: "warning".into(),
+            title: Some("R4a test".into()),
+            content: "once".into(),
+            signal: None,
+            entry_trigger: None,
+            single_bar: None,
+            manual_level: None,
         };
         db.execute_unprepared(
             "CREATE TRIGGER deny_r4a_receipt BEFORE INSERT ON signal_delivery_receipts \
-             BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END"
-        ).await.unwrap();
+             BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END",
+        )
+        .await
+        .unwrap();
         assert!(persist_notice(&db, &task, &item).await.is_err());
-        let count = db.query_one(sql("SELECT COUNT(*) AS n FROM notification_history",vec![]))
-            .await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+        let count = db
+            .query_one(sql(
+                "SELECT COUNT(*) AS n FROM notification_history",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
         assert_eq!(count, 0, "failed receipt must roll back the notice insert");
-        db.execute_unprepared("DROP TRIGGER deny_r4a_receipt").await.unwrap();
+        db.execute_unprepared("DROP TRIGGER deny_r4a_receipt")
+            .await
+            .unwrap();
         let first = persist_notice(&db, &task, &item).await.unwrap();
         assert!(first.is_some());
         assert!(persist_notice(&db, &task, &item).await.unwrap().is_none());
-        let count = db.query_one(sql("SELECT COUNT(*) AS n FROM notification_history",vec![]))
-            .await.unwrap().unwrap().try_get::<i64>("", "n").unwrap();
+        let count = db
+            .query_one(sql(
+                "SELECT COUNT(*) AS n FROM notification_history",
+                vec![],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
         assert_eq!(count, 1);
     }
 }

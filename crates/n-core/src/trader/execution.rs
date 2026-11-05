@@ -57,7 +57,7 @@ pub enum ConditionState {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConditionOrder {
     #[serde(default)]
-    pub frozen: Option<FrozenPlan>,
+    pub frozen: Option<Arc<FrozenPlan>>,
     #[serde(default, flatten)]
     pub origin: TradeOrigin,
     pub id: String,
@@ -380,6 +380,128 @@ struct ExecutionState {
     quotes: HashMap<String, ExecutionQuote>,
     #[serde(skip)]
     entry_symbols_ready: HashSet<String>,
+    #[serde(skip)]
+    entry_started_conditions: HashSet<String>,
+    #[serde(skip)]
+    unsettled_orders: HashSet<String>,
+}
+
+impl ExecutionState {
+    pub(crate) fn rebuild_indices(&mut self) {
+        self.entry_started_conditions = self
+            .orders
+            .values()
+            .filter(|o| o.reason.is_none())
+            .map(|o| o.condition_id.clone())
+            .collect();
+        self.unsettled_orders = self
+            .orders
+            .iter()
+            .filter(|(_, o)| {
+                !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                    || o.filled < o.reported_filled
+            })
+            .map(|(r, _)| r.clone())
+            .collect();
+    }
+
+    pub(crate) fn record_order_update(&mut self, reference: &str) {
+        if let Some(o) = self.orders.get(reference) {
+            if o.reason.is_none() {
+                self.entry_started_conditions.insert(o.condition_id.clone());
+            }
+            if !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                || o.filled < o.reported_filled
+            {
+                self.unsettled_orders.insert(reference.to_string());
+            } else {
+                self.unsettled_orders.remove(reference);
+            }
+        } else {
+            self.unsettled_orders.remove(reference);
+        }
+    }
+
+    pub(crate) fn is_entry_started(&self, condition_id: &str) -> bool {
+        self.entry_started_conditions.contains(condition_id)
+    }
+
+    pub(crate) fn is_entry_exposed(&self, condition_id: &str) -> bool {
+        if self
+            .positions
+            .get(condition_id)
+            .is_some_and(|p| p.volume > 0)
+        {
+            return true;
+        }
+        self.unsettled_orders.iter().any(|r| {
+            self.orders
+                .get(r)
+                .is_some_and(|o| o.condition_id == condition_id && o.reason.is_none())
+        })
+    }
+
+    pub(crate) fn is_order_blocked(&self, condition_id: &str) -> bool {
+        self.unsettled_orders.iter().any(|r| {
+            self.orders
+                .get(r)
+                .is_some_and(|o| o.condition_id == condition_id)
+        })
+    }
+
+    pub(crate) fn unsettled_condition_ids(&self) -> HashSet<String> {
+        self.unsettled_orders
+            .iter()
+            .filter_map(|r| self.orders.get(r))
+            .map(|o| o.condition_id.clone())
+            .collect()
+    }
+
+    pub(crate) fn unsettled_orders_for_revision(&self, revision: &str) -> Vec<ExecutionOrder> {
+        self.unsettled_orders
+            .iter()
+            .filter_map(|r| self.orders.get(r))
+            .filter(|o| o.origin.strategy_version == revision)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn active_conditions_for_revision(
+        &self,
+        revision: &str,
+        unsettled_conditions: &HashSet<String>,
+    ) -> Vec<ConditionOrder> {
+        self.conditions
+            .values()
+            .filter(|c| c.origin.strategy_version == revision)
+            .filter(|c| {
+                matches!(
+                    c.state,
+                    ConditionState::Pending
+                        | ConditionState::WaitingConfirm
+                        | ConditionState::Triggered
+                        | ConditionState::Unknown
+                        | ConditionState::Working
+                        | ConditionState::PartFilled
+                        | ConditionState::Closing
+                ) || self
+                    .positions
+                    .get(&c.id)
+                    .is_some_and(|p| !p.is_closed || p.volume > 0)
+                    || unsettled_conditions.contains(&c.id)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn active_entry_condition_ids(&self) -> Vec<String> {
+        self.unsettled_orders
+            .iter()
+            .filter_map(|r| self.orders.get(r))
+            .filter(|o| o.reason.is_none())
+            .map(|o| o.condition_id.clone())
+            .collect()
+    }
 }
 
 pub struct ExecutionEngine {
@@ -454,6 +576,7 @@ impl ExecutionEngine {
             },
             None => ExecutionState::default(),
         };
+        state.rebuild_indices();
         if lock_error.is_some() {
             state.persistence_error = lock_error;
         }
@@ -1367,6 +1490,7 @@ impl ExecutionEngine {
                 }
             }
         }
+        s.rebuild_indices();
         self.save(s)
     }
 
@@ -1542,6 +1666,7 @@ impl ExecutionEngine {
     pub async fn on_quote_batch(&self, events: Vec<(String, ExecutionQuote)>) -> Result<()> {
         // Observe every tick, then submit using the newest book, not a queued old tick.
         let guard = self.drive_lock.lock().await;
+        self.state.lock().await.rebuild_indices();
         for (code, quote) in events {
             if let Err(error) = self
                 .observe_quotes([(code, quote)].into_iter().collect(), false)
@@ -1578,7 +1703,7 @@ impl ExecutionEngine {
         }
         for quote in quotes.values().filter(|q| q.valid()) {
             if let Err(e) = self.dispatch(StrategyEvent::Quote(quote.clone())).await {
-                self.pause(true).await?;
+                let _ = self.pause(true).await;
                 tracing::error!("策略处理失败，继续保护已有持仓: {e}");
             }
         }
@@ -1601,39 +1726,39 @@ impl ExecutionEngine {
         state
             .comparison
             .advance(&state.quotes, chrono::Utc::now().timestamp());
-        let mut entries = s.conditions.values().cloned().collect::<Vec<_>>();
-        entries.sort_by(|a, b| {
-            (&a.warning_bar_ts, &a.origin.signal_id, &a.id).cmp(&(
-                &b.warning_bar_ts,
-                &b.origin.signal_id,
-                &b.id,
+        let mut candidate_ids: Vec<String> = s
+            .conditions
+            .values()
+            .filter(|c| {
+                matches!(
+                    c.state,
+                    ConditionState::Pending
+                        | ConditionState::WaitingConfirm
+                        | ConditionState::Triggered
+                        | ConditionState::Working
+                        | ConditionState::PartFilled
+                        | ConditionState::Unknown
+                ) || s.authorized_entries.contains(&c.id)
+                    || s.positions
+                        .get(&c.id)
+                        .is_some_and(|p| !p.is_closed || p.volume > 0)
+                    || s.is_entry_exposed(&c.id)
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        candidate_ids.sort_by(|a, b| {
+            let ca = &s.conditions[a];
+            let cb = &s.conditions[b];
+            (&ca.warning_bar_ts, &ca.origin.signal_id, &ca.id).cmp(&(
+                &cb.warning_bar_ts,
+                &cb.origin.signal_id,
+                &cb.id,
             ))
         });
-        // Orders do not change while observing this quote. Index once instead
-        // of rescanning the complete order archive for every condition.
-        let started_entries = s
-            .orders
-            .values()
-            .filter(|o| o.reason.is_none())
-            .map(|o| o.condition_id.clone())
-            .collect::<HashSet<_>>();
-        let exposed_entries = s
-            .orders
-            .values()
-            .filter(|o| {
-                o.reason.is_none()
-                    && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                        || o.filled < o.reported_filled)
-            })
-            .map(|o| o.condition_id.clone())
-            .chain(
-                s.positions
-                    .values()
-                    .filter(|p| p.volume > 0)
-                    .map(|p| p.id.clone()),
-            )
-            .collect::<HashSet<_>>();
-        for cond in entries {
+        for cond_id in candidate_ids {
+            let Some(cond) = s.conditions.get(&cond_id).cloned() else {
+                continue;
+            };
             let strategy = cond
                 .frozen
                 .as_ref()
@@ -1789,14 +1914,14 @@ impl ExecutionEngine {
                 }
             }
             // A stop also terminates an unfilled or partly filled entry.
-            let entry_started = started_entries.contains(&cond.id);
+            let entry_started = s.is_entry_started(&cond.id);
             let stop_hit = cond.stop_price > 0.0
                 && if cond.direction == "up" {
                     q.last <= cond.stop_price
                 } else {
                     q.last >= cond.stop_price
                 };
-            let exposed = exposed_entries.contains(&cond.id);
+            let exposed = s.is_entry_exposed(&cond.id);
             if !exposed
                 && s.authorized_entries.contains(&cond.id)
                 && !s.aborted_entries.contains(&cond.id)
@@ -2021,6 +2146,7 @@ impl ExecutionEngine {
             }
         }
         if unblocked_any {
+            s.rebuild_indices();
             self.save(&mut s)?;
         }
 
@@ -2088,8 +2214,31 @@ impl ExecutionEngine {
             return Ok(());
         }
         let mut entry_state_changed = Self::refresh_entry_funding_waits(&mut s);
-        let mut conditions = s.conditions.values().cloned().collect::<Vec<_>>();
-        conditions.sort_by_key(|o| {
+        s.rebuild_indices();
+        let mut drive_candidate_ids: Vec<String> = s
+            .conditions
+            .values()
+            .filter(|c| {
+                s.closes.contains_key(&c.id)
+                    || s.authorized_entries.contains(&c.id)
+                    || (!matches!(
+                        c.state,
+                        ConditionState::Rejected
+                            | ConditionState::Canceled
+                            | ConditionState::Expired
+                            | ConditionState::Invalidated
+                    ) && s.orders.values().any(|o| {
+                        o.condition_id == c.id
+                            && o.reason.is_none()
+                            && o.phase == OrderPhase::Rejected
+                            && o.filled == 0
+                            && o.reported_filled == 0
+                    }))
+            })
+            .map(|c| c.id.clone())
+            .collect();
+        drive_candidate_ids.sort_by_key(|id| {
+            let o = &s.conditions[id];
             (
                 !s.closes.contains_key(&o.id),
                 o.warning_bar_ts.clone(),
@@ -2098,7 +2247,10 @@ impl ExecutionEngine {
             )
         });
         let mut candidate = None;
-        for cond in conditions {
+        for cond_id in drive_candidate_ids {
+            let Some(cond) = s.conditions.get(&cond_id).cloned() else {
+                continue;
+            };
             let cfg = cond.frozen.as_ref().map(|f| &f.execution).unwrap_or(&cfg);
             let strategy = cond
                 .frozen
@@ -2122,11 +2274,7 @@ impl ExecutionEngine {
                 entry_state_changed = true;
                 continue;
             }
-            let blocked = s.orders.values().any(|o| {
-                o.condition_id == cond.id
-                    && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                        || o.filled < o.reported_filled)
-            });
+            let blocked = s.is_order_blocked(&cond.id);
             if blocked {
                 continue;
             }
@@ -2344,6 +2492,7 @@ impl ExecutionEngine {
                 entry_rules,
             },
         );
+        s.record_order_update(&r);
         if reason.is_none() {
             s.entry_funding_waits.remove(&id);
         }

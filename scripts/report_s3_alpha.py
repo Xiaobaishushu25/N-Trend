@@ -147,6 +147,17 @@ def main():
     registry['implementation_freeze_sha256']=manifest['implementation_freeze_sha256']
     registry['database_sha256']=manifest['database_sha256'];registry['research_version']='1.0'
     registry.to_csv(run/'experiment_registry_with_versions.csv',index=False)
+    reasons=[];reason_counts=collections.Counter()
+    for r in rows:
+        failed=[]
+        for name,condition in [('complete_events_below_60',r['complete_primary']<60),('matched_days_below_30',r['matched_days']<30),
+            ('minimum_match_fraction_below_80pct',r['matched_fraction']<.8),('effect_not_positive',r['effect'] is None or r['effect']<=0),
+            ('CI_lower_not_positive',r['ci_lower'] is None or r['ci_lower']<=0),('Holm_p_above_0.05',r['holm_p']>.05),
+            ('fewer_than_2_positive_blocks',r['positive_blocks']<2),('matched_signal_net_not_positive',r['signal_net_R'] is None or r['signal_net_R']<=0)]:
+            if condition:failed.append(name);reason_counts[name]+=1
+        reasons.append(dict(fold_id=r['fold_id'],candidate_id=r['candidate_id'],decision=r['decision'],reasons=';'.join(failed)))
+    pd.DataFrame(reasons).to_csv(run/'screen_failure_reasons.csv',index=False)
+    reason_table=pd.DataFrame([dict(reason=k,candidate_folds=v) for k,v in reason_counts.items()])
     counttexts='；'.join(f'{k}={v}' for k,v in decisions.items())
     report=f'''# S3 原始 Alpha 检验报告
 
@@ -168,11 +179,17 @@ def main():
 
 {counttexts}。
 
+核心发现：{int(summary.effect.gt(0).sum())} 次检验的相对基线点估计为正，但主效应95%区间下界>0的配置为 {int(summary.ci_lower.gt(0).sum())} 个；在能计算匹配信号自身日期等权净位移的 {int(summary.signal_net_R.notna().sum())} 个候选—轮次中，净位移>0的为 {int(summary.signal_net_R.gt(0).sum())} 个。可见相对更差基线的优势尚未转化为该固定12根期限下可覆盖成本的证据。这不是账户收益率，也不能推广为任何持有期或任何其他交易规则均无效。
+
 P=通过发现期筛选；U=事件/日期/匹配率不足，未证实；N=达到基础证据规模后未通过冻结统计/成本/稳定性门槛。P不等于可部署。每轮24项主检验使用Holm修正，不把重叠发现窗当六次独立验证。
 
 {table(matrix)}
 
 按机制、轮次汇总见 family_fold_decisions.csv，全部144行指标见 primary_evidence.csv / alpha_summary.csv。没有只留下最好候选或删除失败配置。
+
+未满足门槛的原因计数如下（可重叠，不能相加当独立试验数）；逐配置原因见 screen_failure_reasons.csv。区间含0或多重检验未通过表示证据不足以晋级，不是证明真实效应必为0。
+
+{table(reason_table)}
 
 ## 统计与负对照
 

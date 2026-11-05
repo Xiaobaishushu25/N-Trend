@@ -882,7 +882,8 @@ fn r3_history_fingerprint(bars: &[Bar], tick: f64) -> String {
 /// A deleted/reinserted historical event must invalidate the candidate cursor.
 /// Lifecycle transitions do not affect this hash (only stable warning identity).
 fn r3_event_key_fingerprint(events: &[pattern_events::Model]) -> String {
-    let mut keys: Vec<_> = events.iter()
+    let mut keys: Vec<_> = events
+        .iter()
         .map(|e| (e.direction.as_str(), e.warning_ts.as_str()))
         .collect();
     keys.sort_unstable();
@@ -898,13 +899,24 @@ fn r3_event_key_fingerprint(events: &[pattern_events::Model]) -> String {
 
 /// Reuse the cursor only if the entire previously scanned prefix still matches.
 /// The returned index is an inclusive warning-bar start, not a K-line LIMIT.
-fn r3_scan_start_index(bars: &[Bar], old: Option<&R3ScanCursor>, tick: f64, events_hash: &str) -> usize {
-    let Some(old) = old else { return 0; };
-    let Some(index) = bars.iter().position(|b| b.dt.to_bar_ts() == old.last_bar_end) else {
+fn r3_scan_start_index(
+    bars: &[Bar],
+    old: Option<&R3ScanCursor>,
+    tick: f64,
+    events_hash: &str,
+) -> usize {
+    let Some(old) = old else {
+        return 0;
+    };
+    let Some(index) = bars
+        .iter()
+        .position(|b| b.dt.to_bar_ts() == old.last_bar_end)
+    else {
         return 0;
     };
     if old.event_key_hash == events_hash
-        && r3_history_fingerprint(&bars[..=index], tick) == old.history_hash {
+        && r3_history_fingerprint(&bars[..=index], tick) == old.history_hash
+    {
         index + 1
     } else {
         0
@@ -918,35 +930,64 @@ mod r3_cursor_tests {
 
     #[test]
     fn r3_cursor_reuses_append_only_history_but_invalidates_revisions() {
-        let bars: Vec<Bar> = (0..25).map(|i| Bar {
-            dt: DT { year: 2026, month: 11, day: 4, hour: 9 + i / 4, minute: (i % 4) * 15 },
-            open: 100.0 + i as f64,
-            high: 102.0 + i as f64,
-            low: 99.0 + i as f64,
-            close: 101.0 + i as f64,
-            volume: 10.0,
-            hold: 100.0,
-            rollover: false,
-        }).collect();
+        let bars: Vec<Bar> = (0..25)
+            .map(|i| Bar {
+                dt: DT {
+                    year: 2026,
+                    month: 11,
+                    day: 4,
+                    hour: 9 + i / 4,
+                    minute: (i % 4) * 15,
+                },
+                open: 100.0 + i as f64,
+                high: 102.0 + i as f64,
+                low: 99.0 + i as f64,
+                close: 101.0 + i as f64,
+                volume: 10.0,
+                hold: 100.0,
+                rollover: false,
+            })
+            .collect();
         let cursor = R3ScanCursor {
             last_bar_end: bars[19].dt.to_bar_ts(),
             history_hash: r3_history_fingerprint(&bars[..20], 1.0),
             event_key_hash: "unchanged".to_string(),
         };
-        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 1.0, "unchanged"), 20);
-        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 1.0, "deleted_event"), 0);
-        assert_eq!(r3_scan_start_index(&bars[..20], Some(&cursor), 1.0, "unchanged"), 20);
+        assert_eq!(
+            r3_scan_start_index(&bars, Some(&cursor), 1.0, "unchanged"),
+            20
+        );
+        assert_eq!(
+            r3_scan_start_index(&bars, Some(&cursor), 1.0, "deleted_event"),
+            0
+        );
+        assert_eq!(
+            r3_scan_start_index(&bars[..20], Some(&cursor), 1.0, "unchanged"),
+            20
+        );
         assert_eq!(r3_scan_start_index(&bars, None, 1.0, "unchanged"), 0);
-        assert_eq!(r3_scan_start_index(&bars, Some(&cursor), 0.5, "unchanged"), 0);
+        assert_eq!(
+            r3_scan_start_index(&bars, Some(&cursor), 0.5, "unchanged"),
+            0
+        );
         let mut corrected = bars.clone();
         corrected[3].low -= 1.0;
-        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+        assert_eq!(
+            r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"),
+            0
+        );
         corrected = bars.clone();
         corrected[3].rollover = true;
-        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+        assert_eq!(
+            r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"),
+            0
+        );
         corrected = bars.clone();
         corrected.remove(5);
-        assert_eq!(r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"), 0);
+        assert_eq!(
+            r3_scan_start_index(&corrected, Some(&cursor), 1.0, "unchanged"),
+            0
+        );
     }
 }
 
@@ -1180,15 +1221,23 @@ fn advance_triggered(
                 bars[w].low
             };
             let tick = (e.entry - warning_price).abs();
-            if tick > 0.0 { tick } else { 1.0 }
+            if tick > 0.0 {
+                tick
+            } else {
+                1.0
+            }
         },
         ..Default::default()
     };
     ev.setup_features.setup_quality = e.entry_score;
     // This adapter has only 15m bars. It is deliberately more conservative than the raw5m research runner.
     // Non-scan callers still prepare their own inputs; the hot scan path reuses one copy.
-    let owned = prepared.is_none().then(|| PreparedEventReplay::new(&e.symbol, bars));
-    let replay = prepared.or(owned.as_ref()).expect("replay inputs available");
+    let owned = prepared
+        .is_none()
+        .then(|| PreparedEventReplay::new(&e.symbol, bars));
+    let replay = prepared
+        .or(owned.as_ref())
+        .expect("replay inputs available");
     let result = crate::v3::replay::evaluate_at_resolution(
         &ev,
         &replay.raw,
@@ -4253,8 +4302,11 @@ impl Services {
     ) -> Result<(Vec<MarketSnapshot>, Vec<MarketSnapshot>)> {
         // R5a: enabled symbols are read from the same cache as entry detection.
         let symbols = self.market_cache.symbols(&self.db).await?;
-        let mut codes: Vec<String> = symbols.iter().filter(|s| s.enabled)
-            .map(|s| s.code.clone()).collect();
+        let mut codes: Vec<String> = symbols
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.code.clone())
+            .collect();
         for code in contracts {
             if !codes.iter().any(|c| c.eq_ignore_ascii_case(code)) {
                 codes.push(code.clone());
@@ -4277,8 +4329,11 @@ impl Services {
                 change_pct: q.and_then(|q| q.change_pct),
             }
         };
-        let enabled = symbols.iter().filter(|s| s.enabled)
-            .map(|s| snapshot(s.code.clone())).collect();
+        let enabled = symbols
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| snapshot(s.code.clone()))
+            .collect();
         let held = contracts.iter().cloned().map(snapshot).collect();
         Ok((enabled, held))
     }
@@ -4343,7 +4398,8 @@ impl Services {
             self.sync_rollovers_if_needed().await?;
         }
         let symbols = repo::list_symbols(&self.db, true).await?;
-        self.run_scan_models(symbols, true, true, ScanResultMode::Full).await
+        self.run_scan_models(symbols, true, true, ScanResultMode::Full)
+            .await
     }
 
     /// 天勤闭合事件快速路径：只扫描事件涉及的品种，不等待全市场最慢品种。
@@ -4355,7 +4411,8 @@ impl Services {
             .into_iter()
             .filter(|symbol| wanted.contains(symbol.code.as_str()))
             .collect();
-        self.run_scan_models(symbols, false, false, ScanResultMode::Full).await
+        self.run_scan_models(symbols, false, false, ScanResultMode::Full)
+            .await
     }
 
     async fn run_event_scan_symbol(
@@ -4396,7 +4453,10 @@ impl Services {
             return Ok((None, true));
         }
 
-        match self.run_scan_models(symbols, false, false, ScanResultMode::SymbolDelta).await {
+        match self
+            .run_scan_models(symbols, false, false, ScanResultMode::SymbolDelta)
+            .await
+        {
             Ok(result) if result.scanned == 1 && result.failed.is_empty() => {
                 repo::complete_scan_watermark(
                     &self.db,
@@ -4425,7 +4485,8 @@ impl Services {
                     Err(error) => Err(error),
                     Ok(result) => Err(anyhow!(
                         "15m事件扫描未完整完成: {symbol}/{bar_end}, scanned={}, failures={:?}",
-                        result.scanned, result.failed
+                        result.scanned,
+                        result.failed
                     )),
                 }
             }
@@ -4528,14 +4589,17 @@ impl Services {
             let replay_started = Instant::now();
             let candidates = tokio::task::spawn_blocking(move || {
                 event::selected_warnings(&replay_symbol, &replay_bars, tick, false, from)
-            }).await?;
+            })
+            .await?;
             tracing::info!(
                 target: "scan_perf", symbol = %sym.code,
                 candidate_ms = replay_started.elapsed().as_millis(),
                 "[R3_SCAN] candidate replay finished"
             );
-            let mut seen: HashSet<(String, String)> = events.iter()
-                .map(|e| (e.direction.clone(), e.warning_ts.clone())).collect();
+            let mut seen: HashSet<(String, String)> = events
+                .iter()
+                .map(|e| (e.direction.clone(), e.warning_ts.clone()))
+                .collect();
             for c in candidates {
                 let direction = if c.direction == Dir::Up { "up" } else { "down" };
                 let warning_ts = bar_ts(&bars15[c.warning_index]);
@@ -4590,7 +4654,10 @@ impl Services {
                         prepared_replay = Some(PreparedEventReplay::new(&sym.code, &bars15));
                     }
                     advance_event_model_indexed(
-                        &mut e, &bars15, warning_index, prepared_replay.as_ref(),
+                        &mut e,
+                        &bars15,
+                        warning_index,
+                        prepared_replay.as_ref(),
                     )
                 } else {
                     false
@@ -4693,7 +4760,13 @@ impl Services {
             )
         } else {
             build_scan_summary(
-                &started, &finished, scanned, active_count, min_score, &signals, &failed,
+                &started,
+                &finished,
+                scanned,
+                active_count,
+                min_score,
+                &signals,
+                &failed,
             )
         };
         {
@@ -5839,12 +5912,21 @@ mod tests {
         // The two calls may straddle a wall-clock second: updated_at is metadata.
         cached.updated_at = original.updated_at.clone();
         assert_eq!(original, cached);
-        assert_eq!(original.last_advance_ts.as_deref(), Some("2026-08-11 10:15:00"));
+        assert_eq!(
+            original.last_advance_ts.as_deref(),
+            Some("2026-08-11 10:15:00")
+        );
     }
 
     #[test]
     fn r4b_terminal_event_without_missing_features_has_no_write() {
-        let bars = vec![bar_model("2026-08-11 09:45:00", 2570.0, 2582.0, 2569.0, 2574.0)];
+        let bars = vec![bar_model(
+            "2026-08-11 09:45:00",
+            2570.0,
+            2582.0,
+            2569.0,
+            2574.0,
+        )];
         let mut terminal = pattern_event(502, 4.0, "unpriced");
         terminal.trigger_volume_ratio = Some(1.2);
         terminal.overshoot_r = Some(0.5);

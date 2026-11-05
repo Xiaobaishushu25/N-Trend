@@ -1303,3 +1303,1304 @@ async fn strategy_quote_callback_sees_current_alias_book_on_first_tick_and_roll(
         );
     }
 }
+
+#[test]
+fn frozen_plan_arc_roundtrip_and_shared_pointer_on_clone() {
+    let plan = EntryPlan {
+        signal_id: "sig_123".into(),
+        symbol: "PB0".into(),
+        instrument_id: "pb2611".into(),
+        direction: Direction::Long,
+        reference_price: 16500.0,
+        trigger: EntryTrigger::Breakout { price: 16500.0 },
+        stop_price: Some(16400.0),
+        target_price: Some(16700.0),
+        risk_per_unit: 100.0,
+        requested_volume: 2,
+        created_at: chrono::Utc::now().timestamp(),
+        expires_at: Some(chrono::Utc::now().timestamp() + 600),
+        reason: "breakout_setup".into(),
+        evidence: serde_json::json!({
+            "b5": { "cluster": "PB0|up|a|b", "score": 3.8 },
+            "nested_tree": { "key": "value", "list": [1, 2, 3] }
+        }),
+    };
+
+    let original = ConditionOrder {
+        frozen: Some(Arc::new(FrozenPlan {
+            definition: StrategyDefinition::default(),
+            execution: ExecutionConfig::default(),
+            plan,
+        })),
+        origin: TradeOrigin {
+            strategy_id: "n_pattern_v1".into(),
+            strategy_version: "1".into(),
+            signal_id: "sig_123".into(),
+            ..Default::default()
+        },
+        id: "cond_test_1".into(),
+        event_id: Some(1001),
+        symbol: "PB0".into(),
+        instrument_id: "pb2611".into(),
+        direction: "up".into(),
+        tier: PositionTier::Large,
+        entry_price: 16500.0,
+        stop_price: 16400.0,
+        target_price: 16700.0,
+        risk: 100.0,
+        score: 3.8,
+        volume: 2,
+        warning_bar_ts: "2026-11-05 14:00:00".into(),
+        trigger_ts: None,
+        bars_waited: 0,
+        max_wait_bars: 12,
+        state: ConditionState::Pending,
+        created_at: chrono::Utc::now().timestamp(),
+        note: "initial_setup".into(),
+    };
+
+    // 1. JSON 往返兼容性测试 (Serialize -> JSON string -> Deserialize into Arc<FrozenPlan>)
+    let json_str = serde_json::to_string_pretty(&original).expect("Serialization failed");
+    let deserialized: ConditionOrder =
+        serde_json::from_str(&json_str).expect("Deserialization failed");
+
+    // 验证所有字段精确反序列化回结构体中
+    assert!(deserialized.frozen.is_some());
+    let frozen_deser = deserialized.frozen.as_ref().unwrap();
+    assert_eq!(frozen_deser.plan.signal_id, "sig_123");
+    assert_eq!(frozen_deser.plan.evidence["b5"]["cluster"], "PB0|up|a|b");
+    assert_eq!(frozen_deser.plan.evidence["nested_tree"]["key"], "value");
+    assert_eq!(deserialized.id, "cond_test_1");
+    assert_eq!(deserialized.entry_price, 16500.0);
+
+    // 再次序列化回写并比对 JSON Value 等价性
+    let reserialized_json: serde_json::Value =
+        serde_json::to_value(&deserialized).expect("Re-serialization failed");
+    let original_json: serde_json::Value =
+        serde_json::to_value(&original).expect("Original serialization failed");
+    assert_eq!(
+        reserialized_json, original_json,
+        "JSON 往返数据结构必须保持完全一致"
+    );
+
+    // 2. 验证指针共享 (Arc::ptr_eq on clone)
+    let mut cloned = original.clone();
+    assert!(
+        Arc::ptr_eq(
+            original.frozen.as_ref().unwrap(),
+            cloned.frozen.as_ref().unwrap()
+        ),
+        "ConditionOrder clone 时 FrozenPlan 必须通过 Arc 共享，不得深拷贝"
+    );
+
+    // 3. 验证独立修改非冻结字段互不干扰
+    cloned.state = ConditionState::Triggered;
+    cloned.note = "triggered_now".into();
+    cloned.trigger_ts = Some("2026-11-05 14:05:00".into());
+
+    assert_eq!(original.state, ConditionState::Pending);
+    assert_eq!(original.note, "initial_setup");
+    assert_eq!(original.trigger_ts, None);
+
+    assert_eq!(cloned.state, ConditionState::Triggered);
+    assert_eq!(cloned.note, "triggered_now");
+    assert_eq!(cloned.trigger_ts, Some("2026-11-05 14:05:00".into()));
+
+    // 验证修改后指针依然共享
+    assert!(Arc::ptr_eq(
+        original.frozen.as_ref().unwrap(),
+        cloned.frozen.as_ref().unwrap()
+    ));
+}
+
+#[test]
+fn incremental_indices_match_full_table_scan_across_lifecycle() {
+    fn check_consistency(s: &ExecutionState) {
+        // 1. started_entries
+        let expected_started: HashSet<String> = s
+            .orders
+            .values()
+            .filter(|o| o.reason.is_none())
+            .map(|o| o.condition_id.clone())
+            .collect();
+        for cond_id in s.conditions.keys() {
+            assert_eq!(
+                s.is_entry_started(cond_id),
+                expected_started.contains(cond_id),
+                "is_entry_started mismatch for condition {}",
+                cond_id
+            );
+        }
+
+        // 2. exposed_entries
+        let expected_exposed: HashSet<String> = s
+            .orders
+            .values()
+            .filter(|o| {
+                o.reason.is_none()
+                    && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                        || o.filled < o.reported_filled)
+            })
+            .map(|o| o.condition_id.clone())
+            .chain(
+                s.positions
+                    .values()
+                    .filter(|p| p.volume > 0)
+                    .map(|p| p.id.clone()),
+            )
+            .collect();
+        for cond_id in s.conditions.keys() {
+            assert_eq!(
+                s.is_entry_exposed(cond_id),
+                expected_exposed.contains(cond_id),
+                "is_entry_exposed mismatch for condition {}",
+                cond_id
+            );
+        }
+
+        // 3. blocked_orders
+        let is_blocked_full_scan = |cond_id: &str| -> bool {
+            s.orders.values().any(|o| {
+                o.condition_id == cond_id
+                    && (!matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
+                        || o.filled < o.reported_filled)
+            })
+        };
+        for cond_id in s.conditions.keys() {
+            assert_eq!(
+                s.is_order_blocked(cond_id),
+                is_blocked_full_scan(cond_id),
+                "is_order_blocked mismatch for condition {}",
+                cond_id
+            );
+        }
+
+        // 4. Verify that s.rebuild_indices() does not mutate state when incremental was used
+        let mut cloned = s.clone();
+        cloned.rebuild_indices();
+        assert_eq!(
+            s.entry_started_conditions, cloned.entry_started_conditions,
+            "Incremental started set differs from rebuilt"
+        );
+        assert_eq!(
+            s.unsettled_orders, cloned.unsettled_orders,
+            "Incremental unsettled set differs from rebuilt"
+        );
+    }
+
+    let mut state = ExecutionState::default();
+
+    // Add 10 mock conditions in various states
+    for i in 1..=10 {
+        let id = format!("cond_{i}");
+        state.conditions.insert(
+            id.clone(),
+            ConditionOrder {
+                frozen: None,
+                origin: TradeOrigin::default(),
+                id: id.clone(),
+                event_id: Some(i),
+                symbol: "PB0".into(),
+                instrument_id: "pb2611".into(),
+                direction: if i % 2 == 0 { "up" } else { "down" }.into(),
+                tier: PositionTier::Small,
+                entry_price: 15000.0,
+                stop_price: 14900.0,
+                target_price: 15200.0,
+                risk: 100.0,
+                score: 3.0,
+                volume: 1,
+                warning_bar_ts: "2026-11-05 10:00:00".into(),
+                trigger_ts: None,
+                bars_waited: 0,
+                max_wait_bars: 10,
+                state: match i {
+                    1 => ConditionState::Pending,
+                    2 => ConditionState::WaitingConfirm,
+                    3 => ConditionState::Triggered,
+                    4 => ConditionState::Working,
+                    5 => ConditionState::PartFilled,
+                    6 => ConditionState::Filled,
+                    7 => ConditionState::Expired,
+                    8 => ConditionState::Canceled,
+                    9 => ConditionState::Invalidated,
+                    _ => ConditionState::Closed,
+                },
+                created_at: 1000,
+                note: "test".into(),
+            },
+        );
+    }
+
+    state.rebuild_indices();
+    check_consistency(&state);
+
+    // Lifecycle Step 1: Submit Entry Order for cond_1
+    let order_ref_1 = "order_1".to_string();
+    state.orders.insert(
+        order_ref_1.clone(),
+        ExecutionOrder {
+            origin: TradeOrigin::default(),
+            request: OrderInsertRequest {
+                instrument_id: "pb2611".into(),
+                exchange_id: Some("SHFE".into()),
+                direction: "buy".into(),
+                offset: "open".into(),
+                price: 15000.0,
+                volume: 1,
+                order_ref: Some(order_ref_1.clone()),
+            },
+            condition_id: "cond_1".into(),
+            reason: None,
+            phase: OrderPhase::Unknown,
+            reported_filled: 0,
+            filled: 0,
+            action_at: 1001,
+            trading_day: "20261105".into(),
+            note: "".into(),
+            cancel_attempts: 0,
+            funds_at_submit: None,
+            entry_rules: None,
+        },
+    );
+    state.record_order_update(&order_ref_1);
+    check_consistency(&state);
+
+    // Lifecycle Step 2: Order transitions to Working
+    if let Some(o) = state.orders.get_mut(&order_ref_1) {
+        o.phase = OrderPhase::Working;
+    }
+    state.record_order_update(&order_ref_1);
+    check_consistency(&state);
+
+    // Lifecycle Step 3: Counter reports partial fill, not locally aligned yet (filled=0, reported=1)
+    if let Some(o) = state.orders.get_mut(&order_ref_1) {
+        o.reported_filled = 1;
+    }
+    state.record_order_update(&order_ref_1);
+    check_consistency(&state);
+
+    // Lifecycle Step 4: Reconciled trade aligns fill (filled=1, reported=1, phase=Terminal)
+    if let Some(o) = state.orders.get_mut(&order_ref_1) {
+        o.filled = 1;
+        o.phase = OrderPhase::Terminal;
+    }
+    state.record_order_update(&order_ref_1);
+    check_consistency(&state);
+    assert!(state.is_entry_started("cond_1"));
+    assert!(!state.is_entry_exposed("cond_1"));
+
+    // Lifecycle Step 5: Position opens for cond_1
+    state.positions.insert(
+        "cond_1".into(),
+        ManagedPosition {
+            origin: TradeOrigin::default(),
+            id: "cond_1".into(),
+            condition_order_id: "cond_1".into(),
+            symbol: "PB0".into(),
+            instrument_id: "pb2611".into(),
+            direction: "up".into(),
+            tier: PositionTier::Small,
+            fill_price: 15000.0,
+            initial_stop_price: 14900.0,
+            target_price: 15200.0,
+            risk: 100.0,
+            volume: 1,
+            open_ts: "2026-11-05 10:05:00".into(),
+            bars_held: 1,
+            max_mfe_r: 0.5,
+            max_mae_r: -0.1,
+            trailing_grade: 0,
+            current_stop_price: 14900.0,
+            lot1_closed: false,
+            exit_reason: None,
+            exit_price: None,
+            is_closed: false,
+            realized_pnl_pts: None,
+            r_multiple: None,
+            event_id: Some(1),
+            planned_entry_price: Some(15000.0),
+            score: Some(3.0),
+            warning_bar_ts: Some("2026-11-05 10:00:00".into()),
+            trigger_ts: None,
+            order_insert_ts: None,
+        },
+    );
+    check_consistency(&state);
+    assert!(state.is_entry_exposed("cond_1"));
+
+    // Lifecycle Step 6: Submit Exit Order (reason is Some)
+    let exit_ref = "order_exit_1".to_string();
+    state.orders.insert(
+        exit_ref.clone(),
+        ExecutionOrder {
+            origin: TradeOrigin::default(),
+            request: OrderInsertRequest {
+                instrument_id: "pb2611".into(),
+                exchange_id: Some("SHFE".into()),
+                direction: "sell".into(),
+                offset: "close".into(),
+                price: 14900.0,
+                volume: 1,
+                order_ref: Some(exit_ref.clone()),
+            },
+            condition_id: "cond_1".into(),
+            reason: Some("stop".into()),
+            phase: OrderPhase::Working,
+            reported_filled: 0,
+            filled: 0,
+            action_at: 1010,
+            trading_day: "20261105".into(),
+            note: "".into(),
+            cancel_attempts: 0,
+            funds_at_submit: None,
+            entry_rules: None,
+        },
+    );
+    state.record_order_update(&exit_ref);
+    check_consistency(&state);
+
+    // Lifecycle Step 7: Close position and exit order terminates
+    if let Some(pos) = state.positions.get_mut("cond_1") {
+        pos.volume = 0;
+        pos.is_closed = true;
+    }
+    if let Some(exit_ord) = state.orders.get_mut(&exit_ref) {
+        exit_ord.filled = 1;
+        exit_ord.reported_filled = 1;
+        exit_ord.phase = OrderPhase::Terminal;
+    }
+    state.record_order_update(&exit_ref);
+    check_consistency(&state);
+    assert!(state.is_entry_started("cond_1"));
+    assert!(!state.is_entry_exposed("cond_1"));
+
+    // Lifecycle Step 8: Cancel pending order on cond_2
+    let order_ref_2 = "order_2".to_string();
+    state.orders.insert(
+        order_ref_2.clone(),
+        ExecutionOrder {
+            origin: TradeOrigin::default(),
+            request: OrderInsertRequest {
+                instrument_id: "pb2611".into(),
+                exchange_id: Some("SHFE".into()),
+                direction: "sell".into(),
+                offset: "open".into(),
+                price: 15000.0,
+                volume: 1,
+                order_ref: Some(order_ref_2.clone()),
+            },
+            condition_id: "cond_2".into(),
+            reason: None,
+            phase: OrderPhase::CancelPending,
+            reported_filled: 0,
+            filled: 0,
+            action_at: 1020,
+            trading_day: "20261105".into(),
+            note: "".into(),
+            cancel_attempts: 1,
+            funds_at_submit: None,
+            entry_rules: None,
+        },
+    );
+    state.record_order_update(&order_ref_2);
+    check_consistency(&state);
+    assert!(state.is_entry_started("cond_2"));
+    assert!(state.is_entry_exposed("cond_2"));
+    assert!(state.is_order_blocked("cond_2"));
+
+    // Reject order on cond_2
+    if let Some(o) = state.orders.get_mut(&order_ref_2) {
+        o.phase = OrderPhase::Rejected;
+    }
+    state.record_order_update(&order_ref_2);
+    check_consistency(&state);
+    assert!(state.is_entry_started("cond_2"));
+    assert!(!state.is_entry_exposed("cond_2"));
+    assert!(!state.is_order_blocked("cond_2"));
+}
+
+#[tokio::test]
+
+async fn quote_context_filters_terminal_history_but_timer_preserves_all() {
+    #[derive(Clone)]
+
+    struct ContextCheckingStrategy {
+        observed: Arc<StdMutex<Vec<(String, usize, usize)>>>,
+    }
+
+    impl Strategy for ContextCheckingStrategy {
+        fn on_event(
+            &self,
+
+            event: &StrategyEvent,
+
+            c: &StrategyContext<'_>,
+
+            _state: &mut Value,
+        ) -> Result<Vec<TradeIntent>> {
+            match event {
+                StrategyEvent::Quote(_) => {
+                    self.observed.lock().unwrap().push((
+                        "quote".into(),
+                        c.orders.len(),
+                        c.conditions.len(),
+                    ));
+                }
+
+                StrategyEvent::Timer { .. } => {
+                    self.observed.lock().unwrap().push((
+                        "timer".into(),
+                        c.orders.len(),
+                        c.conditions.len(),
+                    ));
+                }
+
+                _ => {}
+            }
+
+            Ok(vec![])
+        }
+    }
+
+    let observed = Arc::new(StdMutex::new(Vec::new()));
+
+    let strat = ContextCheckingStrategy {
+        observed: observed.clone(),
+    };
+
+    let counter = Counter::new();
+
+    let mut engine = counter.engine(ExecutionMode::MonitorOnly, 2);
+
+    let mut registry = StrategyRegistry::default();
+
+    let strat_clone = strat.clone();
+
+    registry.register_strategy(N_STRATEGY, N_VERSION, move |_| {
+        Ok(Box::new(strat_clone.clone()))
+    });
+
+    engine.registry = Arc::new(registry);
+
+    let revision = engine.definition().await.revision;
+
+    {
+        let mut s = engine.state.lock().await;
+
+        // 1 active condition (Pending)
+
+        let active_cond = ConditionOrder {
+            frozen: None,
+
+            origin: TradeOrigin {
+                account_id: "default".into(),
+
+                instance_id: "inst".into(),
+
+                strategy_id: N_STRATEGY.into(),
+
+                strategy_version: revision.clone(),
+
+                signal_id: "sig_active".into(),
+            },
+
+            id: "cond_active".into(),
+
+            event_id: Some(1),
+
+            symbol: "PB0".into(),
+
+            instrument_id: "pb2611".into(),
+
+            direction: "up".into(),
+
+            tier: PositionTier::Small,
+
+            entry_price: 15000.0,
+
+            stop_price: 14800.0,
+
+            target_price: 15400.0,
+
+            risk: 200.0,
+
+            score: 3.0,
+
+            volume: 1,
+
+            warning_bar_ts: "2026-11-05 10:00:00".into(),
+
+            trigger_ts: None,
+
+            bars_waited: 0,
+
+            max_wait_bars: 10,
+
+            state: ConditionState::Pending,
+
+            created_at: 1000,
+
+            note: "".into(),
+        };
+
+        s.conditions.insert("cond_active".into(), active_cond);
+
+        // 1 open position condition (Working, with non-closed position)
+
+        let pos_cond = ConditionOrder {
+            frozen: None,
+
+            origin: TradeOrigin {
+                account_id: "default".into(),
+
+                instance_id: "inst".into(),
+
+                strategy_id: N_STRATEGY.into(),
+
+                strategy_version: revision.clone(),
+
+                signal_id: "sig_pos".into(),
+            },
+
+            id: "cond_pos".into(),
+
+            event_id: Some(2),
+
+            symbol: "PB0".into(),
+
+            instrument_id: "pb2611".into(),
+
+            direction: "up".into(),
+
+            tier: PositionTier::Small,
+
+            entry_price: 15000.0,
+
+            stop_price: 14800.0,
+
+            target_price: 15400.0,
+
+            risk: 200.0,
+
+            score: 3.0,
+
+            volume: 1,
+
+            warning_bar_ts: "2026-11-05 10:00:00".into(),
+
+            trigger_ts: Some("2026-11-05 10:05:00".into()),
+
+            bars_waited: 0,
+
+            max_wait_bars: 10,
+
+            state: ConditionState::Working,
+
+            created_at: 1000,
+
+            note: "".into(),
+        };
+
+        s.conditions.insert("cond_pos".into(), pos_cond);
+
+        s.positions.insert(
+            "cond_pos".into(),
+            ManagedPosition {
+                origin: TradeOrigin {
+                    account_id: "default".into(),
+
+                    instance_id: "inst".into(),
+
+                    strategy_id: N_STRATEGY.into(),
+
+                    strategy_version: revision.clone(),
+
+                    signal_id: "sig_pos".into(),
+                },
+
+                id: "cond_pos".into(),
+
+                condition_order_id: "cond_pos".into(),
+
+                symbol: "PB0".into(),
+
+                instrument_id: "pb2611".into(),
+
+                direction: "up".into(),
+
+                tier: PositionTier::Small,
+
+                fill_price: 15000.0,
+
+                initial_stop_price: 14800.0,
+
+                target_price: 15400.0,
+
+                risk: 200.0,
+
+                volume: 1,
+
+                open_ts: "2026-11-05 10:05:00".into(),
+
+                bars_held: 0,
+
+                max_mfe_r: 0.0,
+
+                max_mae_r: 0.0,
+
+                trailing_grade: 0,
+
+                current_stop_price: 14800.0,
+
+                lot1_closed: false,
+
+                exit_reason: None,
+
+                exit_price: None,
+
+                is_closed: false,
+
+                realized_pnl_pts: None,
+
+                r_multiple: None,
+
+                event_id: Some(2),
+
+                planned_entry_price: Some(15000.0),
+
+                score: Some(3.0),
+
+                warning_bar_ts: Some("2026-11-05 10:00:00".into()),
+
+                trigger_ts: Some("2026-11-05 10:05:00".into()),
+
+                order_insert_ts: Some("2026-11-05 10:05:00".into()),
+            },
+        );
+
+        // 5 terminal conditions
+
+        for i in 1..=5 {
+            let id = format!("cond_term_{i}");
+
+            s.conditions.insert(
+                id.clone(),
+                ConditionOrder {
+                    frozen: None,
+
+                    origin: TradeOrigin {
+                        account_id: "default".into(),
+
+                        instance_id: "inst".into(),
+
+                        strategy_id: N_STRATEGY.into(),
+
+                        strategy_version: revision.clone(),
+
+                        signal_id: format!("sig_term_{i}"),
+                    },
+
+                    id: id.clone(),
+
+                    event_id: Some(10 + i as i64),
+
+                    symbol: "PB0".into(),
+
+                    instrument_id: "pb2611".into(),
+
+                    direction: "up".into(),
+
+                    tier: PositionTier::Small,
+
+                    entry_price: 15000.0,
+
+                    stop_price: 14800.0,
+
+                    target_price: 15400.0,
+
+                    risk: 200.0,
+
+                    score: 3.0,
+
+                    volume: 1,
+
+                    warning_bar_ts: "2026-11-05 09:00:00".into(),
+
+                    trigger_ts: Some("2026-11-05 09:10:00".into()),
+
+                    bars_waited: 0,
+
+                    max_wait_bars: 10,
+
+                    state: ConditionState::Closed,
+
+                    created_at: 900,
+
+                    note: "".into(),
+                },
+            );
+        }
+
+        // 1 unsettled order
+
+        s.orders.insert(
+            "ord_unsettled".into(),
+            ExecutionOrder {
+                origin: TradeOrigin {
+                    account_id: "default".into(),
+
+                    instance_id: "inst".into(),
+
+                    strategy_id: N_STRATEGY.into(),
+
+                    strategy_version: revision.clone(),
+
+                    signal_id: "sig_active".into(),
+                },
+
+                condition_id: "cond_active".into(),
+
+                request: OrderInsertRequest {
+                    instrument_id: "pb2611".into(),
+
+                    exchange_id: Some("SHFE".into()),
+
+                    direction: "buy".into(),
+
+                    offset: "open".into(),
+
+                    price: 15000.0,
+
+                    volume: 1,
+
+                    order_ref: Some("ord_unsettled".into()),
+                },
+
+                reason: None,
+
+                phase: OrderPhase::Working,
+
+                reported_filled: 0,
+
+                filled: 0,
+
+                action_at: 1005,
+
+                trading_day: "20261105".into(),
+
+                note: "".into(),
+
+                cancel_attempts: 0,
+
+                funds_at_submit: None,
+
+                entry_rules: None,
+            },
+        );
+
+        // 10 terminal orders
+
+        for i in 1..=10 {
+            let id = format!("ord_term_{i}");
+
+            s.orders.insert(
+                id.clone(),
+                ExecutionOrder {
+                    origin: TradeOrigin {
+                        account_id: "default".into(),
+
+                        instance_id: "inst".into(),
+
+                        strategy_id: N_STRATEGY.into(),
+
+                        strategy_version: revision.clone(),
+
+                        signal_id: format!("sig_term_{i}"),
+                    },
+
+                    condition_id: "cond_term_1".into(),
+
+                    request: OrderInsertRequest {
+                        instrument_id: "pb2611".into(),
+
+                        exchange_id: Some("SHFE".into()),
+
+                        direction: "buy".into(),
+
+                        offset: "open".into(),
+
+                        price: 15000.0,
+
+                        volume: 1,
+
+                        order_ref: Some(id.clone()),
+                    },
+
+                    reason: None,
+
+                    phase: OrderPhase::Terminal,
+
+                    reported_filled: 1,
+
+                    filled: 1,
+
+                    action_at: 910,
+
+                    trading_day: "20261105".into(),
+
+                    note: "".into(),
+
+                    cancel_attempts: 0,
+
+                    funds_at_submit: None,
+
+                    entry_rules: None,
+                },
+            );
+        }
+
+        s.rebuild_indices();
+    }
+
+    // Dispatch Quote event with fresh timestamp so valid() is true
+
+    let q = ExecutionQuote {
+        instrument_id: "pb2611".into(),
+
+        exchange_id: "SHFE".into(),
+
+        underlying_symbol: "SHFE.pb2611".into(),
+
+        last: 15000.0,
+
+        bid: 14999.0,
+
+        ask: 15001.0,
+
+        tick: 1.0,
+
+        lower: 14000.0,
+
+        upper: 16000.0,
+
+        timestamp: chrono::Utc::now().timestamp(),
+    };
+
+    engine
+        .observe_quotes([("PB0".into(), q)].into_iter().collect(), false)
+        .await
+        .unwrap();
+
+    let records = observed.lock().unwrap().clone();
+
+    assert_eq!(records.len(), 1);
+
+    assert_eq!(records[0].0, "quote");
+
+    // Quote event must prune context:
+
+    // orders has ONLY the 1 unsettled order (not all 11 orders!)
+
+    assert_eq!(records[0].1, 1);
+
+    // conditions has ONLY the 2 active/relevant conditions (not all 7 conditions!)
+
+    assert_eq!(records[0].2, 2);
+
+    // Now dispatch Timer event
+
+    engine
+        .dispatch(StrategyEvent::Timer { timestamp: 1030 })
+        .await
+        .unwrap();
+
+    let records = observed.lock().unwrap().clone();
+
+    assert_eq!(records.len(), 2);
+
+    assert_eq!(records[1].0, "timer");
+
+    // Timer event MUST preserve all conditions and orders:
+
+    assert_eq!(records[1].1, 11);
+
+    assert_eq!(records[1].2, 7);
+}
+
+#[tokio::test]
+
+async fn b5_timer_correctly_releases_terminal_triggered_conditions() {
+    use crate::trader::b5;
+
+    let counter = Counter::new();
+
+    let engine = counter.engine(ExecutionMode::MonitorOnly, 2);
+
+    let def = b5::definition();
+
+    engine.set_definition(def.clone()).await.unwrap();
+
+    let active_def = engine.definition().await;
+
+    {
+        let mut s = engine.state.lock().await;
+
+        // Insert a terminal triggered condition with trigger_ts
+
+        let cond = ConditionOrder {
+            frozen: None,
+
+            origin: TradeOrigin {
+                account_id: "default".into(),
+
+                instance_id: "default".into(),
+
+                strategy_id: active_def.strategy_id.clone(),
+
+                strategy_version: active_def.revision.clone(),
+
+                signal_id: "sig_b5".into(),
+            },
+
+            id: "b5_cond_1".into(),
+
+            event_id: Some(1),
+
+            symbol: "BU0".into(),
+
+            instrument_id: "bu2612".into(),
+
+            direction: "up".into(),
+
+            tier: PositionTier::Small,
+
+            entry_price: 3000.0,
+
+            stop_price: 2900.0,
+
+            target_price: 3200.0,
+
+            risk: 100.0,
+
+            score: 3.0,
+
+            volume: 1,
+
+            warning_bar_ts: "2026-11-05 10:00:00".into(),
+
+            trigger_ts: Some("2026-11-05 10:10:00".into()),
+
+            bars_waited: 0,
+
+            max_wait_bars: 10,
+
+            state: ConditionState::Closed,
+
+            created_at: 1000,
+
+            note: "".into(),
+        };
+
+        s.conditions.insert("b5_cond_1".into(), cond);
+
+        s.rebuild_indices();
+    }
+
+    // Dispatch Timer
+
+    engine
+        .dispatch(StrategyEvent::Timer { timestamp: 2000 })
+        .await
+        .unwrap();
+
+    let s = engine.state.lock().await;
+
+    let b5_state = s
+        .strategy_states
+        .get(&active_def.revision)
+        .expect("b5 state exists");
+
+    // Verify released contains b5_cond_1 -> 2000
+
+    assert_eq!(b5_state["released"]["b5_cond_1"], 2000);
+}
+
+#[tokio::test]
+
+async fn persistence_failure_protects_memory_and_blocks_new_orders_while_preserving_existing_position_stops(
+) {
+    let root = std::env::temp_dir().join(format!("ntrend_pf_test_{}", uuid::Uuid::new_v4()));
+
+    std::fs::create_dir_all(&root).unwrap();
+
+    let config_file = root.join("trader_config.json");
+
+    let state_file = root.join("trader_execution.json");
+
+    let counter = Counter::new();
+
+    // Create engine with config path (which maps to trader_execution.json)
+
+    let engine = ExecutionEngine::with_config_path(
+        BrokerClient::Ctp(CtpTraderClient::new(counter.url.clone())),
+        ExecutionConfig::default(),
+        Some(config_file.clone()),
+    );
+
+    let cond_id = "pos_to_protect".to_string();
+
+    {
+        let mut s = engine.state.lock().await;
+
+        s.broker_connected = true;
+
+        s.broker_ready = true;
+
+        s.conditions.insert(
+            cond_id.clone(),
+            ConditionOrder {
+                frozen: None,
+
+                origin: TradeOrigin::default(),
+
+                id: cond_id.clone(),
+
+                event_id: Some(1),
+
+                symbol: "PB0".into(),
+
+                instrument_id: "pb2611".into(),
+
+                direction: "up".into(),
+
+                tier: PositionTier::Small,
+
+                entry_price: 15000.0,
+
+                stop_price: 14800.0,
+
+                target_price: 15400.0,
+
+                risk: 200.0,
+
+                score: 3.0,
+
+                volume: 1,
+
+                warning_bar_ts: "2026-11-05 10:00:00".into(),
+
+                trigger_ts: Some("2026-11-05 10:05:00".into()),
+
+                bars_waited: 0,
+
+                max_wait_bars: 10,
+
+                state: ConditionState::Working,
+
+                created_at: 1000,
+
+                note: "".into(),
+            },
+        );
+
+        s.positions.insert(
+            cond_id.clone(),
+            ManagedPosition {
+                origin: TradeOrigin::default(),
+
+                id: cond_id.clone(),
+
+                condition_order_id: cond_id.clone(),
+
+                symbol: "PB0".into(),
+
+                instrument_id: "pb2611".into(),
+
+                direction: "up".into(),
+
+                tier: PositionTier::Small,
+
+                fill_price: 15000.0,
+
+                initial_stop_price: 14800.0,
+
+                target_price: 15400.0,
+
+                risk: 200.0,
+
+                volume: 1,
+
+                open_ts: "2026-11-05 10:05:00".into(),
+
+                bars_held: 0,
+
+                max_mfe_r: 0.0,
+
+                max_mae_r: 0.0,
+
+                trailing_grade: 0,
+
+                current_stop_price: 14800.0,
+
+                lot1_closed: false,
+
+                exit_reason: None,
+
+                exit_price: None,
+
+                is_closed: false,
+
+                realized_pnl_pts: None,
+
+                r_multiple: None,
+
+                event_id: Some(1),
+
+                planned_entry_price: Some(15000.0),
+
+                score: Some(3.0),
+
+                warning_bar_ts: Some("2026-11-05 10:00:00".into()),
+
+                trigger_ts: Some("2026-11-05 10:05:00".into()),
+
+                order_insert_ts: Some("2026-11-05 10:05:00".into()),
+            },
+        );
+
+        s.rebuild_indices();
+
+        // Persist initial valid state to disk
+
+        engine.save(&mut s).unwrap();
+    }
+
+    assert!(state_file.exists());
+
+    let initial_disk_content = std::fs::read(&state_file).unwrap();
+
+    // Now induce persistence failure by creating a directory where .tmp file would be written
+
+    let tmp_file = state_file.with_extension("tmp");
+
+    std::fs::create_dir(&tmp_file).unwrap();
+
+    // Attempt to register a new plan that attempts to persist state
+
+    let plan = EntryPlan {
+        signal_id: "new_signal".into(),
+
+        symbol: "PB0".into(),
+
+        instrument_id: "pb2611".into(),
+
+        direction: Direction::Long,
+
+        reference_price: 15000.0,
+
+        trigger: EntryTrigger::Immediate,
+
+        stop_price: Some(14800.0),
+
+        target_price: Some(15400.0),
+
+        risk_per_unit: 200.0,
+
+        requested_volume: 1,
+
+        created_at: chrono::Utc::now().timestamp(),
+
+        expires_at: Some(chrono::Utc::now().timestamp() + 600),
+
+        reason: "test".into(),
+
+        evidence: serde_json::json!({"entry_score": 3.0}),
+    };
+
+    let reg_result = engine
+        .register_plan(plan, engine.definition().await, ExecutionConfig::default())
+        .await;
+
+    assert!(reg_result.is_err(), "Persistence failure must return Err");
+
+    // 1. Verify old file on disk remains completely intact and uncorrupted
+
+    let disk_content_after_fail = std::fs::read(&state_file).unwrap();
+
+    assert_eq!(initial_disk_content, disk_content_after_fail);
+
+    // 2. Verify in-memory state recorded persistence error and did not commit the failed next state
+
+    {
+        let s = engine.state.lock().await;
+
+        assert!(
+            s.persistence_error.is_some(),
+            "In-memory state must record persistence error"
+        );
+
+        assert!(
+            !s.conditions.contains_key("new_signal"),
+            "Failed plan must not be committed to memory"
+        );
+    }
+
+    // 3. Verify drive() blocks any new entry orders from being placed
+
+    engine.drive().await.unwrap();
+
+    assert!(
+        counter.inserts().is_empty(),
+        "drive() must not submit orders when persistence_error is set"
+    );
+
+    // 4. Verify existing position protection still executes according to rule in memory:
+
+    // Quote drops below stop price (14790 < 14800) with fresh timestamp
+
+    let drop_quote = ExecutionQuote {
+        instrument_id: "pb2611".into(),
+
+        exchange_id: "SHFE".into(),
+
+        underlying_symbol: "SHFE.pb2611".into(),
+
+        last: 14790.0,
+
+        bid: 14789.0,
+
+        ask: 14791.0,
+
+        tick: 1.0,
+
+        lower: 14000.0,
+
+        upper: 16000.0,
+
+        timestamp: chrono::Utc::now().timestamp(),
+    };
+
+    let _ = engine
+        .observe_quotes([("PB0".into(), drop_quote)].into_iter().collect(), false)
+        .await;
+
+    let s = engine.state.lock().await;
+
+    assert!(
+        s.closes.contains_key(&cond_id),
+        "Stop loss exit task must be latched in memory"
+    );
+
+    assert_eq!(
+        s.conditions[&cond_id].state,
+        ConditionState::Closing,
+        "Condition must be transitioned to Closing"
+    );
+
+    assert_eq!(s.closes[&cond_id].reason, "stop");
+
+    // Cleanup
+
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -6,10 +6,17 @@
 //! fails: propagate the error and retry on the next tick.
 use anyhow::{anyhow, Result};
 use sea_orm::DatabaseConnection;
-use std::{future::Future, sync::Arc, time::{Duration, Instant}};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::storage::{entities::{pattern_events, symbols}, repo};
+use crate::storage::{
+    entities::{pattern_events, symbols},
+    repo,
+};
 
 const EXTERNAL_REVISION_POLL: Duration = Duration::from_secs(10);
 
@@ -27,7 +34,10 @@ struct RevisionCache<T> {
 
 impl<T> Default for RevisionCache<T> {
     fn default() -> Self {
-        Self { current: RwLock::new(None), refresh_lock: Mutex::new(()) }
+        Self {
+            current: RwLock::new(None),
+            refresh_lock: Mutex::new(()),
+        }
     }
 }
 
@@ -46,9 +56,13 @@ impl<T> RevisionCache<T> {
         // No SQL, allocation of row vectors or long-held lock on a normal tick.
         let now_epoch = epoch();
         if let Some(cached) = self.current.read().await.as_ref() {
-            if cached.local_epoch == now_epoch && cached.checked_at.elapsed() < EXTERNAL_REVISION_POLL {
+            if cached.local_epoch == now_epoch
+                && cached.checked_at.elapsed() < EXTERNAL_REVISION_POLL
+            {
                 let rows = cached.rows.clone();
-                if epoch() == now_epoch { return Ok(rows); }
+                if epoch() == now_epoch {
+                    return Ok(rows);
+                }
             }
         }
         // All concurrent readers share one refresh rather than stampeding SQLite.
@@ -57,9 +71,13 @@ impl<T> RevisionCache<T> {
         {
             let guard = self.current.read().await;
             if let Some(cached) = guard.as_ref() {
-                if cached.local_epoch == now_epoch && cached.checked_at.elapsed() < EXTERNAL_REVISION_POLL {
+                if cached.local_epoch == now_epoch
+                    && cached.checked_at.elapsed() < EXTERNAL_REVISION_POLL
+                {
                     let rows = cached.rows.clone();
-                    if epoch() == now_epoch { return Ok(rows); }
+                    if epoch() == now_epoch {
+                        return Ok(rows);
+                    }
                 }
             }
         }
@@ -68,7 +86,8 @@ impl<T> RevisionCache<T> {
         {
             let mut guard = self.current.write().await;
             if let Some(cached) = guard.as_mut() {
-                if cached.local_epoch == now_epoch && cached.revision == db_revision
+                if cached.local_epoch == now_epoch
+                    && cached.revision == db_revision
                     && epoch() == now_epoch
                 {
                     cached.checked_at = Instant::now();
@@ -96,7 +115,9 @@ impl<T> RevisionCache<T> {
             tracing::debug!(scope, count = rows.len(), "[R5A_CACHE] 刷新缓存");
             return Ok(rows);
         }
-        Err(anyhow!("R5a cache refresh raced with repeated {scope} changes"))
+        Err(anyhow!(
+            "R5a cache refresh raced with repeated {scope} changes"
+        ))
     }
 }
 
@@ -107,14 +128,26 @@ pub(super) struct MarketCache {
 }
 
 impl MarketCache {
-    pub(super) async fn pending(&self, db: &DatabaseConnection) -> Result<Arc<Vec<pattern_events::Model>>> {
-        self.pending.get(db, "signals", repo::r5a_signal_epoch,
-            || repo::pending_entry_events(db)).await
+    pub(super) async fn pending(
+        &self,
+        db: &DatabaseConnection,
+    ) -> Result<Arc<Vec<pattern_events::Model>>> {
+        self.pending
+            .get(db, "signals", repo::r5a_signal_epoch, || {
+                repo::pending_entry_events(db)
+            })
+            .await
     }
 
-    pub(super) async fn symbols(&self, db: &DatabaseConnection) -> Result<Arc<Vec<symbols::Model>>> {
-        self.symbols.get(db, "symbols", repo::r5a_symbol_epoch,
-            || repo::list_symbols(db, false)).await
+    pub(super) async fn symbols(
+        &self,
+        db: &DatabaseConnection,
+    ) -> Result<Arc<Vec<symbols::Model>>> {
+        self.symbols
+            .get(db, "symbols", repo::r5a_symbol_epoch, || {
+                repo::list_symbols(db, false)
+            })
+            .await
     }
 }
 
@@ -138,7 +171,9 @@ mod tests {
 
     #[tokio::test]
     async fn r5a_no_repeat_full_select_and_external_revision_probe() {
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
         let cache = MarketCache::default();
         let first = cache.pending(&db).await.unwrap();
         assert!(first.is_empty());
@@ -148,8 +183,14 @@ mod tests {
 
         // A direct database write bypasses local atomic invalidation.
         db.execute_unprepared(test_warning()).await.unwrap();
-        cache.pending.current.write().await.as_mut().unwrap().checked_at =
-            Instant::now() - EXTERNAL_REVISION_POLL;
+        cache
+            .pending
+            .current
+            .write()
+            .await
+            .as_mut()
+            .unwrap()
+            .checked_at = Instant::now() - EXTERNAL_REVISION_POLL;
         let refreshed = cache.pending(&db).await.unwrap();
         assert_eq!(refreshed.len(), 1);
         assert!(!Arc::ptr_eq(&first, &refreshed));
@@ -157,11 +198,17 @@ mod tests {
 
     #[tokio::test]
     async fn r5a_repository_mutation_invalidates_immediately() {
-        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
         db.execute_unprepared(test_warning()).await.unwrap();
         let cache = MarketCache::default();
         assert_eq!(cache.pending(&db).await.unwrap().len(), 1);
-        let mut row = repo::pending_entry_events(&db).await.unwrap().pop().unwrap();
+        let mut row = repo::pending_entry_events(&db)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
         row.state = "triggered".into();
         row.trigger_ts = Some("2026-08-11 10:01:00".into());
         repo::update_pattern_event(&db, row).await.unwrap();

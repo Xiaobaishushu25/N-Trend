@@ -51,11 +51,11 @@ fn plan(s: Snapshot) -> EntryPlan {
 fn condition(id: &str, s: Snapshot, state: ConditionState) -> ConditionOrder {
     let p = plan(s.clone());
     ConditionOrder {
-        frozen: Some(FrozenPlan {
+        frozen: Some(std::sync::Arc::new(FrozenPlan {
             definition: definition(),
             execution: ExecutionConfig::default(),
             plan: p,
-        }),
+        })),
         origin: TradeOrigin {
             strategy_id: ID.into(),
             strategy_version: "1".into(),

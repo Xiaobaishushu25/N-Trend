@@ -954,126 +954,128 @@ async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
 async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconcile: bool) {
     // Emergency rollback switch. Never run both pathways simultaneously.
     if n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
-    register_execution_signals(ctx, &res.new_warnings).await;
-    // 将新预警和新触发持久化到服务端的 notification_history 并广播
-    for w in &res.new_warnings {
-        let item = NewNotificationHistoryItem {
-            kind: "warning".to_string(),
-            title: Some(format!("{} 出现新形态预警", w.symbol)),
-            content: format!(
-                "{} {} 级形态 (评分: {:.1})",
-                w.direction, w.level, w.entry_score
-            ),
-            signal: Some(n_protocol::dto::NotificationSignal {
-                code: w.symbol.clone(),
-                name: w.symbol.clone(),
-                direction: w.direction.clone(),
-                level: w.level.clone(),
-                grade: w.grade.clone(),
-                score: w.entry_score,
-                entry: w.entry,
-                stop: w.stop,
-                target: w.target,
-                time: Some(w.warning_ts.clone()),
-            }),
-            entry_trigger: None,
-            single_bar: None,
-            manual_level: None,
-        };
-        if let Ok(saved) = n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
-        {
-            let seq = ctx.next_event_seq();
-            ctx.realtime_hub
-                .broadcast(
-                    seq,
-                    "notification.created",
-                    serde_json::to_value(&saved).unwrap_or_default(),
-                )
-                .await;
-        }
-    }
-
-    for t in &res.newly_triggered {
-        let item = NewNotificationHistoryItem {
-            kind: "trigger".to_string(),
-            title: Some(format!("{} 形态入场触发", t.symbol)),
-            content: format!("{} {} 级形态触达入场价: {}", t.direction, t.level, t.entry),
-            signal: Some(n_protocol::dto::NotificationSignal {
-                code: t.symbol.clone(),
-                name: t.symbol.clone(),
-                direction: t.direction.clone(),
-                level: t.level.clone(),
-                grade: t.grade.clone(),
-                score: t.entry_score,
-                entry: t.entry,
-                stop: t.stop,
-                target: t.target,
-                time: t.trigger_bar_ts.clone(),
-            }),
-            entry_trigger: None,
-            single_bar: None,
-            manual_level: None,
-        };
-        if let Ok(saved) = n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
-        {
-            let seq = ctx.next_event_seq();
-            ctx.realtime_hub
-                .broadcast(
-                    seq,
-                    "notification.created",
-                    serde_json::to_value(&saved).unwrap_or_default(),
-                )
-                .await;
-        }
-    }
-
-    // 邮件发送
-    let cfg = ctx.services.config().await;
-    let min_score = cfg.notify.new_pattern_min_score;
-    if cfg.email.enabled && cfg.email.sendable() {
-        let triggered_ids: std::collections::HashSet<i64> =
-            res.newly_triggered.iter().map(|e| e.id).collect();
-        let mut emails = Vec::new();
-        for e in res
-            .new_warnings
-            .iter()
-            .filter(|e| e.entry_score >= min_score && !triggered_ids.contains(&e.id))
-        {
-            emails.push((EventEmailKind::Warning, e));
-        }
-        for e in res
-            .newly_triggered
-            .iter()
-            .filter(|e| e.entry_score >= min_score)
-        {
-            emails.push((EventEmailKind::Trigger, e));
-        }
-        for (kind, e) in emails {
-            let win_rate = if kind == EventEmailKind::Trigger {
-                n_core::v2::prediction::champion_win_rate(&ctx.db, e.id)
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
+        register_execution_signals(ctx, &res.new_warnings).await;
+        // 将新预警和新触发持久化到服务端的 notification_history 并广播
+        for w in &res.new_warnings {
+            let item = NewNotificationHistoryItem {
+                kind: "warning".to_string(),
+                title: Some(format!("{} 出现新形态预警", w.symbol)),
+                content: format!(
+                    "{} {} 级形态 (评分: {:.1})",
+                    w.direction, w.level, w.entry_score
+                ),
+                signal: Some(n_protocol::dto::NotificationSignal {
+                    code: w.symbol.clone(),
+                    name: w.symbol.clone(),
+                    direction: w.direction.clone(),
+                    level: w.level.clone(),
+                    grade: w.grade.clone(),
+                    score: w.entry_score,
+                    entry: w.entry,
+                    stop: w.stop,
+                    target: w.target,
+                    time: Some(w.warning_ts.clone()),
+                }),
+                entry_trigger: None,
+                single_bar: None,
+                manual_level: None,
             };
-            let model = win_rate
-                .as_ref()
-                .map(|rate| (rate.model_id.as_str(), rate.p_win));
-            let (subject, body) = event_email_payload_with_model(kind, e, model);
-            let email_cfg = cfg.email.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
-            });
+            if let Ok(saved) =
+                n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
+            {
+                let seq = ctx.next_event_seq();
+                ctx.realtime_hub
+                    .broadcast(
+                        seq,
+                        "notification.created",
+                        serde_json::to_value(&saved).unwrap_or_default(),
+                    )
+                    .await;
+            }
         }
-        for sb in &res.single_bars {
-            let (subject, body) = single_bar_email_payload(sb);
-            let email_cfg = cfg.email.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
-            });
+
+        for t in &res.newly_triggered {
+            let item = NewNotificationHistoryItem {
+                kind: "trigger".to_string(),
+                title: Some(format!("{} 形态入场触发", t.symbol)),
+                content: format!("{} {} 级形态触达入场价: {}", t.direction, t.level, t.entry),
+                signal: Some(n_protocol::dto::NotificationSignal {
+                    code: t.symbol.clone(),
+                    name: t.symbol.clone(),
+                    direction: t.direction.clone(),
+                    level: t.level.clone(),
+                    grade: t.grade.clone(),
+                    score: t.entry_score,
+                    entry: t.entry,
+                    stop: t.stop,
+                    target: t.target,
+                    time: t.trigger_bar_ts.clone(),
+                }),
+                entry_trigger: None,
+                single_bar: None,
+                manual_level: None,
+            };
+            if let Ok(saved) =
+                n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
+            {
+                let seq = ctx.next_event_seq();
+                ctx.realtime_hub
+                    .broadcast(
+                        seq,
+                        "notification.created",
+                        serde_json::to_value(&saved).unwrap_or_default(),
+                    )
+                    .await;
+            }
         }
-    }
+
+        // 邮件发送
+        let cfg = ctx.services.config().await;
+        let min_score = cfg.notify.new_pattern_min_score;
+        if cfg.email.enabled && cfg.email.sendable() {
+            let triggered_ids: std::collections::HashSet<i64> =
+                res.newly_triggered.iter().map(|e| e.id).collect();
+            let mut emails = Vec::new();
+            for e in res
+                .new_warnings
+                .iter()
+                .filter(|e| e.entry_score >= min_score && !triggered_ids.contains(&e.id))
+            {
+                emails.push((EventEmailKind::Warning, e));
+            }
+            for e in res
+                .newly_triggered
+                .iter()
+                .filter(|e| e.entry_score >= min_score)
+            {
+                emails.push((EventEmailKind::Trigger, e));
+            }
+            for (kind, e) in emails {
+                let win_rate = if kind == EventEmailKind::Trigger {
+                    n_core::v2::prediction::champion_win_rate(&ctx.db, e.id)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let model = win_rate
+                    .as_ref()
+                    .map(|rate| (rate.model_id.as_str(), rate.p_win));
+                let (subject, body) = event_email_payload_with_model(kind, e, model);
+                let email_cfg = cfg.email.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+                });
+            }
+            for sb in &res.single_bars {
+                let (subject, body) = single_bar_email_payload(sb);
+                let email_cfg = cfg.email.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+                });
+            }
+        }
     } // Legacy publisher, disabled while R4a Outbox is active.
 
     // Single-bar notices are not pattern_events and remain on the old path.
@@ -1553,7 +1555,10 @@ fn spawn_tq_closed_scan_worker(
 ) {
     let worker = async move {
         while let Some(task) = rx.recv().await {
-            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+            if ctx
+                .is_shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 break;
             }
             let queued_ms = task.queued_at.elapsed().as_millis() as u64;
@@ -1562,7 +1567,11 @@ fn spawn_tq_closed_scan_worker(
             // Transient SQLite lock/refresh contention should not lose a scan.
             // After bounded retries, the existing scheduled scan is the fallback.
             for attempt in 0..3u64 {
-                match ctx.services.scan_tq_closed_15m_symbol(&task.symbol, &task.bar_end).await {
+                match ctx
+                    .services
+                    .scan_tq_closed_15m_symbol(&task.symbol, &task.bar_end)
+                    .await
+                {
                     Ok(result) => {
                         outcome = Some(result);
                         break;
@@ -1587,14 +1596,17 @@ fn spawn_tq_closed_scan_worker(
                     let publish_ms = publish_started.elapsed().as_millis() as u64;
                     // A symbol delta must never masquerade as the full snapshot
                     // carried by the existing scan.completed channel.
-                    ctx.realtime_hub.broadcast(
-                        ctx.next_event_seq(), "scan.symbol_completed",
-                        serde_json::json!({
-                            "symbol": &task.symbol,
-                            "bar_end": &task.bar_end,
-                            "result": &res,
-                        }),
-                    ).await;
+                    ctx.realtime_hub
+                        .broadcast(
+                            ctx.next_event_seq(),
+                            "scan.symbol_completed",
+                            serde_json::json!({
+                                "symbol": &task.symbol,
+                                "bar_end": &task.bar_end,
+                                "result": &res,
+                            }),
+                        )
+                        .await;
                     tracing::info!(
                         symbol = %task.symbol, bar_end = %task.bar_end,
                         event_id = task.event_id, queued_ms, scan_ms, publish_ms,

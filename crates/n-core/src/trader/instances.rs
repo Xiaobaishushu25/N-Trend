@@ -680,7 +680,10 @@ impl InstanceManager {
         let margin = s["account"]["curr_margin"].as_f64().unwrap_or(0.0);
         let fees = s["account"]["commission"].as_f64();
         self.db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT OR IGNORE INTO trader_equity(instance_id,timestamp,equity,margin,fees,quality,trading_day) VALUES(?,?,?,?,?,?,?)",[id.into(),now.into(),equity.into(),margin.into(),fees.into(),if fees.is_some(){"ok"}else{"fees_unconfirmed"}.into(),s["health"]["trading_day"].as_str().unwrap_or("").into()])).await?;
-        self.equity_sampled_minutes.write().await.insert(id.to_owned(), now);
+        self.equity_sampled_minutes
+            .write()
+            .await
+            .insert(id.to_owned(), now);
         Ok(())
     }
     pub async fn comparison(&self, from: i64, to: i64) -> Result<Value> {

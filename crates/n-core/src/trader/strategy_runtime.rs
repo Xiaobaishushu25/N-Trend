@@ -282,7 +282,7 @@ impl ExecutionEngine {
                 };
             }
             if c.frozen.is_none() {
-                c.frozen = Some(FrozenPlan {
+                c.frozen = Some(Arc::new(FrozenPlan {
                     definition: definition.clone(),
                     execution: cfg.clone(),
                     plan: EntryPlan {
@@ -307,7 +307,7 @@ impl ExecutionEngine {
                         reason: c.note.clone(),
                         evidence: serde_json::json!({"entry_score":c.score,"id":c.event_id,"warning_ts":c.warning_bar_ts}),
                     },
-                });
+                }));
             }
         }
         let ready = s
@@ -401,7 +401,10 @@ impl ExecutionEngine {
         if let Some(path) = &self.config_path {
             atomic_json(path, &cfg)?;
         }
-        self.save(&mut next)?;
+        if let Err(e) = self.save(&mut next) {
+            s.persistence_error = next.persistence_error;
+            return Err(e);
+        }
         *s = next;
         *current = cfg;
         Ok(())
@@ -423,15 +426,7 @@ impl ExecutionEngine {
         s.paused = paused;
         // Pause also prevents a working entry order from adding exposure.
         if paused {
-            let ids = s
-                .orders
-                .values()
-                .filter(|o| {
-                    o.reason.is_none()
-                        && !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                })
-                .map(|o| o.condition_id.clone())
-                .collect::<Vec<_>>();
+            let ids = s.active_entry_condition_ids();
             s.aborted_entries.extend(ids);
         }
         self.save(&mut s)
@@ -588,11 +583,11 @@ impl ExecutionEngine {
                 strategy_version: definition.revision.clone(),
                 signal_id: plan.signal_id.clone(),
             },
-            frozen: Some(FrozenPlan {
+            frozen: Some(Arc::new(FrozenPlan {
                 definition,
                 execution: cfg.clone(),
                 plan: plan.clone(),
-            }),
+            })),
             id: id.clone(),
             event_id: plan.evidence["id"].as_i64(),
             symbol: plan.symbol.clone(),
@@ -640,12 +635,7 @@ impl ExecutionEngine {
         let active = guard.definition.clone();
         let mut versions =
             HashMap::from([(active.revision.clone(), (active.clone(), cfg.clone()))]);
-        let unsettled_conditions = guard
-            .orders
-            .values()
-            .filter(|o| !matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected))
-            .map(|o| o.condition_id.clone())
-            .collect::<HashSet<_>>();
+        let unsettled_conditions = guard.unsettled_condition_ids();
         for c in guard.conditions.values().filter(|c| {
             matches!(
                 c.state,
@@ -656,7 +646,10 @@ impl ExecutionEngine {
                     | ConditionState::Working
                     | ConditionState::PartFilled
                     | ConditionState::Closing
-            ) || guard.positions.get(&c.id).is_some_and(|p| !p.is_closed)
+            ) || guard
+                .positions
+                .get(&c.id)
+                .is_some_and(|p| !p.is_closed || p.volume > 0)
                 || unsettled_conditions.contains(&c.id)
         }) {
             if let Some(f) = &c.frozen {
@@ -678,19 +671,24 @@ impl ExecutionEngine {
         {
             return Ok(());
         }
-        let mut s = guard.clone();
         if let StrategyEvent::Quote(q) = &event {
-            s.quotes.insert(q.instrument_id.to_uppercase(), q.clone());
+            guard
+                .quotes
+                .insert(q.instrument_id.to_uppercase(), q.clone());
         }
         let mut actions = vec![];
         let mut changed = false;
+        let mut state_updates = vec![];
+        let mut bar_updates = vec![];
+        let mut strategy_error = None;
         for (d, version_config, strategy) in handlers {
             let strategy = match strategy {
                 Ok(strategy) => strategy,
                 Err(e) => {
-                    s.paused = true;
-                    s.strategy_error = Some(e.to_string());
+                    guard.paused = true;
+                    guard.strategy_error = Some(e.to_string());
                     changed = true;
+                    strategy_error = Some(e.to_string());
                     tracing::error!("实例 {instance_id} 缺少策略实现: {e}");
                     continue;
                 }
@@ -706,32 +704,44 @@ impl ExecutionEngine {
             } = &event
             {
                 let key = format!("{}:{}:{}", d.revision, symbol, timeframe);
-                if s.strategy_bars.get(&key).is_some_and(|t| t >= timestamp) {
+                if guard
+                    .strategy_bars
+                    .get(&key)
+                    .is_some_and(|t| t >= timestamp)
+                {
                     continue;
                 }
                 Some((key, timestamp.clone()))
             } else {
                 None
             };
-            let positions = s
+            let positions = guard
                 .positions
                 .values()
                 .filter(|p| p.origin.strategy_version == d.revision)
                 .cloned()
                 .collect::<Vec<_>>();
-            let orders = s
-                .orders
-                .values()
-                .filter(|o| o.origin.strategy_version == d.revision)
-                .cloned()
-                .collect::<Vec<_>>();
-            let conditions = s
-                .conditions
-                .values()
-                .filter(|o| o.origin.strategy_version == d.revision)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut state = s
+            let orders = if matches!(event, StrategyEvent::Quote(_)) {
+                guard.unsettled_orders_for_revision(&d.revision)
+            } else {
+                guard
+                    .orders
+                    .values()
+                    .filter(|o| o.origin.strategy_version == d.revision)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let conditions = if matches!(event, StrategyEvent::Quote(_)) {
+                guard.active_conditions_for_revision(&d.revision, &unsettled_conditions)
+            } else {
+                guard
+                    .conditions
+                    .values()
+                    .filter(|o| o.origin.strategy_version == d.revision)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let mut state = guard
                 .strategy_states
                 .get(&d.revision)
                 .cloned()
@@ -741,10 +751,10 @@ impl ExecutionEngine {
                 positions: &positions,
                 orders: &orders,
                 conditions: &conditions,
-                account: s.account_snapshot.as_ref(),
-                quotes: &s.quotes,
+                account: guard.account_snapshot.as_ref(),
+                quotes: &guard.quotes,
                 config: version_config,
-                allow_entries: d.revision == active.revision && !s.paused,
+                allow_entries: d.revision == active.revision && !guard.paused,
             };
             let old_state = state.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -753,25 +763,40 @@ impl ExecutionEngine {
             .unwrap_or_else(|_| Err(anyhow::anyhow!("策略模块发生panic")));
             match result {
                 Ok(intents) => {
-                    changed |= state != old_state || !intents.is_empty() || bar_key.is_some();
-                    s.strategy_states.insert(d.revision.clone(), state);
+                    let state_changed = state != old_state;
+                    changed |= state_changed || !intents.is_empty() || bar_key.is_some();
+                    if state_changed {
+                        state_updates.push((d.revision.clone(), state));
+                    }
                     if let Some((key, ts)) = bar_key {
-                        s.strategy_bars.insert(key, ts);
+                        bar_updates.push((key, ts));
                     }
                     for intent in intents {
                         actions.push((d.clone(), version_config.clone(), intent));
                     }
                 }
                 Err(e) => {
-                    s.paused = true;
-                    s.strategy_error = Some(e.to_string());
+                    guard.paused = true;
+                    guard.strategy_error = Some(e.to_string());
                     changed = true;
+                    strategy_error = Some(e.to_string());
                     tracing::error!("策略实例 {instance_id} 已暂停新入场: {e}");
                 }
             }
         }
         if !changed {
             return Ok(());
+        }
+        let mut s = guard.clone();
+        if let Some(err) = strategy_error {
+            s.paused = true;
+            s.strategy_error = Some(err);
+        }
+        for (rev, state) in state_updates {
+            s.strategy_states.insert(rev, state);
+        }
+        for (key, ts) in bar_updates {
+            s.strategy_bars.insert(key, ts);
         }
         for (d, version_config, intent) in actions {
             let result = match intent {
@@ -788,7 +813,7 @@ impl ExecutionEngine {
             if let Err(e) = result {
                 guard.paused = true;
                 guard.strategy_error = Some(e.to_string());
-                self.save(&mut guard)?;
+                let _ = self.save(&mut guard);
                 return Err(e);
             }
         }

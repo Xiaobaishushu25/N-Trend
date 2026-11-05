@@ -1,13 +1,13 @@
 //! Repository layer over the SeaORM entities.
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::ConnectionTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Process-local fast invalidation complements durable SQLite revision triggers.
 // Reads of these atomics are lock-free and never touch SQLite on a quote tick.
@@ -1441,7 +1441,9 @@ pub async fn delete_fast_pattern_events(db: &DatabaseConnection) -> Result<u64> 
         .exec(db)
         .await
         .context("清理快速路径信号失败")?;
-    if res.rows_affected > 0 { r5a_mark_signals_dirty(); }
+    if res.rows_affected > 0 {
+        r5a_mark_signals_dirty();
+    }
     Ok(res.rows_affected)
 }
 
@@ -1455,7 +1457,9 @@ pub async fn delete_fast_pattern_events_by_symbol(
         .exec(db)
         .await
         .context("删除品种快速形态事件失败")?;
-    if result.rows_affected > 0 { r5a_mark_signals_dirty(); }
+    if result.rows_affected > 0 {
+        r5a_mark_signals_dirty();
+    }
     Ok(result.rows_affected)
 }
 

@@ -7,7 +7,10 @@ use chrono::{Local, NaiveDateTime};
 use n_core::notify::email::{event_email_payload_with_model, EventEmailKind};
 use n_core::storage::{entities::pattern_events, outbox, repo};
 use n_protocol::{dto::NotificationSignal, NewNotificationHistoryItem};
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const EXECUTION_MAX_AGE_SECS: i64 = 2 * 60 * 60;
 const EMAIL_MAX_AGE_SECS: i64 = 12 * 60 * 60;
@@ -28,9 +31,15 @@ fn notice(event: &pattern_events::Model, kind: &str) -> NewNotificationHistoryIt
             format!("{} 出现新形态预警", event.symbol)
         }),
         content: if is_trigger {
-            format!("{} {} 级形态触达入场价: {}", event.direction, event.level, event.entry)
+            format!(
+                "{} {} 级形态触达入场价: {}",
+                event.direction, event.level, event.entry
+            )
         } else {
-            format!("{} {} 级形态 (评分: {:.1})", event.direction, event.level, event.entry_score)
+            format!(
+                "{} {} 级形态 (评分: {:.1})",
+                event.direction, event.level, event.entry_score
+            )
         },
         signal: Some(NotificationSignal {
             code: event.symbol.clone(),
@@ -42,7 +51,11 @@ fn notice(event: &pattern_events::Model, kind: &str) -> NewNotificationHistoryIt
             entry: event.entry,
             stop: event.stop,
             target: event.target,
-            time: if is_trigger { event.trigger_bar_ts.clone() } else { Some(event.warning_ts.clone()) },
+            time: if is_trigger {
+                event.trigger_bar_ts.clone()
+            } else {
+                Some(event.warning_ts.clone())
+            },
         }),
         entry_trigger: None,
         single_bar: None,
@@ -50,28 +63,46 @@ fn notice(event: &pattern_events::Model, kind: &str) -> NewNotificationHistoryIt
     }
 }
 
-enum DeliveryResult { Done, Skipped }
+enum DeliveryResult {
+    Done,
+    Skipped,
+}
 
-async fn deliver_registration(ctx: &Arc<ServerContext>, e: &pattern_events::Model) -> Result<DeliveryResult> {
+async fn deliver_registration(
+    ctx: &Arc<ServerContext>,
+    e: &pattern_events::Model,
+) -> Result<DeliveryResult> {
     if e.entry_score < 2.5 || !matches!(e.direction.as_str(), "up" | "down") {
         return Ok(DeliveryResult::Skipped);
     }
-    let Some(age) = age_seconds(e) else { return Ok(DeliveryResult::Skipped); };
+    let Some(age) = age_seconds(e) else {
+        return Ok(DeliveryResult::Skipped);
+    };
     if age < -60 || age > EXECUTION_MAX_AGE_SECS || e.state != "pending" {
         // NEVER place a stale order after a prolonged network/server outage.
         return Ok(DeliveryResult::Skipped);
     }
-    let not_before = repo::get_setting(&ctx.db, "execution_signal_not_before").await?
-        .unwrap_or_else(|| "0".into()).parse::<i64>()
+    let not_before = repo::get_setting(&ctx.db, "execution_signal_not_before")
+        .await?
+        .unwrap_or_else(|| "0".into())
+        .parse::<i64>()
         .context("执行预警时间界限无效")?;
     let warning_epoch = NaiveDateTime::parse_from_str(&e.warning_ts, "%Y-%m-%d %H:%M:%S")?
-        .and_local_timezone(Local).single()
-        .ok_or_else(|| anyhow!("预警时间本地时区歧义"))?.timestamp();
-    if warning_epoch < not_before { return Ok(DeliveryResult::Skipped); }
+        .and_local_timezone(Local)
+        .single()
+        .ok_or_else(|| anyhow!("预警时间本地时区歧义"))?
+        .timestamp();
+    if warning_epoch < not_before {
+        return Ok(DeliveryResult::Skipped);
+    }
 
-    let enabled = repo::list_symbols(&ctx.db, true).await?
-        .iter().any(|s| s.code == e.symbol);
-    if !enabled { return Ok(DeliveryResult::Skipped); }
+    let enabled = repo::list_symbols(&ctx.db, true)
+        .await?
+        .iter()
+        .any(|s| s.code == e.symbol);
+    if !enabled {
+        return Ok(DeliveryResult::Skipped);
+    }
     // Existing engine conditions are the authoritative idempotency key. The
     // registration function and the fallback ticker share a single mutex.
     register_execution_signals(ctx, std::slice::from_ref(e)).await;
@@ -79,8 +110,11 @@ async fn deliver_registration(ctx: &Arc<ServerContext>, e: &pattern_events::Mode
         let engine = &ctx.execution_engine;
         let strategy_id = engine.definition().await.strategy_id;
         let registered = registered_event_ids(engine.list_conditions().await, &strategy_id);
-        return if registered.contains(&e.id) { Ok(DeliveryResult::Done) }
-               else { Err(anyhow!("默认交易实例尚未完成条件注册")) };
+        return if registered.contains(&e.id) {
+            Ok(DeliveryResult::Done)
+        } else {
+            Err(anyhow!("默认交易实例尚未完成条件注册"))
+        };
     };
     let mut missing = Vec::new();
     for runtime in manager.all().await {
@@ -88,7 +122,9 @@ async fn deliver_registration(ctx: &Arc<ServerContext>, e: &pattern_events::Mode
             continue;
         }
         let strategy_id = runtime.engine.definition().await.strategy_id;
-        if strategy_id != n_core::trader::strategy::N_STRATEGY { continue; }
+        if strategy_id != n_core::trader::strategy::N_STRATEGY {
+            continue;
+        }
         if runtime.engine.paused().await {
             missing.push(runtime.definition.id.clone());
             continue;
@@ -98,8 +134,11 @@ async fn deliver_registration(ctx: &Arc<ServerContext>, e: &pattern_events::Mode
             missing.push(runtime.definition.id.clone());
         }
     }
-    if missing.is_empty() { Ok(DeliveryResult::Done) }
-    else { Err(anyhow!("交易条件尚未在全部适用实例持久化: {missing:?}")) }
+    if missing.is_empty() {
+        Ok(DeliveryResult::Done)
+    } else {
+        Err(anyhow!("交易条件尚未在全部适用实例持久化: {missing:?}"))
+    }
 }
 
 async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<DeliveryResult> {
@@ -110,12 +149,17 @@ async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<De
     // A pattern_events INSERT commits before freeze_event and before the R3
     // scan cursor. Never deliver a newly inserted warning from a half-finished
     // scan: the durable cursor is the commit barrier for the entire scan.
-    if matches!(task.action.as_str(),
-        outbox::NOTICE_WARNING | outbox::EMAIL_WARNING | outbox::REGISTER_WARNING)
-    {
-        let key = format!("r3_scan_cursor_v1:{}:{}",
-            n_core::v2::version::EVENT_LOGIC_VERSION, e.symbol);
-        let finished = repo::get_setting(&ctx.db, &key).await?
+    if matches!(
+        task.action.as_str(),
+        outbox::NOTICE_WARNING | outbox::EMAIL_WARNING | outbox::REGISTER_WARNING
+    ) {
+        let key = format!(
+            "r3_scan_cursor_v1:{}:{}",
+            n_core::v2::version::EVENT_LOGIC_VERSION,
+            e.symbol
+        );
+        let finished = repo::get_setting(&ctx.db, &key)
+            .await?
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
             .and_then(|v| v["last_bar_end"].as_str().map(str::to_owned))
             .is_some_and(|last| last >= e.warning_ts);
@@ -128,16 +172,28 @@ async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<De
     }
     match task.action.as_str() {
         outbox::NOTICE_WARNING | outbox::NOTICE_TRIGGER => {
-            let kind = if task.action == outbox::NOTICE_WARNING { "warning" } else { "trigger" };
+            let kind = if task.action == outbox::NOTICE_WARNING {
+                "warning"
+            } else {
+                "trigger"
+            };
             if let Some(saved) = outbox::persist_notice(&ctx.db, task, &notice(&e, kind)).await? {
-                ctx.realtime_hub.broadcast(ctx.next_event_seq(), "notification.created",
-                    serde_json::to_value(saved).unwrap_or_default()).await;
+                ctx.realtime_hub
+                    .broadcast(
+                        ctx.next_event_seq(),
+                        "notification.created",
+                        serde_json::to_value(saved).unwrap_or_default(),
+                    )
+                    .await;
             }
             Ok(DeliveryResult::Done)
         }
         outbox::EMAIL_WARNING | outbox::EMAIL_TRIGGER => {
             let cfg = ctx.services.config().await;
-            if !cfg.email.enabled || !cfg.email.sendable() || e.entry_score < cfg.notify.new_pattern_min_score {
+            if !cfg.email.enabled
+                || !cfg.email.sendable()
+                || e.entry_score < cfg.notify.new_pattern_min_score
+            {
                 return Ok(DeliveryResult::Skipped);
             }
             if age_seconds(&e).is_none_or(|age| age < -60 || age > EMAIL_MAX_AGE_SECS) {
@@ -148,17 +204,29 @@ async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<De
                 // trigger email (same policy as the previous scan publisher).
                 return Ok(DeliveryResult::Skipped);
             }
-            let kind = if task.action == outbox::EMAIL_WARNING { EventEmailKind::Warning }
-                       else { EventEmailKind::Trigger };
+            let kind = if task.action == outbox::EMAIL_WARNING {
+                EventEmailKind::Warning
+            } else {
+                EventEmailKind::Trigger
+            };
             let win_rate = if kind == EventEmailKind::Trigger {
-                n_core::v2::prediction::champion_win_rate(&ctx.db, e.id).await.ok().flatten()
-            } else { None };
-            let model = win_rate.as_ref().map(|rate| (rate.model_id.as_str(), rate.p_win));
+                n_core::v2::prediction::champion_win_rate(&ctx.db, e.id)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let model = win_rate
+                .as_ref()
+                .map(|rate| (rate.model_id.as_str(), rate.p_win));
             let (subject, body) = event_email_payload_with_model(kind, &e, model);
             let email_cfg = cfg.email.clone();
             tokio::task::spawn_blocking(move || {
                 n_core::notify::email::send_summary(&subject, &body, &email_cfg)
-            }).await.context("SMTP 工作线程失败")??;
+            })
+            .await
+            .context("SMTP 工作线程失败")??;
             Ok(DeliveryResult::Done)
         }
         outbox::REGISTER_WARNING => deliver_registration(ctx, &e).await,
@@ -171,48 +239,55 @@ pub(super) fn spawn(ctx: Arc<ServerContext>) {
     for emails in [false, true] {
         let ctx = ctx.clone();
         tokio::spawn(async move {
-        loop {
-            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) { break; }
-            let task = match outbox::claim_next(&ctx.db, emails).await {
-                Ok(Some(task)) => task,
-                Ok(None) => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
+            loop {
+                if ctx
+                    .is_shutting_down
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    break;
                 }
-                Err(error) => {
-                    tracing::error!("[R4A_OUTBOX] 领取任务失败: {error:#}");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-            let started = Instant::now();
-            let result = deliver(&ctx, &task).await;
-            match result {
-                Ok(DeliveryResult::Done) => {
-                    // persist_notice already ACKed within its own transaction.
-                    if let Err(error) = outbox::complete(&ctx.db, &task, "done").await {
-                        tracing::error!(event_id=task.event_id, action=%task.action,
+                let task = match outbox::claim_next(&ctx.db, emails).await {
+                    Ok(Some(task)) => task,
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!("[R4A_OUTBOX] 领取任务失败: {error:#}");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                let started = Instant::now();
+                let result = deliver(&ctx, &task).await;
+                match result {
+                    Ok(DeliveryResult::Done) => {
+                        // persist_notice already ACKed within its own transaction.
+                        if let Err(error) = outbox::complete(&ctx.db, &task, "done").await {
+                            tracing::error!(event_id=task.event_id, action=%task.action,
                             "[R4A_OUTBOX] 完成标记失败: {error:#}");
-                    } else {
-                        tracing::info!(event_id=task.event_id,action=%task.action,
+                        } else {
+                            tracing::info!(event_id=task.event_id,action=%task.action,
                             attempts=task.attempts, delivery_ms=started.elapsed().as_millis(),
                             "[R4A_OUTBOX] 投递完成");
+                        }
                     }
-                }
-                Ok(DeliveryResult::Skipped) => {
-                    if let Err(error) = outbox::complete(&ctx.db, &task, "skipped").await {
-                        tracing::error!("[R4A_OUTBOX] 跳过标记失败: {error:#}");
+                    Ok(DeliveryResult::Skipped) => {
+                        if let Err(error) = outbox::complete(&ctx.db, &task, "skipped").await {
+                            tracing::error!("[R4A_OUTBOX] 跳过标记失败: {error:#}");
+                        }
                     }
-                }
-                Err(error) => {
-                    tracing::warn!(event_id=task.event_id,action=%task.action,attempts=task.attempts,
+                    Err(error) => {
+                        tracing::warn!(event_id=task.event_id,action=%task.action,attempts=task.attempts,
                         "[R4A_OUTBOX] 投递失败，排队重试: {error:#}");
-                    if let Err(mark_error) = outbox::retry(&ctx.db, &task, &format!("{error:#}")).await {
-                        tracing::error!("[R4A_OUTBOX] 退避状态写入失败: {mark_error:#}");
+                        if let Err(mark_error) =
+                            outbox::retry(&ctx.db, &task, &format!("{error:#}")).await
+                        {
+                            tracing::error!("[R4A_OUTBOX] 退避状态写入失败: {mark_error:#}");
+                        }
                     }
                 }
             }
-        }
         });
     }
 }
