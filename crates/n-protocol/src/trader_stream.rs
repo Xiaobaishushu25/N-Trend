@@ -16,8 +16,7 @@ pub struct TraderPublisher {
     latest: Value,
 }
 
-fn semantic_field(key: &str, value: &Value) -> Value {
-    let mut value = value.clone();
+fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
     let ignored: &[&str] = match key {
         "health" => &[
             "uptime",
@@ -29,12 +28,25 @@ fn semantic_field(key: &str, value: &Value) -> Value {
         "account" => &["updated_at"],
         _ => &[],
     };
-    if let Some(object) = value.as_object_mut() {
-        for key in ignored {
-            object.remove(*key);
-        }
+    if ignored.is_empty() {
+        return left == right;
     }
-    value
+    match (left.as_object(), right.as_object()) {
+        (Some(left), Some(right)) => {
+            left.iter()
+                .filter(|(key, _)| !ignored.contains(&key.as_str()))
+                .all(|(key, value)| right.get(key) == Some(value))
+                && left
+                    .keys()
+                    .filter(|key| !ignored.contains(&key.as_str()))
+                    .count()
+                    == right
+                        .keys()
+                        .filter(|key| !ignored.contains(&key.as_str()))
+                        .count()
+        }
+        _ => left == right,
+    }
 }
 
 impl TraderPublisher {
@@ -62,10 +74,9 @@ impl TraderPublisher {
         let previous = self.latest.as_object();
         let mut changes = Map::new();
         for (key, value) in object.iter() {
-            if previous
+            if !previous
                 .and_then(|p| p.get(key))
-                .map(|old| semantic_field(key, old))
-                != Some(semantic_field(key, value))
+                .is_some_and(|old| semantic_field_eq(key, old, value))
             {
                 changes.insert(key.clone(), value.clone());
             }
@@ -186,6 +197,58 @@ mod tests {
             "account":{"balance":1000,"updated_at":1}, "broker_positions":[{"position":2}],
             "conditions":[{"state":"Working"}], "execution_error":null,
             "execution_orders":vec![json!({"note":"old rejection"});4031], "revision":1})
+    }
+
+    #[test]
+    fn borrowed_comparison_preserves_exact_legacy_semantics() {
+        fn legacy(key: &str, value: &Value) -> Value {
+            let mut value = value.clone();
+            let ignored: &[&str] = match key {
+                "health" => &[
+                    "uptime",
+                    "account_updated_at",
+                    "positions_updated_at",
+                    "orders_updated_at",
+                    "trades_updated_at",
+                ],
+                "account" => &["updated_at"],
+                _ => &[],
+            };
+            if let Some(object) = value.as_object_mut() {
+                for key in ignored {
+                    object.remove(*key);
+                }
+            }
+            value
+        }
+        let values = [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!({"updated_at":1}),
+            json!({"updated_at":2}),
+            json!({"uptime":1,"ready":true}),
+            json!({"ready":true}),
+            json!({"ready":false}),
+            json!({"positions_updated_at":2,"ready":true}),
+            json!({"nested":{"updated_at":1}}),
+            json!({"nested":{"updated_at":2}}),
+            json!([{"updated_at":1}]),
+            json!([{"updated_at":2}]),
+        ];
+        for key in ["health", "account", "conditions", "unknown"] {
+            for left in &values {
+                for right in &values {
+                    assert_eq!(
+                        semantic_field_eq(key, left, right),
+                        legacy(key, left) == legacy(key, right),
+                        "{key}: {left} / {right}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

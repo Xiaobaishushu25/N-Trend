@@ -33,6 +33,9 @@ import { SINGLE_BAR_COLORS } from '../utils/singleBar'
 import { computePriceGaps, gapBoundaryCoordinate, type PriceGapSegment } from '../utils/priceGaps'
 import { useSettingsStore } from '../stores/settings'
 import { reportPerformance } from '../utils/performanceLog'
+import { detectResearchBoxes, researchBoxTimeframes, researchChartTime, type ResearchBoxPeriod } from '../utils/researchBoxes'
+import { researchBoxOverlay } from '../utils/researchBoxOverlay'
+import { zoneReplayOverlay, type ZoneReplayOverlay } from '../utils/zoneReplay'
 
 const props = defineProps<{
   symbol: string
@@ -52,6 +55,10 @@ const props = defineProps<{
   /** 当前周期 MA20 长期趋势线数据点 */
   trendPoints?: TrendPointDto[]
   manualLevels?: ManualLevelDto[]
+  /** Closed bars only: keep the live, unfinished candle out of research recognition. */
+  researchRows?: KlineRow[]
+  zoneReplay?: ZoneReplayOverlay | null
+  researchCanSwitchTimeframe?: boolean
   isMobile?: boolean
   isFullscreen?: boolean
 }>()
@@ -63,12 +70,29 @@ const emit = defineEmits<{
   (e: 'manual-level-draw-mode', active: boolean): void
   (e: 'toggle-fullscreen'): void
   (e: 'crosshair-candle', candle: { time: string; open: number; high: number; low: number; close: number } | null): void
+  (e: 'request-research-5m'): void
 }>()
 
 const container = ref<HTMLDivElement | null>(null)
 const legend = ref<HTMLDivElement | null>(null)
 const timeLeft = ref<HTMLDivElement | null>(null)
 const trendVisible = ref(true)
+const researchPeriod = ref<ResearchBoxPeriod | 0>(48)
+const researchTimeframe = computed(() => researchBoxTimeframes.find(tf => tf === props.timeframe))
+const researchClosedRows = computed(() => (props.researchRows ?? props.rows).filter(row =>
+  row.symbol === props.symbol && row.timeframe === props.timeframe &&
+  (researchChartTime(row.ts) - 8 * 3600) * 1000 <= Date.now(),
+))
+const researchBoxes = computed(() => researchTimeframe.value && researchPeriod.value
+  ? detectResearchBoxes(researchClosedRows.value, researchPeriod.value, props.symbol, researchTimeframe.value) : [])
+const researchStatus = computed(() => {
+  if (!researchPeriod.value) return '临时标记已关闭'
+  if (!researchTimeframe.value) return '切到5、15或30分钟图查看箱体'
+  const latest = researchBoxes.value[researchBoxes.value.length - 1]
+  if (!latest) return `已加载${researchClosedRows.value.length}根收盘K线，暂无符合条件的箱体`
+  const label = { active: '仍有效', breakout: '已突破', expired: '已到期', gap: '数据断点终止', rollover: '换月终止' }[latest.endReason]
+  return `${props.timeframe} · 共${researchBoxes.value.length}个 · 最近${label} · 确认后${latest.endIndex - latest.confirmedIndex}根 · 上轨${latest.upper} / 下轨${latest.lower}`
+})
 const settingsStore = useSettingsStore()
 const minBarSpacing = computed(() => {
   const ui = settingsStore.settings?.ui as any
@@ -801,6 +825,7 @@ let gapPrimitive: GapPrimitive | null = null
 let rolloverPrimitive: RolloverPrimitive | null = null
 let eventLabelPrimitive: EventLabelPrimitive | null = null
 let manualLevelPrimitive: ManualLevelPrimitive | null = null
+let researchPrimitive: ISeriesPrimitive<Time> | null = null
 const drawMode = ref(false)
 const drawing = ref<{ x: number; y: number; x2: number; y2: number } | null>(null)
 const selectedManualLevelId = ref<number | null>(null)
@@ -1311,14 +1336,13 @@ function syncPatternLines() {
 /** 重建当前周期 MA20 长期趋势线（独立 series，不混入 N 形态连线） */
 function syncTrendSeries() {
   if (!chart) return
-  if (trendSeries) {
-    chart.removeSeries(trendSeries)
-    trendSeries = null
+  if (!trendVisible.value) {
+    trendSeries?.applyOptions({ visible: false })
+    return
   }
-  if (!trendVisible.value) return
   const data = buildTrendData()
-  if (!data.length) return
-  trendSeries = chart.addSeries(LineSeries, {
+  if (!trendSeries && !data.length) return
+  if (!trendSeries) trendSeries = chart.addSeries(LineSeries, {
     color: 'rgba(37, 99, 235, 0.85)',
     lineWidth: 1,
     lineStyle: LineStyle.Solid,
@@ -1326,6 +1350,7 @@ function syncTrendSeries() {
     priceLineVisible: false,
     crosshairMarkerVisible: false,
   })
+  trendSeries.applyOptions({ visible: true })
   trendSeries.setData(data)
 }
 
@@ -1691,6 +1716,17 @@ function nearestRowIndex(ts: string): number {
 function centerFocusView(index: number) {
   if (!chart || props.rows.length === 0) return
   const ts = chart.timeScale()
+  const replay = props.zoneReplay
+  if (replay) {
+    const first = nearestRowIndex(replay.viewStart ?? (props.timeframe === '5m' && (replay.trade || replay.viewEnd)
+      ? replay.trade?.entry ?? replay.visit : replay.formed))
+    const last = nearestRowIndex(replay.viewEnd ?? replay.trade?.exit ?? replay.reaction?.ts ?? replay.visit)
+    if (first >= 0 && last >= first) {
+      const padding = Math.max(6, Math.ceil((last - first) * .12))
+      ts.setVisibleLogicalRange({ from: Math.max(-.5, first - padding), to: last + padding })
+      return
+    }
+  }
   const logical = ts.getVisibleLogicalRange()
   const total = props.rows.length
   const span = Math.max(1, Math.min(logical ? Number(logical.to - logical.from) : displayKNum.value, total))
@@ -2327,6 +2363,31 @@ function renderOverlays() {
   syncEventLabels()
   syncManualLevels()
   refreshManualLevelOverlay()
+  syncResearchBoxes()
+}
+
+function syncResearchBoxes() {
+  if (!chart || !candleSeries) return
+  if (researchPrimitive) candleSeries.detachPrimitive(researchPrimitive)
+  researchPrimitive = null
+  if (props.zoneReplay) {
+    researchPrimitive = zoneReplayOverlay(chart, candleSeries, props.zoneReplay)
+  } else {
+    if (!researchBoxes.value.length) return
+    researchPrimitive = researchBoxOverlay(chart, candleSeries, researchClosedRows.value, researchBoxes.value)
+  }
+  candleSeries.attachPrimitive(researchPrimitive)
+}
+
+function focusLatestResearchBox() {
+  const box = researchBoxes.value[researchBoxes.value.length - 1]
+  if (!box || !chart) return
+  const first = researchClosedRows.value[box.startIndex]?.ts
+  const last = researchClosedRows.value[box.endIndex]?.ts
+  const firstIndex = props.rows.findIndex(row => row.ts === first)
+  const lastIndex = props.rows.findIndex(row => row.ts === last)
+  if (firstIndex < 0 || lastIndex < 0) return
+  chart.timeScale().setVisibleLogicalRange({ from: firstIndex - 6, to: lastIndex + 12 })
 }
 
 function handlePointerEnter() {
@@ -3081,10 +3142,18 @@ onMounted(() => {
 
 watch(
   () => props.rows,
-  () => {
+  (rows, previousRows) => {
     if (chart) {
       renderData()
-      renderOverlays()
+      markersApi?.setMarkers(buildMarkers())
+      syncExtremes()
+      syncEventLabels()
+      // Prices/volume in the live tail do not change signal geometry, manual
+      // levels or MA timestamps. Their own watchers handle actual changes.
+      if (rows.length !== previousRows.length || rows[0]?.ts !== previousRows[0]?.ts
+        || rows[rows.length - 1]?.ts !== previousRows[previousRows.length - 1]?.ts) {
+        syncTrendSeries()
+      }
     }
   },
   { deep: true },
@@ -3120,6 +3189,7 @@ watch(trendVisible, () => {
   syncTrendSeries()
   renderFocusLegend()
 })
+watch([researchPeriod, researchBoxes, () => props.zoneReplay], () => syncResearchBoxes())
 watch(
   () => props.reviewExit,
   () => {
@@ -3144,6 +3214,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  if (researchPrimitive && candleSeries) candleSeries.detachPrimitive(researchPrimitive)
+  researchPrimitive = null
   window.removeEventListener('keydown', handleManualLevelKeydown)
   removeLevelDragListeners()
   levelDrag.value = null
@@ -3313,6 +3385,19 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
     ></div>
     <!-- 临时调试面板（已注释，见文件顶部说明；取消注释可复测“巨大K线”问题） -->
     <n-spin v-if="loading" class="spin-mask" />
+    <div v-if="!zoneReplay" class="research-box-panel" @pointerdown.stop @wheel.stop>
+      <div class="research-box-controls">
+        <span>研究箱体 · 临时</span>
+        <button v-for="n in ([24, 48, 96] as const)" :key="n" type="button"
+          :class="{ active: researchPeriod === n }" @click="researchPeriod = n">{{ n }}根</button>
+        <button v-if="!researchTimeframe && researchCanSwitchTimeframe" type="button" @click="emit('request-research-5m')">切至5分钟</button>
+        <button v-if="researchTimeframe" type="button" :disabled="!researchBoxes.length" @click="focusLatestResearchBox">定位最近</button>
+        <button type="button" :class="{ active: !researchPeriod }" @click="researchPeriod = 0">关闭</button>
+      </div>
+      <div>{{ researchStatus }}</div>
+      <div v-if="researchPeriod && researchTimeframe" class="research-box-hint">紫色上轨 / 蓝色下轨 · 圆点为交替触轨 · 虚线为形成回看段，确认后实线</div>
+      <div v-if="researchPeriod && researchTimeframe" class="research-box-hint">当前周期收盘K线识别预览 · 原回测使用5分钟</div>
+    </div>
     <button
       class="trend-toggle"
       :class="{ active: trendVisible }"
@@ -3347,6 +3432,27 @@ defineExpose({ stepCandles, toggleManualLevelDraw, trendVisible, toggleTrendVisi
 </template>
 
 <style scoped>
+.research-box-panel {
+  position: absolute;
+  bottom: 36px;
+  left: 12px;
+  z-index: 6;
+  max-width: calc(100% - 28px);
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .92);
+  color: #475569;
+  font-size: 11px;
+  line-height: 1.6;
+  pointer-events: auto;
+}
+.research-box-controls { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+.research-box-controls > span { font-weight: 600; }
+.research-box-controls button { border: 1px solid #cbd5e1; border-radius: 3px; background: white; color: #475569; padding: 1px 6px; cursor: pointer; font-size: 11px; }
+.research-box-controls button.active { color: #6d28d9; border-color: #a78bfa; background: #f5f3ff; }
+.research-box-controls button:disabled { opacity: .5; cursor: default; }
+.research-box-hint { color: #64748b; font-size: 10px; }
 .kline-wrap {
   position: relative;
   width: 100%;

@@ -357,6 +357,51 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(result["success"], true);
         let id = result["data"]["instance_id"].as_str().unwrap();
+        // Exercise the real authenticated route: large instance snapshots used
+        // to ignore Accept-Encoding even though the legacy endpoint compressed.
+        let runtime = ctx.instances.get().unwrap().get(id).await.unwrap();
+        let fixture = json!({"instance_id":id,"health":{"ready":true},
+            "conditions":vec![json!({"id":"condition","frozen":{
+                "evidence":"immutable strategy evidence", "prices":[100,101,102]
+            }});2000]});
+        *runtime.published.write().await = fixture.clone();
+        for encoding in ["identity", "gzip"] {
+            let request = Request::builder()
+                .uri(format!("/api/v2/trader/instances/{id}/snapshot"))
+                .header(
+                    n_protocol::version::RELEASE_HEADER,
+                    n_protocol::CURRENT_SERVER_VERSION,
+                )
+                .header(n_protocol::version::API_HEADER, n_protocol::API_VERSION)
+                .header("authorization", "Bearer read-test")
+                .header("accept-encoding", encoding)
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let compressed = response
+                .headers()
+                .get("content-encoding")
+                .is_some_and(|v| v == "gzip");
+            assert_eq!(compressed, encoding == "gzip");
+            let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            let bytes = if compressed {
+                use std::io::Read;
+                let mut decoded = Vec::new();
+                flate2::read::GzDecoder::new(bytes.as_ref())
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+                assert!(bytes.len() * 10 < decoded.len());
+                decoded
+            } else {
+                bytes.to_vec()
+            };
+            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded["data"], fixture);
+        }
+        *runtime.published.write().await = Value::Null;
         let (_, snapshot) = call(
             &router,
             "GET",

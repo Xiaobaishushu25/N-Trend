@@ -351,15 +351,35 @@ pub async fn klines(
 }
 
 pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<klines::Model>> {
-    let rows = klines::Entity::find()
+    raw_klines_tail(db, symbol, None).await
+}
+
+/// Read only the requested raw history, preserving the raw-source filter.
+pub async fn raw_klines_tail(
+    db: &DatabaseConnection,
+    symbol: &str,
+    limit: Option<usize>,
+) -> Result<Vec<klines::Model>> {
+    let query = klines::Entity::find()
         .filter(klines::Column::Symbol.eq(symbol))
         .filter(klines::Column::Timeframe.eq("5m"))
-        .filter(klines::Column::Source.eq("raw"))
-        .order_by_asc(klines::Column::Ts)
-        .all(db)
-        .await
-        .context("查询原始K线失败")?;
-    Ok(rows)
+        .filter(klines::Column::Source.eq("raw"));
+    if let Some(limit) = limit {
+        let mut rows = query
+            .order_by_desc(klines::Column::Ts)
+            .limit(limit as u64)
+            .all(db)
+            .await
+            .context("查询原始K线失败")?;
+        rows.reverse();
+        Ok(rows)
+    } else {
+        query
+            .order_by_asc(klines::Column::Ts)
+            .all(db)
+            .await
+            .context("查询原始K线失败")
+    }
 }
 
 /// Count raw 5m rows without materializing the full price history.

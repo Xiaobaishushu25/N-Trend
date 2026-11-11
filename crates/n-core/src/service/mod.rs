@@ -3665,10 +3665,21 @@ impl Services {
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
+        self.bars_for_tail(symbol, timeframe, None).await
+    }
+
+    async fn bars_for_tail(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Bar>> {
+        // Preserve the existing insufficient-derived-history fallback decision.
+        let limit = limit.map(|n| n.max(ATR_PERIOD + 2));
         let cutoff = repo::latest_raw_ts(&self.db, symbol)
             .await?
             .unwrap_or_default();
-        let rows = repo::klines(&self.db, symbol, timeframe, None, Some(&cutoff)).await?;
+        let rows = repo::klines(&self.db, symbol, timeframe, limit, Some(&cutoff)).await?;
         let mut bars: Vec<Bar> = rows
             .iter()
             .filter(|r| r.ts.as_str() <= cutoff.as_str())
@@ -3680,7 +3691,7 @@ impl Services {
             return Ok(bars);
         }
         let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
-        let raw = repo::raw_klines(&self.db, symbol).await?;
+        let raw = repo::raw_klines_tail(&self.db, symbol, aggregation_raw_limit(tf, limit)).await?;
         let fetch_bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let fallback: Vec<Bar> = aggregate(&fetch_bars, tf)
             .iter()
@@ -3743,7 +3754,10 @@ impl Services {
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
         }
-        let raw = repo::raw_klines(&self.db, symbol).await?;
+        // Two spare buckets cover a truncated leading bucket and the unfinished
+        // trailing bucket. Even a full trading day contains at most 288 5m bars.
+        let raw_limit = aggregation_raw_limit(tf, limit);
+        let raw = repo::raw_klines_tail(&self.db, symbol, raw_limit).await?;
         let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let derived = aggregate(&bars, tf);
         let mut bars: Vec<Bar> = derived
@@ -4206,7 +4220,15 @@ impl Services {
         timeframe: &str,
         limit: Option<usize>,
     ) -> Result<Vec<TrendPointDto>> {
-        let bars = self.bars_for(symbol, timeframe).await?;
+        // MA direction also needs the preceding MA. Fetch its warmup together
+        // with the visible tail instead of reading and calculating all history.
+        let bars = self
+            .bars_for_tail(
+                symbol,
+                timeframe,
+                limit.map(|n| n.saturating_add(ATR_PERIOD)),
+            )
+            .await?;
         let ma = crate::analyze::indicators::ma_series(&bars, ATR_PERIOD);
         let mut out = Vec::with_capacity(bars.len());
         for i in 0..bars.len() {
@@ -5225,6 +5247,13 @@ impl Services {
     }
 }
 
+fn aggregation_raw_limit(tf: Timeframe, limit: Option<usize>) -> Option<usize> {
+    limit.map(|n| {
+        n.saturating_add(2)
+            .saturating_mul(tf.minutes().map_or(288, |minutes| (minutes / 5) as usize))
+    })
+}
+
 fn build_scan_summary(
     started: &str,
     finished: &str,
@@ -5638,6 +5667,80 @@ fn parse_dt(s: &str) -> Option<DT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chart_tail_and_ma_match_full_history_across_session_boundaries() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db,
+            config,
+            std::env::temp_dir().join("chart-tail-test.json"),
+        )
+        .await
+        .unwrap();
+        services.seed_symbols("RB0").await.unwrap();
+        let mut raw = Vec::new();
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
+        for day in 0..40 {
+            let date = first + chrono::Days::new(day);
+            // Day/night sessions, breaks, a partial latest bucket and enough
+            // history that even the daily query cuts through its first bucket.
+            for (start, count) in [
+                (9 * 60 + 5, 15),
+                (10 * 60 + 35, 12),
+                (13 * 60 + 35, 18),
+                (21 * 60 + 5, 23),
+            ] {
+                for i in 0..count {
+                    let dt = date.and_hms_opt(0, 0, 0).unwrap()
+                        + chrono::Duration::minutes(start + i * 5);
+                    raw.push(source_test_bar(
+                        &dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        100.0 + (raw.len() % 73) as f64,
+                    ));
+                }
+            }
+        }
+        services
+            .pipeline
+            .process_raw_batch("RB0", &raw)
+            .await
+            .unwrap();
+        for tf in Timeframe::supported() {
+            let full = services.get_klines("RB0", tf.as_str(), None).await.unwrap();
+            let full_ma = services
+                .trend_series("RB0", tf.as_str(), None)
+                .await
+                .unwrap();
+            for limit in [0, 1, 7, 25, 1200] {
+                let tail = services
+                    .get_klines("RB0", tf.as_str(), Some(limit))
+                    .await
+                    .unwrap();
+                let expected = &full[full.len().saturating_sub(limit)..];
+                assert_eq!(
+                    serde_json::to_value(&tail).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "Kline {tf:?} limit={limit}"
+                );
+                let tail_ma = services
+                    .trend_series("RB0", tf.as_str(), Some(limit))
+                    .await
+                    .unwrap();
+                let expected_ma = &full_ma[full_ma.len().saturating_sub(limit)..];
+                assert_eq!(tail_ma.len(), expected_ma.len(), "MA {tf:?} limit={limit}");
+                for (actual, expected) in tail_ma.iter().zip(expected_ma) {
+                    assert_eq!(actual.ts, expected.ts);
+                    assert!((actual.value - expected.value).abs() < 1e-9);
+                    assert_eq!(actual.direction, expected.direction);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn closed_event_persists_final_5m_and_15m_without_starting_a_scan() {

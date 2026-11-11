@@ -78,6 +78,7 @@ const chartReviewSymbolOptions = computed(() => symbolsStore.symbols.map(s => ({
 const VueDraggable = draggable
 
 const symbol = computed(() => String(route.params.symbol || ''))
+const recentZoneProduct = computed(() => /^(?:CZCE\.|DCE\.)?(CF|EG)\d*$/i.exec(symbol.value)?.[1]?.toUpperCase())
 const getSingleBar = (code: string) => scansStore.singleBars.get(code) ?? null
 const chartSingleBars = computed(() => { const sb = scansStore.singleBars.get(symbol.value); return sb ? [sb] : [] })
 const allTimeframes: Timeframe[] = ['5m', '15m', '30m', '60m', '120m', '240m', '1d']
@@ -1178,6 +1179,9 @@ const chartDataStatus = computed(() => {
 })
 
 /** 展示序列：正式历史 + 服务端校准的实时柱。 */
+// Vue caches this boolean: clock ticks only invalidate the series when freshness changes.
+const partialIsFresh = computed(() => !!klinesStore.partialBar
+  && chartClock.value - klinesStore.partialReceivedAt <= 10_000)
 const displayRows = computed<KlineRow[]>(() => {
   const sym = symbol.value
   const tf = timeframe.value
@@ -1195,19 +1199,15 @@ const displayRows = computed<KlineRow[]>(() => {
 
   // 实时K线也必须严格过滤出当前品种与周期
   const partial = klinesStore.partialBar
-  const live = partial && chartClock.value - klinesStore.partialReceivedAt <= 10_000
+  const live = partial && partialIsFresh.value
     ? [...liveBars.value.filter((b) => b.symbol === sym && b.timeframe === tf && b.ts < partial.ts), partial]
       .filter((b) => b.ts > klinesStore.latestClosedTs)
     : []
   if (!live.length) return rows
-  const rowByTs = new Map(rows.map((r) => [r.ts, r]))
   // 正式库中的柱子已经确认收盘，同时间戳的实时缓存不能覆盖它。
-  const out: KlineRow[] = []
-  for (const r of rows) {
-    out.push(r)
-  }
+  const out = rows.slice()
   for (const bar of live) {
-    if (!rowByTs.has(bar.ts) && out.length > 0 && bar.ts > out[out.length - 1].ts) {
+    if (bar.ts > out[out.length - 1].ts) {
       out.push(bar)
     }
   }
@@ -2393,6 +2393,8 @@ onBeforeUnmount(() => {
         />
 
         <div class="topbar-timeframes">
+          <button type="button" class="tf-btn" @click="router.push({ name: 'zone-replay', query: recentZoneProduct ? { product: recentZoneProduct } : {} })">区域研究复盘</button>
+          <button type="button" class="tf-btn" @click="router.push({ name: 'breakout-replay' })">箱体突破复盘</button>
           <div class="tf-group">
             <button
               type="button"
@@ -3216,6 +3218,8 @@ onBeforeUnmount(() => {
             :symbol="symbol"
             :timeframe="timeframe"
             :rows="displayRows"
+            :research-rows="klinesStore.rows"
+            :research-can-switch-timeframe="true"
             :signals="visibleSignals"
             :show-extremes="showExtremes"
             :review-exit="reviewExit"
@@ -3226,6 +3230,7 @@ onBeforeUnmount(() => {
             :is-mobile="isMobile"
             :is-fullscreen="isMobileFullscreen"
             @toggle-fullscreen="enterMobileFullscreen"
+            @request-research-5m="timeframe = '5m'"
             @create-manual-level="handleCreateManualLevel"
             @update-manual-level="handleUpdateManualLevel"
             @preview-manual-level="handleManualLevelPreview"

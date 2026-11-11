@@ -50,3 +50,7 @@ path = "src/bin/signal_search.rs"
 [[bin]]
 name = "signal-quality"
 path = "src/quality/cli.rs"
+
+[[bin]]
+name = "n-signal-worker"
+path = "src/bin/n_signal_worker.rs"

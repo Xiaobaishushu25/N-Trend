@@ -96,6 +96,84 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+test('background event bursts share history work and run one trailing refresh', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  const refreshes = Array.from({ length: 20 }, () => store.load('CF0', '15m', 500, true))
+  assert.equal(requests.length, 1)
+  assert.equal(store.loading, true)
+  requests[0].resolve(response(100))
+  await flush()
+  assert.equal(requests.length, 2)
+  assert.equal(store.rows[0].close, 100)
+  requests[1].resolve(response(110))
+  await Promise.all([first, ...refreshes])
+  assert.equal(requests.length, 2)
+  assert.equal(store.rows[0].close, 110)
+})
+
+test('switching or clearing cancels the old queued background refresh', async () => {
+  for (const clear of [false, true]) {
+    const { store, requests } = klinesHarness()
+    const old = store.load('CF0', '15m')
+    const refresh = store.load('CF0', '15m', 500, true)
+    const next = clear ? (store.clear(), null) : store.load('SR0', '15m')
+    requests[0].resolve(response(100))
+    await Promise.all([old, refresh])
+    assert.equal(requests.length, clear ? 1 : 2)
+    if (next) {
+      requests[1].resolve(response(200))
+      await next
+      assert.equal(store.rows[0].close, 200)
+    } else assert.equal(store.rows.length, 0)
+  }
+})
+
+test('clock ticks reuse display rows until the partial candle actually expires', () => {
+  const { computed, reactive, ref } = require('vue')
+  const source = fs.readFileSync('src/views/ChartView.vue', 'utf8')
+  const code = source.slice(source.indexOf('const partialIsFresh ='), source.indexOf('/** 顶栏/信息卡回退用'))
+  const store = reactive({ symbol: 'CF0', timeframe: '15m', rows: [bar(100)],
+    partialBar: bar(120, 'CF0', '15m', '2026-10-29 14:30:00'),
+    partialReceivedAt: 1000, latestClosedTs: '2026-10-29 14:15:00' })
+  const clock = ref(1000)
+  const context = { computed, klinesStore: store, chartClock: clock,
+    liveBars: ref([]), symbol: ref('CF0'), timeframe: ref('15m') }
+  vm.runInNewContext(ts.transpileModule(`${code}\nglobalThis.rows = displayRows`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText, context)
+  const initial = context.rows.value
+  assert.equal(initial.length, 2)
+  for (let time = 2000; time <= 11000; time += 1000) {
+    clock.value = time
+    assert.equal(context.rows.value, initial, 'no allocation or chart redraw on a clock-only tick')
+  }
+  clock.value = 12000
+  assert.equal(context.rows.value.length, 1)
+  store.partialReceivedAt = 12000
+  assert.equal(context.rows.value.length, 2)
+})
+
+test('live-tail redraw does not rebuild static overlays or the unchanged MA', () => {
+  const source = fs.readFileSync('src/components/KLineChart.vue', 'utf8')
+  const start = source.indexOf('watch(\n  () => props.rows,')
+  const code = source.slice(start, source.indexOf('watch(', start + 6))
+  let handler
+  const calls = []
+  const context = { chart: {}, watch: (_, callback) => { handler = callback },
+    markersApi: { setMarkers: () => calls.push('markers') }, buildMarkers: () => [],
+    renderData: () => calls.push('data'), syncExtremes() {}, syncEventLabels() {},
+    syncTrendSeries: () => calls.push('MA'), renderOverlays: () => { throw Error('static overlays rebuilt') } }
+  vm.runInNewContext(ts.transpileModule(code, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText, context)
+  const previous = [bar(100), bar(110, 'CF0', '15m', '2026-10-29 14:30:00')]
+  handler([previous[0], { ...previous[1], close: 120 }], previous)
+  assert.deepEqual(calls, ['data', 'markers'])
+  handler([...previous, bar(130, 'CF0', '15m', '2026-10-29 14:45:00')], previous)
+  assert.equal(calls.at(-1), 'MA', 'new time slots still extend the MA overlay')
+})
+
 test('final history retires a live candle and rejects delayed partial pushes', async () => {
   const { store, requests } = klinesHarness()
   const load = store.load('CF0', '15m')

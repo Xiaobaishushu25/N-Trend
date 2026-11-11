@@ -35,6 +35,18 @@ export default createRouter({
       meta: { bare: true },
     },
     {
+      path: '/zone-replay',
+      name: 'zone-replay',
+      component: () => import('../views/ZoneReplayView.vue'),
+      meta: { bare: true },
+    },
+    {
+      path: '/breakout-replay',
+      name: 'breakout-replay',
+      component: () => import('../views/BreakoutReplayView.vue'),
+      meta: { bare: true },
+    },
+    {
       path: '/live-trader',
       name: 'live-trader',
       component: () => import('../views/LiveTraderView.vue'),

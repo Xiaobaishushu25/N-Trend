@@ -4,6 +4,14 @@ import { notify } from '../utils/notify'
 import { reportPerformance } from '../utils/performanceLog'
 import type { KlineRow, Timeframe } from '../types'
 
+interface PendingLoad {
+  key: string
+  seq: number
+  dirty: boolean
+  promise: Promise<void>
+}
+const pendingLoads = new WeakMap<object, PendingLoad>()
+
 export const useKlinesStore = defineStore('klines', {
   state: () => ({
     symbol: '' as string,
@@ -36,8 +44,31 @@ export const useKlinesStore = defineStore('klines', {
       return true
     },
     async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
+      const key = JSON.stringify([symbol, timeframe, limit])
+      const pending = pendingLoads.get(this)
+      if (silent && pending?.key === key && pending.seq === this.loadSeq) {
+        // A close/data-update event may postdate the HTTP snapshot. Share the
+        // active request, then run one trailing refresh for all accumulated events.
+        pending.dirty = true
+        return pending.promise
+      }
+      const entry: PendingLoad = { key, seq: this.loadSeq + 1, dirty: false, promise: Promise.resolve() }
+      pendingLoads.set(this, entry)
+      entry.promise = (async () => {
+        await this.loadOnce(symbol, timeframe, limit, silent)
+        while (entry.dirty && pendingLoads.get(this) === entry && entry.seq === this.loadSeq) {
+          entry.dirty = false
+          entry.seq = this.loadSeq + 1
+          await this.loadOnce(symbol, timeframe, limit, true)
+        }
+      })().finally(() => {
+        if (pendingLoads.get(this) === entry) pendingLoads.delete(this)
+      })
+      return entry.promise
+    },
+    async loadOnce(symbol: string, timeframe: Timeframe, limit: number, silent: boolean) {
       const started = performance.now()
-      if (!silent) reportPerformance('chart_load_started', started, { symbol, timeframe })
+      if (!silent) reportPerformance('chart_load_started', 0, { symbol, timeframe })
       // silent：后台静默刷新（如定时入库后），不弹加载遮罩
       if (!silent) {
         this.loadingCount++

@@ -182,8 +182,14 @@ pub fn build_router(ctx: Arc<ServerContext>) -> Router {
             get(instances::list).post(instances::create),
         )
         .route("/trader/instances/comparison", get(instances::comparison))
-        .route("/trader/instances/:id/snapshot", get(instances::snapshot))
-        .route("/trader/instances/:id/orders", get(instances::orders))
+        .route(
+            "/trader/instances/:id/snapshot",
+            get(instances::snapshot).layer(CompressionLayer::new()),
+        )
+        .route(
+            "/trader/instances/:id/orders",
+            get(instances::orders).layer(CompressionLayer::new()),
+        )
         .route("/trader/instances/:id/actions", post(instances::action))
         .route(
             "/trader/instances/:id/connection",
