@@ -124,9 +124,85 @@ fn reference_snapshots_are_valid_and_missing_fee_is_rejected() {
     assert_eq!(p.fees.products["PB"].bound(1000., 1001., 10.), 2.);
     p.validate().unwrap();
 }
+
+#[test]
+fn registry_exposes_only_current_strategies_and_exit_modules() {
+    let registry = StrategyRegistry::default();
+    registry.validate(&definition(P2, parameters())).unwrap();
+    let catalog = registry.catalog();
+    let ids = |field: &str| -> BTreeSet<String> {
+        catalog[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().or_else(|| v["id"].as_str()).unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        ids("strategies"),
+        [N_STRATEGY, P2, crate::trader::b5::ID, p3::ID]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(
+        ids("exit_policies"),
+        [
+            "n_exit_v1",
+            "protect_only_v1",
+            "p2_fixed_exit_v1",
+            p3::EXIT,
+            crate::trader::b5::EXIT
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    );
+}
+
+#[test]
+fn calendar_warns_three_days_before_expiry_and_preserves_frozen_versions() {
+    let definition = definition(P2, parameters());
+    let original = serde_json::to_value(&definition).unwrap();
+    let end = parse_time("2026-10-31 23:59:59").unwrap();
+    assert_eq!(
+        calendar_health(&definition, end - 259201).unwrap()["status"],
+        "ok"
+    );
+    assert_eq!(
+        calendar_health(&definition, end - 259200).unwrap()["status"],
+        "expiring"
+    );
+    assert_eq!(
+        calendar_health(&definition, end).unwrap()["status"],
+        "expiring"
+    );
+    assert_eq!(
+        calendar_health(&definition, end + 1).unwrap()["status"],
+        "uncovered"
+    );
+    assert_eq!(
+        calendar_health(&definition, parse_time("2026-06-30 23:59:59").unwrap()).unwrap()["status"],
+        "uncovered"
+    );
+    assert_eq!(original, serde_json::to_value(&definition).unwrap());
+    // The fresh preset covers November; an old saved calendar still fails closed.
+    let now = parse_time("2026-11-03 13:45:00").unwrap();
+    assert_eq!(parameters().block("JD0", now), Some("calendar_uncovered"));
+    let fresh = Parameters::reference_snapshot();
+    assert_eq!(fresh.block("JD0", now), None);
+    assert_eq!(fresh.calendar.id, "holiday-windows-2026-jul-dec-v2");
+    assert_eq!(
+        fresh.block("JD0", parse_time("2026-12-31 09:00:00").unwrap()),
+        Some("calendar_uncovered")
+    );
+    let mut invalid = definition;
+    invalid.parameters["calendar"]["coverage_end"] = json!("bad timestamp");
+    assert_eq!(calendar_health(&invalid, now).unwrap()["status"], "invalid");
+}
 #[test]
 fn warning_filters_are_frozen_and_deduplicated_across_serialization() {
-    let s = CandidateStrategy::new(parameters(), false).unwrap();
+    let s = CandidateStrategy::new(parameters()).unwrap();
     let p = signal();
     let mut state = Value::Null;
     assert_eq!(
@@ -179,7 +255,7 @@ fn warning_filters_are_frozen_and_deduplicated_across_serialization() {
         .unwrap()
         .roundtrip_fixed_yuan_per_lot = Some(21.);
     assert_eq!(
-        rejection(&CandidateStrategy::new(expensive, false).unwrap(), signal()),
+        rejection(&CandidateStrategy::new(expensive).unwrap(), signal()),
         "friction_above20"
     );
     let mut p = signal();
@@ -188,7 +264,7 @@ fn warning_filters_are_frozen_and_deduplicated_across_serialization() {
 }
 #[test]
 fn proposed_fill_uses_net_space_chase_fresh_book_and_actual_risk() {
-    let s = CandidateStrategy::new(parameters(), false).unwrap();
+    let s = CandidateStrategy::new(parameters()).unwrap();
     let p = plan(&s, signal());
     let now = p.created_at + 1;
     let q = quote(now, 1001.);
@@ -217,42 +293,62 @@ fn proposed_fill_uses_net_space_chase_fresh_book_and_actual_risk() {
         matches!(s.check_entry(&p,&quote(now,1003.),1004.,now),EntryDecision::Reject(r) if r=="filtered_net_rr_fill")
     );
 }
+
 #[test]
-fn p3_caps_both_directions_at_actual_fill_and_never_extends_s1() {
+fn saved_egg_plan_with_old_point_value_cannot_open_but_is_not_rewritten() {
+    let mut params = parameters();
+    let fees = params.fees.products["PB"].clone();
+    params.fees.products.insert("JD".into(), fees);
+    let strategy = CandidateStrategy::new(params).unwrap();
+    let mut payload = signal();
+    payload["symbol"] = json!("JD0");
+    payload["instrument_id"] = json!("jd2701");
+    let mut frozen = plan(&strategy, payload.clone());
+    let now = frozen.created_at + 1;
+    let mut q = quote(now, 1001.);
+    q.instrument_id = "jd2701".into();
+    q.underlying_symbol = "JD0".into();
+    assert!(matches!(
+        strategy.check_entry(&frozen, &q, 1002., now),
+        EntryDecision::Allow
+    ));
+    frozen.evidence["candidate"]["multiplier"] = json!(5.);
+    let original = frozen.evidence.clone();
+    assert!(matches!(strategy.check_entry(&frozen, &q, 1002., now),
+        EntryDecision::Reject(reason) if reason == "contract_metadata_mismatch"));
+    assert_eq!(frozen.evidence, original);
+    payload["multiplier"] = json!(5.);
+    assert!(rejection(&strategy, payload).contains("stale_contract_point_value"));
+}
+#[test]
+fn fixed_s1_target_does_not_move_with_fill_and_keeps_structure_stop() {
+    let strategy = CandidateStrategy::new(parameters()).unwrap();
     for short in [false, true] {
-        let s = CandidateStrategy::new(parameters(), true).unwrap();
         let mut payload = signal();
         if short {
             payload["direction"] = json!("down");
             payload["stop"] = json!(1020.);
             payload["target"] = json!(900.);
         }
-        let p = plan(&s, payload);
+        let plan = plan(&strategy, payload);
         let mut pos = position();
         pos.fill_price = if short { 998. } else { 1002. };
         assert_eq!(
-            FixedExit { cap: true }.target_on_fill(&pos, &p),
-            Some(if short { 954. } else { 1046. })
-        );
-        assert_eq!(
-            FixedExit { cap: false }.target_on_fill(&pos, &p),
+            FixedExit.target_on_fill(&pos, &plan),
             Some(if short { 900. } else { 1100. })
         );
-        let mut snap: Snapshot = serde_json::from_value(p.evidence["candidate"].clone()).unwrap();
-        snap.target = if short { 970. } else { 1030. };
-        assert_eq!(snap.target(pos.fill_price, true), snap.target);
     }
-    let p = position();
-    let exit = FixedExit { cap: true };
-    let update = exit.on_quote(
-        &p,
-        &quote(parse_time(&p.open_ts).unwrap(), 1023.),
+    let pos = position();
+    let update = FixedExit.on_quote(
+        &pos,
+        &quote(parse_time(&pos.open_ts).unwrap(), 1023.),
         &Value::Null,
     );
     assert!(update.close.is_none());
     assert_eq!(update.stop, 980.);
-    assert!(exit.on_bar(&p, &Value::Null).is_none());
+    assert!(FixedExit.on_bar(&pos, &Value::Null).is_none());
 }
+
 #[test]
 fn atr_uses_only_complete_prefix_and_groups_midnight() {
     let start = parse_time("2026-10-20 20:35:00").unwrap();
@@ -294,7 +390,7 @@ fn atr_uses_only_complete_prefix_and_groups_midnight() {
 }
 #[test]
 fn holding_buckets_ignore_lunch_and_future_mfe() {
-    let s = CandidateStrategy::new(parameters(), true).unwrap();
+    let s = CandidateStrategy::new(parameters()).unwrap();
     let p = position();
     let mut state = Value::Null;
     // A later quote must not rescue the fifth completed bucket while catching up after a gap.
@@ -359,7 +455,7 @@ fn holiday_and_weekend_cutoffs_hold_until_actual_close_even_without_quotes() {
         params.block("PB0", parse_time("2026-10-24 00:50:00").unwrap()),
         Some("filtered_weekend_window")
     );
-    let s = CandidateStrategy::new(params, true).unwrap();
+    let s = CandidateStrategy::new(params).unwrap();
     let mut p = position();
     p.open_ts = "2026-09-30 10:00:00".into();
     let actions = run(
@@ -379,8 +475,169 @@ fn holiday_and_weekend_cutoffs_hold_until_actual_close_even_without_quotes() {
 }
 
 #[test]
+fn weekend_cutoffs_follow_actual_contract_sessions_in_shanghai_time() {
+    let params = parameters();
+    for (instrument, before, cutoff) in [
+        ("jd2701", "2026-10-23 14:49:59", "2026-10-23 14:50:00"),
+        ("rb2701", "2026-10-23 22:49:59", "2026-10-23 22:50:00"),
+        ("pb2611", "2026-10-24 00:49:59", "2026-10-24 00:50:00"),
+        ("au2612", "2026-10-24 02:19:59", "2026-10-24 02:20:00"),
+    ] {
+        assert_eq!(params.block(instrument, parse_time(before).unwrap()), None);
+        assert_eq!(
+            params.block(instrument, parse_time(cutoff).unwrap()),
+            Some("filtered_weekend_window"),
+            "{instrument}: {cutoff}"
+        );
+        assert_eq!(
+            params.block(instrument, parse_time("2026-10-26 08:59:59").unwrap()),
+            Some("filtered_weekend_window")
+        );
+        assert_eq!(
+            params.block(instrument, parse_time("2026-10-26 09:00:00").unwrap()),
+            None
+        );
+    }
+    // The same instant must give the same decision on a UTC-configured host.
+    let utc = chrono::DateTime::parse_from_rfc3339("2026-10-23T16:50:00Z").unwrap();
+    assert_eq!(
+        params.block("pb2611", utc.timestamp()),
+        Some("filtered_weekend_window")
+    );
+    // A stale alias must not select the session for a position's bound contract.
+    let s = CandidateStrategy::new(params.clone()).unwrap();
+    let mut p = position();
+    p.symbol = "JD0".into();
+    p.open_ts = "2026-10-23 14:00:00".into();
+    assert!(run(
+        &s,
+        StrategyEvent::Timer {
+            timestamp: parse_time("2026-10-23 14:50:00").unwrap()
+        },
+        &mut Value::Null,
+        &[p.clone()]
+    )
+    .is_empty());
+    let actions = run(
+        &s,
+        StrategyEvent::Timer {
+            timestamp: utc.timestamp(),
+        },
+        &mut Value::Null,
+        &[p],
+    );
+    assert!(matches!(&actions[0], TradeIntent::Close {reason, ..} if reason == "pre_weekend"));
+    // Missed exits remain due on Monday; a newly opened Monday position is not overdue.
+    let monday = parse_time("2026-10-26 09:01:00").unwrap();
+    assert_eq!(
+        params.flat_reason("pb2611", parse_time("2026-10-23 14:00:00").unwrap(), monday),
+        Some("pre_weekend")
+    );
+    assert_eq!(params.flat_reason("pb2611", monday, monday), None);
+}
+
+#[test]
+fn frozen_holiday_suppresses_a_nonexistent_friday_night_close() {
+    let mut params = parameters();
+    params.calendar.windows.push(HolidayWindow {
+        name: "test-friday-night-off".into(),
+        block_from: "2026-10-23 14:50:00".into(),
+        flat_at: "2026-10-23 14:50:00".into(),
+        last_close: "2026-10-23 15:00:00".into(),
+        reopen: "2026-10-26 09:00:00".into(),
+    });
+    params.validate().unwrap();
+    let now = parse_time("2026-10-23 14:50:00").unwrap();
+    assert!(params
+        .weekend_windows("pb2611", now)
+        .contains(&(now, parse_time("2026-10-26 09:00:00").unwrap())));
+    assert_eq!(
+        params.flat_reason("pb2611", now - 3600, now),
+        Some("pre_holiday")
+    );
+    assert!(!params
+        .weekend_windows("pb2611", now)
+        .iter()
+        .any(|(cut, _)| *cut == parse_time("2026-10-24 00:50:00").unwrap()));
+}
+
+#[test]
+fn no_follow_uses_first_five_bucket_mfe_once_even_if_close_events_arrive_late() {
+    let s = CandidateStrategy::new(parameters()).unwrap();
+    for short in [false, true] {
+        let mut p = position();
+        p.direction = if short { "down" } else { "up" }.into();
+        let sign = if short { -1. } else { 1. };
+        let mut state = Value::Null;
+        for (i, time) in [
+            "09:20:00", "09:35:00", "09:50:00", "10:05:00", "10:35:00", "10:50:00",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let r = if i < 5 { 0.1 } else { 0.8 };
+            run(
+                &s,
+                StrategyEvent::Quote(quote(
+                    parse_time(&format!("2026-10-21 {time}")).unwrap(),
+                    p.fill_price + sign * p.risk * r,
+                )),
+                &mut state,
+                &[p.clone()],
+            );
+        }
+        // Pre-change state files have no no_follow_checked field.
+        state["holding"]["position"]
+            .as_object_mut()
+            .unwrap()
+            .remove("no_follow_checked");
+        let actions = run(&s, closed("2026-10-21 11:00:00"), &mut state, &[p.clone()]);
+        assert!(matches!(&actions[0], TradeIntent::Close {reason, ..} if reason == "no_follow"));
+        assert!(run(&s, closed("2026-10-21 11:15:00"), &mut state, &[p]).is_empty());
+    }
+}
+
+#[test]
+fn no_follow_keeps_a_position_that_reached_half_r_then_retraced() {
+    let s = CandidateStrategy::new(parameters()).unwrap();
+    for short in [false, true] {
+        let mut p = position();
+        p.direction = if short { "down" } else { "up" }.into();
+        let sign = if short { -1. } else { 1. };
+        let mut state = Value::Null;
+        run(
+            &s,
+            StrategyEvent::Quote(quote(
+                parse_time("2026-10-21 09:20:00").unwrap(),
+                p.fill_price + sign * p.risk * NO_FOLLOW_MFE_R,
+            )),
+            &mut state,
+            &[p.clone()],
+        );
+        run(
+            &s,
+            StrategyEvent::Quote(quote(
+                parse_time("2026-10-21 10:35:00").unwrap(),
+                p.fill_price + sign * p.risk * 0.1,
+            )),
+            &mut state,
+            &[p.clone()],
+        );
+        for time in ["09:30:00", "09:45:00", "10:00:00", "10:15:00", "10:45:00"] {
+            assert!(run(
+                &s,
+                closed(&format!("2026-10-21 {time}")),
+                &mut state,
+                &[p.clone()]
+            )
+            .is_empty());
+        }
+    }
+}
+
+#[test]
 fn pending_expiry_counts_observed_buckets_without_filling_session_gaps() {
-    let s = CandidateStrategy::new(parameters(), true).unwrap();
+    let s = CandidateStrategy::new(parameters()).unwrap();
     let mut state = Value::Null;
     let config = ExecutionConfig::default();
     let quotes = HashMap::new();

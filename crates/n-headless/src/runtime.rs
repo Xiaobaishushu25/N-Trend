@@ -464,7 +464,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
         let mut timer = tokio::time::interval(Duration::from_secs(1));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut next_sync = Instant::now();
-        let mut history_versions = std::collections::HashMap::new();
+        let mut history = None;
         loop {
             timer.tick().await;
             if ctx
@@ -486,6 +486,21 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             if let Err(e) = ctx.execution_engine.drive().await {
                 tracing::warn!("委托维护失败: {e}");
             }
+            if history.is_none() {
+                if let Some(manager) = ctx.instances.get() {
+                    if let Ok(runtime) = manager.get("default").await {
+                        history = Some(crate::instance_runtime::DefaultHistory::spawn(
+                            ctx.clone(),
+                            runtime,
+                        ));
+                    }
+                }
+            }
+            if let Some(history) = history.as_mut() {
+                if let Err(error) = history.apply_ready(&ctx.execution_engine).await {
+                    tracing::warn!(%error, "默认实例后台历史更新失败，将重试；继续维护委托");
+                }
+            }
             if Instant::now() < next_sync {
                 continue;
             }
@@ -495,117 +510,6 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             }
             if let Ok(signals) = n_core::storage::repo::pending_execution_signals(&ctx.db).await {
                 register_execution_signals(&ctx, &signals).await;
-            }
-            let declared = ctx.execution_engine.market_subscriptions().await;
-            let mut symbols = ctx.execution_engine.active_symbols().await;
-            symbols.extend(
-                declared
-                    .iter()
-                    .filter(|s| s.timeframe.as_deref() == Some("15m"))
-                    .map(|s| s.symbol.clone()),
-            );
-            symbols.sort();
-            symbols.dedup();
-            let strategy_revision = ctx.execution_engine.definition().await.revision;
-            for symbol in symbols {
-                let version =
-                    crate::instance_runtime::market_history_revision(&ctx.db, &symbol, "15m")
-                        .await
-                        .ok()
-                        .map(|history| (strategy_revision.clone(), history));
-                if version
-                    .as_ref()
-                    .is_some_and(|v| history_versions.get(&symbol) == Some(v))
-                {
-                    continue;
-                }
-                let mut refreshed = true;
-                if ctx.execution_engine.needs_completed_15m().await {
-                    if let Ok(raw) = n_core::storage::repo::raw_klines(&ctx.db, &symbol).await {
-                        let bars = raw
-                            .iter()
-                            .map(n_core::service::model_to_fetch)
-                            .collect::<Vec<_>>();
-                        if let Err(e) = crate::instance_runtime::forward_strategy_history(
-                            &ctx,
-                            &ctx.execution_engine,
-                            &symbol,
-                            &bars,
-                        )
-                        .await
-                        {
-                            refreshed = false;
-                            tracing::warn!("策略独立历史推进失败: {e}");
-                        }
-                        if let Err(e) = ctx.execution_engine.on_completed_15m(&symbol, &bars).await
-                        {
-                            refreshed = false;
-                            tracing::warn!("候选策略完整K线推进失败: {e}");
-                        }
-                    } else {
-                        refreshed = false;
-                    }
-                }
-                if let Ok(bars) = ctx.services.bars_for(&symbol, "15m").await {
-                    let last = ctx.execution_engine.last_bar(&symbol).await;
-                    let pending = if let Some(last) = last {
-                        bars.iter()
-                            .filter(|b| b.dt.to_bar_ts() > last)
-                            .collect::<Vec<_>>()
-                    } else {
-                        bars.last().into_iter().collect::<Vec<_>>()
-                    };
-                    for bar in pending {
-                        if let Err(e) = ctx
-                            .execution_engine
-                            .on_price_update(
-                                &symbol,
-                                bar.high,
-                                bar.low,
-                                bar.close,
-                                &bar.dt.to_bar_ts(),
-                                true,
-                            )
-                            .await
-                        {
-                            refreshed = false;
-                            tracing::warn!("执行K线推进失败: {e}");
-                        }
-                    }
-                    let times = bars.iter().map(|b| b.dt.to_bar_ts()).collect::<Vec<_>>();
-                    if let Err(e) = ctx
-                        .execution_engine
-                        .reconcile_entry_age(&symbol, &times)
-                        .await
-                    {
-                        refreshed = false;
-                        tracing::warn!("入场预警时效核对失败: {e}");
-                    }
-                    if refreshed {
-                        if let Some(version) = version {
-                            history_versions.insert(symbol, version);
-                        }
-                    }
-                }
-            }
-            for subscription in declared {
-                if let Some(tf) = subscription.timeframe.filter(|tf| tf != "15m") {
-                    if let Ok(bars) = ctx.services.bars_for(&subscription.symbol, &tf).await {
-                        if let Some(bar) = bars.last() {
-                            let _ = ctx
-                                .execution_engine
-                                .dispatch(n_core::trader::strategy::StrategyEvent::BarClosed {
-                                    symbol: subscription.symbol.clone(),
-                                    timeframe: tf,
-                                    timestamp: bar.dt.to_bar_ts(),
-                                    high: bar.high,
-                                    low: bar.low,
-                                    close: bar.close,
-                                })
-                                .await;
-                        }
-                    }
-                }
             }
         }
     });
@@ -686,6 +590,7 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut publisher =
             n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
+        let mut calendar_warnings = std::collections::HashSet::new();
         let mut last_sent = Instant::now();
         loop {
             // The timer only reads strategy memory; it never queries CTP or HTTP.
@@ -730,6 +635,14 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                 serde_json::to_value(ctx.execution_engine.execution_error().await)
                     .unwrap_or_default();
             snapshot["strategy_comparison"] = ctx.execution_engine.comparison_summary().await;
+            // Coverage warnings do not need to clone the strategy's history/decision archive.
+            snapshot["strategy_diagnostics"] = serde_json::json!({
+                "calendar_health":ctx.execution_engine.calendar_health().await});
+            crate::instance_runtime::warn_calendar_coverage(
+                "default",
+                &snapshot["strategy_diagnostics"],
+                &mut calendar_warnings,
+            );
             let (snapshot, delta) = publisher.update(snapshot);
             if let Some(manager) = ctx.instances.get() {
                 if let Ok(r) = manager.get("default").await {

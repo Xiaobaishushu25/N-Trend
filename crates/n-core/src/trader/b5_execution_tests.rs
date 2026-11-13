@@ -78,6 +78,7 @@ async fn unknown_group_occupancy_survives_executor_restart_and_rejects_third_tri
         let id = e
             .register_plan(plan(symbol, key), d.clone(), config.clone())
             .await
+            .unwrap()
             .unwrap();
         let mut s = e.state.lock().await;
         let o = s.conditions.get_mut(&id).unwrap();
@@ -98,6 +99,7 @@ async fn unknown_group_occupancy_survives_executor_restart_and_rejects_third_tri
     let id = e
         .register_plan(plan("V0", "third"), e.definition().await, config)
         .await
+        .unwrap()
         .unwrap();
     let q = ExecutionQuote {
         instrument_id: "v2701".into(),

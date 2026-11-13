@@ -771,22 +771,7 @@ impl InstanceManager {
                 grouped
                     .values()
                     .filter(|v| !v.3.is_empty() && quote_gaps == 0)
-                    .map(|v| {
-                        (
-                            (
-                                if matches!(
-                                    v.2.as_str(),
-                                    super::candidates::P2 | super::candidates::P3
-                                ) {
-                                    "n_candidate".into()
-                                } else {
-                                    v.2.clone()
-                                },
-                                v.3.clone(),
-                            ),
-                            v.0,
-                        )
-                    })
+                    .map(|v| ((v.2.clone(), v.3.clone()), v.0))
                     .collect(),
             );
             let fees_confirmed = !samples.is_empty() && !quality.contains(&"fees_unconfirmed");

@@ -284,8 +284,9 @@ pub const DEFAULT_MULTIPLIERS: &[(&str, f64)] = &[
     ("C", 10.0),
     ("淀粉", 10.0),
     ("CS", 10.0),
-    ("鸡蛋", 5.0),
-    ("JD", 5.0),
+    // 5 tonnes/lot, quoted in yuan/500 kg: one quoted price point is 10 yuan.
+    ("鸡蛋", 10.0),
+    ("JD", 10.0),
     ("生猪", 16.0),
     ("LH", 16.0),
     ("苹果", 10.0),
@@ -345,6 +346,13 @@ pub fn effective_multiplier(code: &str, variety: &str) -> f64 {
     default_multiplier(code, variety)
 }
 
+/// Saved JD plans may contain the old tonnes-per-lot value (5), rather than
+/// yuan per quoted point (10). Do not silently reinterpret that frozen plan.
+pub fn stale_point_value(code: &str, multiplier: f64) -> bool {
+    code_prefix(code).eq_ignore_ascii_case("JD")
+        && (!multiplier.is_finite() || (multiplier - 10.0).abs() > 1e-7)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +375,18 @@ mod tests {
         assert_eq!(effective_multiplier("AU0", "沪金"), 1000.0);
         assert_eq!(effective_multiplier("SA0", "纯碱"), 20.0);
         assert_eq!(effective_multiplier("IF0", ""), 300.0);
+    }
+
+    #[test]
+    fn egg_quote_unit_is_not_the_contract_tonnage() {
+        for code in ["JD0", "jd2701", "JD2612"] {
+            assert_eq!(effective_multiplier(code, ""), 10.0);
+            assert_eq!(effective_multiplier(code, "鸡蛋"), 10.0);
+            // A 43-point gain on one lot is 430 yuan before fees.
+            assert_eq!(43.0 * effective_multiplier(code, ""), 430.0);
+            assert!(stale_point_value(code, 5.0));
+            assert!(!stale_point_value(code, 10.0));
+        }
     }
 
     #[test]

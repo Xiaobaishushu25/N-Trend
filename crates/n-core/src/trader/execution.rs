@@ -13,6 +13,8 @@ use crate::analyze::model::Dir;
 use crate::analyze::outcome::PENDING_BARS;
 use std::sync::Arc;
 
+#[path = "execution_safety.rs"]
+mod execution_safety;
 #[path = "strategy_runtime.rs"]
 mod strategy_runtime;
 
@@ -252,7 +254,12 @@ pub struct ExecutionOrder {
     pub phase: OrderPhase,
     pub reported_filled: i32,
     pub filled: i32,
+    #[serde(default)]
+    pub entry_fill_notional: f64,
     pub action_at: i64,
+    /// Immutable first submission time; cancellation retries never extend entry life.
+    #[serde(default)]
+    pub submitted_at: i64,
     pub trading_day: String,
     pub note: String,
     #[serde(default)]
@@ -1022,7 +1029,9 @@ impl ExecutionEngine {
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("策略未产生入场计划"))?;
-        self.register_plan(plan, definition, cfg).await
+        self.register_plan(plan, definition, cfg)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("仓位为零，入场计划已正常拒绝"))
     }
 
     pub async fn cancel_condition(&self, id: &str) -> Result<bool> {
@@ -1231,22 +1240,20 @@ impl ExecutionEngine {
             s.seen_trades.insert(key.clone());
             let ord = s.orders.get_mut(&trade.order_ref).unwrap();
             ord.filled += trade.volume;
+            if order.reason.is_none() {
+                ord.entry_fill_notional += trade.price * trade.volume as f64;
+            }
             if ord.filled >= ord.request.volume {
                 ord.phase = OrderPhase::Terminal;
             }
             let cond = s.conditions[&order.condition_id].clone();
             if order.reason.is_none() {
-                let order_insert_ts = s.orders.get(&trade.order_ref).map(|o| {
-                    chrono::DateTime::from_timestamp(o.action_at, 0)
-                        .map(|dt| {
-                            dt.with_timezone(&chrono::Local)
-                                .format("%Y-%m-%d %H:%M:%S")
-                                .to_string()
-                        })
-                        .unwrap_or_else(|| {
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-                        })
-                });
+                let order_insert_ts = s
+                    .orders
+                    .get(&trade.order_ref)
+                    .filter(|o| o.submitted_at > 0)
+                    .map(|o| super::candidates::label(o.submitted_at));
+                let entry_aborted = s.aborted_entries.contains(&cond.id);
                 let pos = s
                     .positions
                     .entry(cond.id.clone())
@@ -1288,6 +1295,9 @@ impl ExecutionEngine {
                 if pos.trigger_ts.is_none() {
                     pos.trigger_ts = cond.trigger_ts.clone();
                 }
+                let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
+                let old_peak_price = pos.fill_price + sign * pos.max_mfe_r * pos.risk;
+                let old_adverse_price = pos.fill_price + sign * pos.max_mae_r * pos.risk;
                 let qty = pos.volume + trade.volume;
                 pos.fill_price = (pos.fill_price * pos.volume as f64
                     + trade.price * trade.volume as f64)
@@ -1298,8 +1308,11 @@ impl ExecutionEngine {
                 } else {
                     cond.risk
                 };
+                // Partial entry fills can change cost and initial R. Preserve
+                // observed price extremes instead of retaining an R from another basis.
+                pos.max_mfe_r = ((old_peak_price - pos.fill_price) * sign / pos.risk).max(0.0);
+                pos.max_mae_r = ((old_adverse_price - pos.fill_price) * sign / pos.risk).min(0.0);
                 pos.is_closed = false;
-                let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
                 let target_space = (cond.target_price - cond.entry_price) * sign;
                 if cond
                     .frozen
@@ -1326,6 +1339,8 @@ impl ExecutionEngine {
                     if task.all {
                         task.target += trade.volume;
                     }
+                } else if entry_aborted {
+                    Self::latch_exit(s, &cond.id, "late_entry_fill", trade.price, true);
                 } else if cond.stop_price > 0.0
                     && ((cond.direction == "up" && trade.price <= cond.stop_price)
                         || (cond.direction == "down" && trade.price >= cond.stop_price))
@@ -1417,6 +1432,8 @@ impl ExecutionEngine {
                 s.history.push(rec);
             }
         }
+        self.recheck_filled_sizing(s);
+        self.complete_partial_exits(s);
         // A terminal order may precede its trade callbacks: wait for every reported fill.
         for id in s.conditions.keys().cloned().collect::<Vec<_>>() {
             let open_filled: i32 = s
@@ -1431,7 +1448,18 @@ impl ExecutionEngine {
                 matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
                     && o.filled >= o.reported_filled
             });
-            let phase = if closing && pos.is_some_and(|p| p.is_closed) && orders_settled {
+            let entry_settled = s
+                .orders
+                .values()
+                .filter(|o| o.condition_id == id && o.reason.is_none())
+                .all(ExecutionOrder::settled);
+            if open_filled > 0 && entry_settled && s.aborted_entries.contains(&id) {
+                // Freeze the actual entry quantity after the remainder is cancelled.
+                // The original plan and sizing configuration remain frozen.
+                let c = s.conditions.get_mut(&id).unwrap();
+                c.volume = c.volume.min(open_filled);
+            }
+            let phase = if pos.is_some_and(|p| p.is_closed) && orders_settled {
                 Some(ConditionState::Closed)
             } else if closing && pos.is_none() && orders_settled {
                 Some(ConditionState::Canceled)
@@ -1944,7 +1972,19 @@ impl ExecutionEngine {
             let r = (q.last - pos.fill_price) * sign / pos.risk.max(1e-9);
             pos.max_mfe_r = pos.max_mfe_r.max(r);
             pos.max_mae_r = pos.max_mae_r.min(r);
-            if !s.closes.contains_key(&cond.id) {
+            if pos.current_stop_price > 0.0 && (q.last - pos.current_stop_price) * sign <= 0.0 {
+                let reason = super::policy::protection_reason(
+                    pos.lot1_closed,
+                    pos.fill_price,
+                    pos.current_stop_price,
+                    sign,
+                    q.tick,
+                );
+                Self::latch_exit(&mut s, &cond.id, reason, pos.current_stop_price, true);
+                must_persist = true;
+            }
+            // Keep evaluating protection while a profit-taking order is working.
+            {
                 let parameters = cond
                     .frozen
                     .as_ref()
@@ -1999,12 +2039,19 @@ impl ExecutionEngine {
                 }
                 must_persist |= pos.current_stop_price != update.stop;
                 pos.current_stop_price = update.stop;
-                if (update.stop - pos.fill_price) * sign > 0.0 {
+                if super::policy::protection_reason(
+                    pos.lot1_closed,
+                    pos.fill_price,
+                    update.stop,
+                    sign,
+                    q.tick,
+                ) == "trailing"
+                {
                     pos.trailing_grade = pos.trailing_grade.max(2)
                 }
                 if let Some((reason, volume)) = update.close {
                     must_persist = true;
-                    Self::latch_exit(
+                    Self::latch_exit_quantity(
                         &mut s,
                         &cond.id,
                         &reason,
@@ -2013,27 +2060,9 @@ impl ExecutionEngine {
                         } else {
                             q.last
                         },
-                        volume.is_none(),
+                        volume,
                     );
-                    if let Some(volume) = volume {
-                        if let Some(task) = s.closes.get_mut(&cond.id) {
-                            task.target = task.target.max(task.filled + volume.min(pos.volume));
-                        }
-                    }
                 }
-            } else if cond
-                .frozen
-                .as_ref()
-                .is_none_or(|f| f.definition.exit_policy == "n_exit_v1")
-                && s.closes[&cond.id].reason == "target_1r"
-                && pos.tier == PositionTier::Large
-                && s.closes[&cond.id].filled >= s.closes[&cond.id].target
-            {
-                pos.lot1_closed = true;
-                pos.current_stop_price = pos.fill_price;
-                pos.trailing_grade = 1;
-                s.closes.remove(&cond.id);
-                must_persist = true;
             }
             s.positions.insert(cond.id, pos);
         }
@@ -2044,31 +2073,11 @@ impl ExecutionEngine {
     }
 
     fn latch_exit(s: &mut ExecutionState, id: &str, reason: &str, reference: f64, all: bool) {
-        s.aborted_entries.insert(id.into());
-        let qty = s.positions.get(id).map(|p| p.volume).unwrap_or(0);
-        let task = s.closes.entry(id.into()).or_insert(CloseTask {
-            reason: reason.into(),
-            target: 0,
-            filled: 0,
-            reference,
-            attempts: 0,
-            all,
-        });
-        task.target = task
-            .target
-            .max(task.filled + if all { qty } else { qty.min(1) });
-        if all {
-            task.reason = reason.into();
-            task.reference = reference;
-            task.all = true;
-        }
-        if let Some(o) = s.conditions.get_mut(id) {
-            o.state = ConditionState::Closing;
-            o.note = format!("退出任务已锁定: {reason}");
-        }
+        Self::latch_exit_quantity(s, id, reason, reference, if all { None } else { Some(1) });
     }
 
-    /// Drive one serialized broker action per two seconds, across every strategy.
+    /// Serialize broker actions. New entries are rate limited; risk exits and
+    /// cancellations do not wait behind the entry throttle.
     pub async fn drive(&self) -> Result<()> {
         let _drive = self.drive_lock.lock().await;
         let cfg = self.get_config().await;
@@ -2107,111 +2116,120 @@ impl ExecutionEngine {
         }
         self.check_overnight_checkpoints(&mut s);
         self.update_overnight_next_open(&mut s);
-        if !s.broker_connected || s.persistence_error.is_some() || now - s.last_action_at < 2 {
+        if s.persistence_error.is_some() {
             return Ok(());
         }
-        // 解除长时间处于 CancelPending 且已重试多次的死锁报单，防止阻塞驱动循环与其它品种交易
-        let mut unblocked_any = false;
-        let strict_orders = s
-            .orders
-            .iter()
-            .filter_map(|(id, o)| {
-                s.conditions
-                    .get(&o.condition_id)
-                    .and_then(|c| c.frozen.as_ref())
-                    .and_then(|f| self.registry.strategy(&f.definition).ok())
-                    .is_some_and(|p| p.entry_constraints().terminal_rejections)
-                    .then_some(id.clone())
-            })
-            .collect::<HashSet<_>>();
+        // A timeout is not a broker rejection. Never release unknown exposure.
+        let mut safety_changed = false;
         for (r, o) in s.orders.iter_mut() {
             if o.phase == OrderPhase::CancelPending
                 && o.cancel_attempts >= 3
                 && now - o.action_at >= 15
             {
-                tracing::warn!(
-                    "⚠️ 报单 {} ({}) 撤单已重试 {} 次仍未获得柜台终态回报",
-                    r,
-                    o.request.instrument_id,
-                    o.cancel_attempts
-                );
-                if strict_orders.contains(r) {
-                    o.phase = OrderPhase::Unknown;
-                    o.note = "撤单未确认，保留未知敞口与品种槽位，禁止替换报单".into();
-                } else {
-                    o.phase = OrderPhase::Rejected;
-                    o.note = "撤单多次未获回报，标记终止".to_string();
-                }
-                unblocked_any = true;
+                tracing::warn!("报单 {r} 撤单未确认，保留未知敞口并禁止替换");
+                o.phase = OrderPhase::Unknown;
+                o.note = "撤单未确认，保留未知敞口与品种槽位，禁止替换报单".into();
+                safety_changed = true;
             }
         }
-        if unblocked_any {
+        if safety_changed {
             s.rebuild_indices();
-            self.save(&mut s)?;
         }
 
-        let wait = cfg.order_wait_seconds.max(2) as i64;
-        // Cancel a timed-out live order before replacing it. Terminal != all fills received.
+        let timed_out = s
+            .orders
+            .values()
+            .filter(|o| {
+                if o.reason.is_some() || o.settled() || o.reported_filled >= o.request.volume {
+                    return false;
+                }
+                let frozen_cfg = s
+                    .conditions
+                    .get(&o.condition_id)
+                    .and_then(|c| c.frozen.as_ref())
+                    .map(|f| &f.execution)
+                    .unwrap_or(&cfg);
+                now >= o
+                    .submitted_at
+                    .saturating_add(frozen_cfg.order_wait_seconds.max(1) as i64)
+            })
+            .map(|o| o.condition_id.clone())
+            .collect::<HashSet<_>>();
+        for id in timed_out {
+            if s.aborted_entries.insert(id.clone()) {
+                let has_position = s.positions.get(&id).is_some_and(|p| p.volume > 0);
+                if let Some(c) = s.conditions.get_mut(&id) {
+                    c.note = "entry_timeout: 停止开仓并撤销未成交剩余量".into();
+                    if !has_position {
+                        c.state = ConditionState::Canceled;
+                    }
+                }
+                safety_changed = true;
+            }
+        }
+        if safety_changed {
+            self.save(&mut s)?;
+        }
+        if !s.broker_connected {
+            return Ok(());
+        }
+        // Cancellation may proceed without a fresh book. Protective exits may
+        // first use the unreserved position quantity while cancellation is pending.
         let cancel = s
             .orders
             .iter()
             .filter(|(_, o)| {
+                let frozen_cfg = s
+                    .conditions
+                    .get(&o.condition_id)
+                    .and_then(|c| c.frozen.as_ref())
+                    .map(|f| &f.execution)
+                    .unwrap_or(&cfg);
+                let wait = frozen_cfg.order_wait_seconds.max(1) as i64;
                 let abort = o.reason.is_none() && s.aborted_entries.contains(&o.condition_id);
-                let reprice = s
-                    .quotes
-                    .get(&o.request.instrument_id.to_uppercase())
-                    .filter(|q| q.valid())
-                    .and_then(|q| {
-                        q.order_price(
-                            o.request.direction == "buy",
-                            o.request.price,
-                            cfg.slippage_ticks,
-                            0,
-                        )
-                    })
-                    .is_some_and(|price| {
-                        if o.request.direction == "buy" {
-                            price > o.request.price
-                        } else {
-                            price < o.request.price
-                        }
+                let superseded = o.reason.is_some()
+                    && s.closes.get(&o.condition_id).is_some_and(|task| {
+                        task.all && o.reason.as_deref() != Some(task.reason.as_str())
                     });
-                (o.phase == OrderPhase::Working
-                    && (abort || (now - o.action_at >= wait && reprice)))
+                let reprice = o.reason.is_some()
+                    && s.quotes
+                        .get(&o.request.instrument_id.to_uppercase())
+                        .filter(|q| q.valid())
+                        .and_then(|q| {
+                            q.order_price(
+                                o.request.direction == "buy",
+                                o.request.price,
+                                frozen_cfg.slippage_ticks,
+                                0,
+                            )
+                        })
+                        .is_some_and(|price| {
+                            if o.request.direction == "buy" {
+                                price > o.request.price
+                            } else {
+                                price < o.request.price
+                            }
+                        });
+                ((matches!(o.phase, OrderPhase::Working | OrderPhase::Unknown)
+                    && o.cancel_attempts < 3)
+                    && (abort
+                        || superseded
+                        || (o.phase == OrderPhase::Working
+                            && now - o.action_at >= wait
+                            && reprice)))
                     || (o.phase == OrderPhase::CancelPending
                         && o.cancel_attempts < 3
                         && now - o.action_at >= wait * (o.cancel_attempts as i64 + 1))
             })
-            .min_by_key(|(_, o)| {
-                (
-                    o.reason.is_none() && !s.aborted_entries.contains(&o.condition_id),
-                    o.action_at,
-                )
-            })
-            .map(|(r, o)| (r.clone(), o.clone()));
-        if let Some((r, order)) = cancel {
-            let o_mut = s.orders.get_mut(&r).unwrap();
-            o_mut.phase = OrderPhase::CancelPending;
-            o_mut.cancel_attempts += 1;
-            o_mut.action_at = now;
-            s.last_action_at = now;
-            self.save(&mut s)?;
-            drop(s);
-            let result = self
-                .client
-                .cancel_order(
-                    &r,
-                    &order.request.instrument_id,
-                    order.request.exchange_id.as_deref(),
-                )
-                .await;
-            if let Err(e) = result {
-                tracing::warn!("撤单结果待柜台确认: {e}");
-            }
-            return Ok(());
-        }
+            .min_by_key(|(_, o)| (o.reason.is_none(), o.action_at))
+            .map(|(r, _)| r.clone());
         if !s.broker_ready || s.error.is_some() || s.market_error.is_some() {
-            return Ok(());
+            drop(s);
+            return if let Some(reference) = cancel {
+                self.request_cancel(reference, now).await
+            } else {
+                Ok(())
+            };
         }
         let mut entry_state_changed = Self::refresh_entry_funding_waits(&mut s);
         s.rebuild_indices();
@@ -2274,8 +2292,7 @@ impl ExecutionEngine {
                 entry_state_changed = true;
                 continue;
             }
-            let blocked = s.is_order_blocked(&cond.id);
-            if blocked {
+            if !s.closes.contains_key(&cond.id) && s.is_order_blocked(&cond.id) {
                 continue;
             }
             let Some(q) = s
@@ -2293,15 +2310,18 @@ impl ExecutionEngine {
                 .map(|o| o.filled)
                 .sum();
             let exit = s.closes.get(&cond.id).cloned();
-            let (qty, reason, reference, attempts) = if let Some(task) = &exit {
+            let (mut qty, reason, reference, attempts) = if let Some(task) = &exit {
                 (
-                    task.target - task.filled,
+                    (task.target - task.filled)
+                        .min(s.positions.get(&cond.id).map(|p| p.volume).unwrap_or(0))
+                        .saturating_sub(s.close_reservation(&cond.id)),
                     Some(task.reason.clone()),
                     task.reference,
                     task.attempts,
                 )
             } else {
-                if s.paused
+                if now - s.last_action_at < 2
+                    || s.paused
                     || cond.frozen.as_ref().is_some_and(|f| {
                         self.registry.validate(&f.definition).is_err()
                             || f.plan.expires_at.is_some_and(|t| now > t)
@@ -2436,6 +2456,43 @@ impl ExecutionEngine {
                     }
                 }
             }
+            if reason.is_none() {
+                match self.sizing_limit(&s, &cond, price, Some(&q), SizingPhase::ProposedOrder) {
+                    Ok(total) if total == 0 && filled == 0 => {
+                        Self::reject_strategy_entry(&mut s, &cond.id, "zero_volume_at_price");
+                        entry_state_changed = true;
+                        continue;
+                    }
+                    Ok(total) if total <= filled => {
+                        s.aborted_entries.insert(cond.id.clone());
+                        if total < filled {
+                            Self::latch_exit(&mut s, &cond.id, "risk_budget", price, true);
+                        }
+                        entry_state_changed = true;
+                        continue;
+                    }
+                    Ok(total) => {
+                        if total < cond.volume {
+                            s.conditions.get_mut(&cond.id).unwrap().volume = total;
+                            s.entry_decisions.insert(
+                                cond.id.clone(),
+                                serde_json::json!({
+                                    "stage":"sizing_fill", "reason":"volume_reduced", "at":now,
+                                    "approved":cond.volume, "volume":total, "proposed":price
+                                }),
+                            );
+                            entry_state_changed = true;
+                        }
+                        qty = qty.min(total - filled);
+                    }
+                    Err(error) => {
+                        s.paused = true;
+                        s.strategy_error = Some(error.to_string());
+                        entry_state_changed = true;
+                        continue;
+                    }
+                }
+            }
             s.last_ref = (s.last_ref + 1).max(chrono::Utc::now().timestamp() as u64 * 100);
             let r = s.last_ref.to_string();
             let req = OrderInsertRequest {
@@ -2461,6 +2518,18 @@ impl ExecutionEngine {
             candidate = Some((r, req, cond.id.clone(), reason, entry_rules));
             break;
         }
+        if let Some(reference) = cancel {
+            let urgent_exit = candidate.as_ref().is_some_and(|(_, _, id, reason, _)| {
+                reason.is_some() && s.closes.get(id).is_some_and(|task| task.all)
+            });
+            if !urgent_exit {
+                if entry_state_changed {
+                    self.save(&mut s)?;
+                }
+                drop(s);
+                return self.request_cancel(reference, now).await;
+            }
+        }
         let Some((r, req, id, reason, entry_rules)) = candidate else {
             if entry_state_changed {
                 self.save(&mut s)?;
@@ -2484,7 +2553,9 @@ impl ExecutionEngine {
                 phase: OrderPhase::Unknown,
                 reported_filled: 0,
                 filled: 0,
+                entry_fill_notional: 0.,
                 action_at: now,
+                submitted_at: now,
                 trading_day: day,
                 note: "已持久化提交意图，等待柜台回报".into(),
                 cancel_attempts: 0,

@@ -78,6 +78,7 @@ function onHeaderMouseDown(e: MouseEvent) {
 }
 
 const exitReasonOptions = [
+  { label: '🎯 P3 首手 S1 止盈', value: 'p3_first_s1' },
   { label: '全部平仓原因', value: '' },
   { label: '🎯 第一手 1.0R 止盈', value: 'target_1r' },
   { label: '📈 第二手阶梯追踪', value: 'trailing' },
@@ -256,6 +257,10 @@ interface StrategyNoteMeta {
 }
 
 const STRATEGY_NOTE_MAP: Record<string, StrategyNoteMeta> = {
+  zero_volume_at_price: { category: '金额风控', text: '拟报价格下允许手数为零', tooltip: '按当前拟报价格复核后没有可批准的开仓手数，本次信号终止。' },
+  contract_rollover: { category: '换月保护', text: '主力合约已切换，撤销待开仓单', tooltip: '待开仓信号绑定的实际合约与当前主力合约不同，撤销剩余开仓意图。' },
+  delivery_month: { category: '合约过滤', text: '避开交割月及过期合约', tooltip: 'P3 主动限制交割月及已过期月份合约开仓。' },
+  outside_trading_session: { category: '会话保护', text: '等待实际合约交易会话', tooltip: '当前不在实际合约的连续交易会话，等待新鲜盘口。' },
   unfilled: {
     category: '滑点保护',
     text: '跳空/滑点超追价上限(放弃入场)',
@@ -406,7 +411,7 @@ function getNoteTooltip(note?: string | null): string {
       market_gap: '【行情事件缺口风控】行情源事件缓存或本实例消费队列发生丢失，无法确认缺失期间是否触及止损。系统停止受影响任务的后续开仓，并锁定风险退出；待有效行情和柜台状态就绪后执行撤单、平仓。此提示不表示价格发生跳空，行情恢复也不会解除已锁定任务。',
       stop: '【触及硬止损】盘中价格击穿建仓时设定的初始止损保护线，按纪律坚决全平止损，严格控制单笔最大风险。',
       target_1r: '【+1.0R第1止盈位】浮盈达到1倍初始风险目标。若是1手则全平落袋；若是多手则平第1手止盈，并将剩余持仓止损线自动移至开仓成本线保本。',
-      breakeven: '【保本平仓离场】在第1手止盈落袋后，行情未能进一步走高而是回落至开仓成本价，系统自动平掉剩余持仓，保住已获利润，做到零回撤。',
+      breakeven: '【成本保护离场】首手成交后，余仓触及成本保护线，系统发起平仓；实际盈亏按成交价格和费用计算。',
       trailing: '【追踪移动止盈】浮盈大幅扩大后，动态保护线随最高点持续跟进；当价格自高位回撤触及移动止损线时平仓，锁住大部分趋势波段利润。',
       target_s1: '【结构阻力位止盈】行情冲刺触及前高/前低或战略结构位 S1，完成既定目标，全平获利了结。',
       no_follow: '【动能衰竭离场】开仓后持有满5根K线但最大浮盈依然小于0.5R，显示突破缺乏跟进动能、走势停滞，主动平仓微利或微损离场，释放资金槽位。',
@@ -487,12 +492,20 @@ function conditionBadgeType(state?: string | null): 'default' | 'primary' | 'inf
 
 function exitReasonBadge(reason: string) {
   switch (reason) {
+    case 'p3_first_s1':
+      return { text: '🎯 P3 首手 S1', type: 'success' as const, tip: '首手在结构 S1 成交，余仓转入保本与追踪管理' }
+    case 'contract_expiry':
+      return { text: '合约到期窗口退出', type: 'warning' as const, tip: 'P3 在交割月前最后交易会话收盘前退出' }
+    case 'pre_calendar_end':
+      return { text: '日历覆盖到期退出', type: 'warning' as const, tip: '交易日历即将到期，停止开仓并发起平仓' }
+    case 'risk_budget':
+      return { text: '金额风控退出', type: 'warning' as const, tip: '成交后风险复核超额或异常，锁定风险退出' }
     case 'target_1r':
       return { text: '🎯 1.0R 锁定保本', type: 'success' as const, tip: '浮盈触及 1.0R，第一手平仓保本' }
     case 'trailing':
       return { text: '📈 追踪止盈', type: 'success' as const, tip: '回撤触及追踪止损线；当前规则为1.6R起按最高浮盈回撤0.8R连续追踪' }
     case 'breakeven':
-      return { text: '🛡️ 成本线保本出场', type: 'info' as const, tip: '第一手止盈后回落至开仓成本线，零损失了结' }
+      return { text: '🛡️ 成本线保护出场', type: 'info' as const, tip: '余仓触及成本保护线后平仓，实际盈亏按成交价格及费用计算' }
     case 'stop':
       return { text: '🛑 触及初始止损', type: 'error' as const, tip: '触及 -1.0R 初始硬止损点' }
     case 'no_follow':

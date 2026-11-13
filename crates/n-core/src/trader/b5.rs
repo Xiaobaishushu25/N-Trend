@@ -366,6 +366,7 @@ impl Strategy for B5 {
             next_quote: true,
             terminal_rejections: true,
             complete_15m: true,
+            entry_timeout_seconds: None,
         }
     }
     fn subscriptions(&self) -> Vec<MarketSubscription> {
@@ -477,7 +478,10 @@ impl Strategy for B5 {
         let Ok(s) = serde_json::from_value::<Snapshot>(plan.evidence["b5"].clone()) else {
             return EntryDecision::Reject("invalid_b5_snapshot".into());
         };
-        if !q.instrument_id.eq_ignore_ascii_case(&s.instrument) || (q.tick - s.tick).abs() > 1e-7 {
+        if !q.instrument_id.eq_ignore_ascii_case(&s.instrument)
+            || (q.tick - s.tick).abs() > 1e-7
+            || crate::precision::stale_point_value(&s.instrument, s.multiplier)
+        {
             return EntryDecision::Reject("contract_metadata_mismatch".into());
         }
         if !q.valid_at(now)
@@ -647,7 +651,7 @@ impl Strategy for B5 {
             e,
             StrategyEvent::Quote(_) | StrategyEvent::BarClosed { .. } | StrategyEvent::Timer { .. }
         ) {
-            let lifecycle = candidates::CandidateStrategy::new(self.parameters.clone(), false)?;
+            let lifecycle = candidates::CandidateStrategy::new(self.parameters.clone())?;
             actions.extend(lifecycle.on_event(e, c, &mut state.lifecycle)?);
         }
         // Avoid two independent exit reasons issuing duplicate controls on one event.

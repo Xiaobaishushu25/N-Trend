@@ -460,7 +460,7 @@ test('B5 filtered signals retain their strategy identity without inventing an ev
   assert.equal(store.conditionPool[0].symbol, 'CJ0')
 })
 
-test('all P2/P3 pre-entry filters have readable reasons', () => {
+test('all candidate pre-entry filters have readable reasons', () => {
   const { store } = setup()
   for (const reason of ['score_below_min', 'risk_ticks_below_min', 'friction_above20', 'atr_unavailable',
     'atr_out_of_range', 'filtered_net_rr_plan', 'filtered_holiday_window', 'filtered_weekend_window', 'calendar_uncovered']) {

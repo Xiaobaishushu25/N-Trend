@@ -1,5 +1,5 @@
 //! Broker-independent, statically registered strategy extension points.
-use super::{model::ExecutionQuote, ExecutionConfig, ManagedPosition};
+use super::{model::ExecutionQuote, ExecutionConfig, ManagedPosition, PositionTier};
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -145,6 +145,7 @@ pub struct EntryConstraints {
     pub next_quote: bool,
     pub terminal_rejections: bool,
     pub complete_15m: bool,
+    pub entry_timeout_seconds: Option<u64>,
 }
 pub enum EntryDecision {
     Allow,
@@ -200,12 +201,46 @@ pub trait Strategy: Send + Sync {
     ) -> Result<Vec<TradeIntent>>;
 }
 pub trait SizingPolicy: Send + Sync {
+    /// Zero is a normal terminal rejection; a negative result is a policy error.
     fn volume(&self, plan: &EntryPlan, config: &ExecutionConfig, parameters: &Value)
         -> Result<i32>;
+
+    /// Recheck the total approved entry quantity at the actual proposed limit.
+    /// Filled entry notional remains included even after a partial exit. The
+    /// executor only reduces the original approval; it never adds to it.
+    fn volume_at_price(
+        &self,
+        _plan: &EntryPlan,
+        _config: &ExecutionConfig,
+        _parameters: &Value,
+        context: &SizingContext<'_>,
+    ) -> Result<i32> {
+        Ok(context.approved_volume)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizingPhase {
+    ProposedOrder,
+    ConfirmedFill,
+}
+pub struct SizingContext<'a> {
+    pub phase: SizingPhase,
+    pub quote: Option<&'a ExecutionQuote>,
+    pub contract_multiplier: f64,
+    /// Limit price for ProposedOrder, actual entry average for ConfirmedFill.
+    pub proposed_price: f64,
+    pub approved_volume: i32,
+    pub filled_volume: i32,
+    /// Sum(entry fill price * lots), before the contract point value or fees.
+    pub filled_notional: f64,
 }
 pub struct ExitUpdate {
     pub stop: f64,
     pub close: Option<(String, Option<i32>)>,
+}
+pub struct PartialExitUpdate {
+    pub stop: f64,
+    pub first_target_completed: bool,
 }
 pub trait ExitPolicy: Send + Sync {
     /// Called only after a confirmed fill. Pending conditions retain their original target.
@@ -220,6 +255,21 @@ pub trait ExitPolicy: Send + Sync {
     ) -> ExitUpdate;
     fn on_bar(&self, _position: &ManagedPosition, _parameters: &Value) -> Option<String> {
         None
+    }
+    /// Called once after a partial exit task has actually filled and every
+    /// associated close order has settled. The executor persists this transition.
+    fn on_partial_close(
+        &self,
+        position: &ManagedPosition,
+        _reason: &str,
+        _filled_volume: i32,
+        _parameters: &Value,
+        _quote: Option<&ExecutionQuote>,
+    ) -> PartialExitUpdate {
+        PartialExitUpdate {
+            stop: position.current_stop_price,
+            first_target_completed: position.lot1_closed,
+        }
     }
 }
 
@@ -243,6 +293,7 @@ impl Default for StrategyRegistry {
         r.register_sizing("n_score_v1", Arc::new(NScoreSizing));
         r.register_sizing("fixed_v1", Arc::new(FixedSizing));
         super::candidates::register(&mut r);
+        super::candidates::p3::register(&mut r);
         super::b5::register(&mut r);
         r
     }
@@ -288,6 +339,7 @@ impl StrategyRegistry {
         self.exit(&d.exit_policy)?;
         self.sizing(&d.sizing_policy)?;
         super::candidates::validate_definition(d)?;
+        super::candidates::p3::validate_definition(d)?;
         super::b5::validate_definition(d)?;
         Ok(())
     }
@@ -297,6 +349,7 @@ impl StrategyRegistry {
             .cloned()
             .unwrap_or_default();
         presets.push(super::b5::preset());
+        presets.push(super::candidates::p3::preset());
         serde_json::json!({"strategies":self.strategies.keys().map(|(id,v)|serde_json::json!({"id":id,"version":v})).collect::<Vec<_>>(),
             "exit_policies":self.exits.keys().collect::<Vec<_>>(), "sizing_policies":self.sizing.keys().collect::<Vec<_>>(),
             "presets":presets})
@@ -389,12 +442,30 @@ impl SizingPolicy for NScoreSizing {
 struct FixedSizing;
 impl SizingPolicy for FixedSizing {
     fn volume(&self, p: &EntryPlan, _: &ExecutionConfig, _: &Value) -> Result<i32> {
-        ensure!(p.requested_volume > 0, "手数必须大于0");
+        ensure!(p.requested_volume >= 0, "手数不能为负");
         Ok(p.requested_volume)
     }
 }
 struct NExitPolicy;
 impl ExitPolicy for NExitPolicy {
+    fn on_partial_close(
+        &self,
+        p: &ManagedPosition,
+        reason: &str,
+        _: i32,
+        _: &Value,
+        _: Option<&ExecutionQuote>,
+    ) -> PartialExitUpdate {
+        let first = p.lot1_closed || (reason == "target_1r" && p.tier == PositionTier::Large);
+        PartialExitUpdate {
+            stop: if first {
+                p.fill_price
+            } else {
+                p.current_stop_price
+            },
+            first_target_completed: first,
+        }
+    }
     fn on_quote(&self, p: &ManagedPosition, q: &ExecutionQuote, _: &Value) -> ExitUpdate {
         let u = super::policy::on_price(
             p.tier,

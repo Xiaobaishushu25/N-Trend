@@ -1,7 +1,8 @@
-//! Frozen P2/P3 decisions on the common multi-account executor.
+//! Frozen P2 decisions on the common multi-account executor.
 //! Live book execution is versioned separately from research-v5 OHLC replay.
 use super::{strategy::*, ConditionState, ManagedPosition};
 use crate::{
+    analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, TIME_HORIZON_BARS},
     fetch::kline::Kline,
     session::{NightSessionType, SessionCalendar},
 };
@@ -15,10 +16,11 @@ use std::{
 };
 
 pub const P2: &str = "n_p2";
-pub const P3: &str = "n_p3";
 pub const CODE_VERSION: &str = "1";
 pub const EXECUTION_VERSION: &str = "candidate-book-v1";
 pub const ONE_LOT: &str = "candidate_one_lot_v1";
+
+pub mod p3;
 
 fn shanghai() -> FixedOffset {
     FixedOffset::east_opt(28800).unwrap()
@@ -129,7 +131,7 @@ impl Parameters {
             fees: serde_json::from_str(include_str!("candidates/reference-fees-20261022.json"))
                 .unwrap(),
             calendar: serde_json::from_str(include_str!(
-                "candidates/reference-holidays-2026-jul-oct.json"
+                "candidates/reference-holidays-2026-jul-dec-v2.json"
             ))
             .unwrap(),
         }
@@ -137,13 +139,13 @@ impl Parameters {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.fees.id.is_empty() && !self.fees.products.is_empty(),
-            "P2/P3必须冻结费用版本与费率"
+            "候选策略必须冻结费用版本与费率"
         );
         ensure!(
             self.fees.products.values().all(Fees::valid),
-            "P2/P3费率无效"
+            "候选策略费率无效"
         );
-        ensure!(!self.calendar.id.is_empty(), "P2/P3必须声明日历版本");
+        ensure!(!self.calendar.id.is_empty(), "候选策略必须声明日历版本");
         let first = parse_time(&self.calendar.coverage_start)?;
         let last = parse_time(&self.calendar.coverage_end)?;
         ensure!(first < last, "日历覆盖区间无效");
@@ -156,7 +158,7 @@ impl Parameters {
                 parse_time(&h.reopen)?,
             );
             ensure!(
-                end <= b && b < f && f < c && c < r && r <= last,
+                end <= b && b <= f && f < c && c < r && r <= last,
                 "长假窗口顺序或覆盖范围无效"
             );
             end = r;
@@ -184,7 +186,7 @@ impl Parameters {
         }) {
             return Some("filtered_holiday_window");
         }
-        weekend_windows(symbol, now)
+        self.weekend_windows(symbol, now)
             .iter()
             .any(|(cut, reopen)| now >= *cut && now < *reopen)
             .then_some("filtered_weekend_window")
@@ -195,20 +197,70 @@ impl Parameters {
         }) {
             return Some("pre_holiday");
         }
-        weekend_windows(symbol, now)
+        self.weekend_windows(symbol, now)
             .iter()
             .any(|(cut, reopen)| opened < *reopen && now >= *cut)
             .then_some("pre_weekend")
     }
+
+    /// Exchange wall-clock windows, selected from the bound contract rather than
+    /// the broker's trading-day label (Friday night is often labelled Monday).
+    /// Frozen holiday closures can remove the nominal Friday night session.
+    fn weekend_windows(&self, instrument: &str, now: i64) -> Vec<(i64, i64)> {
+        weekend_windows(instrument, now)
+            .into_iter()
+            .map(|(cut, reopen)| {
+                let nominal_close = cut + 600;
+                self.calendar
+                    .windows
+                    .iter()
+                    .filter_map(|h| {
+                        let close = parse_time(&h.last_close).ok()?;
+                        let holiday_reopen = parse_time(&h.reopen).ok()?;
+                        (close <= nominal_close && nominal_close < holiday_reopen)
+                            .then_some((close - 600, holiday_reopen.max(reopen)))
+                    })
+                    .min_by_key(|(cut, _)| *cut)
+                    .unwrap_or((cut, reopen))
+            })
+            .collect()
+    }
+}
+
+/// Report coverage for the supplied frozen definition; never rewrite its calendar.
+/// Three days' notice allows an operator to install a new, explicit revision.
+pub fn calendar_health(definition: &StrategyDefinition, now: i64) -> Option<Value> {
+    let calendar = definition.parameters.get("calendar")?;
+    let first = calendar["coverage_start"]
+        .as_str()
+        .and_then(|s| parse_time(s).ok());
+    let last = calendar["coverage_end"]
+        .as_str()
+        .and_then(|s| parse_time(s).ok());
+    let remaining = last.map(|end| end.saturating_sub(now));
+    let status = match (first, last) {
+        (Some(start), Some(end)) if start < end && start <= now && now <= end => {
+            if end - now <= 3 * 24 * 60 * 60 {
+                "expiring"
+            } else {
+                "ok"
+            }
+        }
+        (Some(start), Some(end)) if start < end => "uncovered",
+        _ => "invalid",
+    };
+    Some(
+        json!({"strategy_id":definition.strategy_id,"revision":definition.revision,
+        "calendar_version":calendar["id"],"coverage_start":calendar["coverage_start"],
+        "coverage_end":calendar["coverage_end"],"status":status,"remaining_seconds":remaining,
+        "warning_lead_seconds":3*24*60*60}),
+    )
 }
 /// Last weekly cutoff plus this week's cutoff; overdue positions stay exposed until a confirmed fill.
-fn weekend_windows(symbol: &str, now: i64) -> Vec<(i64, i64)> {
+fn weekend_windows(instrument: &str, now: i64) -> Vec<(i64, i64)> {
     let today = local(now).date_naive();
     let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
-    let night = match SessionCalendar::contract_prefix(symbol).as_str() {
-        "SF" | "SM" => NightSessionType::None,
-        _ => SessionCalendar::get(symbol).night_type,
-    };
+    let night = SessionCalendar::get(instrument).night_type;
     [-1, 0]
         .into_iter()
         .map(|weeks| {
@@ -333,15 +385,8 @@ impl Snapshot {
             -1.
         }
     }
-    fn target(&self, fill: f64, cap: bool) -> f64 {
-        if !cap {
-            return self.target;
-        }
-        fill + self.sign()
-            * ((self.target - fill) * self.sign()).min(2. * (fill - self.stop) * self.sign())
-    }
-    fn net_space(&self, fill: f64, cap: bool) -> bool {
-        let target = self.target(fill, cap) - self.sign() * self.tick;
+    fn net_space(&self, fill: f64) -> bool {
+        let target = self.target - self.sign() * self.tick;
         let stop = self.stop - self.sign() * self.tick;
         let reward = (target - fill) * self.sign() * self.multiplier
             - self.fees.bound(fill, target, self.multiplier);
@@ -353,6 +398,23 @@ impl Snapshot {
 #[derive(Default, Serialize, Deserialize)]
 struct Clock {
     buckets: BTreeMap<String, f64>,
+    #[serde(default)]
+    no_follow_checked: bool,
+    #[serde(default)]
+    basis: Option<(f64, f64)>,
+}
+impl Clock {
+    fn align_holding(&mut self, p: &ManagedPosition) {
+        if let Some((fill, risk)) = self.basis {
+            if fill != p.fill_price || risk != p.risk {
+                let sign = if p.direction == "up" { 1. } else { -1. };
+                for r in self.buckets.values_mut() {
+                    *r = ((fill + sign * (*r) * risk - p.fill_price) * sign / p.risk).max(0.);
+                }
+            }
+        }
+        self.basis = Some((p.fill_price, p.risk));
+    }
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -372,16 +434,19 @@ impl State {
 
 pub struct CandidateStrategy {
     parameters: Parameters,
-    cap: bool,
+    min_score: f64,
     #[cfg(test)]
     calendar_time_override: Option<i64>,
 }
 impl CandidateStrategy {
-    pub fn new(parameters: Parameters, cap: bool) -> Result<Self> {
+    pub fn new(parameters: Parameters) -> Result<Self> {
+        Self::with_min_score(parameters, 3.)
+    }
+    fn with_min_score(parameters: Parameters, min_score: f64) -> Result<Self> {
         parameters.validate()?;
         Ok(Self {
             parameters,
-            cap,
+            min_score,
             #[cfg(test)]
             calendar_time_override: None,
         })
@@ -478,6 +543,10 @@ impl CandidateStrategy {
             );
             let symbol = p["symbol"].as_str().unwrap();
             let instrument = p["instrument_id"].as_str().unwrap();
+            ensure!(
+                !crate::precision::stale_point_value(instrument, multiplier),
+                "stale_contract_point_value"
+            );
             let fees = self
                 .parameters
                 .fee(symbol, instrument)
@@ -518,7 +587,7 @@ impl CandidateStrategy {
         let friction = 2. * s.tick * s.multiplier
             + s.fees
                 .bound(forecast, s.stop - s.sign() * s.tick, s.multiplier);
-        let reason = if s.score < 3. {
+        let reason = if s.score < self.min_score {
             Some("score_below_min")
         } else if s.risk / s.tick + 1e-6 < 10. {
             Some("risk_ticks_below_min")
@@ -531,12 +600,14 @@ impl CandidateStrategy {
             Some("atr_unavailable")
         } else if !(0.75..=2.5).contains(&(s.risk / s.atr14)) {
             Some("atr_out_of_range")
-        } else if !s.net_space(forecast, self.cap) {
+        } else if !s.net_space(forecast) {
             Some("filtered_net_rr_plan")
         } else {
-            self.parameters.block(&s.symbol, self.calendar_time(now))
+            self.parameters
+                .block(&s.instrument, self.calendar_time(now))
         };
-        let values = json!({"warning":values,"snapshot":s,"friction_yuan":friction,"risk_atr":s.risk/s.atr14});
+        let values = json!({"warning":values,"snapshot":s,"friction_yuan":friction,
+            "risk_atr":s.risk/s.atr14,"min_score":self.min_score});
         if let Some(reason) = reason {
             state.record(&key, reason, values);
             return Ok(vec![]);
@@ -556,7 +627,7 @@ impl CandidateStrategy {
             requested_volume: 1,
             created_at: now,
             expires_at: None,
-            reason: "P2/P3条件单，固定一手与原结构止损".into(),
+            reason: "候选策略条件单，固定一手与原结构止损".into(),
             evidence: json!({"id":p["id"],"entry_score":s.score,"warning_ts":s.warning_ts,
                 "candidate":s,"execution_version":EXECUTION_VERSION,"source_evidence":p.get("source_evidence").unwrap_or(p)}),
         })])
@@ -569,6 +640,7 @@ impl Strategy for CandidateStrategy {
             next_quote: true,
             terminal_rejections: true,
             complete_15m: true,
+            entry_timeout_seconds: None,
         }
     }
     fn check_entry(
@@ -581,7 +653,10 @@ impl Strategy for CandidateStrategy {
         let Ok(s) = serde_json::from_value::<Snapshot>(plan.evidence["candidate"].clone()) else {
             return EntryDecision::Reject("invalid_candidate_snapshot".into());
         };
-        if !q.instrument_id.eq_ignore_ascii_case(&s.instrument) || (q.tick - s.tick).abs() > 1e-7 {
+        if !q.instrument_id.eq_ignore_ascii_case(&s.instrument)
+            || (q.tick - s.tick).abs() > 1e-7
+            || crate::precision::stale_point_value(&s.instrument, s.multiplier)
+        {
             return EntryDecision::Reject("contract_metadata_mismatch".into());
         }
         if !q.valid_at(now)
@@ -595,7 +670,10 @@ impl Strategy for CandidateStrategy {
         {
             return EntryDecision::Wait("unavailable_quote".into());
         }
-        if let Some(reason) = self.parameters.block(&s.symbol, self.calendar_time(now)) {
+        if let Some(reason) = self
+            .parameters
+            .block(&s.instrument, self.calendar_time(now))
+        {
             return EntryDecision::Reject(reason.into());
         }
         if !fill.is_finite()
@@ -606,7 +684,7 @@ impl Strategy for CandidateStrategy {
         if (s.target - fill) * s.sign() <= 0. {
             return EntryDecision::Reject("invalid_target".into());
         }
-        if !s.net_space(fill, self.cap) {
+        if !s.net_space(fill) {
             return EntryDecision::Reject("filtered_net_rr_fill".into());
         }
         if (fill - s.stop) * s.sign() / s.tick + 1e-6 < 10. {
@@ -671,13 +749,9 @@ impl Strategy for CandidateStrategy {
                         let r = (q.last - p.fill_price)
                             * if p.direction == "up" { 1. } else { -1. }
                             / p.risk;
-                        let mfe = state
-                            .holding
-                            .entry(p.id.clone())
-                            .or_default()
-                            .buckets
-                            .entry(bucket(q.timestamp))
-                            .or_insert(0.);
+                        let clock = state.holding.entry(p.id.clone()).or_default();
+                        clock.align_holding(p);
+                        let mfe = clock.buckets.entry(bucket(q.timestamp)).or_insert(0.);
                         *mfe = mfe.max(r);
                     }
                 }
@@ -719,27 +793,34 @@ impl Strategy for CandidateStrategy {
                     .iter()
                     .filter(|p| !p.is_closed && p.symbol == *symbol)
                 {
-                    if c.conditions
-                        .iter()
-                        .any(|o| o.id == p.id && o.state == ConditionState::Closing)
-                    {
-                        continue;
-                    }
                     let start = bucket(parse_time(&p.open_ts)?);
                     if timestamp < &start {
                         continue;
                     }
                     let clock = state.holding.entry(p.id.clone()).or_default();
+                    clock.align_holding(p);
                     clock.buckets.entry(start).or_insert(0.);
                     clock.buckets.entry(timestamp.clone()).or_insert(0.);
                     let completed = clock
                         .buckets
                         .range(..=timestamp.clone())
                         .collect::<Vec<_>>();
-                    let mfe = completed.iter().map(|(_, r)| **r).fold(0., f64::max);
-                    let reason = if completed.len() >= 60 {
+                    // Inspect only the first five observed trading buckets, even
+                    // when bar-close delivery catches up after the fifth one.
+                    // Later quotes cannot rescue an earlier no-follow failure.
+                    let no_follow_due =
+                        !clock.no_follow_checked && completed.len() >= NO_FOLLOW_BAR;
+                    let first_mfe = completed
+                        .iter()
+                        .take(NO_FOLLOW_BAR)
+                        .map(|(_, r)| **r)
+                        .fold(0., f64::max);
+                    if no_follow_due {
+                        clock.no_follow_checked = true;
+                    }
+                    let reason = if completed.len() >= TIME_HORIZON_BARS {
                         Some("time_exit")
-                    } else if completed.len() == 5 && mfe < 0.5 {
+                    } else if no_follow_due && first_mfe < NO_FOLLOW_MFE_R {
                         Some("no_follow")
                     } else {
                         None
@@ -760,16 +841,11 @@ impl Strategy for CandidateStrategy {
             }
             StrategyEvent::Timer { timestamp } => {
                 for p in c.positions.iter().filter(|p| !p.is_closed && p.volume > 0) {
-                    if c.conditions
-                        .iter()
-                        .any(|o| o.id == p.id && o.state == ConditionState::Closing)
-                    {
-                        continue;
-                    }
-                    if let Some(reason) =
-                        self.parameters
-                            .flat_reason(&p.symbol, parse_time(&p.open_ts)?, *timestamp)
-                    {
+                    if let Some(reason) = self.parameters.flat_reason(
+                        &p.instrument_id,
+                        parse_time(&p.open_ts)?,
+                        *timestamp,
+                    ) {
                         actions.push(TradeIntent::Close {
                             position_id: p.id.clone(),
                             direction: if p.direction == "up" {
@@ -792,7 +868,7 @@ impl Strategy for CandidateStrategy {
                             | ConditionState::Unknown
                     ) && !c.positions.iter().any(|p| p.id == o.id && !p.is_closed)
                 }) {
-                    if let Some(reason) = self.parameters.block(&cond.symbol, *timestamp) {
+                    if let Some(reason) = self.parameters.block(&cond.instrument_id, *timestamp) {
                         actions.push(TradeIntent::CancelEntry {
                             condition_id: cond.id.clone(),
                             reason: reason.into(),
@@ -809,17 +885,15 @@ impl Strategy for CandidateStrategy {
 struct OneLot;
 impl SizingPolicy for OneLot {
     fn volume(&self, p: &EntryPlan, _: &super::ExecutionConfig, _: &Value) -> Result<i32> {
-        ensure!(p.requested_volume == 1, "P2/P3只允许固定一手");
+        ensure!(p.requested_volume == 1, "候选策略只允许固定一手");
         Ok(1)
     }
 }
-struct FixedExit {
-    cap: bool,
-}
+struct FixedExit;
 impl ExitPolicy for FixedExit {
-    fn target_on_fill(&self, p: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
+    fn target_on_fill(&self, _: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
         let s: Snapshot = serde_json::from_value(plan.evidence["candidate"].clone()).ok()?;
-        Some(s.target(p.fill_price, self.cap))
+        Some(s.target)
     }
     fn on_quote(
         &self,
@@ -845,52 +919,33 @@ pub fn definition(id: &str, parameters: Parameters) -> StrategyDefinition {
         strategy_id: id.into(),
         code_version: CODE_VERSION.into(),
         revision: "1".into(),
-        exit_policy: if id == P3 {
-            "p3_fixed_exit_v1"
-        } else {
-            "p2_fixed_exit_v1"
-        }
-        .into(),
+        exit_policy: "p2_fixed_exit_v1".into(),
         sizing_policy: ONE_LOT.into(),
         parameters: serde_json::to_value(parameters).unwrap(),
     }
 }
 pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
-    if matches!(d.strategy_id.as_str(), P2 | P3) {
+    if d.strategy_id == P2 {
         ensure!(
             d.code_version == CODE_VERSION
                 && d.sizing_policy == ONE_LOT
-                && d.exit_policy
-                    == if d.strategy_id == P3 {
-                        "p3_fixed_exit_v1"
-                    } else {
-                        "p2_fixed_exit_v1"
-                    },
-            "P2/P3必须使用对应固定目标退出和固定一手模块"
+                && d.exit_policy == "p2_fixed_exit_v1",
+            "P2必须使用对应固定目标退出和固定一手模块"
         );
     }
     Ok(())
 }
 pub fn register(r: &mut StrategyRegistry) {
     r.register_strategy(P2, CODE_VERSION, |p| {
-        Ok(Box::new(CandidateStrategy::new(
-            serde_json::from_value(p.clone())?,
-            false,
-        )?))
+        Ok(Box::new(CandidateStrategy::new(serde_json::from_value(
+            p.clone(),
+        )?)?))
     });
-    r.register_strategy(P3, CODE_VERSION, |p| {
-        Ok(Box::new(CandidateStrategy::new(
-            serde_json::from_value(p.clone())?,
-            true,
-        )?))
-    });
-    r.register_exit("p2_fixed_exit_v1", Arc::new(FixedExit { cap: false }));
-    r.register_exit("p3_fixed_exit_v1", Arc::new(FixedExit { cap: true }));
+    r.register_exit("p2_fixed_exit_v1", Arc::new(FixedExit));
     r.register_sizing(ONE_LOT, Arc::new(OneLot));
 }
 pub fn presets() -> Value {
-    json!([{"label":"P2 · ATR过滤 / 原S1目标","definition":definition(P2,Parameters::reference_snapshot())},
-        {"label":"P3 · ATR过滤 / 2R目标上限","definition":definition(P3,Parameters::reference_snapshot())}])
+    json!([{"label":"P2 · ATR过滤 / 原S1目标","definition":definition(P2,Parameters::reference_snapshot())}])
 }
 
 #[cfg(test)]

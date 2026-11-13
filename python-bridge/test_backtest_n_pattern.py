@@ -114,7 +114,8 @@ class TestPureHelpers(unittest.TestCase):
             price_tick=1.0,
             volume_multiple=10.0,
         )
-        self.assertIsNone(compute_slippage_limit_price("BUY", q, 0))
+        self.assertEqual(compute_slippage_limit_price("BUY", q, 0), 3501.0)
+        self.assertEqual(compute_slippage_limit_price("SELL", q, 0), 3499.0)
         self.assertEqual(compute_slippage_limit_price("BUY", q, 1), 3502.0)
         self.assertEqual(compute_slippage_limit_price("SELL", q, 2), 3497.0)
 
@@ -320,9 +321,11 @@ class TestNExitAndLifecycle(unittest.TestCase):
             [],
         )
 
-        # Expire after PENDING_BARS (12)
+        # Live expires only after PENDING_BARS, so bar 12 is still valid.
         for i in range(PENDING_BARS):
             eng.step_bar_timers("RB0", f"bar_{i}", 95.0)
+        self.assertEqual(c1[0].state, "pending")
+        eng.step_bar_timers("RB0", "bar_12", 95.0)
         self.assertEqual(c1[0].state, "expired")
 
         # Duplicate after expiry with |entry - prev.entry| <= 0.3 * prev.risk -> still skipped
@@ -340,7 +343,7 @@ class TestNExitAndLifecycle(unittest.TestCase):
 
 class TestRolloverHoldAndAnalytics(unittest.TestCase):
     def test_rollover_hold_cancels_pending_keeps_open_and_tracks_old_contract(self):
-        eng = NPatternBacktestEngine(_make_cfg(allow_rollover_overlap=False))
+        eng = NPatternBacktestEngine(_make_cfg(allow_rollover_overlap=False, one_per_symbol=True))
 
         # Open position on old contract rb2501
         c1 = eng.ingest_signals(
@@ -542,6 +545,7 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
             volume_short_frozen_today=0,
         )
         recorded_orders = []
+        tick_subscriptions = []
 
         class FakeSim:
             def __init__(self, init_balance=1_000_000.0):
@@ -568,13 +572,19 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
                     return self.df
                 return pd.DataFrame([])
 
+            def get_tick_serial(self, sym, data_length=5):
+                tick_subscriptions.append(sym)
+                return pd.DataFrame([])
+
             def get_account(self):
                 return account_obj
 
             def get_position(self, sym):
                 return pos_rb2501
 
-            def is_changing(self, obj, _fields):
+            def is_changing(self, obj, _fields=None):
+                if obj is self.df:
+                    return self._step in (1, 3)
                 return bool(getattr(obj, "_changing", False))
 
             def insert_order(self, *, symbol, direction, offset, volume, limit_price=None):
@@ -591,6 +601,7 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
                     volume_orign=volume,
                     volume_left=0,
                     trade_price=fill_px,
+                    limit_price=limit_price,
                     last_msg="全部成交",
                     insert_date_time=t_active1,
                 )
@@ -643,7 +654,8 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
                 pass
 
             def init_symbol(self, symbol, tick, bars):
-                return {"ok": True, "tick": tick, "multiplier": 10.0, "bar_count": len(bars)}
+                # Deliberately return stale multiplier (like JD0 5.0 vs real 10.0)
+                return {"ok": True, "tick": tick, "multiplier": 5.0, "bar_count": len(bars)}
 
             def step_bar(self, symbol, bar):
                 self.rollovers_seen.append(bar["rollover"])
@@ -667,6 +679,7 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
             report = run_tq_backtest(_make_cfg(symbols=["RB0"]), account="demo", password="pw")
 
         self.assertEqual(worker_instance.rollovers_seen, [False, True])
+        self.assertEqual(tick_subscriptions, ["SHFE.rb2501", "SHFE.rb2505"])
         self.assertEqual(recorded_orders, [
             ("SIM_1", "SHFE.rb2501", "BUY", "OPEN", 1),
             ("SIM_2", "SHFE.rb2501", "SELL", "CLOSETODAY", 1),
@@ -676,6 +689,9 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
         self.assertAlmostEqual(report["overall"]["gross_pnl"], 100.0)
         self.assertAlmostEqual(report["overall"]["commission"], 7.0)
         self.assertAlmostEqual(report["overall"]["net_pnl"], 93.0)
+        self.assertTrue(report["validation"]["accounting_reconciled"])
+        self.assertTrue(report["validation"]["no_unresolved_broker_orders"])
+        self.assertTrue(report["validation"]["tick_replay"])
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()

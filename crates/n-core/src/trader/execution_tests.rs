@@ -10,6 +10,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[path = "execution_foundation_tests.rs"]
+mod foundation;
+#[path = "p3_execution_tests.rs"]
+mod p3_tests;
+
 #[tokio::test]
 async fn historical_orders_are_paged_newest_first_without_changing_archive() {
     let engine = ExecutionEngine::new(
@@ -386,7 +391,7 @@ async fn one_signal_survives_restart_unknown_ack_and_repeated_crossings_without_
 }
 
 #[tokio::test]
-async fn semi_auto_stop_waits_for_cancel_and_late_fills_then_reprices_only_remaining_quantity() {
+async fn semi_auto_stop_reserves_late_fills_and_closes_only_unreserved_quantity() {
     let counter = Counter::new();
     let engine = counter.engine(ExecutionMode::SemiAuto, 3);
     ready(&engine, vec![], vec![]).await;
@@ -436,7 +441,9 @@ async fn semi_auto_stop_waits_for_cancel_and_late_fills_then_reprices_only_remai
     .await;
     age(&engine).await;
     engine.drive().await.unwrap();
-    assert_eq!(counter.inserts().len(), 2); // The second reported fill has not arrived yet.
+    // One reported fill is missing, so reserve it and close the other known lot.
+    assert_eq!(counter.inserts().len(), 3);
+    assert_eq!(counter.inserts()[2]["volume"], 1);
     let fill2 = trade(&close, "close2", 1, 998.0);
     let mut fills = vec![opened, fill1, fill2];
     ready(&engine, canceled.clone(), fills.clone()).await;
@@ -471,6 +478,8 @@ async fn stop_during_partial_entry_cancels_open_and_exits_late_fills_without_ree
     .await;
     age(&engine).await;
     quote(&engine, 1000.0).await;
+    assert_eq!(counter.inserts()[1]["volume"], 1);
+    engine.drive().await.unwrap();
     assert_eq!(
         counter.requests.lock().unwrap().last().unwrap().0,
         "/order/cancel"
@@ -485,7 +494,8 @@ async fn stop_during_partial_entry_cancels_open_and_exits_late_fills_without_ree
     assert_eq!(engine.list_positions().await[0].volume, 2);
     age(&engine).await;
     quote(&engine, 1000.0).await;
-    assert_eq!(counter.inserts()[1]["volume"], 2);
+    assert_eq!(counter.inserts()[1]["volume"], 1);
+    assert_eq!(counter.inserts()[2]["volume"], 1);
     assert_eq!(counter.inserts()[1]["direction"], "sell");
     for p in [1010.0, 999.0, 1010.0] {
         age(&engine).await;
@@ -646,7 +656,7 @@ async fn entry_overshoot_beyond_point_two_r_suspends_order_until_pullback() {
 }
 
 #[tokio::test]
-async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions() {
+async fn cancel_pending_keeps_unknown_exposure_without_starving_other_conditions() {
     let counter = Counter::new();
     let engine = counter.engine(ExecutionMode::FullAuto, 2);
     ready(&engine, vec![], vec![]).await;
@@ -673,6 +683,8 @@ async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions()
                 phase: OrderPhase::CancelPending,
                 reported_filled: 0,
                 filled: 0,
+                submitted_at: chrono::Utc::now().timestamp(),
+                entry_fill_notional: 0.,
                 action_at: chrono::Utc::now().timestamp() - 20, // 20s ago
                 trading_day: "20261019".to_string(),
                 note: "waiting for counter".into(),
@@ -683,14 +695,14 @@ async fn cancel_pending_deadlock_unblocks_and_does_not_starve_other_conditions()
         );
     }
 
-    // Now drive runs. It should unblock stuck order to Rejected and not loop endlessly!
+    // Keep ambiguous exposure while allowing independent conditions to progress.
     engine.drive().await.unwrap();
 
     {
         let s = engine.state.lock().await;
         let o = s.orders.get("ref_stuck").unwrap();
-        assert_eq!(o.phase, OrderPhase::Rejected);
-        assert!(o.note.contains("撤单多次未获回报"));
+        assert_eq!(o.phase, OrderPhase::Unknown);
+        assert!(o.note.contains("撤单未确认"));
     }
 }
 
@@ -1555,6 +1567,8 @@ fn incremental_indices_match_full_table_scan_across_lifecycle() {
             phase: OrderPhase::Unknown,
             reported_filled: 0,
             filled: 0,
+            submitted_at: chrono::Utc::now().timestamp(),
+            entry_fill_notional: 0.,
             action_at: 1001,
             trading_day: "20261105".into(),
             note: "".into(),
@@ -1649,6 +1663,8 @@ fn incremental_indices_match_full_table_scan_across_lifecycle() {
             phase: OrderPhase::Working,
             reported_filled: 0,
             filled: 0,
+            submitted_at: chrono::Utc::now().timestamp(),
+            entry_fill_notional: 0.,
             action_at: 1010,
             trading_day: "20261105".into(),
             note: "".into(),
@@ -1695,6 +1711,8 @@ fn incremental_indices_match_full_table_scan_across_lifecycle() {
             phase: OrderPhase::CancelPending,
             reported_filled: 0,
             filled: 0,
+            submitted_at: chrono::Utc::now().timestamp(),
+            entry_fill_notional: 0.,
             action_at: 1020,
             trading_day: "20261105".into(),
             note: "".into(),
@@ -2085,6 +2103,10 @@ async fn quote_context_filters_terminal_history_but_timer_preserves_all() {
 
                 filled: 0,
 
+                submitted_at: chrono::Utc::now().timestamp(),
+
+                entry_fill_notional: 0.,
+
                 action_at: 1005,
 
                 trading_day: "20261105".into(),
@@ -2144,6 +2166,10 @@ async fn quote_context_filters_terminal_history_but_timer_preserves_all() {
                     reported_filled: 1,
 
                     filled: 1,
+
+                    submitted_at: chrono::Utc::now().timestamp(),
+
+                    entry_fill_notional: 0.,
 
                     action_at: 910,
 

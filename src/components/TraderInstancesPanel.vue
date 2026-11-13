@@ -85,8 +85,22 @@ const strategy = ref<StrategyDefinition | null>(null)
 const parameters = ref('{}')
 const createPreset = ref('')
 const presets = computed(() => trader.instanceCatalog?.modules?.presets || [])
-const isCandidate = computed(() => ['n_p2', 'n_p3', 'n_b5_six'].includes(strategy.value?.strategy_id || ''))
+const isCandidate = computed(() => ['n_p2', 'n_b5_six', 'n_p3_v1'].includes(strategy.value?.strategy_id || ''))
 const isB5 = computed(() => strategy.value?.strategy_id === 'n_b5_six')
+const isP3 = computed(() => strategy.value?.strategy_id === 'n_p3_v1')
+function p3Parameter(key: string, fallback: string | number): string | number {
+  try { return JSON.parse(parameters.value)[key] ?? fallback } catch { return fallback }
+}
+function updateP3Parameter(key: string, value: string | number) {
+  try {
+    const next = JSON.parse(parameters.value)
+    next[key] = value
+    parameters.value = JSON.stringify(next, null, 2)
+  } catch { setDialogError('请先修正策略参数中的 JSON，再调整 P3 设置。') }
+}
+const p3ExitMode = computed({ get: () => String(p3Parameter('exit_mode', 'fixed_s1')), set: (v: string) => updateP3Parameter('exit_mode', v) })
+const p3Budget = computed({ get: () => Number(p3Parameter('risk_budget_yuan', 600)), set: (v: number) => updateP3Parameter('risk_budget_yuan', v) })
+const p3MaxLots = computed({ get: () => Number(p3Parameter('max_lots', 2)), set: (v: number) => updateP3Parameter('max_lots', v) })
 const compareOpen = ref(false)
 const compareBusy = ref(false)
 const compare = ref<any>(null)
@@ -117,7 +131,7 @@ const localDate = (timestamp: number) => {
 const from = ref(localDate(Date.now() - 30 * 86400000))
 const to = ref(localDate(Date.now()))
 const number = (v: unknown, digits = 2) => typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '—'
-const moduleLabel = (id: string) => ({ n_b5_six: '六品种 B5', b5_structural_exit_v1: 'B5 结构目标与固定止损', n_pattern: 'N 字形', n_exit_v1: '现有 N 字形退出', n_score_v1: '现有评分分档', fixed_v1: '计划手数', protect_only_v1: '保护价退出', n_p2: 'P2 · ATR / 原 S1', n_p3: 'P3 · ATR / 2R 上限', p2_fixed_exit_v1: 'P2 固定止损与原 S1', p3_fixed_exit_v1: 'P3 固定止损与 2R 上限', candidate_one_lot_v1: 'P2/P3 固定一手' }[id] || id)
+const moduleLabel = (id: string) => ({ n_b5_six: '六品种 B5', b5_structural_exit_v1: 'B5 结构目标与固定止损', n_pattern: 'N 字形', n_exit_v1: '现有 N 字形退出', n_score_v1: '现有评分分档', fixed_v1: '计划手数', protect_only_v1: '保护价退出', n_p2: 'P2 · ATR / 原 S1', p2_fixed_exit_v1: 'P2 固定止损与原 S1', candidate_one_lot_v1: 'P2 固定一手', n_p3_v1: 'P3 · 金额预算', p3_exit_v1: 'P3 S1 / 分批追踪', risk_budget_v1: '含成本金额预算' }[id] || id)
 
 const connectionTooltip = computed(() => {
   if (trader.errorMsg) return trader.errorMsg
@@ -145,7 +159,7 @@ function applyPreset(id: string) {
   }
   strategy.value = JSON.parse(JSON.stringify(preset.definition)) as StrategyDefinition
   parameters.value = JSON.stringify(strategy.value.parameters, null, 2)
-  if (config.value) Object.assign(config.value, { min_entry_risk_ticks: 10, default_large_volume: 1, default_small_volume: 1, slippage_ticks: 0 })
+  if (config.value) Object.assign(config.value, { min_entry_risk_ticks: 10, default_large_volume: 1, default_small_volume: 1, slippage_ticks: 0, ...(id === 'n_p3_v1' ? { order_wait_seconds: 3 } : {}) })
 }
 
 function openCreate(copy: boolean) {
@@ -837,36 +851,54 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
 
                 <div class="form-row">
                   <label class="form-label">退出模块</label>
-                  <select v-model="strategy.exit_policy" class="form-select">
+                  <select v-model="strategy.exit_policy" class="form-select" :disabled="isP3">
                     <option v-for="id in trader.instanceCatalog?.modules.exit_policies" :key="id" :value="id">{{ moduleLabel(id) }}</option>
                   </select>
                 </div>
 
                 <div class="form-row">
                   <label class="form-label">仓位模块</label>
-                  <select v-model="strategy.sizing_policy" class="form-select">
+                  <select v-model="strategy.sizing_policy" class="form-select" :disabled="isP3">
                     <option v-for="id in trader.instanceCatalog?.modules.sizing_policies" :key="id" :value="id">{{ moduleLabel(id) }}</option>
                   </select>
                 </div>
 
                 <div class="form-row">
                   <label class="form-label">大仓手数</label>
-                  <input v-model.number="config.default_large_volume" type="number" min="1" class="form-input" required>
+                  <input v-model.number="config.default_large_volume" type="number" min="1" class="form-input" :disabled="isP3" required>
                 </div>
 
                 <div class="form-row">
                   <label class="form-label">小仓手数</label>
-                  <input v-model.number="config.default_small_volume" type="number" min="1" class="form-input" required>
+                  <input v-model.number="config.default_small_volume" type="number" min="1" class="form-input" :disabled="isP3" required>
                 </div>
 
                 <div class="form-row">
                   <label class="form-label">最小入场风险 (tick)</label>
-                  <input v-model.number="config.min_entry_risk_ticks" type="number" min="0" class="form-input" required>
+                  <input v-model.number="config.min_entry_risk_ticks" type="number" min="0" class="form-input" :disabled="isP3" required>
                 </div>
 
                 <div class="form-row">
                   <label class="form-label">报单偏移滑点 (tick)</label>
                   <input v-model.number="config.slippage_ticks" type="number" min="0" max="100" class="form-input" required>
+                </div>
+              </div>
+
+              <div v-if="isP3" class="form-grid">
+                <div class="form-row">
+                  <label class="form-label">P3 出场方式</label>
+                  <select v-model="p3ExitMode" class="form-select">
+                    <option value="fixed_s1">模式 A：全部在 S1 退出</option>
+                    <option value="hybrid_s1">模式 B：首手 S1，余仓保本追踪</option>
+                  </select>
+                </div>
+                <div class="form-row">
+                  <label class="form-label">单笔计划风险预算（元）</label>
+                  <input v-model.number="p3Budget" type="number" min="0.01" step="0.01" class="form-input" required>
+                </div>
+                <div class="form-row">
+                  <label class="form-label">最多开仓手数</label>
+                  <select v-model.number="p3MaxLots" class="form-select"><option :value="1">1 手</option><option :value="2">2 手</option></select>
                 </div>
               </div>
 
@@ -876,7 +908,8 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               </div>
 
               <p v-if="isB5" class="field-hint">六品种 B5：最近合格 A、不合并摆点、目标成本比≤10%、A 净实体同向；小时不顺向同组同向最多两单，同 A 两次原止损后停试。固定一手，独立生成新预警。</p>
-              <p v-else-if="isCandidate" class="field-hint">P2/P3 固定一手、原结构止损；P3 按实际成交价锁定目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
+              <p v-else-if="isP3" class="field-hint">P3 按含成本风险预算开 0～2 手，入场委托三秒未全成撤销剩余量。单手均在 S1 退出；分批模式确认首手成交后才保护余仓。修改配置只影响之后的新信号。</p>
+              <p v-else-if="isCandidate" class="field-hint">候选策略固定一手、原结构止损和 S1 目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
             </template>
           </div>
 

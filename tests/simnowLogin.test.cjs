@@ -6,7 +6,7 @@ const ts = require('typescript')
 const vue = require('vue')
 
 function compile(source, modules) {
-  const context = { exports: {}, console, crypto: require('node:crypto'), Date,
+  const context = { exports: {}, console, crypto: require('node:crypto'), Date, defineEmits: () => () => {},
     require: name => { if (Object.hasOwn(modules, name)) return modules[name]; throw Error(name) } }
   vm.runInNewContext(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, context)
   return context.exports
@@ -17,6 +17,7 @@ function panel() {
   const row = { instance: { id: 'sim-a', name: 'A' }, account: { kind: 'ctp', broker_id: '9999', user_id: '123456', name: 'A' } }
   const trader = {
     selectedInstanceId: 'sim-a', instanceCatalog: { instances: [row] },
+    activePositions: [],
     loadInstances: async () => {}, selectInstance: async id => { trader.selectedInstanceId = id },
     loginSimnow: async (id, input) => sent.push({ operation: 'login', id, input }),
   }
@@ -27,7 +28,10 @@ function panel() {
   } }
   let source = fs.readFileSync('src/components/TraderInstancesPanel.vue', 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   source += '\nexport { openCreate, openLogin, create, login, kind, simnow, dialog, savedCredentials, name };'
-  const form = compile(source, { vue, '../services/api': { api }, '../stores/liveTrader': { useLiveTraderStore: () => trader }, './SimnowLoginFields.vue': {}, '../utils/simnow': helpers })
+  const form = compile(source, { vue, '../services/api': { api }, '../stores/liveTrader': { useLiveTraderStore: () => trader }, './SimnowLoginFields.vue': {}, '../utils/simnow': helpers,
+    'naive-ui': { useMessage: () => ({ error() {}, success() {}, warning() {} }) },
+    '../utils/contextMenu': { openContextMenu() {} },
+  })
   return { form, trader, sent }
 }
 test('SimNow creation sends credentials without manual file or port configuration', async () => {

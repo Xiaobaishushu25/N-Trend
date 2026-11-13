@@ -157,9 +157,32 @@ impl ExecutionEngine {
         }
         Ok(())
     }
+    fn calendar_health_for_state(&self, s: &ExecutionState, now: i64) -> Vec<serde_json::Value> {
+        let mut definitions =
+            std::collections::BTreeMap::from([(s.definition.revision.clone(), &s.definition)]);
+        for c in s
+            .conditions
+            .values()
+            .filter(|c| self.completed_bar_condition(&s, c))
+        {
+            if let Some(frozen) = &c.frozen {
+                definitions.insert(frozen.definition.revision.clone(), &frozen.definition);
+            }
+        }
+        definitions
+            .values()
+            .filter_map(|d| super::super::candidates::calendar_health(d, now))
+            .collect()
+    }
+    pub async fn calendar_health(&self) -> Vec<serde_json::Value> {
+        let s = self.state.lock().await;
+        self.calendar_health_for_state(&s, chrono::Utc::now().timestamp())
+    }
     pub async fn strategy_diagnostics(&self) -> serde_json::Value {
         let s = self.state.lock().await;
-        serde_json::json!({"states":s.strategy_states,"entry_decisions":s.entry_decisions,"symbol_slots":s.symbol_slots})
+        let calendars = self.calendar_health_for_state(&s, chrono::Utc::now().timestamp());
+        serde_json::json!({"states":s.strategy_states,"entry_decisions":s.entry_decisions,
+            "symbol_slots":s.symbol_slots,"calendar_health":calendars})
     }
     pub(super) fn reject_strategy_entry(s: &mut ExecutionState, id: &str, reason: &str) {
         s.aborted_entries.insert(id.into());
@@ -379,15 +402,17 @@ impl ExecutionEngine {
     ) -> Result<()> {
         self.registry.validate(&d)?;
         Self::validate_config(&cfg)?;
-        if self
-            .registry
-            .strategy(&d)?
-            .entry_constraints()
-            .terminal_rejections
-        {
+        let constraints = self.registry.strategy(&d)?.entry_constraints();
+        if let Some(timeout) = constraints.entry_timeout_seconds {
+            anyhow::ensure!(
+                cfg.order_wait_seconds == timeout,
+                "策略入场超时必须为{timeout}秒"
+            );
+        }
+        if constraints.terminal_rejections {
             anyhow::ensure!(
                 cfg.min_entry_risk_ticks == 10,
-                "P2/P3最小入场风险必须为10 tick"
+                "候选策略最小入场风险必须为10 tick"
             );
         }
         let mut current = self.config.write().await;
@@ -477,12 +502,13 @@ impl ExecutionEngine {
                 )
             })
     }
+    /// None means a normally rejected zero-size signal, recorded without an order.
     pub async fn register_plan(
         &self,
         plan: EntryPlan,
         definition: StrategyDefinition,
         cfg: ExecutionConfig,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let identity = self.identity.read().await.clone();
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
@@ -505,18 +531,20 @@ impl ExecutionEngine {
         definition: StrategyDefinition,
         cfg: ExecutionConfig,
         identity: (String, String),
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         self.registry.validate(&definition)?;
         Self::validate_config(&cfg)?;
-        if self
-            .registry
-            .strategy(&definition)?
-            .entry_constraints()
-            .terminal_rejections
-        {
+        let constraints = self.registry.strategy(&definition)?.entry_constraints();
+        if let Some(timeout) = constraints.entry_timeout_seconds {
+            anyhow::ensure!(
+                cfg.order_wait_seconds == timeout,
+                "策略入场超时必须为{timeout}秒"
+            );
+        }
+        if constraints.terminal_rejections {
             anyhow::ensure!(
                 cfg.min_entry_risk_ticks == 10,
-                "P2/P3最小入场风险固定为10 tick"
+                "候选策略最小入场风险固定为10 tick"
             );
         }
         anyhow::ensure!(
@@ -559,18 +587,33 @@ impl ExecutionEngine {
                     .is_none_or(|t| t >= chrono::Utc::now().timestamp()),
             "信号时间无效或已过期"
         );
+        if let Some(c) = s.conditions.values().find(|c| {
+            c.origin.strategy_id == definition.strategy_id && c.origin.signal_id == plan.signal_id
+        }) {
+            return Ok(Some(c.id.clone()));
+        }
+        let rejection_key = format!("signal:{}:{}", definition.strategy_id, plan.signal_id);
+        if s.entry_decisions.contains_key(&rejection_key) {
+            return Ok(None);
+        }
         let volume = self.registry.sizing(&definition.sizing_policy)?.volume(
             &plan,
             &cfg,
             &definition.parameters,
         )?;
-        anyhow::ensure!(volume > 0, "仓位模块必须返回正整数手数");
-        let (account_id, instance_id) = identity;
-        if let Some(c) = s.conditions.values().find(|c| {
-            c.origin.strategy_id == definition.strategy_id && c.origin.signal_id == plan.signal_id
-        }) {
-            return Ok(c.id.clone());
+        anyhow::ensure!(volume >= 0, "仓位模块不能返回负手数");
+        if volume == 0 {
+            s.entry_decisions.insert(
+                rejection_key,
+                serde_json::json!({
+                    "stage":"sizing", "reason":"zero_volume", "at":chrono::Utc::now().timestamp(),
+                    "signal_id":plan.signal_id, "strategy_id":definition.strategy_id,
+                    "version":definition.revision, "plan":plan
+                }),
+            );
+            return Ok(None);
         }
+        let (account_id, instance_id) = identity;
         anyhow::ensure!(!s.paused, "实例已暂停新入场");
         let id = uuid::Uuid::new_v4().to_string();
         let score = plan.evidence["entry_score"].as_f64().unwrap_or(0.0);
@@ -625,7 +668,7 @@ impl ExecutionEngine {
             s.entry_symbols_ready.insert(plan.symbol.clone());
         }
         s.conditions.insert(id.clone(), c);
-        Ok(id)
+        Ok(Some(id))
     }
     pub async fn dispatch(&self, event: StrategyEvent) -> Result<()> {
         let cfg = self.get_config().await;
@@ -861,11 +904,7 @@ impl ExecutionEngine {
                     "平仓数量无效"
                 );
                 let reference = p.fill_price;
-                let target = volume.unwrap_or(p.volume);
-                Self::latch_exit(s, &position_id, &reason, reference, volume.is_none());
-                if let Some(t) = s.closes.get_mut(&position_id) {
-                    t.target = t.filled + target;
-                }
+                Self::latch_exit_quantity(s, &position_id, &reason, reference, volume);
             }
             TradeIntent::Protect {
                 position_id,

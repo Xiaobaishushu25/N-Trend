@@ -1,5 +1,28 @@
 //! Shared pure quote policy. Orders and fills remain the adapter's responsibility.
 use super::{trailing::continuous_stop_price, PositionTier};
+
+pub(crate) fn align_protection(price: f64, sign: f64, tick: f64) -> f64 {
+    if sign > 0. {
+        (price / tick).ceil() * tick
+    } else {
+        (price / tick).floor() * tick
+    }
+}
+pub(crate) fn protection_reason(
+    first_closed: bool,
+    fill: f64,
+    stop: f64,
+    sign: f64,
+    tick: f64,
+) -> &'static str {
+    if !first_closed {
+        "stop"
+    } else if (stop - align_protection(fill, sign, tick)) * sign > tick * 1e-8 {
+        "trailing"
+    } else {
+        "breakeven"
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExitIntent {
     pub reason: &'static str,

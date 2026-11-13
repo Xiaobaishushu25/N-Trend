@@ -15,6 +15,13 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
   const risk = number(s.risk ?? warning.risk)
   const tick = number(s.tick ?? warning.tick)
   const reasons: Record<string, string> = {
+    risk_budget_exceeded: `单手含成本风险超过 ${metric(values.risk_budget_yuan)} 元预算，放弃开仓`,
+    delivery_month: 'P3 主动避开交割月及已过期合约',
+    contract_expiry_window: '已进入合约到期前的退出窗口，禁止开仓',
+    calendar_coverage_ending: '即将超出交易日历覆盖范围，停止开仓',
+    contract_entry_cutoff: '已到该实际合约配置的开仓截止时间',
+    contract_metadata_mismatch: '信号与实际合约元数据不一致',
+    invalid_actual_contract: '实际月份合约编号无效',
     score_below_min: `评分 ${metric(s.score ?? warning.score)}，低于准入门槛 ${metric(values.min_score ?? 3)}`,
     risk_ticks_below_min: `止损距离 ${metric(risk / tick)} tick，小于准入门槛 10 tick`,
     friction_above20: `预估往返摩擦成本 ${metric(values.friction_yuan)} 元，超过计划风险金额的 20%`,
@@ -28,7 +35,6 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
     a_body_net_nonpositive: `A 段排除起点柱后的方向净实体为 ${metric(values.a_body_net_ex_s0)}，未沿交易方向推进`,
     incomplete_warning_bar: '预警柱不是完整的 15 分钟行情',
     stale_warning: '预警超过新信号入场时效，不补开历史交易',
-    calendar_coverage_ending: '日历覆盖即将到期，停止新入场',
     hour_counter_pre_long_break: '小时强逆向，处于长休市前最后 10 分钟',
   }
   if (reason.startsWith('invalid_input:')) {

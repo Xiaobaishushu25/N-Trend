@@ -30,10 +30,10 @@ fn registry() -> Arc<StrategyRegistry> {
     // Quotes retain their real clock; execution scenarios use a fixed open session
     // so CI also works on weekends and after the reference calendar expires.
     // Calendar boundaries are tested without this override in candidates/tests.rs.
-    for (id, cap) in [(P2, false), (P3, true)] {
-        registry.register_strategy(id, CODE_VERSION, move |p| {
+    {
+        registry.register_strategy(P2, CODE_VERSION, move |p| {
             Ok(Box::new(
-                CandidateStrategy::new(serde_json::from_value(p.clone())?, cap)?
+                CandidateStrategy::new(serde_json::from_value(p.clone())?)?
                     .with_test_calendar_time(parse_time("2026-10-21 10:00:00")?),
             ))
         });
@@ -72,7 +72,7 @@ async fn engine(root: &Path, id: &str, p: Arc<PaperBroker>) -> ExecutionEngine {
     );
     e.registry = registry();
     e.bind(id, id).await.unwrap();
-    e.set_definition(definition(P3, parameters()))
+    e.set_definition(definition(P2, parameters()))
         .await
         .unwrap();
     e
@@ -163,7 +163,7 @@ async fn filtered_signal_keeps_display_evidence_after_restart_without_orders() {
 }
 
 #[tokio::test]
-async fn p3_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
+async fn p2_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
     let root = directory();
     let p = broker(&root, "a");
     let e = engine(&root, "a", p.clone()).await;
@@ -181,11 +181,11 @@ async fn p3_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
         assert_eq!(pos.volume, 1);
         assert_eq!(pos.fill_price, 1003.);
         assert_eq!(pos.risk, 23.);
-        assert_eq!(pos.target_price, 1049.);
+        assert_eq!(pos.target_price, 1100.);
         assert_eq!(pos.initial_stop_price, 980.);
         (pos.id.clone(), pos.origin.strategy_version.clone())
     };
-    // Reconfiguration may affect only subsequent signals; the open P3 position keeps its target.
+    // Reconfiguration may affect only subsequent signals; the open position keeps its target.
     e.set_definition(definition(P2, parameters()))
         .await
         .unwrap();
@@ -200,8 +200,8 @@ async fn p3_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
     send(&restored, payload).await;
     assert_eq!(
         restored.state.lock().await.conditions.len(),
-        2,
-        "different strategy ids may each observe a source signal"
+        1,
+        "reconfiguring the same strategy must not duplicate a source signal"
     );
     tick(&restored, &p, 1027.).await;
     {
@@ -209,10 +209,10 @@ async fn p3_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
         let pos = &s.positions[&id];
         assert!(!pos.is_closed);
         assert_eq!(pos.current_stop_price, 980.);
-        assert_eq!(pos.target_price, 1049.);
+        assert_eq!(pos.target_price, 1100.);
         assert_eq!(pos.origin.strategy_version, version);
     }
-    tick(&restored, &p, 1050.).await;
+    tick(&restored, &p, 1101.).await;
     {
         let s = restored.state.lock().await;
         assert!(s.positions[&id].is_closed);
@@ -232,7 +232,7 @@ async fn two_accounts_are_independent_and_same_strategy_signals_deduplicate() {
     let payload = signal("shared");
     send(&ea, payload.clone()).await;
     send(&eb, payload.clone()).await;
-    ea.set_definition(definition(P3, parameters()))
+    ea.set_definition(definition(P2, parameters()))
         .await
         .unwrap();
     send(&ea, payload).await;
@@ -323,7 +323,7 @@ async fn unknown_cancel_keeps_slot_and_never_replaces_order() {
 }
 
 #[tokio::test]
-async fn p2_p3_completed_same_source_trades_are_paired_across_accounts() {
+async fn completed_same_source_trades_are_paired_across_accounts() {
     use crate::trader::instances::*;
     let root = directory();
     let db = crate::storage::connect(&root.join("test.db"))
@@ -339,7 +339,7 @@ async fn p2_p3_completed_same_source_trades_are_paired_across_accounts() {
         .await
         .unwrap();
     let mut ids = vec![];
-    for (id, strategy) in [("a", P2), ("b", P3)] {
+    for id in ["a", "b"] {
         let account = AccountDefinition {
             id: id.into(),
             name: id.into(),
@@ -360,12 +360,7 @@ async fn p2_p3_completed_same_source_trades_are_paired_across_accounts() {
             },
         };
         let instance = manager
-            .create(
-                id.into(),
-                account,
-                definition(strategy, parameters()),
-                config(),
-            )
+            .create(id.into(), account, definition(P2, parameters()), config())
             .await
             .unwrap();
         let r = manager.get(&instance).await.unwrap();
@@ -428,7 +423,7 @@ async fn stop_before_entry_and_failed_fill_gate_are_terminal_without_orders() {
 }
 
 #[tokio::test]
-async fn short_p3_opens_on_bid_caps_from_fill_and_closes_on_ask() {
+async fn short_fixed_s1_opens_on_bid_and_closes_on_ask() {
     let root = directory();
     let p = broker(&root, "a");
     let e = engine(&root, "a", p.clone()).await;
@@ -444,11 +439,11 @@ async fn short_p3_opens_on_bid_caps_from_fill_and_closes_on_ask() {
         let pos = s.positions.values().next().unwrap();
         assert_eq!(pos.fill_price, 997.);
         assert_eq!(pos.risk, 23.);
-        assert_eq!(pos.target_price, 951.);
+        assert_eq!(pos.target_price, 900.);
     }
-    tick(&e, &p, 950.).await;
+    tick(&e, &p, 899.).await;
     let s = e.state.lock().await;
     assert_eq!(s.history.len(), 1);
-    assert_eq!(s.history[0].exit_price, 951.);
-    assert_eq!(s.history[0].realized_pnl_amount, 460.);
+    assert_eq!(s.history[0].exit_price, 900.);
+    assert_eq!(s.history[0].realized_pnl_amount, 970.);
 }
