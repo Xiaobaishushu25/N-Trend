@@ -379,7 +379,21 @@ impl Strategy for B5 {
             .collect()
     }
     fn handles_event(&self, e: &StrategyEvent) -> bool {
-        !matches!(e, StrategyEvent::Signal { .. })
+        matches!(
+            e,
+            StrategyEvent::History5m { .. } | StrategyEvent::Quote(_) | StrategyEvent::Timer { .. }
+        ) || matches!(e, StrategyEvent::BarClosed { timeframe, .. } if timeframe == "candidate15m")
+    }
+    fn event_state_scope(&self, e: &StrategyEvent) -> EventStateScope {
+        if matches!(e, StrategyEvent::History5m { .. }) {
+            EventStateScope::Full
+        } else if matches!(e, StrategyEvent::Quote(_)) {
+            // Released-task timestamps are only inspected by Timer/portfolio
+            // admission; they are not needed for minute-close observation.
+            EventStateScope::Fields(&["minutes", "confirmed", "lifecycle"])
+        } else {
+            EventStateScope::Fields(&["minutes", "confirmed", "released", "lifecycle"])
+        }
     }
     fn check_portfolio(&self, plan: &EntryPlan, p: &EntryPortfolio<'_>, now: i64) -> EntryDecision {
         let Ok(s) = serde_json::from_value::<Snapshot>(plan.evidence["b5"].clone()) else {

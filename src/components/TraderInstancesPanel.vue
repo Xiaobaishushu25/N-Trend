@@ -101,6 +101,7 @@ function updateP3Parameter(key: string, value: string | number) {
 const p3ExitMode = computed({ get: () => String(p3Parameter('exit_mode', 'fixed_s1')), set: (v: string) => updateP3Parameter('exit_mode', v) })
 const p3Budget = computed({ get: () => Number(p3Parameter('risk_budget_yuan', 600)), set: (v: number) => updateP3Parameter('risk_budget_yuan', v) })
 const p3MaxLots = computed({ get: () => Number(p3Parameter('max_lots', 2)), set: (v: number) => updateP3Parameter('max_lots', v) })
+const p3MinNetRr = computed({ get: () => Number(p3Parameter('min_net_rr', 1)), set: (v: number) => updateP3Parameter('min_net_rr', v) })
 const compareOpen = ref(false)
 const compareBusy = ref(false)
 const compare = ref<any>(null)
@@ -199,7 +200,13 @@ async function login() {
 }
 function openConfigure() {
   if (!selected.value) return
-  config.value = { ...selected.value.config }
+  config.value = {
+    quote_source: 'tianqin',
+    ...selected.value.config,
+  }
+  if (!config.value.quote_source) {
+    config.value.quote_source = 'tianqin'
+  }
   strategy.value = { ...selected.value.strategy }
   parameters.value = JSON.stringify(selected.value.strategy.parameters ?? {}, null, 2)
   renameInstanceName.value = selected.value.instance.name
@@ -226,7 +233,7 @@ async function create() {
       account.config = { initial_balance: balance.value, contracts: mapping }
     }
     const preset = presets.value.find(p => p.definition.strategy_id === createPreset.value)
-    const candidateConfig: ExecutionConfig = { mode: 'SemiAuto', max_risk_percent: 1, daily_loss_limit_r: 3, default_large_volume: 1, default_small_volume: 1, order_wait_seconds: 3, slippage_ticks: 0, max_slippage_ticks: 20, max_exit_slippage_ticks: 0, min_entry_risk_ticks: 10 }
+    const candidateConfig: ExecutionConfig = { mode: 'SemiAuto', max_risk_percent: 1, daily_loss_limit_r: 3, default_large_volume: 1, default_small_volume: 1, order_wait_seconds: 3, slippage_ticks: 0, max_slippage_ticks: 20, max_exit_slippage_ticks: 0, min_entry_risk_ticks: 10, quote_source: 'tianqin' }
     const result = await api.traderInstanceRequest<{ instance_id: string }>('create', undefined, { name: name.value, ...(kind.value === 'simnow' ? { simnow: { ...simnow.value } } : { account }), copy_from: copyFrom.value,
       ...(preset ? { strategy: preset.definition, config: candidateConfig } : {}) })
     await trader.loadInstances(); await trader.selectInstance(result.instance_id)
@@ -543,6 +550,15 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               {{ ctpConnectionLabel(trader.health, trader.bridgeOnline) }}
             </span>
 
+            <!-- 行情执行来源徽章 -->
+            <span
+              class="badge-quote-source"
+              :class="selected?.config?.quote_source === 'ctp' ? 'is-ctp' : 'is-tq'"
+              :title="selected?.config?.quote_source === 'ctp' ? '当前策略使用 CTP MdFront 官方极速行情订阅（毫秒级推送）' : '当前策略使用天勤 TQSDK 行情增量事件流'"
+            >
+              {{ selected?.config?.quote_source === 'ctp' ? 'CTP极速行情' : '天勤行情' }}
+            </span>
+
             <!-- CTP 快速登录/认证配置 -->
             <button
               type="button"
@@ -734,7 +750,8 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                   <option v-for="p in presets" :key="p.definition.strategy_id" :value="p.definition.strategy_id">{{ p.label }}</option>
                 </select>
               </div>
-              <p v-if="createPreset" class="field-hint">候选策略使用固定一手、10 tick 最小风险和半自动模式。创建后请核对费用与日历；六品种 B5 固定交易 EG、PP、PVC、JD、SR、CJ。</p>
+              <p v-if="createPreset === 'n_p3_v1'" class="field-hint">P3 按 600 元含成本预算开 0～2 手，默认 S1 净盈亏比门槛 1.0，保留摩擦限制并取消 ATR 下限。创建后可调整门槛与退出模式。</p>
+              <p v-else-if="createPreset" class="field-hint">候选策略使用固定一手、10 tick 最小风险和半自动模式。创建后请核对费用与日历；六品种 B5 固定交易 EG、PP、PVC、JD、SR、CJ。</p>
 
               <div class="form-row">
                 <label class="form-label">账户类型</label>
@@ -882,6 +899,17 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                   <label class="form-label">报单偏移滑点 (tick)</label>
                   <input v-model.number="config.slippage_ticks" type="number" min="0" max="100" class="form-input" required>
                 </div>
+
+                <div class="form-row">
+                  <label class="form-label">
+                    行情执行来源
+                    <span class="label-tip">用于条件单触发与实时分桶</span>
+                  </label>
+                  <select v-model="config.quote_source" class="form-select">
+                    <option value="tianqin">天勤数据源 (TQSDK 增量流)</option>
+                    <option value="ctp">CTP 官方极速行情 (MdFront 毫秒级推送)</option>
+                  </select>
+                </div>
               </div>
 
               <div v-if="isP3" class="form-grid">
@@ -900,6 +928,11 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                   <label class="form-label">最多开仓手数</label>
                   <select v-model.number="p3MaxLots" class="form-select"><option :value="1">1 手</option><option :value="2">2 手</option></select>
                 </div>
+                  <div class="form-row">
+                    <label class="form-label">S1 最低净盈亏比</label>
+                    <input v-model.number="p3MinNetRr" type="number" min="0.01" step="0.1" class="form-input" :disabled="strategy?.code_version !== '2'" required>
+                    <span class="field-hint">调高通常减少交易；调低会增加候选。旧版实例需先加载新版 P3 预设。</span>
+                  </div>
               </div>
 
               <div class="form-row full-width">
@@ -1194,6 +1227,25 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+}
+
+.badge-quote-source {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: help;
+}
+.badge-quote-source.is-ctp {
+  background: #e0e7ff;
+  color: #3730a3;
+  border: 1px solid #c7d2fe;
+}
+.badge-quote-source.is-tq {
+  background: #f1f5f9;
+  color: #475569;
 }
 
 /* 按钮基础风格 */

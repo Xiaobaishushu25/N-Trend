@@ -19,6 +19,7 @@ def load_bridge():
     api.CThostFtdcTraderSpi = object
     api.CThostFtdcQryTradingAccountField = types.SimpleNamespace
     api.CThostFtdcQryInvestorPositionField = types.SimpleNamespace
+    api.CThostFtdcQryInstrumentField = types.SimpleNamespace
     api.CThostFtdcInputOrderActionField = types.SimpleNamespace
     api.CThostFtdcInputOrderField = types.SimpleNamespace
     for name in ["D_Buy", "D_Sell", "OF_Open", "OF_CloseToday", "OF_Close", "OPT_LimitPrice",
@@ -26,11 +27,21 @@ def load_bridge():
         setattr(api, "THOST_FTDC_" + name, name)
     api.THOST_FTDC_AF_Delete = "0"
     api.THOST_FTDC_PD_Long = "2"
+
+    md_api = types.ModuleType("openctp_ctp.thostmduserapi")
+    md_api.CThostFtdcMdSpi = object
+    md_api.CThostFtdcReqUserLoginField = types.SimpleNamespace
+
     package = types.ModuleType("openctp_ctp")
     package.thosttraderapi = api
+    package.thostmduserapi = md_api
     spec = importlib.util.spec_from_file_location("ctp_bridge_test", pathlib.Path(__file__).with_name("ctp_trader.py"))
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"openctp_ctp": package, "openctp_ctp.thosttraderapi": api}):
+    with patch.dict(sys.modules, {
+        "openctp_ctp": package,
+        "openctp_ctp.thosttraderapi": api,
+        "openctp_ctp.thostmduserapi": md_api,
+    }):
         spec.loader.exec_module(module)
     return module
 
@@ -56,12 +67,35 @@ class FakeApi:
     def ReqQryInvestorPosition(self, req, req_id):
         return self.send("positions", req_id)
 
+    def ReqQryInstrument(self, req, req_id):
+        return self.send("instrument", req_id)
+
     def ReqOrderAction(self, req, req_id):
         return self.send("cancel", req_id)
 
     def wait_for(self, count):
         with self.changed:
             return self.changed.wait_for(lambda: len(self.calls) >= count, timeout=2)
+
+
+class FakeMdApi:
+    def __init__(self):
+        self.calls = []
+        self.return_code = 0
+        self.subscribed = []
+        self.unsubscribed = []
+
+    def ReqUserLogin(self, req, req_id):
+        self.calls.append(("login", req_id))
+        return self.return_code
+
+    def SubscribeMarketData(self, symbols, count):
+        self.subscribed.extend([s.decode("utf-8") if isinstance(s, bytes) else str(s) for s in symbols])
+        return self.return_code
+
+    def UnSubscribeMarketData(self, symbols, count):
+        self.unsubscribed.extend([s.decode("utf-8") if isinstance(s, bytes) else str(s) for s in symbols])
+        return self.return_code
 
 
 def position(today=1, volume=1, cost=100):
@@ -329,6 +363,192 @@ class QueryTests(unittest.TestCase):
             self.assertEqual(self.m.api.calls, [])
         finally:
             self.m.stop()
+            server.shutdown()
+            server.server_close()
+
+
+class MarketDataTests(unittest.TestCase):
+    def setUp(self):
+        self.md = bridge.CtpMdManager({"BrokerID": "7090", "UserID": "85530059"})
+        self.md.api = FakeMdApi()
+        self.md.instruments_meta = {
+            "rb2501": {
+                "instrument_id": "rb2501",
+                "exchange_id": "SHFE",
+                "price_tick": 1.0,
+                "volume_multiple": 10,
+            }
+        }
+
+    def tearDown(self):
+        self.md.stop()
+
+    def test_timestamp_parsing_beijing_time(self):
+        ts, dt_str = bridge.parse_ctp_timestamp("20261113", "20261116", "21:15:30", 500)
+        self.assertIn("+08:00", dt_str)
+        self.assertIn("2026-11-13T21:15:30.500", dt_str)
+        self.assertGreater(ts, 1700000000)
+
+    def test_depth_data_processing_and_sanitization(self):
+        tick = types.SimpleNamespace(
+            InstrumentID="rb2501",
+            ExchangeID="SHFE",
+            LastPrice=3500.0,
+            Volume=12000,
+            Turnover=420000000.0,
+            OpenInterest=50000.0,
+            BidPrice1=3499.0,
+            BidVolume1=50,
+            AskPrice1=3501.0,
+            AskVolume1=40,
+            UpperLimitPrice=3800.0,
+            LowerLimitPrice=3200.0,
+            ActionDay="20261113",
+            TradingDay="20261113",
+            UpdateTime="09:30:00",
+            UpdateMillisec=500,
+        )
+        self.md.OnRtnDepthMarketData(tick)
+        self.assertEqual(len(self.md.ring_buffer), 1)
+        evt = self.md.ring_buffer[0]
+        self.assertEqual(evt["type"], "tick")
+        self.assertEqual(evt["instrument_id"], "rb2501")
+        self.assertEqual(evt["price_tick"], 1.0)
+        self.assertEqual(evt["last_price"], 3500.0)
+        self.assertEqual(evt["upper_limit_price"], 3800.0)
+        self.assertEqual(evt["seq_id"], 1)
+
+        # Extreme limit prices (> 1e10 or <= 0) sanitized to 0.0
+        abnormal_tick = types.SimpleNamespace(
+            InstrumentID="rb2501",
+            ExchangeID="",
+            LastPrice=1e300,
+            Volume=0,
+            Turnover=0.0,
+            OpenInterest=0.0,
+            BidPrice1=1e300,
+            BidVolume1=0,
+            AskPrice1=1e300,
+            AskVolume1=0,
+            UpperLimitPrice=1.7976931348623157e308,
+            LowerLimitPrice=-1.0,
+            ActionDay="",
+            TradingDay="",
+            UpdateTime="08:59:00",
+            UpdateMillisec=0,
+        )
+        self.md.OnRtnDepthMarketData(abnormal_tick)
+        self.assertEqual(len(self.md.ring_buffer), 2)
+        evt2 = self.md.ring_buffer[1]
+        self.assertEqual(evt2["last_price"], 0.0)
+        self.assertEqual(evt2["upper_limit_price"], 0.0)
+        self.assertEqual(evt2["lower_limit_price"], 0.0)
+
+    def test_ring_buffer_gap_detection(self):
+        self.md.max_buffer_size = 5
+        for i in range(10):
+            tick = types.SimpleNamespace(
+                InstrumentID="rb2501",
+                LastPrice=3500.0 + i,
+                Volume=i,
+                Turnover=0.0,
+                OpenInterest=0.0,
+                BidPrice1=3500.0,
+                BidVolume1=1,
+                AskPrice1=3501.0,
+                AskVolume1=1,
+                UpperLimitPrice=3800.0,
+                LowerLimitPrice=3200.0,
+                ActionDay="20261113",
+                TradingDay="20261113",
+                UpdateTime="09:30:00",
+                UpdateMillisec=i,
+            )
+            self.md.OnRtnDepthMarketData(tick)
+
+        # Buffer only holds the last 5 ticks (seq 6 to 10)
+        self.assertEqual(len(self.md.ring_buffer), 5)
+        self.assertEqual(self.md.ring_buffer[0]["seq_id"], 6)
+
+        # Asking for after_id = 2 should detect GAP because 3..5 were evicted
+        res = self.md.get_ticks(self.md.stream_id, after_id=2)
+        self.assertTrue(res["gap"])
+
+        # Asking for after_id = 5 is continuous with oldest=6, so NO gap
+        res_ok = self.md.get_ticks(self.md.stream_id, after_id=5)
+        self.assertFalse(res_ok["gap"])
+        self.assertEqual(len(res_ok["events"]), 5)
+
+        # Stream id mismatch triggers GAP
+        res_stream_mismatch = self.md.get_ticks("different_stream_id", after_id=5)
+        self.assertTrue(res_stream_mismatch["gap"])
+
+    def test_md_status_events(self):
+        self.md.OnFrontDisconnected(4097)
+        self.assertFalse(self.md.is_connected)
+        self.assertEqual(len(self.md.ring_buffer), 1)
+        evt = self.md.ring_buffer[0]
+        self.assertEqual(evt["type"], "md_status")
+        self.assertEqual(evt["status"], "disconnected")
+        self.assertEqual(evt["reason"], 4097)
+
+        # Login event & auto re-subscription
+        self.md.subscribed_symbols = {"rb2501", "hc2501"}
+        login_field = types.SimpleNamespace(TradingDay="20261113")
+        self.md.OnRspUserLogin(login_field, None, 1, True)
+        self.assertTrue(self.md.is_logged_in)
+        self.assertEqual(len(self.md.ring_buffer), 2)
+        self.assertEqual(self.md.ring_buffer[1]["status"], "logged_in")
+        self.assertIn("rb2501", self.md.api.subscribed)
+        self.assertIn("hc2501", self.md.api.subscribed)
+
+    def test_http_market_endpoints(self):
+        bridge.g_md_mgr = self.md
+        server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), bridge.CtpHttpHandler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+            # Health
+            with urllib.request.urlopen(base_url + "/market/health", timeout=2) as resp:
+                health = json.load(resp)
+                self.assertIn("stream_id", health)
+                self.assertIn("latest_seq_id", health)
+
+            # Subscribe
+            sub_req = urllib.request.Request(
+                base_url + "/market/subscribe",
+                data=json.dumps({"symbols": ["rb2501", "cu2412"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(sub_req, timeout=2) as resp:
+                sub_res = json.load(resp)
+                self.assertTrue(sub_res["success"])
+                self.assertIn("rb2501", sub_res["subscribed"])
+                self.assertIn("cu2412", sub_res["subscribed"])
+
+            # Unsubscribe
+            unsub_req = urllib.request.Request(
+                base_url + "/market/unsubscribe",
+                data=json.dumps({"symbols": ["cu2412"]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(unsub_req, timeout=2) as resp:
+                unsub_res = json.load(resp)
+                self.assertTrue(unsub_res["success"])
+                self.assertNotIn("cu2412", unsub_res["subscribed"])
+                self.assertIn("rb2501", unsub_res["subscribed"])
+
+            # Ticks endpoint
+            with urllib.request.urlopen(base_url + "/market/ticks", timeout=2) as resp:
+                ticks = json.load(resp)
+                self.assertEqual(ticks["stream_id"], self.md.stream_id)
+                self.assertFalse(ticks["gap"])
+        finally:
             server.shutdown()
             server.server_close()
 

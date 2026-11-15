@@ -54,6 +54,7 @@ impl ExecutionEngine {
             reference,
             attempts: 0,
             all,
+            note: None,
         });
         // A repeated partial-close request is the same task, not another lot.
         // A full exit may enlarge the task, but a profit request cannot demote it.
@@ -68,6 +69,22 @@ impl ExecutionEngine {
         if let Some(c) = s.conditions.get_mut(id) {
             c.state = ConditionState::Closing;
             c.note = format!("退出任务已锁定: {}", task.reason);
+        }
+    }
+
+    pub(super) fn latch_exit_with_note(
+        s: &mut ExecutionState,
+        id: &str,
+        reason: &str,
+        reference: f64,
+        volume: Option<i32>,
+        note: Option<String>,
+    ) {
+        Self::latch_exit_quantity(s, id, reason, reference, volume);
+        if let Some(task) = s.closes.get_mut(id) {
+            if note.is_some() {
+                task.note = note;
+            }
         }
     }
 

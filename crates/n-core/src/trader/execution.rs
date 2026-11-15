@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 use tokio::sync::{Mutex, RwLock};
 
 use super::broker::BrokerClient;
+#[path = "execution_clock.rs"]
+mod clock;
+pub use clock::{ExecutionClock, ReplayClock};
+#[path = "execution_replay.rs"]
+mod execution_replay;
 use super::client::CtpTraderClient;
 use super::model::*;
 use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
@@ -124,6 +129,10 @@ pub struct ManagedPosition {
     pub trigger_ts: Option<String>,
     #[serde(default)]
     pub order_insert_ts: Option<String>,
+    #[serde(default)]
+    pub user_note: Option<String>,
+    #[serde(default)]
+    pub is_manual: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -166,6 +175,10 @@ pub struct TradeRecord {
     pub trigger_ts: Option<String>,
     #[serde(default)]
     pub order_insert_ts: Option<String>,
+    #[serde(default)]
+    pub user_note: Option<String>,
+    #[serde(default)]
+    pub is_manual: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -182,6 +195,14 @@ pub struct TradeStatistics {
     pub exit_reason_breakdown: HashMap<String, usize>,
     #[serde(default)]
     pub total_pnl: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteSource {
+    #[default]
+    Tianqin,
+    Ctp,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -202,6 +223,8 @@ pub struct ExecutionConfig {
     /// Reject new entries whose structural stop is too narrow for trading costs.
     #[serde(default = "default_min_entry_risk_ticks")]
     pub min_entry_risk_ticks: u32,
+    #[serde(default)]
+    pub quote_source: QuoteSource,
 }
 
 impl Default for ExecutionConfig {
@@ -217,6 +240,7 @@ impl Default for ExecutionConfig {
             max_slippage_ticks: default_max_slippage(),
             max_exit_slippage_ticks: 0,
             min_entry_risk_ticks: default_min_entry_risk_ticks(),
+            quote_source: QuoteSource::default(),
         }
     }
 }
@@ -331,6 +355,8 @@ struct CloseTask {
     reference: f64,
     attempts: u32,
     all: bool,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -371,6 +397,8 @@ struct ExecutionState {
     entry_funds: Option<EntryFunds>,
     #[serde(skip)]
     account_snapshot: Option<TraderAccount>,
+    #[serde(skip)]
+    pub broker_positions: Vec<TraderPosition>,
     #[serde(skip)]
     broker_ready: bool,
     #[serde(skip)]
@@ -512,6 +540,7 @@ impl ExecutionState {
 }
 
 pub struct ExecutionEngine {
+    clock: Arc<dyn ExecutionClock>,
     client: BrokerClient,
     pub registry: Arc<StrategyRegistry>,
     identity: RwLock<(String, String)>,
@@ -588,6 +617,7 @@ impl ExecutionEngine {
             state.persistence_error = lock_error;
         }
         Self {
+            clock: Arc::new(clock::SystemClock),
             client: client.into(),
             registry: Arc::new(StrategyRegistry::default()),
             identity: RwLock::new(("default".into(), "default".into())),
@@ -846,7 +876,7 @@ impl ExecutionEngine {
     }
 
     fn check_overnight_checkpoints(&self, s: &mut ExecutionState) {
-        let now = chrono::Local::now();
+        let now = self.now_local();
         let tracking_path = self.overnight_tracking_path();
         let open_positions: Vec<ManagedPosition> = s
             .positions
@@ -856,13 +886,13 @@ impl ExecutionEngine {
             .collect();
 
         for pos in open_positions {
-            if let Some(checkpoint_type) = check_pre_close_checkpoint(&pos.symbol, &now, 2) {
+            if let Some(checkpoint_type) = check_pre_close_checkpoint(&pos.symbol, &now.with_timezone(&chrono::Local), 2) {
                 let checkpoint_key = format!("{}:{}:{:?}", pos.id, s.trading_day, checkpoint_type);
                 if !s.recorded_checkpoints.contains(&checkpoint_key) {
                     if let Some(quote) = s
                         .quotes
                         .get(&pos.instrument_id.to_uppercase())
-                        .filter(|q| q.valid())
+                        .filter(|q| q.valid_at(self.now_utc().timestamp()))
                     {
                         let snap =
                             OvernightSnapshot::create(&pos, quote, checkpoint_type, &s.trading_day);
@@ -889,7 +919,7 @@ impl ExecutionEngine {
     }
 
     fn update_overnight_next_open(&self, s: &mut ExecutionState) {
-        let now = chrono::Local::now();
+        let now = self.now_local();
         let now_ts = now.timestamp();
         let tracking_path = self.overnight_tracking_path();
 
@@ -899,7 +929,7 @@ impl ExecutionEngine {
                     if let Some(quote) = s
                         .quotes
                         .get(&snap.instrument_id.to_uppercase())
-                        .filter(|q| q.valid())
+                        .filter(|q| q.valid_at(self.now_utc().timestamp()))
                     {
                         let open_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
                         snap.update_next_open(quote.last, &open_ts);
@@ -1068,7 +1098,7 @@ impl ExecutionEngine {
         let o = s.conditions.get_mut(id).unwrap();
         o.state = ConditionState::Triggered;
         if o.trigger_ts.is_none() {
-            o.trigger_ts = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+            o.trigger_ts = Some(self.now_local().format("%Y-%m-%d %H:%M:%S").to_string());
         }
         o.note = "已确认，等待有效盘口提交委托；尚未成交".into();
         self.save(&mut s)?;
@@ -1099,6 +1129,7 @@ impl ExecutionEngine {
         snapshot: &serde_json::Value,
     ) -> Result<()> {
         s.account_snapshot = serde_json::from_value(snapshot["account"].clone()).ok();
+        s.broker_positions = serde_json::from_value(snapshot["broker_positions"].clone()).unwrap_or_default();
         let h = &snapshot["health"];
         s.broker_connected = h["logged_in"].as_bool().unwrap_or(false)
             && h["settlement_confirmed"]
@@ -1206,6 +1237,76 @@ impl ExecutionEngine {
                 fill_day, trade.exchange_id, trade.instrument_id, trade.direction, trade.trade_id
             );
             let Some(order) = s.orders.get(&trade.order_ref).cloned() else {
+                // If it's a close trade from outside (e.g. mobile app) matching an open position:
+                if trade.offset != "open"
+                    && !s.seen_trades.contains(&key)
+                    && trade.volume > 0
+                    && trade.price.is_finite()
+                    && trade.price > 0.0
+                {
+                    let matching_pos_id = s.positions.iter().find(|(_, p)| {
+                        !p.is_closed
+                            && p.volume > 0
+                            && p.instrument_id.eq_ignore_ascii_case(&trade.instrument_id)
+                            && (if p.direction == "up" { "sell" } else { "buy" }) == trade.direction
+                    }).map(|(id, _)| id.clone());
+
+                    if let Some(pos_id) = matching_pos_id {
+                        s.seen_trades.insert(key.clone());
+                        let pos = s.positions.get_mut(&pos_id).unwrap();
+                        let close_vol = trade.volume.min(pos.volume);
+                        let points = (trade.price - pos.fill_price) * if pos.direction == "up" { 1.0 } else { -1.0 };
+                        pos.volume -= close_vol;
+                        pos.is_closed = pos.volume == 0;
+                        pos.exit_price = Some(trade.price);
+                        pos.exit_reason = Some("external_manual".into());
+                        let r = points / pos.risk.max(1e-9);
+                        let mult = self.client.multiplier(&pos.instrument_id);
+                        let pnl_amount = points * mult * close_vol as f64;
+                        let cond = s.conditions.get(&pos_id).cloned();
+                        let rec = TradeRecord {
+                            origin: pos.origin.clone(),
+                            signal_evidence: cond.as_ref().and_then(|c| c.frozen.as_ref()).filter(|f| f.definition.strategy_id != N_STRATEGY && !f.plan.evidence.is_null()).map(|f| f.plan.evidence.clone()),
+                            id: key.clone(),
+                            condition_order_id: pos.id.clone(),
+                            symbol: pos.symbol.clone(),
+                            instrument_id: pos.instrument_id.clone(),
+                            direction: pos.direction.clone(),
+                            tier: pos.tier,
+                            volume: close_vol,
+                            fill_price: pos.fill_price,
+                            exit_price: trade.price,
+                            risk: pos.risk,
+                            initial_stop_price: pos.initial_stop_price,
+                            target_price: pos.target_price,
+                            open_ts: pos.open_ts.clone(),
+                            exit_ts: format!("{} {}", trade.trade_date, trade.trade_time),
+                            exit_reason: "external_manual".into(),
+                            realized_pnl_pts: points,
+                            realized_pnl_amount: pnl_amount,
+                            r_multiple: r,
+                            max_mfe_r: pos.max_mfe_r,
+                            max_mae_r: pos.max_mae_r,
+                            bars_held: pos.bars_held,
+                            event_id: cond.as_ref().and_then(|c| c.event_id).or(pos.event_id),
+                            planned_entry_price: cond.as_ref().map(|c| c.entry_price).or(pos.planned_entry_price),
+                            score: cond.as_ref().map(|c| c.score).or(pos.score),
+                            warning_bar_ts: cond.as_ref().map(|c| c.warning_bar_ts.clone()).or_else(|| pos.warning_bar_ts.clone()),
+                            trigger_ts: cond.as_ref().and_then(|c| c.trigger_ts.clone()).or_else(|| pos.trigger_ts.clone()),
+                            order_insert_ts: pos.order_insert_ts.clone(),
+                            user_note: Some("手机/外部平仓".into()),
+                            is_manual: true,
+                        };
+                        if pos.is_closed {
+                            if let Some(c) = s.conditions.get_mut(&pos_id) {
+                                c.state = ConditionState::Closed;
+                                c.note = "外部手动平仓完成".into();
+                            }
+                            s.closes.remove(&pos_id);
+                        }
+                        s.history.push(rec);
+                    }
+                }
                 continue;
             };
             if !trade
@@ -1288,6 +1389,8 @@ impl ExecutionEngine {
                         warning_bar_ts: Some(cond.warning_bar_ts.clone()),
                         trigger_ts: cond.trigger_ts.clone(),
                         order_insert_ts: order_insert_ts.clone(),
+                        user_note: None,
+                        is_manual: false,
                     });
                 if pos.order_insert_ts.is_none() {
                     pos.order_insert_ts = order_insert_ts;
@@ -1398,6 +1501,9 @@ impl ExecutionEngine {
                         .or_else(|| pos.warning_bar_ts.clone()),
                     trigger_ts: cond.trigger_ts.clone().or_else(|| pos.trigger_ts.clone()),
                     order_insert_ts: pos.order_insert_ts.clone(),
+                    user_note: s.closes.get(&cond.id).and_then(|t| t.note.clone()),
+                    is_manual: order.reason.as_deref().is_some_and(|r| r.starts_with("manual"))
+                        || s.closes.get(&cond.id).is_some_and(|t| t.note.is_some()),
                 };
                 if r < 0.0 && *fill_day == s.trading_day {
                     s.loss_r -= r * trade.volume as f64;
@@ -1627,7 +1733,7 @@ impl ExecutionEngine {
     pub async fn market_unavailable(&self) {
         let mut s = self.state.lock().await;
         if s.market_error.is_none() {
-            s.quote_gaps.push(chrono::Utc::now().timestamp());
+            s.quote_gaps.push(self.now_utc().timestamp());
             s.comparison.mark_quote_gap();
         }
         s.quotes.clear();
@@ -1655,7 +1761,7 @@ impl ExecutionEngine {
 
     pub async fn quote_gap_with_reason(&self, reason: &str) -> Result<()> {
         let mut s = self.state.lock().await;
-        s.quote_gaps.push(chrono::Utc::now().timestamp());
+        s.quote_gaps.push(self.now_utc().timestamp());
         s.comparison.mark_quote_gap();
         let ids = s
             .orders
@@ -1729,8 +1835,11 @@ impl ExecutionEngine {
                 s.quotes.insert(code.to_uppercase(), q.clone());
             }
         }
-        for quote in quotes.values().filter(|q| q.valid()) {
-            if let Err(e) = self.dispatch(StrategyEvent::Quote(quote.clone())).await {
+        for quote in quotes.values().filter(|q| q.valid_at(self.now_utc().timestamp())) {
+            if let Err(e) = self
+                .dispatch_observation(StrategyEvent::Quote(quote.clone()), persist)
+                .await
+            {
                 let _ = self.pause(true).await;
                 tracing::error!("策略处理失败，继续保护已有持仓: {e}");
             }
@@ -1740,20 +1849,20 @@ impl ExecutionEngine {
         let mut must_persist = persist;
         let observed = quotes
             .values()
-            .filter(|q| q.valid())
+            .filter(|q| q.valid_at(self.now_utc().timestamp()))
             .map(|q| q.instrument_id.to_uppercase())
             .collect::<HashSet<_>>();
         for instrument in &observed {
             *s.quote_sequences.entry(instrument.clone()).or_default() += 1;
         }
         Self::release_symbol_slots(&mut s, &observed);
-        if quotes.values().any(|q| q.valid()) {
+        if quotes.values().any(|q| q.valid_at(self.now_utc().timestamp())) {
             s.market_error = None;
         }
         let state = &mut *s;
         state
             .comparison
-            .advance(&state.quotes, chrono::Utc::now().timestamp());
+            .advance(&state.quotes, self.now_utc().timestamp());
         let mut candidate_ids: Vec<String> = s
             .conditions
             .values()
@@ -1798,7 +1907,7 @@ impl ExecutionEngine {
             if cond.frozen.as_ref().is_some_and(|f| {
                 f.plan
                     .expires_at
-                    .is_some_and(|t| chrono::Utc::now().timestamp() > t)
+                    .is_some_and(|t| self.now_utc().timestamp() > t)
             }) {
                 s.aborted_entries.insert(cond.id.clone());
                 if let Some(c) = s.conditions.get_mut(&cond.id).filter(|c| {
@@ -1817,7 +1926,7 @@ impl ExecutionEngine {
                 .quotes
                 .get(&cond.instrument_id.to_uppercase())
                 .cloned()
-                .filter(|q| q.valid() && q.instrument_id.eq_ignore_ascii_case(&cond.instrument_id))
+                .filter(|q| q.valid_at(self.now_utc().timestamp()) && q.instrument_id.eq_ignore_ascii_case(&cond.instrument_id))
             else {
                 continue;
             };
@@ -1840,7 +1949,7 @@ impl ExecutionEngine {
                 && (q.last - cond.stop_price) * if cond.direction == "up" { 1.0 } else { -1.0 }
                     <= 0.0
             {
-                Self::reject_strategy_entry(&mut s, &cond.id, "invalidated");
+                self.reject_strategy_entry(&mut s, &cond.id, "invalidated");
                 must_persist = true;
                 continue;
             }
@@ -1850,7 +1959,7 @@ impl ExecutionEngine {
                 && cond.frozen.as_ref().is_none_or(|f| {
                     f.plan
                         .expires_at
-                        .is_none_or(|t| chrono::Utc::now().timestamp() <= t)
+                        .is_none_or(|t| self.now_utc().timestamp() <= t)
                 })
                 && !s.aborted_entries.contains(&cond.id)
                 && s.entry_symbols_ready.contains(&cond.symbol)
@@ -1870,18 +1979,18 @@ impl ExecutionEngine {
                     if let Some(o) = s.conditions.get_mut(&cond.id) {
                         if o.trigger_ts.is_none() {
                             o.trigger_ts =
-                                Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                                Some(self.now_local().format("%Y-%m-%d %H:%M:%S").to_string());
                         }
                     }
                     if constraints.one_per_symbol {
-                        match self.portfolio_decision(&s, &cond, chrono::Utc::now().timestamp()) {
+                        match self.portfolio_decision(&s, &cond, self.now_utc().timestamp()) {
                             EntryDecision::Allow => {}
                             EntryDecision::Wait(reason) => {
                                 Self::set_entry_note(&mut s, &cond.id, reason);
                                 continue;
                             }
                             EntryDecision::Reject(reason) => {
-                                Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                self.reject_strategy_entry(&mut s, &cond.id, &reason);
                                 must_persist = true;
                                 continue;
                             }
@@ -1892,21 +2001,21 @@ impl ExecutionEngine {
                             &frozen.plan,
                             &q,
                             proposed,
-                            chrono::Utc::now().timestamp(),
+                            self.now_utc().timestamp(),
                         ) {
                             EntryDecision::Wait(reason) => {
                                 Self::set_entry_note(&mut s, &cond.id, reason);
                                 continue;
                             }
                             EntryDecision::Reject(reason) => {
-                                Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                                self.reject_strategy_entry(&mut s, &cond.id, &reason);
                                 must_persist = true;
                                 continue;
                             }
                             EntryDecision::Allow => {}
                         }
                         if Self::symbol_slot_blocked(&s, &cond) {
-                            Self::reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
+                            self.reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
                             continue;
                         }
                         s.symbol_slots.insert(cond.symbol.clone(), cond.id.clone());
@@ -1922,7 +2031,7 @@ impl ExecutionEngine {
                     let o = s.conditions.get_mut(&cond.id).unwrap();
                     if o.trigger_ts.is_none() {
                         o.trigger_ts =
-                            Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+                            Some(self.now_local().format("%Y-%m-%d %H:%M:%S").to_string());
                     }
                     o.state = if mode == ExecutionMode::SemiAuto {
                         ConditionState::WaitingConfirm
@@ -2081,7 +2190,7 @@ impl ExecutionEngine {
     pub async fn drive(&self) -> Result<()> {
         let _drive = self.drive_lock.lock().await;
         let cfg = self.get_config().await;
-        let now = chrono::Utc::now().timestamp();
+        let now = self.now_utc().timestamp();
         let mut s = self.state.lock().await;
         let state = &mut *s;
         if state.comparison.advance(&state.quotes, now) {
@@ -2194,13 +2303,14 @@ impl ExecutionEngine {
                 let reprice = o.reason.is_some()
                     && s.quotes
                         .get(&o.request.instrument_id.to_uppercase())
-                        .filter(|q| q.valid())
+                        .filter(|q| q.valid_at(self.now_utc().timestamp()))
                         .and_then(|q| {
-                            q.order_price(
+                            q.order_price_at(
                                 o.request.direction == "buy",
                                 o.request.price,
                                 frozen_cfg.slippage_ticks,
                                 0,
+                                now,
                             )
                         })
                         .is_some_and(|price| {
@@ -2288,7 +2398,7 @@ impl ExecutionEngine {
                         && o.reported_filled == 0
                 })
             {
-                Self::reject_strategy_entry(&mut s, &cond.id, "broker_rejected");
+                self.reject_strategy_entry(&mut s, &cond.id, "broker_rejected");
                 entry_state_changed = true;
                 continue;
             }
@@ -2299,7 +2409,7 @@ impl ExecutionEngine {
                 .quotes
                 .get(&cond.instrument_id.to_uppercase())
                 .cloned()
-                .filter(|q| q.valid())
+                .filter(|q| q.valid_at(self.now_utc().timestamp()))
             else {
                 continue;
             };
@@ -2349,7 +2459,7 @@ impl ExecutionEngine {
                     }
                 }
                 if constraints.one_per_symbol && Self::symbol_slot_blocked(&s, &cond) {
-                    Self::reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
+                    self.reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
                     entry_state_changed = true;
                     continue;
                 }
@@ -2397,7 +2507,7 @@ impl ExecutionEngine {
                 };
                 if overshot {
                     if constraints.terminal_rejections {
-                        Self::reject_strategy_entry(&mut s, &cond.id, "unfilled");
+                        self.reject_strategy_entry(&mut s, &cond.id, "unfilled");
                         entry_state_changed = true;
                         continue;
                     }
@@ -2418,7 +2528,7 @@ impl ExecutionEngine {
                 (max_entry_slippage / q.tick).round() as u32
             };
             let ticks = cfg.slippage_ticks.saturating_add(attempts).min(20);
-            let Some(price) = q.order_price(buy, reference, ticks, max_ticks) else {
+            let Some(price) = q.order_price_at(buy, reference, ticks, max_ticks, now) else {
                 continue;
             };
             if reason.is_none() {
@@ -2429,7 +2539,7 @@ impl ExecutionEngine {
                         continue;
                     }
                     EntryDecision::Reject(reason) => {
-                        Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                        self.reject_strategy_entry(&mut s, &cond.id, &reason);
                         entry_state_changed = true;
                         continue;
                     }
@@ -2449,7 +2559,7 @@ impl ExecutionEngine {
                             continue;
                         }
                         EntryDecision::Reject(reason) => {
-                            Self::reject_strategy_entry(&mut s, &cond.id, &reason);
+                            self.reject_strategy_entry(&mut s, &cond.id, &reason);
                             entry_state_changed = true;
                             continue;
                         }
@@ -2459,7 +2569,7 @@ impl ExecutionEngine {
             if reason.is_none() {
                 match self.sizing_limit(&s, &cond, price, Some(&q), SizingPhase::ProposedOrder) {
                     Ok(total) if total == 0 && filled == 0 => {
-                        Self::reject_strategy_entry(&mut s, &cond.id, "zero_volume_at_price");
+                        self.reject_strategy_entry(&mut s, &cond.id, "zero_volume_at_price");
                         entry_state_changed = true;
                         continue;
                     }
@@ -2493,7 +2603,7 @@ impl ExecutionEngine {
                     }
                 }
             }
-            s.last_ref = (s.last_ref + 1).max(chrono::Utc::now().timestamp() as u64 * 100);
+            s.last_ref = (s.last_ref + 1).max(self.now_utc().timestamp() as u64 * 100);
             let r = s.last_ref.to_string();
             let req = OrderInsertRequest {
                 instrument_id: cond.instrument_id.clone(),

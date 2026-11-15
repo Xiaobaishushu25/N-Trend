@@ -13,7 +13,7 @@ impl ExecutionEngine {
         raw: &[crate::fetch::kline::Kline],
         rollovers: Vec<crate::derive::rollover::RolloverRecord>,
     ) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
+        let now = self.now_utc().timestamp();
         let latest = raw
             .iter()
             .rev()
@@ -139,7 +139,7 @@ impl ExecutionEngine {
                 .collect::<Vec<_>>();
             starts.into_iter().min()
         };
-        let bars = super::super::candidates::completed_bars(raw, chrono::Utc::now().timestamp())?;
+        let bars = super::super::candidates::completed_bars(raw, self.now_utc().timestamp())?;
         let start = start.or_else(|| bars.last().map(|b| b.datetime.clone()));
         for b in bars
             .iter()
@@ -176,15 +176,15 @@ impl ExecutionEngine {
     }
     pub async fn calendar_health(&self) -> Vec<serde_json::Value> {
         let s = self.state.lock().await;
-        self.calendar_health_for_state(&s, chrono::Utc::now().timestamp())
+        self.calendar_health_for_state(&s, self.now_utc().timestamp())
     }
     pub async fn strategy_diagnostics(&self) -> serde_json::Value {
         let s = self.state.lock().await;
-        let calendars = self.calendar_health_for_state(&s, chrono::Utc::now().timestamp());
+        let calendars = self.calendar_health_for_state(&s, self.now_utc().timestamp());
         serde_json::json!({"states":s.strategy_states,"entry_decisions":s.entry_decisions,
             "symbol_slots":s.symbol_slots,"calendar_health":calendars})
     }
-    pub(super) fn reject_strategy_entry(s: &mut ExecutionState, id: &str, reason: &str) {
+    pub(super) fn reject_strategy_entry(&self, s: &mut ExecutionState, id: &str, reason: &str) {
         s.aborted_entries.insert(id.into());
         if let Some(c) = s.conditions.get_mut(id) {
             c.state = if reason == "invalidated" {
@@ -194,7 +194,7 @@ impl ExecutionEngine {
             };
             c.note = reason.into();
         }
-        s.entry_decisions.insert(id.into(),serde_json::json!({"stage":"entry","reason":reason,"at":chrono::Utc::now().timestamp()}));
+        s.entry_decisions.insert(id.into(),serde_json::json!({"stage":"entry","reason":reason,"at":self.now_utc().timestamp()}));
     }
     pub(super) fn symbol_slot_blocked(s: &ExecutionState, c: &ConditionOrder) -> bool {
         s.symbol_slots.get(&c.symbol).is_some_and(|id| id != &c.id)
@@ -478,9 +478,270 @@ impl ExecutionEngine {
             c.note = "紧急平仓已取消后续入场".into();
         }
         for p in positions {
-            Self::latch_exit(&mut s, &p.id, "manual", p.fill_price, true);
+            let actual: i32 = s.broker_positions
+                .iter()
+                .filter(|bp| {
+                    bp.instrument_id.eq_ignore_ascii_case(&p.instrument_id)
+                        && bp.direction == if p.direction == "up" { "buy" } else { "sell" }
+                })
+                .map(|bp| bp.position)
+                .sum();
+
+            if actual <= 0 {
+                let mult = self.client.multiplier(&p.instrument_id);
+                let exit_price = s.quotes.get(&p.symbol).map(|q| q.last).unwrap_or(p.fill_price);
+                let points = (exit_price - p.fill_price) * if p.direction == "up" { 1.0 } else { -1.0 };
+                let pnl_amount = points * mult * p.volume as f64;
+                let r = points / p.risk.max(1e-9);
+                let cond = s.conditions.get(&p.id).cloned();
+                let key = format!("manual_flatten:{}:{}", p.id, chrono::Utc::now().timestamp_millis());
+                let rec = TradeRecord {
+                    origin: p.origin.clone(),
+                    signal_evidence: None,
+                    id: key,
+                    condition_order_id: p.id.clone(),
+                    symbol: p.symbol.clone(),
+                    instrument_id: p.instrument_id.clone(),
+                    direction: p.direction.clone(),
+                    tier: p.tier,
+                    volume: p.volume,
+                    fill_price: p.fill_price,
+                    exit_price,
+                    risk: p.risk,
+                    initial_stop_price: p.initial_stop_price,
+                    target_price: p.target_price,
+                    open_ts: p.open_ts.clone(),
+                    exit_ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    exit_reason: "manual".into(),
+                    realized_pnl_pts: points,
+                    realized_pnl_amount: pnl_amount,
+                    r_multiple: r,
+                    max_mfe_r: p.max_mfe_r,
+                    max_mae_r: p.max_mae_r,
+                    bars_held: p.bars_held,
+                    event_id: cond.as_ref().and_then(|c| c.event_id).or(p.event_id),
+                    planned_entry_price: cond.as_ref().map(|c| c.entry_price).or(p.planned_entry_price),
+                    score: cond.as_ref().map(|c| c.score).or(p.score),
+                    warning_bar_ts: cond.as_ref().map(|c| c.warning_bar_ts.clone()).or_else(|| p.warning_bar_ts.clone()),
+                    trigger_ts: cond.as_ref().and_then(|c| c.trigger_ts.clone()).or_else(|| p.trigger_ts.clone()),
+                    order_insert_ts: p.order_insert_ts.clone(),
+                    user_note: Some("一键平仓（按柜台零持仓核销）".into()),
+                    is_manual: true,
+                };
+                if let Some(pos) = s.positions.get_mut(&p.id) {
+                    pos.volume = 0;
+                    pos.is_closed = true;
+                    pos.exit_price = Some(exit_price);
+                    pos.exit_reason = Some("manual".into());
+                }
+                if let Some(c) = s.conditions.get_mut(&p.id) {
+                    c.state = ConditionState::Closed;
+                    c.note = "一键平仓已完成".into();
+                }
+                s.history.push(rec);
+            } else {
+                Self::latch_exit(&mut s, &p.id, "manual", p.fill_price, true);
+            }
         }
+        s.rebuild_indices();
+        s.error = None;
         self.save(&mut s)
+    }
+
+    pub async fn close_managed_position(
+        &self,
+        position_id: &str,
+        volume: Option<i32>,
+        reason: Option<String>,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let mut s = self.state.lock().await;
+        let Some(p) = s.positions.get(position_id).cloned().filter(|p| !p.is_closed && p.volume > 0) else {
+            return Ok(false);
+        };
+        let close_qty = volume.unwrap_or(p.volume).min(p.volume);
+        if close_qty <= 0 {
+            return Ok(false);
+        }
+
+        let actual: i32 = s.broker_positions
+            .iter()
+            .filter(|bp| {
+                bp.instrument_id.eq_ignore_ascii_case(&p.instrument_id)
+                    && bp.direction == if p.direction == "up" { "buy" } else { "sell" }
+            })
+            .map(|bp| bp.position)
+            .sum();
+
+        let final_reason = reason.unwrap_or_else(|| "manual".into());
+
+        if actual <= 0 {
+            // Broker position is 0: reconcile directly
+            let mult = self.client.multiplier(&p.instrument_id);
+            let exit_price = s.quotes.get(&p.symbol).map(|q| q.last).unwrap_or(p.fill_price);
+            let points = (exit_price - p.fill_price) * if p.direction == "up" { 1.0 } else { -1.0 };
+            let pnl_amount = points * mult * close_qty as f64;
+            let r = points / p.risk.max(1e-9);
+            let cond = s.conditions.get(&p.id).cloned();
+            let key = format!("manual_close:{}:{}", p.id, chrono::Utc::now().timestamp_millis());
+            let rec = TradeRecord {
+                origin: p.origin.clone(),
+                signal_evidence: None,
+                id: key,
+                condition_order_id: p.id.clone(),
+                symbol: p.symbol.clone(),
+                instrument_id: p.instrument_id.clone(),
+                direction: p.direction.clone(),
+                tier: p.tier,
+                volume: close_qty,
+                fill_price: p.fill_price,
+                exit_price,
+                risk: p.risk,
+                initial_stop_price: p.initial_stop_price,
+                target_price: p.target_price,
+                open_ts: p.open_ts.clone(),
+                exit_ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                exit_reason: final_reason.clone(),
+                realized_pnl_pts: points,
+                realized_pnl_amount: pnl_amount,
+                r_multiple: r,
+                max_mfe_r: p.max_mfe_r,
+                max_mae_r: p.max_mae_r,
+                bars_held: p.bars_held,
+                event_id: cond.as_ref().and_then(|c| c.event_id).or(p.event_id),
+                planned_entry_price: cond.as_ref().map(|c| c.entry_price).or(p.planned_entry_price),
+                score: cond.as_ref().map(|c| c.score).or(p.score),
+                warning_bar_ts: cond.as_ref().map(|c| c.warning_bar_ts.clone()).or_else(|| p.warning_bar_ts.clone()),
+                trigger_ts: cond.as_ref().and_then(|c| c.trigger_ts.clone()).or_else(|| p.trigger_ts.clone()),
+                order_insert_ts: p.order_insert_ts.clone(),
+                user_note: note,
+                is_manual: true,
+            };
+            let mut is_fully_closed = false;
+            if let Some(pos) = s.positions.get_mut(position_id) {
+                pos.volume -= close_qty;
+                pos.is_closed = pos.volume == 0;
+                pos.exit_price = Some(exit_price);
+                pos.exit_reason = Some(final_reason);
+                is_fully_closed = pos.is_closed;
+            }
+            if is_fully_closed {
+                if let Some(c) = s.conditions.get_mut(position_id) {
+                    c.state = ConditionState::Closed;
+                    c.note = "手动平仓已完成".into();
+                }
+            }
+            s.history.push(rec);
+            s.rebuild_indices();
+            s.error = None;
+        } else {
+            Self::latch_exit_with_note(&mut s, position_id, &final_reason, p.fill_price, Some(close_qty), note);
+        }
+        self.save(&mut s)?;
+        Ok(true)
+    }
+
+    pub async fn sync_broker_positions(&self) -> Result<usize> {
+        let mut s = self.state.lock().await;
+        let mut reconciled = 0;
+        let unclosed_ids: Vec<String> = s.positions.iter()
+            .filter(|(_, p)| !p.is_closed && p.volume > 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in unclosed_ids {
+            let p = s.positions[&id].clone();
+            let actual: i32 = s.broker_positions
+                .iter()
+                .filter(|bp| {
+                    bp.instrument_id.eq_ignore_ascii_case(&p.instrument_id)
+                        && bp.direction == if p.direction == "up" { "buy" } else { "sell" }
+                })
+                .map(|bp| bp.position)
+                .sum();
+
+            if actual < p.volume {
+                let diff = p.volume - actual;
+                let mult = self.client.multiplier(&p.instrument_id);
+                let exit_price = s.quotes.get(&p.symbol).map(|q| q.last).unwrap_or(p.fill_price);
+                let points = (exit_price - p.fill_price) * if p.direction == "up" { 1.0 } else { -1.0 };
+                let pnl_amount = points * mult * diff as f64;
+                let r = points / p.risk.max(1e-9);
+                let cond = s.conditions.get(&p.id).cloned();
+                let key = format!("sync_broker:{}:{}", p.id, chrono::Utc::now().timestamp_millis());
+                let rec = TradeRecord {
+                    origin: p.origin.clone(),
+                    signal_evidence: None,
+                    id: key,
+                    condition_order_id: p.id.clone(),
+                    symbol: p.symbol.clone(),
+                    instrument_id: p.instrument_id.clone(),
+                    direction: p.direction.clone(),
+                    tier: p.tier,
+                    volume: diff,
+                    fill_price: p.fill_price,
+                    exit_price,
+                    risk: p.risk,
+                    initial_stop_price: p.initial_stop_price,
+                    target_price: p.target_price,
+                    open_ts: p.open_ts.clone(),
+                    exit_ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    exit_reason: "external_manual".into(),
+                    realized_pnl_pts: points,
+                    realized_pnl_amount: pnl_amount,
+                    r_multiple: r,
+                    max_mfe_r: p.max_mfe_r,
+                    max_mae_r: p.max_mae_r,
+                    bars_held: p.bars_held,
+                    event_id: cond.as_ref().and_then(|c| c.event_id).or(p.event_id),
+                    planned_entry_price: cond.as_ref().map(|c| c.entry_price).or(p.planned_entry_price),
+                    score: cond.as_ref().map(|c| c.score).or(p.score),
+                    warning_bar_ts: cond.as_ref().map(|c| c.warning_bar_ts.clone()).or_else(|| p.warning_bar_ts.clone()),
+                    trigger_ts: cond.as_ref().and_then(|c| c.trigger_ts.clone()).or_else(|| p.trigger_ts.clone()),
+                    order_insert_ts: p.order_insert_ts.clone(),
+                    user_note: Some("按柜台真实持仓核销".into()),
+                    is_manual: true,
+                };
+                if let Some(pos) = s.positions.get_mut(&id) {
+                    pos.volume = actual;
+                    pos.is_closed = actual == 0;
+                    pos.exit_price = Some(exit_price);
+                    pos.exit_reason = Some("external_manual".into());
+                }
+                if let Some(c) = s.conditions.get_mut(&id) {
+                    if actual == 0 {
+                        c.state = ConditionState::Closed;
+                        c.note = "按柜台真实持仓核销完成".into();
+                    }
+                }
+                s.history.push(rec);
+                reconciled += 1;
+            }
+        }
+        s.rebuild_indices();
+        s.error = None;
+        self.save(&mut s)?;
+        Ok(reconciled)
+    }
+
+    pub async fn update_trade_record(
+        &self,
+        trade_id: &str,
+        user_note: Option<String>,
+        exit_reason: Option<String>,
+    ) -> Result<bool> {
+        let mut s = self.state.lock().await;
+        if let Some(r) = s.history.iter_mut().find(|r| r.id == trade_id) {
+            if let Some(note) = user_note {
+                r.user_note = Some(note);
+            }
+            if let Some(reason) = exit_reason {
+                r.exit_reason = reason;
+            }
+            self.save(&mut s)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
     pub async fn has_unfinished(&self) -> bool {
         let s = self.state.lock().await;
@@ -581,10 +842,10 @@ impl ExecutionEngine {
             "突破价格必须等于入场参考价"
         );
         anyhow::ensure!(
-            plan.created_at <= chrono::Utc::now().timestamp() + 5
+            plan.created_at <= self.now_utc().timestamp() + 5
                 && plan
                     .expires_at
-                    .is_none_or(|t| t >= chrono::Utc::now().timestamp()),
+                    .is_none_or(|t| t >= self.now_utc().timestamp()),
             "信号时间无效或已过期"
         );
         if let Some(c) = s.conditions.values().find(|c| {
@@ -606,7 +867,7 @@ impl ExecutionEngine {
             s.entry_decisions.insert(
                 rejection_key,
                 serde_json::json!({
-                    "stage":"sizing", "reason":"zero_volume", "at":chrono::Utc::now().timestamp(),
+                    "stage":"sizing", "reason":"zero_volume", "at":self.now_utc().timestamp(),
                     "signal_id":plan.signal_id, "strategy_id":definition.strategy_id,
                     "version":definition.revision, "plan":plan
                 }),
@@ -671,6 +932,15 @@ impl ExecutionEngine {
         Ok(Some(id))
     }
     pub async fn dispatch(&self, event: StrategyEvent) -> Result<()> {
+        self.dispatch_observation(event, true).await
+    }
+    /// Pure quote observations commit at batch end under drive_lock. Intents,
+    /// errors and every standalone event retain immediate durable commits.
+    pub(super) async fn dispatch_observation(
+        &self,
+        event: StrategyEvent,
+        persist: bool,
+    ) -> Result<()> {
         let cfg = self.get_config().await;
         let identity = self.identity.read().await.clone();
         let instance_id = identity.1.clone();
@@ -762,6 +1032,9 @@ impl ExecutionEngine {
                 .positions
                 .values()
                 .filter(|p| p.origin.strategy_version == d.revision)
+                .filter(|p| {
+                    !matches!(event, StrategyEvent::Quote(_)) || !p.is_closed || p.volume > 0
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let orders = if matches!(event, StrategyEvent::Quote(_)) {
@@ -784,11 +1057,13 @@ impl ExecutionEngine {
                     .cloned()
                     .collect::<Vec<_>>()
             };
-            let mut state = guard
-                .strategy_states
-                .get(&d.revision)
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
+            let scope = strategy.event_state_scope(&event);
+            let mut state = scope.select(
+                guard
+                    .strategy_states
+                    .get(&d.revision)
+                    .unwrap_or(&serde_json::Value::Null),
+            );
             let context = StrategyContext {
                 instance_id: &instance_id,
                 positions: &positions,
@@ -799,17 +1074,22 @@ impl ExecutionEngine {
                 config: version_config,
                 allow_entries: d.revision == active.revision && !guard.paused,
             };
-            let old_state = state.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 strategy.on_event(&event, &context, &mut state)
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("策略模块发生panic")));
             match result {
                 Ok(intents) => {
-                    let state_changed = state != old_state;
+                    let state_changed = !scope.unchanged(
+                        guard
+                            .strategy_states
+                            .get(&d.revision)
+                            .unwrap_or(&serde_json::Value::Null),
+                        &state,
+                    );
                     changed |= state_changed || !intents.is_empty() || bar_key.is_some();
                     if state_changed {
-                        state_updates.push((d.revision.clone(), state));
+                        state_updates.push((d.revision.clone(), scope, state));
                     }
                     if let Some((key, ts)) = bar_key {
                         bar_updates.push((key, ts));
@@ -830,13 +1110,28 @@ impl ExecutionEngine {
         if !changed {
             return Ok(());
         }
+        if actions.is_empty() && strategy_error.is_none() {
+            // No orders, controls or configuration changed: do not deep-copy
+            // the complete persisted trade archive for an MFE/clock update.
+            for (rev, scope, update) in state_updates {
+                scope.apply(guard.strategy_states.entry(rev).or_default(), update);
+            }
+            for (key, ts) in bar_updates {
+                guard.strategy_bars.insert(key, ts);
+            }
+            return if persist {
+                self.save(&mut guard)
+            } else {
+                Ok(())
+            };
+        }
         let mut s = guard.clone();
         if let Some(err) = strategy_error {
             s.paused = true;
             s.strategy_error = Some(err);
         }
-        for (rev, state) in state_updates {
-            s.strategy_states.insert(rev, state);
+        for (rev, scope, state) in state_updates {
+            scope.apply(s.strategy_states.entry(rev).or_default(), state);
         }
         for (key, ts) in bar_updates {
             s.strategy_bars.insert(key, ts);

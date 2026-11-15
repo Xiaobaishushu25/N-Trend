@@ -14,6 +14,11 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
   const warning = values.warning || values
   const risk = number(s.risk ?? warning.risk)
   const tick = number(s.tick ?? warning.tick)
+  const minRiskAtr = number(values.min_risk_atr ?? 0.75)
+  const maxRiskAtr = number(values.max_risk_atr ?? 2.5)
+  const atrRange = minRiskAtr === 0
+    ? `大于 0 且不超过 ${metric(maxRiskAtr)}`
+    : `${metric(minRiskAtr)}～${metric(maxRiskAtr)}`
   const reasons: Record<string, string> = {
     risk_budget_exceeded: `单手含成本风险超过 ${metric(values.risk_budget_yuan)} 元预算，放弃开仓`,
     delivery_month: 'P3 主动避开交割月及已过期合约',
@@ -26,8 +31,8 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
     risk_ticks_below_min: `止损距离 ${metric(risk / tick)} tick，小于准入门槛 10 tick`,
     friction_above20: `预估往返摩擦成本 ${metric(values.friction_yuan)} 元，超过计划风险金额的 20%`,
     atr_unavailable: '预警时点的完整 ATR14 数据不可用',
-    atr_out_of_range: `止损距离 / ATR14 为 ${metric(values.risk_atr)}，超出允许区间 0.75～2.50`,
-    filtered_net_rr_plan: '扣除手续费及滑点后，S1 目标净空间不足 1R',
+    atr_out_of_range: `止损距离 / ATR14 为 ${metric(values.risk_atr)}，超出允许区间 ${atrRange}`,
+    filtered_net_rr_plan: `扣除手续费及滑点后，S1 目标净空间不足 ${metric(values.min_net_rr ?? 1)}R`,
     filtered_holiday_window: '处于节假日禁止开仓窗口',
     filtered_weekend_window: '处于周末禁止开仓窗口',
     calendar_uncovered: '交易日历未覆盖当前时点',

@@ -161,6 +161,18 @@ pub enum Action {
     },
     CancelAll,
     CloseAll,
+    ClosePosition {
+        position_id: String,
+        volume: Option<i32>,
+        reason: Option<String>,
+        note: Option<String>,
+    },
+    UpdateTradeRecord {
+        trade_id: String,
+        user_note: Option<String>,
+        exit_reason: Option<String>,
+    },
+    SyncBrokerPositions,
 }
 pub async fn action(
     State(ctx): State<Arc<ServerContext>>,
@@ -212,6 +224,28 @@ pub async fn action(
                 }
                 Action::CloseAll => {
                     r.engine.flatten_positions().await?;
+                }
+                Action::ClosePosition {
+                    position_id,
+                    volume,
+                    reason,
+                    note,
+                } => {
+                    r.engine
+                        .close_managed_position(&position_id, volume, reason, note)
+                        .await?;
+                }
+                Action::UpdateTradeRecord {
+                    trade_id,
+                    user_note,
+                    exit_reason,
+                } => {
+                    r.engine
+                        .update_trade_record(&trade_id, user_note, exit_reason)
+                        .await?;
+                }
+                Action::SyncBrokerPositions => {
+                    r.engine.sync_broker_positions().await?;
                 }
             }
             Ok(json!({"instance_id":id,"accepted":true}))

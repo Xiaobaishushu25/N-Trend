@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use super::model::*;
@@ -41,6 +42,221 @@ mod tests {
         assert_eq!(stream.next_snapshot().await.unwrap()["revision"], 2);
         assert!(stream.next_snapshot().await.is_err());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn test_ctp_market_event_deserialization_and_quote_conversion() {
+        let json_data = r#"{
+            "type": "tick",
+            "seq_id": 42,
+            "stream_id": "stream_1",
+            "instrument_id": "rb2501",
+            "exchange_id": "SHFE",
+            "last_price": 3500.0,
+            "volume": 1000,
+            "turnover": 35000000.0,
+            "open_interest": 5000.0,
+            "bid_price1": 3499.0,
+            "bid_volume1": 10,
+            "ask_price1": 3501.0,
+            "ask_volume1": 20,
+            "upper_limit_price": 3800.0,
+            "lower_limit_price": 3200.0,
+            "price_tick": 1.0,
+            "action_day": "20261113",
+            "trading_day": "20261113",
+            "update_time": "14:30:00",
+            "update_millisec": 500,
+            "datetime": "2026-11-13T14:30:00.500+08:00",
+            "timestamp": 1763015400.5,
+            "recv_time": 1763015400.501
+        }"#;
+
+        let event: CtpMarketEvent = serde_json::from_str(json_data).unwrap();
+        assert_eq!(event.seq_id(), 42);
+        assert_eq!(event.stream_id(), "stream_1");
+
+        let quote = event.to_execution_quote().unwrap();
+        assert_eq!(quote.instrument_id, "rb2501");
+        assert_eq!(quote.exchange_id, "SHFE");
+        assert_eq!(quote.underlying_symbol, "rb2501");
+        assert_eq!(quote.last, 3500.0);
+        assert_eq!(quote.bid, 3499.0);
+        assert_eq!(quote.ask, 3501.0);
+        assert_eq!(quote.tick, 1.0);
+        assert_eq!(quote.lower, 3200.0);
+        assert_eq!(quote.upper, 3800.0);
+        assert_eq!(quote.timestamp, 1763015400);
+
+        // Valid within 15s age
+        assert!(quote.valid_at(1763015405));
+        // Stale after 16s age
+        assert!(!quote.valid_at(1763015420));
+    }
+}
+
+fn trim_ascii_bytes(slice: &[u8]) -> &[u8] {
+    let mut start = 0;
+    while start < slice.len() && slice[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = slice.len();
+    while end > start && slice[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &slice[start..end]
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CtpMarketEvent {
+    #[serde(rename = "tick")]
+    Tick {
+        seq_id: u64,
+        stream_id: String,
+        instrument_id: String,
+        exchange_id: String,
+        last_price: f64,
+        volume: u64,
+        turnover: f64,
+        open_interest: f64,
+        bid_price1: f64,
+        bid_volume1: u64,
+        ask_price1: f64,
+        ask_volume1: u64,
+        upper_limit_price: f64,
+        lower_limit_price: f64,
+        price_tick: f64,
+        action_day: String,
+        trading_day: String,
+        update_time: String,
+        update_millisec: u32,
+        datetime: String,
+        timestamp: f64,
+        recv_time: f64,
+    },
+    #[serde(rename = "md_status")]
+    Status {
+        seq_id: u64,
+        stream_id: String,
+        status: String,
+        #[serde(default)]
+        reason: Option<i32>,
+        #[serde(default)]
+        error_id: Option<i32>,
+        #[serde(default)]
+        error_msg: Option<String>,
+        #[serde(default)]
+        trading_day: Option<String>,
+        #[serde(default)]
+        timestamp: Option<f64>,
+    },
+    #[serde(rename = "gap")]
+    Gap {
+        stream_id: String,
+        reason: String,
+        #[serde(default)]
+        oldest_seq: Option<u64>,
+    },
+}
+
+impl CtpMarketEvent {
+    pub fn seq_id(&self) -> u64 {
+        match self {
+            Self::Tick { seq_id, .. } => *seq_id,
+            Self::Status { seq_id, .. } => *seq_id,
+            Self::Gap { .. } => 0,
+        }
+    }
+
+    pub fn stream_id(&self) -> &str {
+        match self {
+            Self::Tick { stream_id, .. } => stream_id.as_str(),
+            Self::Status { stream_id, .. } => stream_id.as_str(),
+            Self::Gap { stream_id, .. } => stream_id.as_str(),
+        }
+    }
+
+    pub fn to_execution_quote(&self) -> Option<ExecutionQuote> {
+        match self {
+            Self::Tick {
+                instrument_id,
+                exchange_id,
+                last_price,
+                bid_price1,
+                ask_price1,
+                upper_limit_price,
+                lower_limit_price,
+                price_tick,
+                timestamp,
+                ..
+            } => Some(ExecutionQuote {
+                instrument_id: instrument_id.clone(),
+                exchange_id: exchange_id.clone(),
+                underlying_symbol: instrument_id.clone(),
+                last: *last_price,
+                bid: *bid_price1,
+                ask: *ask_price1,
+                tick: *price_tick,
+                lower: *lower_limit_price,
+                upper: *upper_limit_price,
+                timestamp: *timestamp as i64,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CtpMarketBatch {
+    pub stream_id: String,
+    pub latest_seq_id: u64,
+    pub gap: bool,
+    pub events: Vec<CtpMarketEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CtpMarketHealth {
+    pub connected: bool,
+    pub logged_in: bool,
+    pub stream_id: String,
+    pub latest_seq_id: u64,
+    pub buffer_size: usize,
+    pub subscribed_count: usize,
+    pub subscribed: Vec<String>,
+    pub last_tick_time: f64,
+}
+
+pub struct CtpMarketEventStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+}
+
+impl CtpMarketEventStream {
+    pub async fn next_event(&mut self) -> Result<CtpMarketEvent> {
+        loop {
+            if let Some(end) = self.buffer.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buffer.drain(..=end).collect();
+                let trimmed = trim_ascii_bytes(&line);
+                if trimmed.is_empty() || trimmed.starts_with(b":") {
+                    continue;
+                }
+                if let Some(data) = trimmed.strip_prefix(b"data:") {
+                    let data = trim_ascii_bytes(data);
+                    return serde_json::from_slice(data).context("CTP 行情事件格式错误");
+                }
+                continue;
+            }
+            let chunk =
+                tokio::time::timeout(Duration::from_secs(30), self.response.chunk()).await??;
+            let Some(chunk) = chunk else {
+                anyhow::bail!("CTP 行情推送连接已关闭")
+            };
+            self.buffer.extend_from_slice(&chunk);
+            if self.buffer.len() > 4 * 1024 * 1024 {
+                anyhow::bail!("CTP 行情推送帧过大");
+            }
+        }
     }
 }
 
@@ -260,5 +476,113 @@ impl CtpTraderClient {
             .get("success")
             .and_then(|v| v.as_bool())
             .unwrap_or(false))
+    }
+
+    pub async fn market_event_stream(
+        &self,
+        stream_id: &str,
+        after_id: u64,
+    ) -> Result<CtpMarketEventStream> {
+        let mut url = format!("{}/market/events?after_id={}", self.base_url, after_id);
+        if !stream_id.is_empty() {
+            url.push_str(&format!("&stream_id={}", stream_id));
+        }
+        let response = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()?
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()
+            .context("CTP 行情推送连接失败")?;
+        Ok(CtpMarketEventStream {
+            response,
+            buffer: Vec::new(),
+        })
+    }
+
+    pub async fn fetch_market_ticks(
+        &self,
+        stream_id: &str,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<CtpMarketBatch> {
+        let mut url = format!(
+            "{}/market/ticks?after_id={}&limit={}",
+            self.base_url, after_id, limit
+        );
+        if !stream_id.is_empty() {
+            url.push_str(&format!("&stream_id={}", stream_id));
+        }
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("请求 CTP 行情批次失败: {}", url))?
+            .error_for_status()?;
+        let batch = resp.json::<CtpMarketBatch>().await?;
+        Ok(batch)
+    }
+
+    pub async fn subscribe_market(&self, symbols: &[String]) -> Result<Vec<String>> {
+        #[derive(Serialize)]
+        struct SubReq<'a> {
+            symbols: &'a [String],
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct SubResp {
+            success: bool,
+            subscribed: Vec<String>,
+        }
+        let url = format!("{}/market/subscribe", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&SubReq { symbols })
+            .send()
+            .await
+            .with_context(|| format!("请求 CTP 订阅行情失败: {}", url))?
+            .error_for_status()?;
+        let res = resp.json::<SubResp>().await?;
+        Ok(res.subscribed)
+    }
+
+    pub async fn unsubscribe_market(&self, symbols: &[String]) -> Result<Vec<String>> {
+        #[derive(Serialize)]
+        struct UnsubReq<'a> {
+            symbols: &'a [String],
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct UnsubResp {
+            success: bool,
+            subscribed: Vec<String>,
+        }
+        let url = format!("{}/market/unsubscribe", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&UnsubReq { symbols })
+            .send()
+            .await
+            .with_context(|| format!("请求 CTP 退订行情失败: {}", url))?
+            .error_for_status()?;
+        let res = resp.json::<UnsubResp>().await?;
+        Ok(res.subscribed)
+    }
+
+    pub async fn market_health(&self) -> Result<CtpMarketHealth> {
+        let url = format!("{}/market/health", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("请求 CTP 行情健康检查失败: {}", url))?
+            .error_for_status()?;
+        let res = resp.json::<CtpMarketHealth>().await?;
+        Ok(res)
     }
 }

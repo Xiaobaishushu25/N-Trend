@@ -473,6 +473,18 @@ test('all candidate pre-entry filters have readable reasons', () => {
   assert.equal(store.conditionPool.length, 0)
 })
 
+test('P3 filter notes use the frozen net-RR threshold and ATR range', () => {
+  const { store } = setup()
+  const rr = candidateAudit('filtered_net_rr_plan')
+  Object.values(rr.states.p2.decisions)[0].values.min_net_rr = 0.8
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: rr })
+  assert.match(store.conditionPool[0].note, /0.80R/)
+  const atr = candidateAudit('atr_out_of_range')
+  Object.assign(Object.values(atr.states.p2.decisions)[0].values, { min_risk_atr: 0, max_risk_atr: 2.5, risk_atr: 3 })
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: atr })
+  assert.match(store.conditionPool[0].note, /大于 0 且不超过 2.50/)
+})
+
 test('actual condition-pool template shows blocked reasons and omits execution controls', async () => {
   const Vue = require('vue')
   const { compile } = require('@vue/compiler-dom')

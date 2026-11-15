@@ -8,6 +8,9 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+#[path = "replay_broker.rs"]
+mod replay;
+pub use replay::ReplayBroker;
 
 pub(crate) fn atomic_write(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
     use std::io::Write;
@@ -21,6 +24,7 @@ pub(crate) fn atomic_write(path: &std::path::Path, value: &impl Serialize) -> Re
 
 #[derive(Clone)]
 pub enum BrokerClient {
+    Replay(Arc<ReplayBroker>),
     Ctp(CtpTraderClient),
     Paper(Arc<PaperBroker>),
     Disabled(String),
@@ -33,6 +37,7 @@ impl From<CtpTraderClient> for BrokerClient {
 impl BrokerClient {
     pub fn multiplier(&self, instrument: &str) -> f64 {
         match self {
+            Self::Replay(p) => p.multiplier(instrument),
             Self::Disabled(_) => 0.0,
             Self::Ctp(_) => crate::precision::effective_multiplier(instrument, ""),
             Self::Paper(p) => p
@@ -45,6 +50,7 @@ impl BrokerClient {
     }
     pub async fn insert_order(&self, r: &OrderInsertRequest) -> Result<OrderInsertResponse> {
         match self {
+            Self::Replay(p) => p.insert(r),
             Self::Disabled(reason) => Err(anyhow::anyhow!("账户执行已禁用: {reason}")),
             Self::Ctp(c) => c.insert_order(r).await,
             Self::Paper(p) => p.insert(r),
@@ -57,6 +63,7 @@ impl BrokerClient {
         e: Option<&str>,
     ) -> Result<OrderCancelResponse> {
         match self {
+            Self::Replay(p) => p.cancel(r, i, e),
             Self::Disabled(reason) => Err(anyhow::anyhow!("账户执行已禁用: {reason}")),
             Self::Ctp(c) => c.cancel_order(r, i, e).await,
             Self::Paper(p) => p.cancel(r),

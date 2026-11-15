@@ -11,7 +11,8 @@ mod risk_budget;
 use risk_budget::{BudgetSettings, RiskBudget};
 
 pub const ID: &str = "n_p3_v1";
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
+const PREVIOUS_VERSION: &str = "1";
 pub const EXIT: &str = "p3_exit_v1";
 pub const SIZING: &str = "risk_budget_v1";
 const FIRST_S1: &str = "p3_first_s1";
@@ -31,9 +32,15 @@ pub struct P3Parameters {
     pub risk_budget_yuan: f64,
     pub max_lots: i32,
     pub exit_mode: ExitMode,
+    /// Missing in frozen v1 definitions: their threshold remains exactly 1.
+    #[serde(default = "default_min_net_rr")]
+    pub min_net_rr: f64,
     /// Explicit account/product deadlines may be earlier than the delivery month.
     #[serde(default)]
     pub entry_cutoffs: BTreeMap<String, String>,
+}
+fn default_min_net_rr() -> f64 {
+    1.
 }
 impl P3Parameters {
     pub fn reference_snapshot() -> Self {
@@ -50,6 +57,7 @@ impl P3Parameters {
             risk_budget_yuan: 600.,
             max_lots: 2,
             exit_mode: ExitMode::FixedS1,
+            min_net_rr: default_min_net_rr(),
             entry_cutoffs: BTreeMap::new(),
         }
     }
@@ -65,6 +73,10 @@ impl P3Parameters {
     pub fn validate(&self) -> Result<()> {
         self.common().validate()?;
         self.budget()?;
+        ensure!(
+            self.min_net_rr.is_finite() && self.min_net_rr > 0.,
+            "P3净盈亏比门槛必须为正有限数"
+        );
         for (instrument, timestamp) in &self.entry_cutoffs {
             ensure!(
                 is_actual_futures_contract(instrument),
@@ -88,9 +100,24 @@ pub struct P3Strategy {
 }
 impl P3Strategy {
     pub fn new(p: P3Parameters) -> Result<Self> {
+        Self::with_atr_floor(p, false)
+    }
+    fn with_atr_floor(p: P3Parameters, keep_floor: bool) -> Result<Self> {
         p.validate()?;
+        if keep_floor {
+            ensure!(
+                p.min_net_rr == 1.,
+                "P3代码版本1的净盈亏比门槛固定为1，请加载新版预设"
+            );
+        }
+        let base =
+            CandidateStrategy::with_min_score(p.common(), 2.5)?.with_min_net_rr(p.min_net_rr)?;
         Ok(Self {
-            base: CandidateStrategy::with_min_score(p.common(), 2.5)?,
+            base: if keep_floor {
+                base
+            } else {
+                base.without_atr_floor()
+            },
             budget: p.budget()?,
             exit_mode: p.exit_mode,
             entry_cutoffs: p.entry_cutoffs,
@@ -177,6 +204,12 @@ impl P3Strategy {
     }
 }
 impl Strategy for P3Strategy {
+    fn handles_event(&self, event: &StrategyEvent) -> bool {
+        self.base.handles_event(event)
+    }
+    fn event_state_scope(&self, event: &StrategyEvent) -> EventStateScope {
+        self.base.event_state_scope(event)
+    }
     fn entry_constraints(&self) -> EntryConstraints {
         EntryConstraints {
             entry_timeout_seconds: Some(3),
@@ -390,14 +423,30 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     }
     if d.strategy_id == ID {
         ensure!(
-            d.code_version == VERSION && d.exit_policy == EXIT && d.sizing_policy == SIZING,
+            [PREVIOUS_VERSION, VERSION].contains(&d.code_version.as_str())
+                && d.exit_policy == EXIT
+                && d.sizing_policy == SIZING,
             "P3必须使用配套金额预算和退出模块"
         );
-        serde_json::from_value::<P3Parameters>(d.parameters.clone())?.validate()?;
+        let parameters = serde_json::from_value::<P3Parameters>(d.parameters.clone())?;
+        parameters.validate()?;
+        if d.code_version == PREVIOUS_VERSION {
+            ensure!(
+                parameters.min_net_rr == 1.,
+                "P3代码版本1的净盈亏比门槛固定为1，请加载新版预设"
+            );
+        }
     }
     Ok(())
 }
 pub fn register(r: &mut StrategyRegistry) {
+    // Frozen v1 conditions must not acquire v2 admission rules after restart.
+    r.register_strategy(ID, PREVIOUS_VERSION, |p| {
+        Ok(Box::new(P3Strategy::with_atr_floor(
+            serde_json::from_value(p.clone())?,
+            true,
+        )?))
+    });
     r.register_strategy(ID, VERSION, |p| {
         Ok(Box::new(P3Strategy::new(serde_json::from_value(
             p.clone(),

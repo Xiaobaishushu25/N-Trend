@@ -5,6 +5,7 @@ Powered by openctp_ctp.
 """
 
 import argparse
+import datetime
 import http.server
 import json
 import logging
@@ -13,9 +14,14 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 from typing import Dict, List, Optional, Any
 
 import openctp_ctp.thosttraderapi as tdapi
+try:
+    import openctp_ctp.thostmduserapi as mdapi
+except ImportError:
+    mdapi = None
 
 # Configure logging
 logging.basicConfig(
@@ -63,6 +69,48 @@ def guess_exchange_id(instrument_id: str) -> str:
         else:
             break
     return EXCHANGE_PREFIX_MAP.get(prefix, "SHFE")
+
+
+BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+def parse_ctp_timestamp(action_day: str, trading_day: str, update_time: str, update_millisec: int) -> tuple[float, str]:
+    """
+    Parses CTP tick time in Beijing Time (+08:00).
+    Returns (unix_timestamp_seconds, iso_format_string).
+    """
+    now = datetime.datetime.now(BEIJING_TZ)
+    day_str = action_day.strip() if action_day else ""
+    if not day_str or len(day_str) != 8 or not day_str.isdigit():
+        day_str = now.strftime("%Y%m%d")
+
+    time_str = update_time.strip() if update_time else "00:00:00"
+    parts = time_str.split(":")
+    if len(parts) == 3:
+        try:
+            hour, minute, second = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            hour, minute, second = 0, 0, 0
+    else:
+        hour, minute, second = 0, 0, 0
+
+    msec = int(update_millisec) if update_millisec else 0
+    if msec < 0 or msec > 999:
+        msec = 0
+
+    try:
+        dt = datetime.datetime(
+            year=int(day_str[:4]),
+            month=int(day_str[4:6]),
+            day=int(day_str[6:8]),
+            hour=hour,
+            minute=minute,
+            second=second,
+            microsecond=msec * 1000,
+            tzinfo=BEIJING_TZ,
+        )
+        return dt.timestamp(), dt.isoformat()
+    except Exception:
+        return now.timestamp(), now.isoformat()
 
 
 class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
@@ -130,6 +178,32 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         if self._journal_path and os.path.exists(self._journal_path):
             with open(self._journal_path, "r", encoding="utf-8") as journal:
                 self._submitted_requests = json.load(journal)
+
+        # Instrument Metadata (price_tick, exchange_id, volume_multiple)
+        self.instruments_meta: Dict[str, Dict[str, Any]] = {}
+        self._metadata_path = config.get("InstrumentMetadataPath")
+        if self._metadata_path and os.path.exists(self._metadata_path):
+            try:
+                with open(self._metadata_path, "r", encoding="utf-8") as f:
+                    self.instruments_meta = json.load(f)
+                    logger.info(f"已加载 {len(self.instruments_meta)} 个本地合约元数据缓存")
+            except Exception as e:
+                logger.warning(f"读取合约元数据缓存失败: {e}")
+
+    def request_instrument_query(self, inst_id: str):
+        with self._condition:
+            key = f"instrument:{inst_id}"
+            if key not in self._pending_queries and inst_id not in self.instruments_meta:
+                self._pending_queries[key] = time.monotonic()
+                self._condition.notify_all()
+
+    def _save_instrument_metadata(self):
+        if self._metadata_path:
+            try:
+                with open(self._metadata_path, "w", encoding="utf-8") as f:
+                    json.dump(self.instruments_meta, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"保存合约元数据失败: {e}")
 
     def get_req_id(self) -> int:
         with self.lock:
@@ -360,11 +434,20 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 elif kind == "orders":
                     req = tdapi.CThostFtdcQryOrderField()
                     send = self.api.ReqQryOrder
+                elif kind == "trades":
+                    req = tdapi.CThostFtdcQryTradeField()
+                    send = self.api.ReqQryTrade
+                elif kind.startswith("instrument:"):
+                    inst_id = kind.split(":", 1)[1]
+                    req = tdapi.CThostFtdcQryInstrumentField()
+                    req.InstrumentID = inst_id
+                    send = self.api.ReqQryInstrument
                 else:
                     req = tdapi.CThostFtdcQryTradeField()
                     send = self.api.ReqQryTrade
-                req.BrokerID = self.config.get("BrokerID", "9999")
-                req.InvestorID = self.config.get("UserID", "")
+                if not kind.startswith("instrument:"):
+                    req.BrokerID = self.config.get("BrokerID", "9999")
+                    req.InvestorID = self.config.get("UserID", "")
                 ret = send(req, req_id)
                 if ret != 0:
                     with self._condition:
@@ -392,6 +475,10 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 self.positions = query["rows"]
                 self.positions_updated_at = time.time()
                 self.emit_event("positions", list(self.positions.values()))
+                if g_md_mgr and g_md_mgr.is_logged_in:
+                    pos_symbols = list({p["instrument_id"] for p in self.positions.values() if p.get("position", 0) > 0})
+                    if pos_symbols:
+                        g_md_mgr.subscribe(pos_symbols)
             elif kind == "orders":
                 for ref, record in query["rows"].items():
                     if self._order_versions.get(ref, 0) <= query["revision"]:
@@ -403,6 +490,9 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                     self._merge_trade(record)
                 self.trades_updated_at = time.time()
                 self.emit_event("trades", self.trades)
+            elif kind.startswith("instrument:"):
+                # Metadata is recorded in OnRspQryInstrument
+                pass
             elif query["rows"]:
                 self.account_data = query["rows"]
                 self.emit_event("account", self.account_data)
@@ -413,8 +503,10 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 self.emit_event("sync_error", self.sync_error)
                 self._condition.notify_all()
                 return
-            self._synced.add(kind)
-            if self._synced == {"account", "positions", "orders", "trades"} and not self._pending_queries:
+            if not kind.startswith("instrument:"):
+                self._synced.add(kind)
+            pending_core = [k for k in self._pending_queries if not k.startswith("instrument:")]
+            if {"account", "positions", "orders", "trades"}.issubset(self._synced) and not pending_core:
                 self.sync_error = None
                 self.is_ready = True
                 self.emit_event("ready", {"trading_day": self.trading_day})
@@ -636,6 +728,8 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             self.last_trade_at = time.time()
         self.request_sync(delay=0.5)
         self.emit_event("trade", record)
+        if g_md_mgr and g_md_mgr.is_logged_in and pTrade and getattr(pTrade, "InstrumentID", None):
+            g_md_mgr.subscribe([str(pTrade.InstrumentID).strip()])
 
     def OnRspQryTrade(self, pTrade, pRspInfo, nRequestID, bIsLast):
         with self._condition:
@@ -648,6 +742,32 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                 record = self._trade_record(pTrade)
                 key = (record.get("trading_day") or record["trade_date"], record["exchange_id"], record["trade_id"], record["instrument_id"], record["direction"])
                 query["rows"][key] = record
+            if bIsLast:
+                self._finish_query(nRequestID)
+
+    def OnRspQryInstrument(self, pInstrument, pRspInfo, nRequestID, bIsLast):
+        with self._condition:
+            query = self._inflight
+            if not query or query["id"] != nRequestID or not query["kind"].startswith("instrument"):
+                return
+            if pRspInfo and pRspInfo.ErrorID:
+                query["error"] = f"合约查询失败: {pRspInfo.ErrorMsg}"
+            elif pInstrument and getattr(pInstrument, "InstrumentID", None):
+                inst_id = str(pInstrument.InstrumentID).strip()
+                price_tick = float(getattr(pInstrument, "PriceTick", 0.0) or 0.0)
+                exchange_id = str(getattr(pInstrument, "ExchangeID", "") or guess_exchange_id(inst_id)).strip()
+                vol_mult = int(getattr(pInstrument, "VolumeMultiple", 1) or 1)
+                meta = {
+                    "instrument_id": inst_id,
+                    "exchange_id": exchange_id,
+                    "price_tick": price_tick,
+                    "volume_multiple": vol_mult,
+                    "updated_at": time.time(),
+                }
+                self.instruments_meta[inst_id] = meta
+                if g_md_mgr:
+                    g_md_mgr.instruments_meta[inst_id] = meta
+                self._save_instrument_metadata()
             if bIsLast:
                 self._finish_query(nRequestID)
 
@@ -868,8 +988,256 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
             return {"success": False, "msg": f"撤单指令失败 (错误码: {res})"}
 
 
+# ── CTP Market Data Manager ──
+
+class CtpMdManager(mdapi.CThostFtdcMdSpi if mdapi else object):
+    def __init__(self, config: Dict[str, Any]):
+        if mdapi:
+            super().__init__()
+        self.config = config
+        self.api = None
+        self.req_id = 2000
+        self.lock = threading.RLock()
+
+        self.is_connected = False
+        self.is_logged_in = False
+        self.subscribed_symbols: set = set()
+        self.instruments_meta: Dict[str, Dict[str, Any]] = {}
+
+        # Stream session & ring buffer (capacity 5000)
+        self.stream_id = f"ctpmd_{int(time.time())}_{os.getpid()}"
+        self.seq_id = 0
+        self.ring_buffer: List[Dict[str, Any]] = []
+        self.max_buffer_size = 5000
+        self.ring_buffer_lock = threading.Lock()
+        self.ring_buffer_cond = threading.Condition(self.ring_buffer_lock)
+        self._stop_requested = False
+        self.last_tick_time = 0.0
+
+    def get_req_id(self) -> int:
+        with self.lock:
+            self.req_id += 1
+            return self.req_id
+
+    def stop(self):
+        self._stop_requested = True
+        with self.ring_buffer_cond:
+            self.ring_buffer_cond.notify_all()
+
+    def emit_status_event(self, status: str, extra: Optional[Dict[str, Any]] = None):
+        with self.ring_buffer_cond:
+            self.seq_id += 1
+            evt = {
+                "seq_id": self.seq_id,
+                "stream_id": self.stream_id,
+                "type": "md_status",
+                "status": status,
+                "timestamp": time.time(),
+            }
+            if extra:
+                evt.update(extra)
+            self.ring_buffer.append(evt)
+            if len(self.ring_buffer) > self.max_buffer_size:
+                self.ring_buffer.pop(0)
+            self.ring_buffer_cond.notify_all()
+
+    def OnFrontConnected(self):
+        logger.info("[行情前置] 行情前置连接成功，正在登录行情...")
+        self.is_connected = True
+        if not self.api or not mdapi:
+            return
+        req = mdapi.CThostFtdcReqUserLoginField()
+        req.BrokerID = self.config.get("BrokerID", "")
+        req.UserID = self.config.get("UserID", "")
+        req.Password = self.config.get("Password", "")
+        self.api.ReqUserLogin(req, self.get_req_id())
+
+    def OnFrontDisconnected(self, nReason: int):
+        logger.warning(f"[行情前置] 行情前置连接断开 (代码: {nReason})")
+        self.is_connected = False
+        self.is_logged_in = False
+        self.emit_status_event("disconnected", {"reason": nReason})
+
+    def OnRspUserLogin(self, pRspUserLogin, pRspInfo, nRequestID, bIsLast):
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            logger.error(f"[行情登录] 行情登录失败 ({pRspInfo.ErrorID}): {pRspInfo.ErrorMsg}")
+            self.is_logged_in = False
+            self.emit_status_event("login_error", {
+                "error_id": pRspInfo.ErrorID,
+                "error_msg": str(pRspInfo.ErrorMsg),
+            })
+            return
+        trading_day = getattr(pRspUserLogin, "TradingDay", "") if pRspUserLogin else ""
+        logger.info(f"[行情登录] 行情登录成功，交易日: {trading_day}")
+        self.is_logged_in = True
+        self.emit_status_event("logged_in", {"trading_day": str(trading_day)})
+        with self.lock:
+            if self.subscribed_symbols and self.api:
+                symbols_list = list(self.subscribed_symbols)
+                logger.info(f"[行情重连] 自动恢复订阅 {len(symbols_list)} 个合约: {symbols_list}")
+                encoded = [s.encode("utf-8") for s in symbols_list]
+                self.api.SubscribeMarketData(encoded, len(encoded))
+
+    def OnRspSubMarketData(self, pSpecificInstrument, pRspInfo, nRequestID, bIsLast):
+        inst = getattr(pSpecificInstrument, "InstrumentID", "") if pSpecificInstrument else ""
+        if pRspInfo and pRspInfo.ErrorID != 0:
+            logger.warning(f"[行情订阅] 订阅合约 {inst} 失败 ({pRspInfo.ErrorID}): {pRspInfo.ErrorMsg}")
+        else:
+            logger.info(f"[行情订阅] 订阅合约 {inst} 成功")
+
+    def OnRspUnSubMarketData(self, pSpecificInstrument, pRspInfo, nRequestID, bIsLast):
+        inst = getattr(pSpecificInstrument, "InstrumentID", "") if pSpecificInstrument else ""
+        logger.info(f"[行情退订] 退订合约 {inst} 成功")
+
+    def OnRtnDepthMarketData(self, pDepthMarketData):
+        if not pDepthMarketData:
+            return
+        inst_id = str(getattr(pDepthMarketData, "InstrumentID", "")).strip()
+        if not inst_id:
+            return
+
+        last_price = float(getattr(pDepthMarketData, "LastPrice", 0.0) or 0.0)
+        volume = int(getattr(pDepthMarketData, "Volume", 0) or 0)
+        turnover = float(getattr(pDepthMarketData, "Turnover", 0.0) or 0.0)
+        open_interest = float(getattr(pDepthMarketData, "OpenInterest", 0.0) or 0.0)
+        bid_price1 = float(getattr(pDepthMarketData, "BidPrice1", 0.0) or 0.0)
+        bid_volume1 = int(getattr(pDepthMarketData, "BidVolume1", 0) or 0)
+        ask_price1 = float(getattr(pDepthMarketData, "AskPrice1", 0.0) or 0.0)
+        ask_volume1 = int(getattr(pDepthMarketData, "AskVolume1", 0) or 0)
+        upper_limit = float(getattr(pDepthMarketData, "UpperLimitPrice", 0.0) or 0.0)
+        lower_limit = float(getattr(pDepthMarketData, "LowerLimitPrice", 0.0) or 0.0)
+
+        # Sanitize abnormal values
+        if upper_limit > 1e10 or upper_limit <= 0.0:
+            upper_limit = 0.0
+        if lower_limit > 1e10 or lower_limit <= 0.0:
+            lower_limit = 0.0
+        if bid_price1 > 1e10 or bid_price1 <= 0.0:
+            bid_price1 = 0.0
+            bid_volume1 = 0
+        if ask_price1 > 1e10 or ask_price1 <= 0.0:
+            ask_price1 = 0.0
+            ask_volume1 = 0
+        if last_price > 1e10 or last_price < 0.0:
+            last_price = 0.0
+
+        action_day = str(getattr(pDepthMarketData, "ActionDay", "") or "").strip()
+        trading_day = str(getattr(pDepthMarketData, "TradingDay", "") or "").strip()
+        update_time = str(getattr(pDepthMarketData, "UpdateTime", "") or "00:00:00").strip()
+        update_millisec = int(getattr(pDepthMarketData, "UpdateMillisec", 0) or 0)
+
+        ts, dt_str = parse_ctp_timestamp(action_day, trading_day, update_time, update_millisec)
+
+        meta = self.instruments_meta.get(inst_id, {})
+        exchange_id = meta.get("exchange_id") or str(getattr(pDepthMarketData, "ExchangeID", "") or guess_exchange_id(inst_id)).strip()
+        price_tick = float(meta.get("price_tick", 0.0) or 0.0)
+
+        tick = {
+            "type": "tick",
+            "instrument_id": inst_id,
+            "exchange_id": exchange_id,
+            "last_price": last_price,
+            "volume": volume,
+            "turnover": turnover,
+            "open_interest": open_interest,
+            "bid_price1": bid_price1,
+            "bid_volume1": bid_volume1,
+            "ask_price1": ask_price1,
+            "ask_volume1": ask_volume1,
+            "upper_limit_price": upper_limit,
+            "lower_limit_price": lower_limit,
+            "price_tick": price_tick,
+            "action_day": action_day,
+            "trading_day": trading_day,
+            "update_time": update_time,
+            "update_millisec": update_millisec,
+            "datetime": dt_str,
+            "timestamp": ts,
+            "recv_time": time.time(),
+        }
+
+        with self.ring_buffer_cond:
+            self.seq_id += 1
+            tick["seq_id"] = self.seq_id
+            tick["stream_id"] = self.stream_id
+            self.ring_buffer.append(tick)
+            if len(self.ring_buffer) > self.max_buffer_size:
+                self.ring_buffer.pop(0)
+            self.last_tick_time = time.time()
+            self.ring_buffer_cond.notify_all()
+
+    def subscribe(self, symbols: List[str]) -> bool:
+        if not symbols:
+            return True
+        symbols_to_sub = [s.strip() for s in symbols if s.strip()]
+        with self.lock:
+            for s in symbols_to_sub:
+                self.subscribed_symbols.add(s)
+                if s not in self.instruments_meta and g_trader_mgr:
+                    g_trader_mgr.request_instrument_query(s)
+            if self.is_logged_in and self.api:
+                encoded = [s.encode("utf-8") for s in symbols_to_sub]
+                ret = self.api.SubscribeMarketData(encoded, len(encoded))
+                logger.info(f"[行情订阅] 订阅合约 {symbols_to_sub}，返回码: {ret}")
+                return ret == 0
+        return True
+
+    def unsubscribe(self, symbols: List[str]) -> bool:
+        if not symbols:
+            return True
+        symbols_to_unsub = [s.strip() for s in symbols if s.strip()]
+        with self.lock:
+            for s in symbols_to_unsub:
+                self.subscribed_symbols.discard(s)
+            if self.is_logged_in and self.api:
+                encoded = [s.encode("utf-8") for s in symbols_to_unsub]
+                ret = self.api.UnSubscribeMarketData(encoded, len(encoded))
+                logger.info(f"[退订行情] 退订合约 {symbols_to_unsub}，返回码: {ret}")
+                return ret == 0
+        return True
+
+    def get_ticks(self, stream_id: str, after_id: int, limit: int = 500) -> Dict[str, Any]:
+        with self.ring_buffer_lock:
+            gap = False
+            if stream_id and stream_id != self.stream_id:
+                gap = True
+            elif after_id > 0 and len(self.ring_buffer) > 0:
+                oldest_seq = self.ring_buffer[0]["seq_id"]
+                if after_id < oldest_seq - 1:
+                    gap = True
+
+            events = []
+            for evt in self.ring_buffer:
+                if evt["seq_id"] > after_id:
+                    events.append(evt)
+                    if len(events) >= limit:
+                        break
+
+            return {
+                "stream_id": self.stream_id,
+                "latest_seq_id": self.seq_id,
+                "gap": gap,
+                "events": events,
+            }
+
+    def get_health(self) -> Dict[str, Any]:
+        with self.lock:
+            with self.ring_buffer_lock:
+                return {
+                    "connected": self.is_connected,
+                    "logged_in": self.is_logged_in,
+                    "stream_id": self.stream_id,
+                    "latest_seq_id": self.seq_id,
+                    "buffer_size": len(self.ring_buffer),
+                    "subscribed_count": len(self.subscribed_symbols),
+                    "subscribed": list(self.subscribed_symbols),
+                    "last_tick_time": self.last_tick_time,
+                }
+
+
 # ── HTTP Server Request Handler ──
 g_trader_mgr: Optional[CtpTraderManager] = None
+g_md_mgr: Optional[CtpMdManager] = None
 
 class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
     def _send_json(self, status_code: int, data: Any):
@@ -891,11 +1259,28 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        global g_trader_mgr
+        global g_trader_mgr, g_md_mgr
+        path = self.path.split("?")[0]
+
+        if path.startswith("/market/"):
+            if not g_md_mgr:
+                return self._send_json(503, {"error": "CTP Market Data manager not initialized"})
+            if path == "/market/health":
+                return self._send_json(200, g_md_mgr.get_health())
+            elif path == "/market/ticks":
+                params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                stream_id = params.get("stream_id", [""])[0]
+                after_id = int(params.get("after_id", [0])[0]) if params.get("after_id") else 0
+                limit = int(params.get("limit", [500])[0]) if params.get("limit") else 500
+                return self._send_json(200, g_md_mgr.get_ticks(stream_id, after_id, limit))
+            elif path == "/market/events":
+                return self._handle_market_events()
+            else:
+                return self._send_json(404, {"error": f"Unknown market GET endpoint: {path}"})
+
         if not g_trader_mgr:
             return self._send_json(500, {"error": "Trader manager not initialized"})
 
-        path = self.path.split("?")[0]
         if path == "/events":
             # SSE stays on loopback. Each message is a full snapshot, so reconnects
             # and slow consumers recover without replaying a truncated event log.
@@ -956,8 +1341,100 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
         else:
             return self._send_json(404, {"error": f"Unknown endpoint: {path}"})
 
+    def _handle_market_events(self):
+        global g_md_mgr
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        stream_id = params.get("stream_id", [""])[0]
+        after_id = int(params.get("after_id", [0])[0]) if params.get("after_id") else 0
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        last_seq = after_id
+        try:
+            self.connection.settimeout(20)
+            with g_md_mgr.ring_buffer_lock:
+                if stream_id and stream_id != g_md_mgr.stream_id:
+                    gap_evt = json.dumps({
+                        "type": "gap",
+                        "stream_id": g_md_mgr.stream_id,
+                        "reason": "stream_id_mismatch",
+                    })
+                    self.wfile.write(("data: " + gap_evt + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                    last_seq = 0
+                elif last_seq > 0 and len(g_md_mgr.ring_buffer) > 0:
+                    oldest_seq = g_md_mgr.ring_buffer[0]["seq_id"]
+                    if last_seq < oldest_seq - 1:
+                        gap_evt = json.dumps({
+                            "type": "gap",
+                            "stream_id": g_md_mgr.stream_id,
+                            "reason": "ring_buffer_overflow",
+                            "oldest_seq": oldest_seq,
+                        })
+                        self.wfile.write(("data: " + gap_evt + "\n\n").encode("utf-8"))
+                        self.wfile.flush()
+
+            while not g_md_mgr._stop_requested:
+                events_to_send = []
+                with g_md_mgr.ring_buffer_cond:
+                    for evt in g_md_mgr.ring_buffer:
+                        if evt["seq_id"] > last_seq:
+                            events_to_send.append(evt)
+                    if not events_to_send:
+                        g_md_mgr.ring_buffer_cond.wait(timeout=10.0)
+                        if g_md_mgr._stop_requested:
+                            break
+                        for evt in g_md_mgr.ring_buffer:
+                            if evt["seq_id"] > last_seq:
+                                events_to_send.append(evt)
+
+                if events_to_send:
+                    for evt in events_to_send:
+                        data = json.dumps(evt, ensure_ascii=False)
+                        self.wfile.write(("data: " + data + "\n\n").encode("utf-8"))
+                        last_seq = evt["seq_id"]
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return
+
     def do_POST(self):
-        global g_trader_mgr
+        global g_trader_mgr, g_md_mgr
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            params = json.loads(body.decode("utf-8")) if body else {}
+        except Exception as e:
+            return self._send_json(400, {"error": f"Invalid JSON payload: {e}"})
+
+        path = self.path.split("?")[0]
+        if path.startswith("/market/"):
+            if not g_md_mgr:
+                return self._send_json(503, {"error": "CTP Market Data manager not initialized"})
+            if path == "/market/subscribe":
+                symbols = params.get("symbols", [])
+                if not isinstance(symbols, list):
+                    return self._send_json(400, {"error": "symbols must be a list"})
+                ok = g_md_mgr.subscribe(symbols)
+                return self._send_json(200, {"success": ok, "subscribed": list(g_md_mgr.subscribed_symbols)})
+            elif path == "/market/unsubscribe":
+                symbols = params.get("symbols", [])
+                if not isinstance(symbols, list):
+                    return self._send_json(400, {"error": "symbols must be a list"})
+                ok = g_md_mgr.unsubscribe(symbols)
+                return self._send_json(200, {"success": ok, "subscribed": list(g_md_mgr.subscribed_symbols)})
+            else:
+                return self._send_json(404, {"error": f"Unknown market POST endpoint: {path}"})
+
         if not g_trader_mgr:
             return self._send_json(500, {"error": "Trader manager not initialized"})
 
@@ -966,13 +1443,6 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
         if ((expected_broker is not None and expected_broker != str(g_trader_mgr.config.get("BrokerID", "")))
                 or (expected_user is not None and expected_user != str(g_trader_mgr.config.get("UserID", "")))):
             return self._send_json(409, {"success": False, "msg": "Account identity mismatch"})
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        try:
-            params = json.loads(body.decode("utf-8")) if body else {}
-        except Exception as e:
-            return self._send_json(400, {"error": f"Invalid JSON payload: {e}"})
 
         path = self.path.split("?")[0]
         if path == "/order/insert":
@@ -1127,7 +1597,7 @@ def main():
             raise RuntimeError("Configured account credentials are incomplete")
 
     # Create CTP Trader API
-    global g_trader_mgr
+    global g_trader_mgr, g_md_mgr
     logger.info(f"Connecting to CTP Trader Front: {config['TdFront']} ...")
     flow_dir = os.path.abspath(args.flow_dir) if args.flow_dir else os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow_ctp")
     os.makedirs(flow_dir, exist_ok=True)
@@ -1135,8 +1605,10 @@ def main():
     trader_api = tdapi.CThostFtdcTraderApi.CreateFtdcTraderApi(flow_dir + os.sep)
     if args.flow_dir:
         config["OrderJournalPath"] = os.path.join(flow_dir, "order_requests.json")
+        config["InstrumentMetadataPath"] = os.path.join(flow_dir, "instrument_metadata.json")
     else:
         config.setdefault("OrderJournalPath", os.path.join(flow_dir, "order_requests.json"))
+        config.setdefault("InstrumentMetadataPath", os.path.join(flow_dir, "instrument_metadata.json"))
     g_trader_mgr = CtpTraderManager(config)
     g_trader_mgr.api = trader_api
     trader_api.RegisterSpi(g_trader_mgr)
@@ -1144,6 +1616,23 @@ def main():
     trader_api.SubscribePublicTopic(tdapi.THOST_TERT_QUICK)
     trader_api.SubscribePrivateTopic(tdapi.THOST_TERT_RESUME)
     trader_api.Init()
+
+    # Create CTP Market Data API
+    md_api = None
+    md_front = config.get("MdFront")
+    if md_front and mdapi:
+        logger.info(f"Connecting to CTP Market Data Front: {md_front} ...")
+        md_flow_dir = os.path.join(flow_dir, "md")
+        os.makedirs(md_flow_dir, exist_ok=True)
+        md_api = mdapi.CThostFtdcMdApi.CreateFtdcMdApi(md_flow_dir + os.sep)
+        g_md_mgr = CtpMdManager(config)
+        g_md_mgr.api = md_api
+        g_md_mgr.instruments_meta = g_trader_mgr.instruments_meta
+        md_api.RegisterSpi(g_md_mgr)
+        md_api.RegisterFront(md_front)
+        md_api.Init()
+    elif not mdapi:
+        logger.warning("openctp_ctp.thostmduserapi is not available; CTP market data disabled")
 
     # Start HTTP Server
     socketserver.ThreadingTCPServer.allow_reuse_address = True
@@ -1157,6 +1646,10 @@ def main():
     except KeyboardInterrupt:
         logger.info("Stopping CTP Bridge...")
     finally:
+        if g_md_mgr:
+            g_md_mgr.stop()
+        if md_api:
+            md_api.Release()
         if g_trader_mgr:
             g_trader_mgr.stop()
         if trader_api:

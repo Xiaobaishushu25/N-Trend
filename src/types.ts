@@ -950,6 +950,7 @@ export interface ExecutionConfig {
   max_slippage_ticks?: number
   max_exit_slippage_ticks?: number
   min_entry_risk_ticks?: number
+  quote_source?: 'tianqin' | 'ctp'
 }
 
 export interface TraderAccount {
@@ -1175,6 +1176,8 @@ export interface LiveManagedPosition {
   warning_bar_ts?: string | null
   trigger_ts?: string | null
   order_insert_ts?: string | null
+  user_note?: string | null
+  is_manual?: boolean | null
 }
 
 export interface LiveTradeRecord {
@@ -1206,6 +1209,8 @@ export interface LiveTradeRecord {
   warning_bar_ts?: string | null
   trigger_ts?: string | null
   order_insert_ts?: string | null
+  user_note?: string | null
+  is_manual?: boolean | null
 }
 
 export interface LiveTradeStatistics {

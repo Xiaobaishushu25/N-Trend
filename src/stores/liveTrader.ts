@@ -641,5 +641,54 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         notify.error(`一键全平失败: ${e}`)
       }
     },
+
+    async closePosition(positionId: string, volume?: number, reason?: string, note?: string) {
+      try {
+        if (this.instancesSupported) {
+          await this.instanceAction({
+            action: 'close_position',
+            position_id: positionId,
+            volume,
+            reason,
+            note,
+          })
+        }
+        notify.success('平仓指令已提交')
+        await this.refresh()
+      } catch (e: any) {
+        notify.error(`平仓失败: ${e?.message || e}`)
+      }
+    },
+
+    async updateTradeRecord(tradeId: string, userNote?: string, exitReason?: string) {
+      try {
+        if (this.instancesSupported) {
+          await this.instanceAction({
+            action: 'update_trade_record',
+            trade_id: tradeId,
+            user_note: userNote,
+            exit_reason: exitReason,
+          })
+        }
+        notify.success('备注已更新')
+        await this.refresh()
+      } catch (e: any) {
+        notify.error(`更新备注失败: ${e?.message || e}`)
+      }
+    },
+
+    async syncBrokerPositions() {
+      try {
+        if (this.instancesSupported) {
+          await this.instanceAction({
+            action: 'sync_broker_positions',
+          })
+        }
+        notify.success('已按柜台真实持仓完成对齐核销')
+        await this.refresh()
+      } catch (e: any) {
+        notify.error(`对齐核销失败: ${e?.message || e}`)
+      }
+    },
   },
 })

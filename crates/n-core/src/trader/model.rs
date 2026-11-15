@@ -51,7 +51,11 @@ impl ExecutionQuote {
         ticks: u32,
         max_ticks: u32,
     ) -> Option<f64> {
-        if !self.valid() {
+        self.order_price_at(buy, reference, ticks, max_ticks, chrono::Utc::now().timestamp())
+    }
+
+    pub fn order_price_at(&self, buy: bool, reference: f64, ticks: u32, max_ticks: u32, now: i64) -> Option<f64> {
+        if !self.valid_at(now) {
             return None;
         }
         let opposite = if buy { self.ask } else { self.bid };

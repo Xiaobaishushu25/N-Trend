@@ -11,10 +11,12 @@ pub mod policy;
 pub mod strategy;
 mod trailing;
 
-pub use client::CtpTraderClient;
+pub use client::{
+    CtpMarketBatch, CtpMarketEvent, CtpMarketEventStream, CtpMarketHealth, CtpTraderClient,
+};
 pub use execution::{
     ConditionOrder, ConditionState, ExecutionConfig, ExecutionEngine, ManagedPosition,
-    PositionTier, TradeRecord, TradeStatistics,
+    PositionTier, QuoteSource, TradeRecord, TradeStatistics,
 };
 pub use model::{
     ExecutionMode, OrderCancelRequest, OrderCancelResponse, OrderInsertRequest,

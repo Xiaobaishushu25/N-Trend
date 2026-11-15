@@ -7,7 +7,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 pub(crate) type HistoryRevision = Vec<(String, Option<String>, i64)>;
 
@@ -461,19 +461,85 @@ pub(crate) fn warn_calendar_coverage(
     *previous = current;
 }
 
+/// UI serialization, websocket publication and equity SQL never execute on
+/// the quote consumer. One fixed-rate worker per instance bounds this cost
+/// regardless of quote frequency; dropping the consumer aborts its worker.
+struct InstancePublisher(tokio::task::JoinHandle<()>);
+impl Drop for InstancePublisher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+impl InstancePublisher {
+    fn spawn(
+        ctx: Arc<ServerContext>,
+        r: Arc<InstanceRuntime>,
+        diagnostics: Arc<RwLock<serde_json::Value>>,
+    ) -> Self {
+        Self(tokio::spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(1));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut publisher =
+                n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
+            let mut calendar_warnings = HashSet::new();
+            let mut last_heartbeat = Instant::now();
+            loop {
+                timer.tick().await;
+                if ctx.is_shutting_down.load(Ordering::Relaxed) {
+                    break;
+                }
+                let manager = ctx.instances.get().unwrap();
+                if manager.get(&r.definition.id).await.is_err() {
+                    break;
+                }
+                let started = Instant::now();
+                let result: anyhow::Result<()> = async {
+                    let mut snapshot = manager.build_snapshot(&r.definition.id).await?;
+                    warn_calendar_coverage(&r.definition.id, &snapshot["strategy_diagnostics"], &mut calendar_warnings);
+                    snapshot["runtime_diagnostics"] = diagnostics.read().await.clone();
+                    let (baseline, delta) = publisher.update(snapshot);
+                    // Publish before potentially slow equity SQL, which must
+                    // not hold up REST recovery or the quote/exit task either.
+                    *r.published.write().await = baseline;
+                    if let Some(delta) = delta {
+                        ctx.realtime_hub.broadcast(ctx.next_event_seq(), "trader.instance.delta",
+                            json!({"instance_id":r.definition.id,"delta":delta})).await;
+                    }
+                    if last_heartbeat.elapsed() >= Duration::from_secs(15) {
+                        ctx.realtime_hub.broadcast(ctx.next_event_seq(), "trader.instance.heartbeat",
+                            json!({"instance_id":r.definition.id,"heartbeat":publisher.heartbeat()})).await;
+                        last_heartbeat = Instant::now();
+                    }
+                    // Only the small broker snapshot is needed for sampling.
+                    let broker = r.snapshot.read().await.clone();
+                    manager.sample_equity(&r.definition.id, &broker).await?;
+                    Ok(())
+                }.await;
+                if let Err(error) = result {
+                    tracing::warn!(instance_id = %r.definition.id, error = %error, "实例状态发布/净值采样失败，行情消费继续独立运行");
+                }
+                if started.elapsed() >= Duration::from_millis(500) {
+                    tracing::warn!(instance_id = %r.definition.id, publish_ms = started.elapsed().as_millis(), "实例后台发布较慢");
+                }
+            }
+        }))
+    }
+}
+
 async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
     let Some(mut rx) = r.quote_rx.lock().await.take() else {
         return;
     };
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut publisher =
-        n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
+    let diagnostics = Arc::new(RwLock::new(json!({})));
+    let _publisher = InstancePublisher::spawn(ctx.clone(), r.clone(), diagnostics.clone());
     let mut last_bars = HashMap::<(String, String), String>::new();
     let mut history = HistoryLoader::spawn(ctx.clone(), r.clone());
     let mut history_errors = HashMap::<HistoryKey, String>::new();
-    let mut calendar_warnings = HashSet::new();
-    let mut ticks = 0u64;
+    let mut last_timer = None::<Instant>;
+    let mut total_quotes = 0u64;
+    let mut queue_high_water = 0usize;
     loop {
         let (quotes, loaded) =
             match next_account_event(&mut timer, &mut rx, &mut history.updates).await {
@@ -482,7 +548,27 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 AccountEvent::Tick => (None, None),
                 AccountEvent::Closed => break,
             };
+        queue_high_water = queue_high_water.max(rx.len());
         let quotes = quotes.map(|events| crate::runtime::drain_quote_batches(&mut rx, events));
+        let batch_quotes = quotes.as_ref().map_or(0, Vec::len);
+        total_quotes = total_quotes.saturating_add(batch_quotes as u64);
+        let oldest_quote_age_seconds = quotes
+            .as_ref()
+            .and_then(|events| {
+                events
+                    .iter()
+                    .map(|(_, q)| {
+                        chrono::Utc::now()
+                            .timestamp()
+                            .saturating_sub(q.timestamp)
+                            .max(0)
+                    })
+                    .max()
+            })
+            .unwrap_or(0);
+        let processing_started = Instant::now();
+        let timer_due = last_timer.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        let mut needs_drive = quotes.is_none() || timer_due;
         let manager = ctx.instances.get().unwrap();
         if ctx.is_shutting_down.load(Ordering::Relaxed)
             || manager.get(&r.definition.id).await.is_err()
@@ -502,17 +588,19 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 }
                 r.engine.on_quote_batch(events).await?;
             }
-            if let Err(e) = r
-                .engine
-                .dispatch(StrategyEvent::Timer {
-                    timestamp: chrono::Utc::now().timestamp(),
-                })
-                .await
-            {
-                r.engine.pause(true).await?;
-                tracing::error!("实例策略定时处理失败，继续执行平仓: {e}");
+            if timer_due {
+                last_timer = Some(Instant::now());
+                if let Err(e) = r
+                    .engine
+                    .dispatch(StrategyEvent::Timer {
+                        timestamp: chrono::Utc::now().timestamp(),
+                    })
+                    .await
+                {
+                    r.engine.pause(true).await?;
+                    tracing::error!("实例策略定时处理失败，继续执行平仓: {e}");
+                }
             }
-            r.engine.drive().await?;
             if let BrokerClient::Paper(p) = &r.broker {
                 let s = p.snapshot();
                 r.engine.reconcile(&s).await?;
@@ -524,6 +612,7 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             // Apply at most one loaded symbol between quote batches. Slow I/O
             // remains in the background; engine mutations stay serialized here.
             if let Some(message) = loaded.or_else(|| history.updates.try_recv().ok()) {
+                needs_drive = true;
                 let applied_at = Instant::now();
                 let result = match message.result {
                     Ok(update) => {
@@ -550,66 +639,35 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                         "实例历史应用较慢，请检查策略计算与持久化耗时");
                 }
             }
+            if needs_drive {
+                r.engine.drive().await?;
+            }
             *r.runtime_error.write().await = None;
-            let mut snapshot = manager.build_snapshot(&r.definition.id).await?;
-            warn_calendar_coverage(
-                &r.definition.id,
-                &snapshot["strategy_diagnostics"],
-                &mut calendar_warnings,
-            );
-            snapshot["runtime_diagnostics"] = json!({
-                "quote_queue_batches":rx.len(),
-                "history_errors":history_errors.iter().map(|(key, error)|
-                    json!({"symbol":key.0,"timeframe":key.1,"error":error})).collect::<Vec<_>>()});
-            if let Err(e) = manager.sample_equity(&r.definition.id, &snapshot).await {
-                tracing::warn!("账户净值采样失败: {e}");
-            }
-            let (baseline, delta) = publisher.update(snapshot.take());
-            *r.published.write().await = baseline.clone();
-            if let Some(delta) = delta {
-                ctx.realtime_hub
-                    .broadcast(
-                        ctx.next_event_seq(),
-                        "trader.instance.delta",
-                        json!({"instance_id":r.definition.id,"delta":delta}),
-                    )
-                    .await;
-            }
-            // The cached baseline is used for REST recovery; never share sequences across instances.
-            // Store only broker data separately; the publisher owns its own monotonically increasing stream.
-            if ticks % 15 == 0 {
-                ctx.realtime_hub
-                    .broadcast(
-                        ctx.next_event_seq(),
-                        "trader.instance.heartbeat",
-                        json!({"instance_id":r.definition.id,"heartbeat":publisher.heartbeat()}),
-                    )
-                    .await;
-            }
-            let _ = baseline;
             Ok(())
         }
         .await;
         if let Err(e) = result {
             *r.runtime_error.write().await = Some(e.to_string());
-            if let Ok(snapshot) = manager.build_snapshot(&r.definition.id).await {
-                let (baseline, delta) = publisher.update(snapshot);
-                *r.published.write().await = baseline;
-                if let Some(delta) = delta {
-                    ctx.realtime_hub
-                        .broadcast(
-                            ctx.next_event_seq(),
-                            "trader.instance.delta",
-                            json!({"instance_id":r.definition.id,"delta":delta}),
-                        )
-                        .await;
-                }
-            }
             tracing::warn!("实例 {} 推进失败: {e:#}", r.definition.id);
         }
-        ticks = ticks.wrapping_add(1);
+        let elapsed = processing_started.elapsed();
+        *diagnostics.write().await = json!({"quote_queue_batches":rx.len(),
+            "quote_queue_high_water":queue_high_water,"processed_quotes":total_quotes,
+            "last_batch_quotes":batch_quotes,"oldest_quote_age_seconds":oldest_quote_age_seconds,
+            "last_processing_ms":elapsed.as_millis() as u64,
+            "history_errors":history_errors.iter().map(|(key,error)|
+                json!({"symbol":key.0,"timeframe":key.1,"error":error})).collect::<Vec<_>>()});
+        if batch_quotes > 0 && elapsed >= Duration::from_millis(250) {
+            tracing::warn!(instance_id = %r.definition.id, batch_quotes,
+                processing_ms = elapsed.as_millis(), quote_queue_batches = rx.len(),
+                oldest_quote_age_seconds, "实例行情处理较慢");
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "instance_market_tests.rs"]
+mod market_load_tests;
 
 #[cfg(test)]
 mod history_revision_tests {

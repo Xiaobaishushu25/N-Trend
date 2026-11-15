@@ -161,6 +161,52 @@ pub struct EntryPortfolio<'a> {
     pub state: &'a Value,
 }
 
+/// Fields a callback may update. Market callbacks need their live clocks, not
+/// a copy of the accumulated signal/evidence archive. Unlisted fields remain
+/// untouched; custom strategies retain the full-state contract by default.
+#[derive(Clone, Copy, Default)]
+pub enum EventStateScope {
+    #[default]
+    Full,
+    Fields(&'static [&'static str]),
+}
+impl EventStateScope {
+    pub(crate) fn select(self, state: &Value) -> Value {
+        match self {
+            Self::Full => state.clone(),
+            Self::Fields(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter_map(|key| state.get(*key).map(|v| ((*key).to_owned(), v.clone())))
+                    .collect(),
+            ),
+        }
+    }
+    pub(crate) fn unchanged(self, old: &Value, new: &Value) -> bool {
+        match self {
+            Self::Full => old == new,
+            Self::Fields(fields) => fields.iter().all(|key| old.get(*key) == new.get(*key)),
+        }
+    }
+    pub(crate) fn apply(self, saved: &mut Value, mut update: Value) {
+        match self {
+            Self::Full => *saved = update,
+            Self::Fields(fields) => {
+                if !saved.is_object() {
+                    *saved = Value::Object(Default::default());
+                }
+                for key in fields {
+                    if let Some(value) = update.as_object_mut().and_then(|o| o.remove(*key)) {
+                        saved[*key] = value;
+                    } else {
+                        saved.as_object_mut().unwrap().remove(*key);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub trait Strategy: Send + Sync {
     fn uses_history(&self) -> bool {
         false
@@ -191,6 +237,9 @@ pub trait Strategy: Send + Sync {
     }
     fn handles_event(&self, _event: &StrategyEvent) -> bool {
         true
+    }
+    fn event_state_scope(&self, _event: &StrategyEvent) -> EventStateScope {
+        EventStateScope::Full
     }
     /// State is JSON, persisted by the executor after processing each event.
     fn on_event(

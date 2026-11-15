@@ -14,6 +14,8 @@ import {
   NDivider,
   NEmpty,
   NIcon,
+  NInput,
+  NInputNumber,
   NModal,
   NPagination,
   NPopconfirm,
@@ -38,6 +40,7 @@ import {
   Flame,
   InfoCircle,
   LayersSubtract,
+  Pencil,
   Refresh,
   ShieldCheck,
   Target,
@@ -78,8 +81,12 @@ function onHeaderMouseDown(e: MouseEvent) {
 }
 
 const exitReasonOptions = [
-  { label: '🎯 P3 首手 S1 止盈', value: 'p3_first_s1' },
   { label: '全部平仓原因', value: '' },
+  { label: '✋ 主观手动平仓', value: 'manual' },
+  { label: '📱 外部手动平仓', value: 'external_manual' },
+  { label: '⚖ 柜台对齐核销', value: 'reconciled_broker' },
+  { label: '🏖 周末前平仓', value: 'pre_weekend' },
+  { label: '🎯 P3 首手 S1 止盈', value: 'p3_first_s1' },
   { label: '🎯 第一手 1.0R 止盈', value: 'target_1r' },
   { label: '📈 第二手阶梯追踪', value: 'trailing' },
   { label: '🛡️ 成本线保本出场', value: 'breakeven' },
@@ -155,6 +162,66 @@ function getInstrumentName(inst: string): string {
 }
 
 
+
+// --- 主观平仓 Modal 状态 ---
+const showManualCloseModal = ref(false)
+const manualCloseTarget = ref<any>(null)
+const manualCloseVolume = ref(1)
+const manualCloseMaxVolume = ref(1)
+const manualCloseReasonTag = ref('周末避险')
+const manualCloseReasonTags = ['周末避险', '盘感止盈', '主观止损', '外部纠偏', '锁定利润', '其它']
+const manualCloseNote = ref('')
+const manualCloseSubmitting = ref(false)
+
+function openManualCloseModal(pos: any) {
+  manualCloseTarget.value = pos
+  const maxVol = pos.managed?.volume || pos.position || 1
+  manualCloseMaxVolume.value = maxVol
+  manualCloseVolume.value = maxVol
+  manualCloseReasonTag.value = '周末避险'
+  manualCloseNote.value = ''
+  showManualCloseModal.value = true
+}
+
+async function handleConfirmManualClose() {
+  if (!manualCloseTarget.value) return
+  manualCloseSubmitting.value = true
+  try {
+    const posId = manualCloseTarget.value.managed?.id || manualCloseTarget.value.instrument_id
+    const fullNote = manualCloseNote.value.trim()
+      ? `[${manualCloseReasonTag.value}] ${manualCloseNote.value.trim()}`
+      : `[${manualCloseReasonTag.value}]`
+    await trader.closePosition(posId, manualCloseVolume.value, 'manual', fullNote)
+    showManualCloseModal.value = false
+  } finally {
+    manualCloseSubmitting.value = false
+  }
+}
+
+// --- 编辑流水说明 Modal 状态 ---
+const showEditNoteModal = ref(false)
+const editNoteTarget = ref<LiveTradeRecord | null>(null)
+const editNoteReason = ref('manual')
+const editNoteContent = ref('')
+const editNoteSubmitting = ref(false)
+
+function openEditNoteModal(rec: LiveTradeRecord) {
+  editNoteTarget.value = rec
+  editNoteReason.value = rec.exit_reason || 'manual'
+  editNoteContent.value = rec.user_note || ''
+  showEditNoteModal.value = true
+}
+
+async function handleConfirmEditNote() {
+  if (!editNoteTarget.value) return
+  editNoteSubmitting.value = true
+  try {
+    await trader.updateTradeRecord(editNoteTarget.value.id, editNoteContent.value, editNoteReason.value)
+    showEditNoteModal.value = false
+  } finally {
+    editNoteSubmitting.value = false
+  }
+}
 
 onMounted(async () => {
   window.addEventListener('open-live-trader-window', onPopoutCustomEvent)
@@ -514,6 +581,14 @@ function exitReasonBadge(reason: string) {
       return { text: '⏳ 60根Bar超时', type: 'warning' as const, tip: '持仓达 60 根 K 线自动清仓' }
     case 'target_s1':
       return { text: '🏁 触及原形态目标', type: 'success' as const, tip: '触及前高/前低 S1 阻力支撑位' }
+    case 'manual':
+      return { text: '✋ 主观手动平仓', type: 'warning' as const, tip: '交易员在终端手动操作平仓' }
+    case 'external_manual':
+      return { text: '📱 外部手动平仓', type: 'warning' as const, tip: '在手机等外部交易终端手动平仓' }
+    case 'reconciled_broker':
+      return { text: '⚖ 柜台对齐核销', type: 'info' as const, tip: '根据柜台实际持仓完成对齐核销' }
+    case 'pre_weekend':
+      return { text: '🏖 周末前平仓', type: 'warning' as const, tip: '周五夜盘收盘前自动清仓规避周末跳空风险' }
     default:
       return { text: reason || '平仓了结', type: 'default' as const, tip: '' }
   }
@@ -658,6 +733,16 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             · <span class="error-msg-text">{{ trader.errorMsg }}</span>
             <n-button text size="tiny" type="error" class="retry-btn" :loading="trader.refreshing" @click="trader.refresh">
               重试
+            </n-button>
+            <n-button
+              v-if="trader.errorMsg.includes('小于托管持仓')"
+              size="tiny"
+              type="warning"
+              secondary
+              style="margin-left: 8px;"
+              @click="trader.syncBrokerPositions"
+            >
+              按柜台核销
             </n-button>
           </span>
         </div>
@@ -1105,6 +1190,19 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                   <span class="val">{{ pos.managed.risk.toFixed(1) }} 点</span>
                 </div>
               </div>
+
+              <!-- 主观操作控制区 -->
+              <div v-if="pos.managed" class="pos-card-footer">
+                <n-button
+                  size="small"
+                  type="warning"
+                  secondary
+                  @click="openManualCloseModal(pos)"
+                >
+                  <template #icon><n-icon :component="AlertTriangle" /></template>
+                  主观平仓
+                </n-button>
+              </div>
             </div>
           </div>
         </div>
@@ -1522,12 +1620,170 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 >
                   <n-icon :component="Eye" size="13" /> 在行情图表中复盘
                 </button>
+                <n-button
+                  size="tiny"
+                  quaternary
+                  type="primary"
+                  style="margin-left: auto;"
+                  @click="openEditNoteModal(rec)"
+                >
+                  <template #icon><n-icon :component="Pencil" /></template>
+                  {{ rec.user_note ? '修改说明' : '补充说明' }}
+                </n-button>
+              </div>
+
+              <!-- 复盘备注展示区 -->
+              <div v-if="rec.user_note" class="hist-user-note">
+                <span class="note-lbl">📝 复盘说明:</span>
+                <span class="note-txt">{{ rec.user_note }}</span>
               </div>
             </div>
           </div>
         </div>
       </section>
     </main>
+
+    <!-- 主观手动平仓弹窗 -->
+    <n-modal
+      v-model:show="showManualCloseModal"
+      preset="card"
+      title="主观手动平仓"
+      style="width: 480px; max-width: 90vw;"
+      :bordered="false"
+      size="medium"
+    >
+      <div v-if="manualCloseTarget" class="manual-close-form">
+        <div class="modal-info-bar">
+          <span class="info-name">{{ getInstrumentName(manualCloseTarget.instrument_id) }}</span>
+          <span class="info-code">({{ manualCloseTarget.instrument_id }})</span>
+          <n-tag size="small" :type="manualCloseTarget.direction === 'buy' || manualCloseTarget.direction === 'up' ? 'error' : 'success'">
+            {{ dirLabel(manualCloseTarget.direction) }}
+          </n-tag>
+          <span class="info-hold">在手 {{ manualCloseMaxVolume }} 手</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-lbl">平仓手数：</label>
+          <div class="form-field flex-row">
+            <n-input-number
+              v-model:value="manualCloseVolume"
+              :min="1"
+              :max="manualCloseMaxVolume"
+              size="small"
+              style="width: 130px;"
+            />
+            <n-button
+              v-if="manualCloseMaxVolume > 1"
+              size="small"
+              quaternary
+              type="primary"
+              @click="manualCloseVolume = 1"
+            >
+              平 1 手
+            </n-button>
+            <n-button
+              v-if="manualCloseMaxVolume > 1"
+              size="small"
+              quaternary
+              type="warning"
+              @click="manualCloseVolume = manualCloseMaxVolume"
+            >
+              全部平仓
+            </n-button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="form-lbl">出场原因：</label>
+          <div class="form-field">
+            <n-radio-group v-model:value="manualCloseReasonTag" size="small">
+              <n-radio-button
+                v-for="tag in manualCloseReasonTags"
+                :key="tag"
+                :value="tag"
+              >
+                {{ tag }}
+              </n-radio-button>
+            </n-radio-group>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="form-lbl">详细说明：</label>
+          <div class="form-field">
+            <n-input
+              v-model:value="manualCloseNote"
+              type="textarea"
+              placeholder="可输入具体复盘思考或操作原因（如：周末避险、盘面异动等）..."
+              :rows="3"
+            />
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <n-button @click="showManualCloseModal = false">取消</n-button>
+          <n-button
+            type="warning"
+            :loading="manualCloseSubmitting"
+            @click="handleConfirmManualClose"
+          >
+            确认平仓
+          </n-button>
+        </div>
+      </div>
+    </n-modal>
+
+    <!-- 编辑流水复盘说明弹窗 -->
+    <n-modal
+      v-model:show="showEditNoteModal"
+      preset="card"
+      title="修改平仓流水说明"
+      style="width: 480px; max-width: 90vw;"
+      :bordered="false"
+      size="medium"
+    >
+      <div v-if="editNoteTarget" class="manual-close-form">
+        <div class="modal-info-bar">
+          <span class="info-name">{{ getInstrumentName(editNoteTarget.instrument_id) }}</span>
+          <span class="info-code">({{ editNoteTarget.instrument_id }})</span>
+          <span>成交: {{ fmtPrice(editNoteTarget.exit_price) }} ({{ formatPnlPoints(editNoteTarget.realized_pnl_pts) }})</span>
+        </div>
+
+        <div class="form-row">
+          <label class="form-lbl">平仓标签：</label>
+          <div class="form-field">
+            <n-select
+              v-model:value="editNoteReason"
+              :options="exitReasonOptions.filter(o => o.value)"
+              size="small"
+            />
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label class="form-lbl">复盘说明：</label>
+          <div class="form-field">
+            <n-input
+              v-model:value="editNoteContent"
+              type="textarea"
+              placeholder="输入该笔交易的复盘总结或操作原因..."
+              :rows="3"
+            />
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <n-button @click="showEditNoteModal = false">取消</n-button>
+          <n-button
+            type="primary"
+            :loading="editNoteSubmitting"
+            @click="handleConfirmEditNote"
+          >
+            保存说明
+          </n-button>
+        </div>
+      </div>
+    </n-modal>
   </div>
 </template>
 
@@ -2857,5 +3113,94 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   justify-content: space-between;
   align-items: center;
   width: 100%;
+}
+
+.pos-card-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(226, 232, 240, 0.8);
+  margin-top: 10px;
+}
+
+.hist-user-note {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border-left: 3px solid #3b82f6;
+  border-radius: 0 4px 4px 0;
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.hist-user-note .note-lbl {
+  color: #3b82f6;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.hist-user-note .note-txt {
+  color: #334155;
+  word-break: break-all;
+}
+
+.manual-close-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modal-info-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: #f1f5f9;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.modal-info-bar .info-name {
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.modal-info-bar .info-code {
+  color: #64748b;
+  font-family: monospace;
+}
+
+.modal-info-bar .info-hold {
+  margin-left: auto;
+  color: #475569;
+  font-weight: 600;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-row .form-lbl {
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.form-field.flex-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 10px;
 }
 </style>

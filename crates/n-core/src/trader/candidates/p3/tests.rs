@@ -117,7 +117,7 @@ fn signal() -> Value {
         "warning_context":{"as_of":"2026-11-12 09:15:00","complete":true,"atr14":20.}})
 }
 fn run(
-    strategy: &P3Strategy,
+    strategy: &dyn Strategy,
     event: StrategyEvent,
     state: &mut Value,
     positions: &[ManagedPosition],
@@ -211,7 +211,7 @@ fn registry_preset_is_paired_and_invalid_parameters_are_rejected() {
 }
 
 #[test]
-fn score_two_point_five_is_admitted_and_atr_floor_remains() {
+fn score_two_point_five_is_admitted_and_upper_atr_limit_remains() {
     let plan = make_plan(signal());
     assert_eq!(plan.requested_volume, 2);
     assert_eq!(plan.target_price, Some(1100.));
@@ -220,7 +220,7 @@ fn score_two_point_five_is_admitted_and_atr_floor_remains() {
         ("entry_score", json!(2.49), "score_below_min"),
         (
             "warning_context",
-            json!({"as_of":"2026-11-12 09:15:00","complete":true,"atr14":40.}),
+            json!({"as_of":"2026-11-12 09:15:00","complete":true,"atr14":7.}),
             "atr_out_of_range",
         ),
     ] {
@@ -246,6 +246,178 @@ fn score_two_point_five_is_admitted_and_atr_floor_remains() {
             .unwrap();
         assert_eq!(d["reason"], reason);
         assert_eq!(d["values"]["min_score"], 2.5);
+    }
+}
+
+fn signal_decision(strategy: &dyn Strategy, payload: Value) -> (Vec<TradeIntent>, Value) {
+    let mut state = Value::Null;
+    let actions = run(
+        strategy,
+        StrategyEvent::Signal {
+            source: N_STRATEGY.into(),
+            payload,
+        },
+        &mut state,
+        &[],
+        &[],
+    );
+    let decision = state["decisions"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    (actions, decision)
+}
+
+#[test]
+fn v2_removes_only_atr_floor_for_both_exit_modes_and_directions() {
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        let mut params = parameters();
+        params.exit_mode = mode;
+        let current = P3Strategy::new(params.clone()).unwrap();
+        let previous = P3Strategy::with_atr_floor(params.clone(), true).unwrap();
+        let p2 = CandidateStrategy::new(params.common()).unwrap();
+        for short in [false, true] {
+            let mut payload = signal();
+            payload["entry_score"] = json!(4.);
+            payload["warning_context"]["atr14"] = json!(40.);
+            if short {
+                payload["direction"] = json!("down");
+                payload["stop"] = json!(1020.);
+                payload["target"] = json!(900.);
+            }
+            let (actions, audit) = signal_decision(&current, payload.clone());
+            assert!(matches!(&actions[0], TradeIntent::Open(plan) if plan.requested_volume == 2));
+            assert_eq!(audit["reason"], "accepted_warning");
+            assert_eq!(audit["values"]["min_risk_atr"], 0.);
+            assert_eq!(
+                signal_decision(&previous, payload.clone()).1["reason"],
+                "atr_out_of_range"
+            );
+            assert_eq!(
+                signal_decision(&p2, payload).1["reason"],
+                "atr_out_of_range"
+            );
+        }
+    }
+}
+
+#[test]
+fn configurable_rr_is_enforced_at_signal_and_proposed_price_in_both_modes_and_directions() {
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        for short in [false, true] {
+            let sign = if short { -1. } else { 1. };
+            let mut payload = signal();
+            payload["warning_context"]["atr14"] = json!(40.);
+            payload["direction"] = json!(if short { "down" } else { "up" });
+            payload["stop"] = json!(1000. - sign * 20.);
+            payload["target"] = json!(1000. + sign * 23.);
+            let mut params = parameters();
+            params.exit_mode = mode;
+            let strict = P3Strategy::new(params.clone()).unwrap();
+            assert_eq!(
+                signal_decision(&strict, payload.clone()).1["reason"],
+                "filtered_net_rr_plan"
+            );
+            params.min_net_rr = 0.8;
+            let relaxed = P3Strategy::new(params.clone()).unwrap();
+            let (actions, decision) = signal_decision(&relaxed, payload);
+            assert_eq!(decision["values"]["min_net_rr"], 0.8);
+            assert!(decision["values"]["planned_net_rr"].as_f64().unwrap() < 1.);
+            let TradeIntent::Open(plan) = &actions[0] else {
+                panic!("expected plan")
+            };
+            let favorable = 1000. + sign * 2.;
+            let q = quote(favorable);
+            assert!(matches!(
+                relaxed.check_entry(plan, &q, favorable, q.timestamp),
+                EntryDecision::Allow
+            ));
+            let adverse = 1000. + sign * 3.;
+            let q = quote(adverse);
+            assert!(
+                matches!(relaxed.check_entry(plan, &q, adverse, q.timestamp), EntryDecision::Reject(r) if r == "filtered_net_rr_fill")
+            );
+            params.min_net_rr = 1.2;
+            let higher = P3Strategy::new(params).unwrap();
+            assert!(
+                matches!(higher.check_entry(plan, &quote(favorable), favorable, q.timestamp), EntryDecision::Reject(r) if r == "filtered_net_rr_fill")
+            );
+        }
+    }
+}
+
+#[test]
+fn v2_keeps_atr_validity_friction_and_structural_risk_guards() {
+    let strategy = P3Strategy::new(parameters()).unwrap();
+    for atr in [json!(0), json!(null)] {
+        let mut payload = signal();
+        payload["warning_context"]["atr14"] = atr;
+        assert_eq!(
+            signal_decision(&strategy, payload).1["reason"],
+            "atr_unavailable"
+        );
+    }
+    let mut payload = signal();
+    payload["warning_context"]["complete"] = json!(false);
+    assert_eq!(
+        signal_decision(&strategy, payload).1["reason"],
+        "atr_unavailable"
+    );
+    let mut payload = signal();
+    payload["stop"] = json!(991.);
+    payload["risk"] = json!(9.);
+    assert_eq!(
+        signal_decision(&strategy, payload).1["reason"],
+        "risk_ticks_below_min"
+    );
+    let mut params = parameters();
+    params.fees.products.insert(
+        "PB".into(),
+        serde_json::from_value(json!({"roundtrip_fixed_yuan_per_lot":21.})).unwrap(),
+    );
+    assert_eq!(
+        signal_decision(&P3Strategy::new(params).unwrap(), signal()).1["reason"],
+        "friction_above20"
+    );
+}
+
+#[test]
+fn frozen_v1_definitions_keep_their_floor_and_fixed_rr_after_roundtrip() {
+    let registry = StrategyRegistry::default();
+    let mut old = serde_json::to_value(definition(parameters())).unwrap();
+    old["code_version"] = json!(PREVIOUS_VERSION);
+    old["parameters"]
+        .as_object_mut()
+        .unwrap()
+        .remove("min_net_rr");
+    let old: StrategyDefinition =
+        serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+    registry.validate(&old).unwrap();
+    let mut payload = signal();
+    payload["warning_context"]["atr14"] = json!(40.);
+    assert_eq!(
+        signal_decision(registry.strategy(&old).unwrap().as_ref(), payload.clone()).1["reason"],
+        "atr_out_of_range"
+    );
+    let current = definition(parameters());
+    assert_eq!(current.code_version, "2");
+    assert_eq!(
+        signal_decision(registry.strategy(&current).unwrap().as_ref(), payload).1["reason"],
+        "accepted_warning"
+    );
+    let mut altered_old = old;
+    altered_old.parameters["min_net_rr"] = json!(0.8);
+    assert!(registry.validate(&altered_old).is_err());
+    let mut unknown = current;
+    unknown.code_version = "3".into();
+    assert!(registry.validate(&unknown).is_err());
+    for bad in [0., -0.1, f64::NAN, f64::INFINITY] {
+        let mut params = parameters();
+        params.min_net_rr = bad;
+        assert!(params.validate().is_err());
     }
 }
 

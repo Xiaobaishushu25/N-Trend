@@ -43,6 +43,88 @@ fn filter_quote_events(
         .collect()
 }
 
+async fn handle_quote_gap(quote_ctx: &ServerContext, reason: &str) {
+    if let Some(manager) = quote_ctx.instances.get() {
+        for r in manager.all().await {
+            if let Err(e) = r.engine.quote_gap_with_reason(reason).await {
+                tracing::error!("实例 {} 行情缺口保存失败: {e}", r.definition.id);
+            }
+        }
+    } else if let Err(e) = quote_ctx.execution_engine.quote_gap_with_reason(reason).await {
+        tracing::error!("行情缺口保存失败: {e}");
+    }
+}
+
+async fn handle_market_recovered(quote_ctx: &ServerContext) {
+    if let Some(manager) = quote_ctx.instances.get() {
+        for r in manager.all().await {
+            if r.engine.market_recovered().await {
+                tracing::info!(
+                    instance_id = %r.definition.id,
+                    "执行行情连接恢复，报单仍需本合约有效新盘口"
+                );
+            }
+        }
+    } else if quote_ctx.execution_engine.market_recovered().await {
+        tracing::info!("执行行情连接恢复，报单仍需本合约有效新盘口");
+    }
+}
+
+async fn handle_market_unavailable(quote_ctx: &ServerContext) {
+    quote_ctx.execution_engine.market_unavailable().await;
+    if let Some(manager) = quote_ctx.instances.get() {
+        for r in manager.all().await {
+            r.engine.market_unavailable().await;
+        }
+    }
+}
+
+async fn dispatch_quote_events(quote_ctx: &ServerContext, events: QuoteBatch) {
+    if events.is_empty() {
+        return;
+    }
+    if let Some(manager) = quote_ctx.instances.get() {
+        for r in manager.all().await {
+            let mut subscriptions = r.engine.requested_contracts().await;
+            subscriptions.extend(
+                r.engine
+                    .market_subscriptions()
+                    .await
+                    .into_iter()
+                    .map(|s| s.symbol),
+            );
+            let subscriptions = subscriptions
+                .into_iter()
+                .map(|s| s.to_uppercase())
+                .collect();
+            let events = filter_quote_events(&events, &subscriptions);
+            if events.is_empty() {
+                continue;
+            }
+            match r.quote_tx.try_send(events) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(events)) => {
+                    if !r.quote_gap.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            instance_id = %r.definition.id,
+                            dropped_ticks = events.len(),
+                            "本实例行情消费队列已满，启动缺口保护"
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::warn!(instance_id = %r.definition.id, "实例行情消费者已关闭");
+                }
+            }
+        }
+    }
+    if quote_ctx.instances.get().is_none() {
+        if let Err(e) = quote_ctx.execution_engine.on_quote_batch(events).await {
+            tracing::warn!("执行行情推进失败: {e}");
+        }
+    }
+}
+
 struct SignalRegistrationTarget {
     engine: Arc<n_core::trader::ExecutionEngine>,
     created_at: Option<i64>,
@@ -293,6 +375,8 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
         };
         while let Some(events) = rx.recv().await {
             let events = drain_quote_batches(&mut rx, events);
+            let batch_quotes = events.len();
+            let processing_started = Instant::now();
             if worker
                 .is_shutting_down
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -310,12 +394,22 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
             if let Err(e) = r.engine.on_quote_batch(events).await {
                 tracing::warn!("默认实例行情推进失败: {e}");
             }
+            if processing_started.elapsed() >= Duration::from_millis(250) {
+                tracing::warn!(
+                    instance_id = "default",
+                    batch_quotes,
+                    processing_ms = processing_started.elapsed().as_millis(),
+                    quote_queue_batches = rx.len(),
+                    "实例行情处理较慢"
+                );
+            }
         }
     });
     let quote_ctx = ctx.clone();
     tokio::spawn(async move {
         let mut cursor = 0;
         let mut stream_id = String::new();
+        let mut active_source = None;
         loop {
             if quote_ctx
                 .is_shutting_down
@@ -342,120 +436,187 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            // The cursor belongs to the global bridge stream. Changing the
-            // symbol set must not skip intervening ticks of existing positions.
-            let tq = quote_ctx.services.data_source.tq_client().await;
-            match tq.execution_events(&codes, cursor, &stream_id).await {
-                Ok(batch) => {
-                    let restarted = !stream_id.is_empty()
-                        && batch["stream_id"]
-                            .as_str()
-                            .is_some_and(|id| id != stream_id);
-                    if batch["gap"].as_bool().unwrap_or(false) || restarted {
-                        let reason = if restarted {
-                            "行情桥事件流已重启"
-                        } else {
-                            "行情源事件缓存已覆盖未消费数据"
-                        };
-                        tracing::warn!(cursor, stream_id, reason, "执行行情源需要重新同步");
-                        if let Some(manager) = quote_ctx.instances.get() {
-                            for r in manager.all().await {
-                                if let Err(e) = r.engine.quote_gap_with_reason(reason).await {
-                                    tracing::error!(
-                                        "实例 {} 行情缺口保存失败: {e}",
-                                        r.definition.id
-                                    );
-                                }
-                            }
-                        } else if let Err(e) = quote_ctx
-                            .execution_engine
-                            .quote_gap_with_reason(reason)
-                            .await
-                        {
-                            tracing::error!("行情缺口保存失败: {e}");
+
+            let quote_source = if std::env::var("NTREND_QUOTE_SOURCE")
+                .map(|v| v.eq_ignore_ascii_case("ctp"))
+                .unwrap_or(false)
+            {
+                n_core::trader::QuoteSource::Ctp
+            } else if let Some(manager) = quote_ctx.instances.get() {
+                let runtimes = manager.all().await;
+                if runtimes.is_empty() {
+                    quote_ctx.execution_engine.get_config().await.quote_source
+                } else {
+                    let mut any_ctp = false;
+                    for r in runtimes {
+                        if r.engine.get_config().await.quote_source == n_core::trader::QuoteSource::Ctp {
+                            any_ctp = true;
+                            break;
                         }
-                        stream_id.clear();
-                        cursor = 0;
-                        continue;
                     }
-                    stream_id = batch["stream_id"].as_str().unwrap_or("").into();
-                    cursor = batch["latest_event_id"].as_u64().unwrap_or(0);
-                    // Idle/closed-session responses also prove transport health.
-                    // Every instance shares this stream, including P2 and B5.
-                    if let Some(manager) = quote_ctx.instances.get() {
-                        for r in manager.all().await {
-                            if r.engine.market_recovered().await {
-                                tracing::info!(instance_id = %r.definition.id, "执行行情连接恢复，报单仍需本合约有效新盘口");
-                            }
-                        }
+                    if any_ctp {
+                        n_core::trader::QuoteSource::Ctp
                     } else {
-                        if quote_ctx.execution_engine.market_recovered().await {
-                            tracing::info!("执行行情连接恢复，报单仍需本合约有效新盘口");
-                        }
+                        n_core::trader::QuoteSource::Tianqin
                     }
-                    let events: Vec<(String, n_core::trader::model::ExecutionQuote)> = batch
-                        ["events"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|event| {
-                            let code = event["code"].as_str().unwrap_or("");
-                            (
-                                code.to_uppercase(),
-                                n_core::fetch::tq_client::TqBridgeClient::decode_execution_quote(
-                                    code,
-                                    &event["quote"],
-                                ),
-                            )
-                        })
-                        .collect();
-                    if let Some(manager) = quote_ctx.instances.get() {
-                        for r in manager.all().await {
-                            let mut subscriptions = r.engine.requested_contracts().await;
-                            subscriptions.extend(
-                                r.engine
-                                    .market_subscriptions()
-                                    .await
-                                    .into_iter()
-                                    .map(|s| s.symbol),
-                            );
-                            let subscriptions = subscriptions
-                                .into_iter()
-                                .map(|s| s.to_uppercase())
-                                .collect();
-                            let events = filter_quote_events(&events, &subscriptions);
-                            if events.is_empty() {
+                }
+            } else {
+                quote_ctx.execution_engine.get_config().await.quote_source
+            };
+
+            if active_source != Some(quote_source) {
+                tracing::info!(?quote_source, "执行行情源已切换，重置事件流游标");
+                active_source = Some(quote_source);
+                stream_id.clear();
+                cursor = 0;
+            }
+
+            match quote_source {
+                n_core::trader::QuoteSource::Tianqin => {
+                    let tq = quote_ctx.services.data_source.tq_client().await;
+                    match tq.execution_events(&codes, cursor, &stream_id).await {
+                        Ok(batch) => {
+                            let restarted = !stream_id.is_empty()
+                                && batch["stream_id"]
+                                    .as_str()
+                                    .is_some_and(|id| id != stream_id);
+                            if batch["gap"].as_bool().unwrap_or(false) || restarted {
+                                let reason = if restarted {
+                                    "天勤行情桥事件流已重启"
+                                } else {
+                                    "天勤行情源事件缓存已覆盖未消费数据"
+                                };
+                                tracing::warn!(cursor, stream_id, reason, "天勤执行行情源需要重新同步");
+                                handle_quote_gap(&quote_ctx, reason).await;
+                                stream_id.clear();
+                                cursor = 0;
                                 continue;
                             }
-                            match r.quote_tx.try_send(events) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(events)) => {
-                                    if !r.quote_gap.swap(true, std::sync::atomic::Ordering::Relaxed)
-                                    {
-                                        tracing::warn!(instance_id = %r.definition.id, dropped_ticks = events.len(), "本实例行情消费队列已满，启动缺口保护");
-                                    }
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    tracing::warn!(instance_id = %r.definition.id, "实例行情消费者已关闭");
-                                }
-                            }
+                            stream_id = batch["stream_id"].as_str().unwrap_or("").into();
+                            cursor = batch["latest_event_id"].as_u64().unwrap_or(0);
+                            handle_market_recovered(&quote_ctx).await;
+
+                            let events: Vec<(String, n_core::trader::model::ExecutionQuote)> = batch
+                                ["events"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|event| {
+                                    let code = event["code"].as_str().unwrap_or("");
+                                    (
+                                        code.to_uppercase(),
+                                        n_core::fetch::tq_client::TqBridgeClient::decode_execution_quote(
+                                            code,
+                                            &event["quote"],
+                                        ),
+                                    )
+                                })
+                                .collect();
+                            dispatch_quote_events(&quote_ctx, events).await;
                         }
-                    }
-                    if quote_ctx.instances.get().is_none() {
-                        if let Err(e) = quote_ctx.execution_engine.on_quote_batch(events).await {
-                            tracing::warn!("执行行情推进失败: {e}");
+                        Err(e) => {
+                            handle_market_unavailable(&quote_ctx).await;
+                            tracing::warn!("天勤执行行情连接失败: {e}");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
                         }
                     }
                 }
-                Err(e) => {
-                    quote_ctx.execution_engine.market_unavailable().await;
+                n_core::trader::QuoteSource::Ctp => {
+                    let mut port = 8766;
                     if let Some(manager) = quote_ctx.instances.get() {
                         for r in manager.all().await {
-                            r.engine.market_unavailable().await;
+                            if let n_core::trader::instances::AccountKind::Ctp { port: p, .. } = r.account.kind {
+                                port = p;
+                                break;
+                            }
                         }
                     }
-                    tracing::warn!("执行行情连接失败: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let ctp = n_core::trader::CtpTraderClient::for_port(port);
+                    let _ = ctp.subscribe_market(&codes).await;
+                    match ctp.fetch_market_ticks(&stream_id, cursor, 500).await {
+                        Ok(batch) => {
+                            let restarted = !stream_id.is_empty() && batch.stream_id != stream_id;
+                            if batch.gap || restarted {
+                                let reason = if restarted {
+                                    "CTP行情桥事件流已重启"
+                                } else {
+                                    "CTP行情源环形缓存已覆盖未消费数据"
+                                };
+                                tracing::warn!(cursor, stream_id = %batch.stream_id, reason, "CTP执行行情源需要重新同步");
+                                handle_quote_gap(&quote_ctx, reason).await;
+                                stream_id.clear();
+                                cursor = 0;
+                                continue;
+                            }
+                            stream_id = batch.stream_id;
+                            cursor = batch.latest_seq_id;
+                            handle_market_recovered(&quote_ctx).await;
+
+                            let mut events: QuoteBatch = Vec::new();
+                            let now_ts = chrono::Utc::now().timestamp();
+                            for ev in batch.events {
+                                match ev {
+                                    n_core::trader::CtpMarketEvent::Status { ref status, .. } => {
+                                        if status == "disconnected" {
+                                            tracing::warn!("收到 CTP 行情前置断开事件，标记行情不可用");
+                                            handle_market_unavailable(&quote_ctx).await;
+                                        } else if status == "logged_in" {
+                                            tracing::info!("收到 CTP 行情前置登录成功事件");
+                                            handle_market_recovered(&quote_ctx).await;
+                                        }
+                                    }
+                                    n_core::trader::CtpMarketEvent::Tick {
+                                        ref instrument_id,
+                                        last_price,
+                                        volume,
+                                        open_interest,
+                                        ref trading_day,
+                                        ..
+                                    } => {
+                                        let now_dt = chrono::Local::now().naive_local();
+                                        let updated_bars = quote_ctx.services.live_chart.update_ctp_tick(
+                                            instrument_id,
+                                            last_price,
+                                            volume,
+                                            open_interest,
+                                            trading_day,
+                                            now_dt,
+                                        );
+                                        for bar in updated_bars {
+                                            let sym = bar.symbol.clone();
+                                            let tf = bar.timeframe.clone();
+                                            quote_ctx
+                                                .realtime_hub
+                                                .broadcast_kline(
+                                                    quote_ctx.next_event_seq(),
+                                                    "kline.partial",
+                                                    &sym,
+                                                    &tf,
+                                                    serde_json::json!({ "symbol": sym, "timeframe": tf, "bar": bar }),
+                                                )
+                                                .await;
+                                        }
+
+                                        if let Some(quote) = ev.to_execution_quote() {
+                                            if quote.valid_at(now_ts) {
+                                                events.push((quote.instrument_id.to_uppercase(), quote));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            dispatch_quote_events(&quote_ctx, events).await;
+                            if cursor == 0 {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                        Err(e) => {
+                            handle_market_unavailable(&quote_ctx).await;
+                            tracing::warn!("CTP执行行情连接失败: {e}");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
                 }
             }
         }
@@ -517,7 +678,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
 
 fn spawn_trader_stream(ctx: Arc<ServerContext>) {
     // watch coalesces bursts: a slow consumer always receives the latest snapshot.
-    let (tx, mut rx) = tokio::sync::watch::channel(serde_json::Value::Null);
+    let (tx, rx) = tokio::sync::watch::channel(serde_json::Value::Null);
     let bridge_ctx = ctx.clone();
     tokio::spawn(async move {
         let client = n_core::trader::CtpTraderClient::for_port(8766);
@@ -593,10 +754,11 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
         let mut calendar_warnings = std::collections::HashSet::new();
         let mut last_sent = Instant::now();
         loop {
-            // The timer only reads strategy memory; it never queries CTP or HTTP.
-            tokio::select! {
-                _ = ticker.tick() => {},
-                changed = rx.changed() => { if changed.is_err() { break; } },
+            // Broker updates coalesce in watch; UI snapshots have a fixed
+            // cadence instead of rebuilding the full archive on every update.
+            ticker.tick().await;
+            if rx.has_changed().is_err() {
+                break;
             }
             if ctx
                 .is_shutting_down

@@ -6,7 +6,7 @@ const ts = require('typescript')
 
 function setup() {
   const preset = { label: 'P2', definition: { strategy_id: 'n_p2', code_version: '1', revision: '1', exit_policy: 'p2_fixed_exit_v1', sizing_policy: 'candidate_one_lot_v1', parameters: { fees: { id: 'frozen' }, calendar: { id: 'frozen-calendar' } } } }
-  const p3Preset = { label: 'P3', definition: { strategy_id: 'n_p3_v1', code_version: '1', revision: '1', exit_policy: 'p3_exit_v1', sizing_policy: 'risk_budget_v1', parameters: { fees: { id: 'p3-fees' }, calendar: { id: 'p3-calendar' }, risk_budget_yuan: 600, max_lots: 2, exit_mode: 'fixed_s1', entry_cutoffs: {} } } }
+  const p3Preset = { label: 'P3', definition: { strategy_id: 'n_p3_v1', code_version: '2', revision: '1', exit_policy: 'p3_exit_v1', sizing_policy: 'risk_budget_v1', parameters: { fees: { id: 'p3-fees' }, calendar: { id: 'p3-calendar' }, risk_budget_yuan: 600, max_lots: 2, exit_mode: 'fixed_s1', min_net_rr: 1, entry_cutoffs: {} } } }
   const calls = []
   const trader = { instanceCatalog: { instances: [], modules: { presets: [preset, p3Preset] } }, selectedInstanceId: 'default',
     async loadInstances() {}, async selectInstance(id) { this.selectedInstanceId = id } }
@@ -22,7 +22,7 @@ function setup() {
       throw Error(name)
     } }
   const source = fs.readFileSync('src/components/TraderInstancesPanel.vue', 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-  const compiled = ts.transpileModule(source + '\nexport { applyPreset, strategy, parameters, config, createPreset, contracts, create, kind, error, dialogError, formatErrorMessage, p3ExitMode, p3Budget, p3MaxLots };', { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } })
+  const compiled = ts.transpileModule(source + '\nexport { applyPreset, strategy, parameters, config, createPreset, contracts, create, kind, error, dialogError, formatErrorMessage, p3ExitMode, p3Budget, p3MaxLots, p3MinNetRr };', { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } })
   vm.runInNewContext(compiled.outputText, context)
   return { ui: context.exports, trader, preset, p3Preset, calls }
 }
@@ -35,11 +35,13 @@ test('P3 mode and budget controls edit frozen parameters without mutating the pr
   assert.equal(ui.strategy.value.sizing_policy, 'risk_budget_v1')
   assert.equal(ui.config.value.order_wait_seconds, 3)
   assert.equal(ui.config.value.mode, 'MonitorOnly')
-  ui.p3ExitMode.value = 'hybrid_s1'; ui.p3Budget.value = 450; ui.p3MaxLots.value = 1
+  ui.p3ExitMode.value = 'hybrid_s1'; ui.p3Budget.value = 450; ui.p3MaxLots.value = 1; ui.p3MinNetRr.value = 0.8
   const params = JSON.parse(ui.parameters.value)
   assert.equal(params.exit_mode, 'hybrid_s1'); assert.equal(params.risk_budget_yuan, 450); assert.equal(params.max_lots, 1)
+  assert.equal(params.min_net_rr, 0.8)
   assert.equal(p3Preset.definition.parameters.exit_mode, 'fixed_s1')
   assert.equal(p3Preset.definition.parameters.risk_budget_yuan, 600)
+  assert.equal(p3Preset.definition.parameters.min_net_rr, 1)
 })
 
 test('P3 creation defaults to fixed S1 and the paired risk-budget module', async () => {
@@ -50,8 +52,10 @@ test('P3 creation defaults to fixed S1 and the paired risk-budget module', async
   assert.equal(calls.length, 1)
   const payload = calls[0][2]
   assert.equal(payload.strategy.strategy_id, 'n_p3_v1')
+  assert.equal(payload.strategy.code_version, '2')
   assert.equal(payload.strategy.parameters.exit_mode, 'fixed_s1')
   assert.equal(payload.strategy.parameters.risk_budget_yuan, 600)
+  assert.equal(payload.strategy.parameters.min_net_rr, 1)
   assert.equal(payload.strategy.sizing_policy, 'risk_budget_v1')
   assert.equal(payload.config.order_wait_seconds, 3)
   assert.equal(payload.config.mode, 'SemiAuto')

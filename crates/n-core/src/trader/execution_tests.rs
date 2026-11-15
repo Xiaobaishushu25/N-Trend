@@ -15,6 +15,9 @@ mod foundation;
 #[path = "p3_execution_tests.rs"]
 mod p3_tests;
 
+#[path = "execution_market_tests.rs"]
+mod market_tests;
+
 #[tokio::test]
 async fn historical_orders_are_paged_newest_first_without_changing_archive() {
     let engine = ExecutionEngine::new(
@@ -1638,6 +1641,8 @@ fn incremental_indices_match_full_table_scan_across_lifecycle() {
             warning_bar_ts: Some("2026-11-05 10:00:00".into()),
             trigger_ts: None,
             order_insert_ts: None,
+            is_manual: false,
+            user_note: None,
         },
     );
     check_consistency(&state);
@@ -1994,6 +1999,8 @@ async fn quote_context_filters_terminal_history_but_timer_preserves_all() {
                 trigger_ts: Some("2026-11-05 10:05:00".into()),
 
                 order_insert_ts: Some("2026-11-05 10:05:00".into()),
+                is_manual: false,
+                user_note: None,
             },
         );
 
@@ -2492,6 +2499,8 @@ async fn persistence_failure_protects_memory_and_blocks_new_orders_while_preserv
                 trigger_ts: Some("2026-11-05 10:05:00".into()),
 
                 order_insert_ts: Some("2026-11-05 10:05:00".into()),
+                is_manual: false,
+                user_note: None,
             },
         );
 

@@ -289,6 +289,64 @@ async fn p3_proposed_price_reduces_lots_before_any_counter_submission() {
 }
 
 #[tokio::test]
+async fn p3_v2_low_atr_signal_reaches_broker_and_keeps_s1_exit_modes() {
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        let counter = Counter::new();
+        let e = engine(&counter, mode).await;
+        let mut payload = signal("low-atr", false, 20., 30.);
+        payload["warning_context"]["atr14"] = json!(40.);
+        send(&e, payload).await;
+        assert_eq!(e.list_conditions().await.len(), 1);
+        quote(&e, 1000.).await;
+        age(&e).await;
+        quote(&e, 1001.).await;
+        let open = counter.inserts()[0].clone();
+        assert_eq!(open["volume"], 2);
+        let fill = trade(&open, "low-atr-open", 2, 1002.);
+        ready(&e, vec![order(&open, "all_traded", 2)], vec![fill]).await;
+        age(&e).await;
+        quote(&e, 1030.).await;
+        assert_eq!(
+            counter.inserts()[1]["volume"],
+            if mode == ExitMode::HybridS1 { 1 } else { 2 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn p3_custom_rr_is_frozen_when_new_signals_switch_to_a_stricter_threshold() {
+    let counter = Counter::new();
+    let e = engine(&counter, ExitMode::FixedS1).await;
+    let cfg = e.get_config().await;
+    let mut params = parameters(ExitMode::FixedS1);
+    params.min_net_rr = 0.8;
+    e.configure_strategy(p3::definition(params), cfg.clone())
+        .await
+        .unwrap();
+    let mut payload = signal("custom-rr", false, 20., 24.);
+    payload["warning_context"]["atr14"] = json!(40.);
+    send(&e, payload).await;
+    let conditions = e.list_conditions().await;
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(
+        conditions[0].frozen.as_ref().unwrap().definition.parameters["min_net_rr"],
+        0.8
+    );
+    e.configure_strategy(p3::definition(parameters(ExitMode::FixedS1)), cfg)
+        .await
+        .unwrap();
+    quote(&e, 1000.).await;
+    age(&e).await;
+    quote(&e, 1001.).await;
+    assert_eq!(
+        counter.inserts().len(),
+        1,
+        "the old approved condition must use its own 0.8 threshold"
+    );
+    assert_eq!(counter.inserts()[0]["volume"], 2);
+}
+
+#[tokio::test]
 async fn p3_point_value_mismatch_cannot_open_and_invalid_execution_timeout_is_rejected() {
     let counter = Counter::new();
     let e = engine(&counter, ExitMode::FixedS1).await;

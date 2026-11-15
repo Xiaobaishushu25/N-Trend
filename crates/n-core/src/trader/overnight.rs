@@ -379,6 +379,8 @@ mod tests {
             warning_bar_ts: None,
             trigger_ts: None,
             order_insert_ts: None,
+            is_manual: false,
+            user_note: None,
         };
 
         let quote = ExecutionQuote {

@@ -385,14 +385,18 @@ impl Snapshot {
             -1.
         }
     }
-    fn net_space(&self, fill: f64) -> bool {
+    fn net_reward_loss(&self, fill: f64) -> (f64, f64) {
         let target = self.target - self.sign() * self.tick;
         let stop = self.stop - self.sign() * self.tick;
         let reward = (target - fill) * self.sign() * self.multiplier
             - self.fees.bound(fill, target, self.multiplier);
         let loss = (fill - stop) * self.sign() * self.multiplier
             + self.fees.bound(fill, stop, self.multiplier);
-        loss > 0. && reward + 1e-7 >= loss
+        (reward, loss)
+    }
+    fn net_space(&self, fill: f64, min_net_rr: f64) -> bool {
+        let (reward, loss) = self.net_reward_loss(fill);
+        reward.is_finite() && loss.is_finite() && loss > 0. && reward + 1e-7 >= min_net_rr * loss
     }
 }
 #[derive(Default, Serialize, Deserialize)]
@@ -435,6 +439,8 @@ impl State {
 pub struct CandidateStrategy {
     parameters: Parameters,
     min_score: f64,
+    min_risk_atr: f64,
+    min_net_rr: f64,
     #[cfg(test)]
     calendar_time_override: Option<i64>,
 }
@@ -447,9 +453,24 @@ impl CandidateStrategy {
         Ok(Self {
             parameters,
             min_score,
+            min_risk_atr: 0.75,
+            min_net_rr: 1.,
             #[cfg(test)]
             calendar_time_override: None,
         })
+    }
+    /// P3 v2 keeps the S1/cost selection while removing only the ATR floor.
+    fn without_atr_floor(mut self) -> Self {
+        self.min_risk_atr = 0.;
+        self
+    }
+    fn with_min_net_rr(mut self, min_net_rr: f64) -> Result<Self> {
+        ensure!(
+            min_net_rr.is_finite() && min_net_rr > 0.,
+            "净盈亏比门槛必须为正有限数"
+        );
+        self.min_net_rr = min_net_rr;
+        Ok(self)
     }
     #[cfg(test)]
     pub(crate) fn with_test_calendar_time(mut self, timestamp: i64) -> Self {
@@ -598,16 +619,19 @@ impl CandidateStrategy {
             || s.atr14 <= 0.
         {
             Some("atr_unavailable")
-        } else if !(0.75..=2.5).contains(&(s.risk / s.atr14)) {
+        } else if !(self.min_risk_atr..=2.5).contains(&(s.risk / s.atr14)) {
             Some("atr_out_of_range")
-        } else if !s.net_space(forecast) {
+        } else if !s.net_space(forecast, self.min_net_rr) {
             Some("filtered_net_rr_plan")
         } else {
             self.parameters
                 .block(&s.instrument, self.calendar_time(now))
         };
+        let (net_reward, net_loss) = s.net_reward_loss(forecast);
         let values = json!({"warning":values,"snapshot":s,"friction_yuan":friction,
-            "risk_atr":s.risk/s.atr14,"min_score":self.min_score});
+            "risk_atr":s.risk/s.atr14,"min_score":self.min_score,
+            "min_risk_atr":self.min_risk_atr,"max_risk_atr":2.5,
+            "min_net_rr":self.min_net_rr,"planned_net_rr":net_reward/net_loss});
         if let Some(reason) = reason {
             state.record(&key, reason, values);
             return Ok(vec![]);
@@ -634,6 +658,18 @@ impl CandidateStrategy {
     }
 }
 impl Strategy for CandidateStrategy {
+    fn handles_event(&self, event: &StrategyEvent) -> bool {
+        matches!(event, StrategyEvent::Signal { source, .. } if source == N_STRATEGY)
+            || matches!(event, StrategyEvent::Quote(_) | StrategyEvent::Timer { .. })
+            || matches!(event, StrategyEvent::BarClosed { timeframe, .. } if timeframe == "candidate15m")
+    }
+    fn event_state_scope(&self, event: &StrategyEvent) -> EventStateScope {
+        if matches!(event, StrategyEvent::Signal { .. }) {
+            EventStateScope::Full
+        } else {
+            EventStateScope::Fields(&["pending", "holding"])
+        }
+    }
     fn entry_constraints(&self) -> EntryConstraints {
         EntryConstraints {
             one_per_symbol: true,
@@ -684,7 +720,7 @@ impl Strategy for CandidateStrategy {
         if (s.target - fill) * s.sign() <= 0. {
             return EntryDecision::Reject("invalid_target".into());
         }
-        if !s.net_space(fill) {
+        if !s.net_space(fill, self.min_net_rr) {
             return EntryDecision::Reject("filtered_net_rr_fill".into());
         }
         if (fill - s.stop) * s.sign() / s.tick + 1e-6 < 10. {
@@ -840,6 +876,38 @@ impl Strategy for CandidateStrategy {
                 }
             }
             StrategyEvent::Timer { timestamp } => {
+                // Only live tasks need observed-bucket clocks. Keep the signal
+                // decision/dedup archive, but do not carry finished trades'
+                // per-bucket MFE through every future quote callback.
+                let pending = c
+                    .conditions
+                    .iter()
+                    .filter(|o| {
+                        matches!(
+                            o.state,
+                            ConditionState::Pending
+                                | ConditionState::WaitingConfirm
+                                | ConditionState::Triggered
+                                | ConditionState::Working
+                                | ConditionState::Unknown
+                                | ConditionState::PartFilled
+                                | ConditionState::Closing
+                        )
+                    })
+                    .map(|o| o.origin.signal_id.as_str())
+                    .collect::<BTreeSet<_>>();
+                state
+                    .pending
+                    .retain(|key, _| pending.contains(key.as_str()));
+                let holding = c
+                    .positions
+                    .iter()
+                    .filter(|p| !p.is_closed || p.volume > 0)
+                    .map(|p| p.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                state
+                    .holding
+                    .retain(|key, _| holding.contains(key.as_str()));
                 for p in c.positions.iter().filter(|p| !p.is_closed && p.volume > 0) {
                     if let Some(reason) = self.parameters.flat_reason(
                         &p.instrument_id,

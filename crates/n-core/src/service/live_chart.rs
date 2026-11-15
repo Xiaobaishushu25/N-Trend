@@ -24,12 +24,19 @@ struct Interest {
     rebase_bucket: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct VolumeTracker {
+    last_cumulative_volume: u64,
+    last_trading_day: String,
+}
+
 struct Published {
     received: Instant,
     calibrated: Instant,
     base_end: String,
     bars: HashMap<String, KlineDto>,
     quote: Option<QuoteUpdate>,
+    volume_tracker: Option<VolumeTracker>,
 }
 
 #[derive(Clone)]
@@ -176,6 +183,10 @@ impl LiveChartCache {
         if let Some(quote) = &quote {
             apply_quote(&mut bars, quote);
         }
+        let volume_tracker = published
+            .get(symbol)
+            .filter(|entry| entry.base_end == base_end)
+            .and_then(|entry| entry.volume_tracker.clone());
         let result = bars.values().cloned().collect();
         published.insert(
             symbol.into(),
@@ -185,6 +196,7 @@ impl LiveChartCache {
                 base_end,
                 bars,
                 quote,
+                volume_tracker,
             },
         );
         result
@@ -240,6 +252,97 @@ impl LiveChartCache {
             }
         }
         updated
+    }
+
+    /// Update chart candles in-memory with real-time CTP tick data.
+    /// Accumulates volume deltas continuously (without leaking cross-bucket volume),
+    /// maintains high/low/close across all derived timeframes, and triggers calibration when crossing a 5m boundary.
+    pub fn update_ctp_tick(
+        &self,
+        symbol: &str,
+        price: f64,
+        cumulative_volume: u64,
+        open_interest: f64,
+        trading_day: &str,
+        now: NaiveDateTime,
+    ) -> Vec<KlineDto> {
+        if !price.is_finite() || price <= 0.0 {
+            return Vec::new();
+        }
+        let base_end = live_5m_end(now);
+        let mut published = self.published.lock().unwrap();
+        let Some(entry) = published.get_mut(symbol) else {
+            return Vec::new();
+        };
+
+        if !is_slice(
+            symbol,
+            NaiveDateTime::parse_from_str(&base_end, FORMAT).unwrap_or(now),
+        ) {
+            return Vec::new();
+        }
+
+        if entry.base_end != base_end || entry.calibrated.elapsed() > CALIBRATION_MAX_AGE {
+            drop(published);
+            let mut interests = self.interests.lock().unwrap();
+            if let Some(interest) = interests.get_mut(symbol) {
+                if interest.rebase_bucket.as_ref() != Some(&base_end) {
+                    interest.rebase_bucket = Some(base_end);
+                    interest.attempted = None;
+                    self.wake.notify_one();
+                }
+            }
+            return Vec::new();
+        }
+
+        // Calculate continuous volume delta
+        let delta_v = match &mut entry.volume_tracker {
+            None => {
+                entry.volume_tracker = Some(VolumeTracker {
+                    last_cumulative_volume: cumulative_volume,
+                    last_trading_day: trading_day.to_string(),
+                });
+                0.0
+            }
+            Some(tracker) => {
+                if tracker.last_trading_day != trading_day {
+                    tracker.last_trading_day = trading_day.to_string();
+                    tracker.last_cumulative_volume = cumulative_volume;
+                    cumulative_volume as f64
+                } else if cumulative_volume >= tracker.last_cumulative_volume {
+                    let d = (cumulative_volume - tracker.last_cumulative_volume) as f64;
+                    tracker.last_cumulative_volume = cumulative_volume;
+                    d
+                } else {
+                    tracker.last_cumulative_volume = cumulative_volume;
+                    0.0
+                }
+            }
+        };
+
+        let quote = entry.quote.get_or_insert(QuoteUpdate {
+            at: Instant::now(),
+            latest: price,
+            high: price,
+            low: price,
+        });
+        quote.at = Instant::now();
+        quote.latest = price;
+        quote.high = quote.high.max(price);
+        quote.low = quote.low.min(price);
+
+        for bar in entry.bars.values_mut() {
+            bar.high = bar.high.max(price);
+            bar.low = bar.low.min(price);
+            bar.close = price;
+            bar.volume += delta_v;
+            if open_interest > 0.0 {
+                bar.hold = open_interest;
+            }
+            bar.source = "ctp_live_partial".into();
+        }
+        entry.received = Instant::now();
+        entry.bars.values().cloned().collect()
     }
 }
 
@@ -536,5 +639,42 @@ mod tests {
             .calibrated = Instant::now() - CALIBRATION_MAX_AGE - Duration::from_secs(1);
         assert!(cache.update_prices(&[quote(120.)], now).is_empty());
         assert!(cache.get("JD0", Timeframe::M15, now).is_none());
+    }
+
+    #[test]
+    fn test_update_ctp_tick_continuous_volume_and_extremes() {
+        let cache = LiveChartCache::default();
+        let now = dt("2026-10-29 09:02:00");
+        // Initial seed from Tianqin 5m partial bar with volume 50.0
+        cache.publish(
+            "JD0",
+            vec![row("2026-10-29 09:05:00", 100., 110., 99., 105., 50.)],
+            now,
+        );
+
+        // First CTP tick establishes baseline (cumulative volume 1000)
+        let bars1 = cache.update_ctp_tick("JD0", 106.0, 1000, 500.0, "20261029", now);
+        assert!(!bars1.is_empty());
+        let bar_5m = cache.get("JD0", Timeframe::M5, now).unwrap();
+        assert_eq!(bar_5m.close, 106.0);
+        assert_eq!(bar_5m.volume, 50.0); // Baseline established, no delta added yet
+
+        // Second CTP tick with cumulative volume 1012 -> delta = +12
+        let bars2 = cache.update_ctp_tick("JD0", 112.0, 1012, 510.0, "20261029", now);
+        assert!(!bars2.is_empty());
+        let bar_5m = cache.get("JD0", Timeframe::M5, now).unwrap();
+        assert_eq!(bar_5m.high, 112.0); // High updated
+        assert_eq!(bar_5m.close, 112.0);
+        assert_eq!(bar_5m.volume, 62.0); // 50 + 12 = 62
+
+        // Third CTP tick with cumulative volume 1015 -> delta = +3, low dropped to 95.0
+        let bars3 = cache.update_ctp_tick("JD0", 95.0, 1015, 520.0, "20261029", now);
+        assert!(!bars3.is_empty());
+        let bar_5m = cache.get("JD0", Timeframe::M5, now).unwrap();
+        assert_eq!(bar_5m.low, 95.0); // Low updated
+        assert_eq!(bar_5m.close, 95.0);
+        assert_eq!(bar_5m.volume, 65.0); // 62 + 3 = 65
+        assert_eq!(bar_5m.hold, 520.0);
+        assert_eq!(bar_5m.source, "ctp_live_partial");
     }
 }
