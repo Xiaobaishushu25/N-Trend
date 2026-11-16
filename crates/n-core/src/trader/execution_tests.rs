@@ -2639,3 +2639,87 @@ async fn persistence_failure_protects_memory_and_blocks_new_orders_while_preserv
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn test_night_session_and_external_trade_chronology() {
+    use super::*;
+
+    // 1. Session phase check:
+    // Friday night 22:59:09 belongs to phase 0 (night session pre-midnight)
+    assert_eq!(trade_session_phase("22:59:09"), 0);
+    // 01:15:00 belongs to phase 1 (night session post-midnight)
+    assert_eq!(trade_session_phase("01:15:00"), 1);
+    // Monday day 14:08:43 belongs to phase 2 (day session)
+    assert_eq!(trade_session_phase("14:08:43"), 2);
+
+    // 2. Position open check:
+    // Position opened on 2026-11-16 14:08:43 (Monday day session)
+    let pos = ManagedPosition {
+        origin: TradeOrigin::default(),
+        id: "pos_pp2701".into(),
+        condition_order_id: "cond_pp2701".into(),
+        symbol: "PP0".into(),
+        instrument_id: "pp2701".into(),
+        direction: "up".into(),
+        tier: PositionTier::Large,
+        fill_price: 9252.0,
+        initial_stop_price: 9195.835,
+        target_price: 9477.0,
+        risk: 56.165,
+        volume: 2,
+        open_ts: "2026-11-16 14:08:43".into(),
+        bars_held: 0,
+        max_mfe_r: 0.0,
+        max_mae_r: 0.0,
+        trailing_grade: 0,
+        current_stop_price: 9195.835,
+        lot1_closed: false,
+        exit_reason: None,
+        exit_price: None,
+        is_closed: false,
+        realized_pnl_pts: None,
+        r_multiple: None,
+        event_id: None,
+        planned_entry_price: None,
+        score: None,
+        warning_bar_ts: None,
+        trigger_ts: None,
+        order_insert_ts: None,
+        user_note: None,
+        is_manual: false,
+    };
+
+    // Trade from Friday night: trade_time 22:59:09, trading_day 20261116
+    let friday_night_trade = TraderTradeRecord {
+        trade_id: "102191655".into(),
+        order_ref: "1".into(),
+        instrument_id: "pp2701".into(),
+        exchange_id: "DCE".into(),
+        direction: "sell".into(),
+        offset: "close".into(),
+        price: 9419.0,
+        volume: 2,
+        trade_date: "20261113".into(),
+        trade_time: "22:59:09".into(),
+        trading_day: "20261116".into(),
+    };
+
+    // Friday night trade happened BEFORE Monday afternoon position, so trade_is_after_position_open must be false!
+    assert!(!trade_is_after_position_open(&friday_night_trade, &pos));
+
+    // A legitimate exit on Monday afternoon at 14:30:00 must be true
+    let monday_later_trade = TraderTradeRecord {
+        trade_id: "102191999".into(),
+        order_ref: "2".into(),
+        instrument_id: "pp2701".into(),
+        exchange_id: "DCE".into(),
+        direction: "sell".into(),
+        offset: "close".into(),
+        price: 9240.0,
+        volume: 2,
+        trade_date: "20261116".into(),
+        trade_time: "14:30:00".into(),
+        trading_day: "20261116".into(),
+    };
+    assert!(trade_is_after_position_open(&monday_later_trade, &pos));
+}

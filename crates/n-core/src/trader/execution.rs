@@ -562,6 +562,72 @@ fn atomic_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Session phase within a Chinese futures trading day:
+/// Phase 0: Night session pre-midnight (20:00:00 - 23:59:59)
+/// Phase 1: Night session post-midnight (00:00:00 - 05:00:00)
+/// Phase 2: Day session (06:00:00 - 19:59:59)
+pub fn trade_session_phase(time_str: &str) -> u8 {
+    let hour = time_str
+        .split(':')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    if hour >= 20 {
+        0
+    } else if hour <= 5 {
+        1
+    } else {
+        2
+    }
+}
+
+pub fn normalize_date_key(d: &str) -> String {
+    d.chars().filter(|c| c.is_ascii_digit()).collect()
+}
+
+pub fn extract_date_and_time(ts: &str) -> (String, String) {
+    let mut parts = ts.split_whitespace();
+    let d = parts.next().unwrap_or("");
+    let t = parts.next().unwrap_or("");
+    (normalize_date_key(d), t.to_string())
+}
+
+/// Returns true if trade occurs strictly after position open time chronologically.
+pub fn trade_is_after_position_open(trade: &TraderTradeRecord, pos: &ManagedPosition) -> bool {
+    let fill_day = if trade.trading_day.is_empty() {
+        &trade.trade_date
+    } else {
+        &trade.trading_day
+    };
+    let trade_day_norm = normalize_date_key(fill_day);
+    let (pos_day_norm, pos_time) = extract_date_and_time(&pos.open_ts);
+
+    let trade_phase = trade_session_phase(&trade.trade_time);
+    let pos_phase = trade_session_phase(&pos_time);
+
+    if !trade_day_norm.is_empty() && !pos_day_norm.is_empty() {
+        if trade_day_norm < pos_day_norm {
+            return false;
+        }
+        if trade_day_norm == pos_day_norm {
+            if trade_phase < pos_phase {
+                return false;
+            }
+            if trade_phase == pos_phase && trade.trade_time <= pos_time {
+                return false;
+            }
+        }
+    } else {
+        if trade_phase < pos_phase {
+            return false;
+        }
+        if trade_phase == pos_phase && trade.trade_time <= pos_time {
+            return false;
+        }
+    }
+    true
+}
+
 impl ExecutionEngine {
     pub fn new(client: CtpTraderClient, config: ExecutionConfig) -> Self {
         Self::with_config_path(client, config, None)
@@ -1217,9 +1283,16 @@ impl ExecutionEngine {
             .flatten()
             .map(|raw| serde_json::from_value::<TraderTradeRecord>(raw.clone()))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+
         trades.sort_by_key(|t| {
+            let day = if t.trading_day.is_empty() {
+                &t.trade_date
+            } else {
+                &t.trading_day
+            };
             (
-                t.trade_date.clone(),
+                normalize_date_key(day),
+                trade_session_phase(&t.trade_time),
                 t.trade_time.clone(),
                 t.offset != "open",
                 t.order_ref.parse::<u64>().unwrap_or(0),
@@ -1249,6 +1322,7 @@ impl ExecutionEngine {
                             && p.volume > 0
                             && p.instrument_id.eq_ignore_ascii_case(&trade.instrument_id)
                             && (if p.direction == "up" { "sell" } else { "buy" }) == trade.direction
+                            && trade_is_after_position_open(&trade, p)
                     }).map(|(id, _)| id.clone());
 
                     if let Some(pos_id) = matching_pos_id {
@@ -1305,6 +1379,10 @@ impl ExecutionEngine {
                             s.closes.remove(&pos_id);
                         }
                         s.history.push(rec);
+                    } else {
+                        // Mark external close trade as seen if no matching open position exists,
+                        // preventing lingering unconsumed trades from matching future positions.
+                        s.seen_trades.insert(key.clone());
                     }
                 }
                 continue;

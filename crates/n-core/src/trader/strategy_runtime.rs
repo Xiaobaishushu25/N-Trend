@@ -718,6 +718,43 @@ impl ExecutionEngine {
                 reconciled += 1;
             }
         }
+
+        // Reverse reconciliation: broker holds positions that the strategy mistakenly marked closed (e.g. false external_manual)
+        let broker_positions = s.broker_positions.clone();
+        for bp in &broker_positions {
+            if bp.position <= 0 {
+                continue;
+            }
+            let expected_direction = if bp.direction == "buy" { "up" } else { "down" };
+            let managed_volume: i32 = s.positions.values()
+                .filter(|p| !p.is_closed && p.volume > 0 && p.instrument_id.eq_ignore_ascii_case(&bp.instrument_id) && p.direction == expected_direction)
+                .map(|p| p.volume)
+                .sum();
+            if bp.position > managed_volume {
+                let diff = bp.position - managed_volume;
+                let candidate_id = s.positions.iter()
+                    .filter(|(_, p)| p.is_closed && p.instrument_id.eq_ignore_ascii_case(&bp.instrument_id) && p.direction == expected_direction && p.exit_reason.as_deref() == Some("external_manual"))
+                    .max_by_key(|(_, p)| p.open_ts.clone())
+                    .map(|(id, _)| id.clone());
+
+                if let Some(revive_id) = candidate_id {
+                    let pos = s.positions.get_mut(&revive_id).unwrap();
+                    pos.volume = diff;
+                    pos.is_closed = false;
+                    pos.exit_price = None;
+                    pos.exit_reason = None;
+                    pos.realized_pnl_pts = None;
+                    pos.r_multiple = None;
+                    if let Some(cond) = s.conditions.get_mut(&revive_id) {
+                        cond.state = ConditionState::Filled;
+                        cond.note = format!("按柜台真实持仓恢复托管 ({}手)", diff);
+                    }
+                    s.history.retain(|t| !(t.condition_order_id == revive_id && t.exit_reason == "external_manual"));
+                    reconciled += 1;
+                    tracing::info!(instrument_id = %bp.instrument_id, revive_id = %revive_id, "按柜台真实持仓恢复被误平的持仓");
+                }
+            }
+        }
         s.rebuild_indices();
         s.error = None;
         self.save(&mut s)?;
