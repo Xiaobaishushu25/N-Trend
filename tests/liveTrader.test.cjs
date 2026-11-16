@@ -625,3 +625,48 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
   assert.match(html, /跳空\/滑点超追价上限\(放弃入场\)/)
   assert.match(html, /触价后被拒/)
 })
+
+test('resolveEventId resolves candidate strategy trades with signal_evidence but blocks pre-v3-archive', () => {
+  const { store } = setup()
+  const resolve = store.resolveEventId
+
+  // 1. Candidate strategy trade with plan evidence and event_id (e.g. P3 id=8177)
+  const candidateTrade = {
+    event_id: 8177,
+    signal_evidence: {
+      id: 8177,
+      entry_score: 3.33,
+      p3: { approved_lots: 2 },
+      candidate: { instrument: 'MA701' }
+    }
+  }
+  assert.equal(resolve(candidateTrade), 8177)
+
+  // 2. Candidate trade where event_id is only in signal_evidence.id
+  const candidateTradeEvidenceOnly = {
+    event_id: null,
+    signal_evidence: {
+      id: 8177,
+      p3: {}
+    }
+  }
+  assert.equal(resolve(candidateTradeEvidenceOnly), 8177)
+
+  // 3. True pre-v3 archive where SQLite event was purged during upgrade
+  const preV3Trade = {
+    event_id: 2809,
+    signal_evidence: {
+      origin: 'pre-v3-archive',
+      event_id: 2809,
+      signal: { entry: 3140 }
+    }
+  }
+  assert.equal(resolve(preV3Trade), null)
+
+  // 4. Normal N_STRATEGY trade without signal_evidence
+  const normalTrade = {
+    event_id: 8142,
+    signal_evidence: null
+  }
+  assert.equal(resolve(normalTrade), 8142)
+})

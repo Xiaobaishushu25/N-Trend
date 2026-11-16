@@ -1181,7 +1181,13 @@ export interface LiveManagedPosition {
 }
 
 export interface LiveTradeRecord {
-  signal_evidence?: { origin: string; event_id: number; archive_sha256: string; signal?: Record<string, unknown> | null } | null
+  signal_evidence?: {
+    origin?: string
+    event_id?: number
+    archive_sha256?: string
+    signal?: Record<string, unknown> | null
+    [key: string]: unknown
+  } | null
   id: string
   condition_order_id: string
   symbol: string

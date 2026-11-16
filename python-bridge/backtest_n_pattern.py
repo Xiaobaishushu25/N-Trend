@@ -85,13 +85,23 @@ def p2_calc_fee(symbol: str, fill: float, close: float, multiplier: float) -> fl
     return charge(f.get("open"), fill) + max(charge(f.get("close_today"), close), charge(f.get("close_yesterday"), close))
 
 
-def p2_net_space(symbol: str, direction: str, entry: float, target: float, stop: float, tick: float, multiplier: float, fill: float) -> bool:
+def p2_net_space(symbol: str, direction: str, entry: float, target: float, stop: float, tick: float, multiplier: float, fill: float, min_rr: float = 1.0) -> bool:
     sign = 1.0 if direction == "up" else -1.0
     t_adj = target - sign * tick
     s_adj = stop - sign * tick
     reward = (t_adj - fill) * sign * multiplier - p2_calc_fee(symbol, fill, t_adj, multiplier)
     loss = (fill - s_adj) * sign * multiplier + p2_calc_fee(symbol, fill, s_adj, multiplier)
-    return loss > 0.0 and reward + 1e-7 >= loss
+    return loss > 0.0 and reward + 1e-7 >= loss * min_rr
+
+
+def p3_unit_loss(symbol: str, fill: float, stop: float, tick: float, multiplier: float, sign: float) -> float:
+    stop_adj = stop - sign * tick
+    points = (fill - stop_adj) * sign
+    if points <= 0:
+        return 0.0
+    fees = p2_calc_fee(symbol, fill, stop_adj, multiplier)
+    loss = points * multiplier + fees
+    return math.ceil(loss * 100.0) / 100.0
 
 
 def p2_is_weekend_window(symbol: str, dt_str: str) -> bool:
@@ -180,7 +190,10 @@ class BacktestConfig:
     max_exit_slippage_ticks: int = 0
     large_volume: int = 2
     small_volume: int = 1
-    strategy: str = "n_pattern"  # "n_pattern" | "p2"
+    strategy: str = "n_pattern"  # "n_pattern" | "p2" | "p3"
+    p3_mode: str = "fixed_s1"  # "fixed_s1" | "hybrid_s1"
+    p3_budget: float = 600.0
+    p3_min_net_rr: float = 1.0
     one_per_symbol: bool = False  # NPatternStrategy uses default (non-exclusive) EntryConstraints.
     max_positions: Optional[int] = None  # Maximum concurrent open positions allowed across portfolio
     market_gap_events: Optional[str] = None
@@ -204,14 +217,22 @@ class BacktestConfig:
         if min(self.large_volume, self.small_volume) < 1 or min(self.slippage_ticks, self.min_risk_ticks,
                 self.max_exit_slippage_ticks, self.order_wait_seconds, self.action_interval_seconds) < 0:
             raise ValueError("Invalid sizing or execution limits")
-        if self.strategy not in ("n_pattern", "p2"):
-            raise ValueError("strategy must be 'n_pattern' or 'p2'")
+        if self.strategy not in ("n_pattern", "p2", "p3"):
+            raise ValueError("strategy must be 'n_pattern', 'p2', or 'p3'")
         if self.strategy == "p2":
             self.large_volume = 1
             self.small_volume = 1
             self.one_per_symbol = True
             if self.min_score < 3.0:
                 self.min_score = 3.0
+        elif self.strategy == "p3":
+            self.one_per_symbol = True
+            if self.min_score < 2.5:
+                self.min_score = 2.5
+            if self.p3_mode not in ("fixed_s1", "hybrid_s1"):
+                raise ValueError("p3_mode must be 'fixed_s1' or 'hybrid_s1'")
+            if self.p3_budget <= 0:
+                raise ValueError("p3_budget must be positive")
         if self.max_positions is not None and self.max_positions <= 0:
             raise ValueError("max_positions must be positive")
 
@@ -1166,45 +1187,73 @@ class NPatternBacktestEngine:
             if (target - entry) * sign <= risk:
                 target = entry + sign * risk
 
-            if self.cfg.strategy == "p2":
-                if score < 3.0:
-                    self.analytics.inc_counter(logical_symbol, "p2_score_below_min")
+            if self.cfg.strategy in ("p2", "p3"):
+                prefix = self.cfg.strategy
+                min_score = 3.0 if self.cfg.strategy == "p2" else 2.5
+                if score < min_score:
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_score_below_min")
                     continue
                 if risk / tick + 1e-6 < 10.0:
-                    self.analytics.inc_counter(logical_symbol, "p2_risk_ticks_below_min")
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_risk_ticks_below_min")
                     continue
                 forecast_fill = entry + sign * tick
                 forecast_stop = stop - sign * tick
                 friction = 2.0 * tick * multiplier + p2_calc_fee(logical_symbol, forecast_fill, forecast_stop, multiplier)
                 if friction > 0.20 * risk * multiplier + 1e-7:
-                    self.analytics.inc_counter(logical_symbol, "p2_friction_above20")
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_friction_above20")
                     continue
                 atr14 = p2_compute_atr14(self._history_bars.get(logical_symbol, []))
                 if atr14 is None or atr14 <= 0:
-                    self.analytics.inc_counter(logical_symbol, "p2_atr_unavailable")
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_atr_unavailable")
                     continue
-                if not (0.75 <= (risk / atr14) <= 2.5):
+                if self.cfg.strategy == "p2" and not (0.75 <= (risk / atr14) <= 2.5):
                     self.analytics.inc_counter(logical_symbol, "p2_atr_out_of_range")
                     continue
-                if not p2_net_space(logical_symbol, direction, entry, target, stop, tick, multiplier, forecast_fill):
-                    self.analytics.inc_counter(logical_symbol, "p2_filtered_net_rr_plan")
+                if self.cfg.strategy == "p3" and (risk / atr14) > 2.5:
+                    self.analytics.inc_counter(logical_symbol, "p3_atr_out_of_range")
+                    continue
+                min_rr = self.cfg.p3_min_net_rr if self.cfg.strategy == "p3" else 1.0
+                if not p2_net_space(logical_symbol, direction, entry, target, stop, tick, multiplier, forecast_fill, min_rr=min_rr):
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_filtered_net_rr_plan")
                     continue
                 if p2_is_weekend_window(logical_symbol, bar_ts):
-                    self.analytics.inc_counter(logical_symbol, "p2_filtered_weekend_window")
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_filtered_weekend_window")
                     continue
 
-            decision = RiskGate.evaluate(
-                entry_score=score,
-                risk=risk,
-                tick=tick,
-                multiplier=multiplier,
-                cfg=self.cfg,
-                current_equity=current_equity,
-            )
-            cond_id = self._next_cond_id(logical_symbol)
-            planned_lots = 1 if self.cfg.strategy == "p2" else (
-                self.cfg.large_volume if score >= self.cfg.large_score else self.cfg.small_volume
-            )
+            if self.cfg.strategy == "p3":
+                u_loss = p3_unit_loss(logical_symbol, forecast_fill, stop, tick, multiplier, sign)
+                if u_loss <= 0:
+                    continue
+                budget_cents = int(self.cfg.p3_budget * 100.0)
+                loss_cents = int(u_loss * 100.0)
+                approved_lots = min(2, budget_cents // loss_cents)
+                if approved_lots <= 0:
+                    self.analytics.inc_counter(logical_symbol, "p3_risk_budget_exceeded")
+                    continue
+                decision = RiskGateDecision(
+                    allowed=True,
+                    lots=approved_lots,
+                    downsized=False,
+                    reason="p3_risk_budget",
+                    unit_risk_yuan=u_loss,
+                    total_risk_yuan=u_loss * approved_lots,
+                    effective_cap_yuan=self.cfg.p3_budget,
+                )
+                cond_id = self._next_cond_id(logical_symbol)
+                planned_lots = approved_lots
+            else:
+                decision = RiskGate.evaluate(
+                    entry_score=score,
+                    risk=risk,
+                    tick=tick,
+                    multiplier=multiplier,
+                    cfg=self.cfg,
+                    current_equity=current_equity,
+                )
+                cond_id = self._next_cond_id(logical_symbol)
+                planned_lots = 1 if self.cfg.strategy == "p2" else (
+                    self.cfg.large_volume if score >= self.cfg.large_score else self.cfg.small_volume
+                )
 
             if decision.downsized or not decision.allowed:
                 self.analytics.record_risk_event(RiskGateEvent(
@@ -1336,7 +1385,7 @@ class NPatternBacktestEngine:
                 instructions.append(OrderInstruction("close", pos.pos_id, pos.logical_symbol, pos.actual_symbol,
                     "SELL" if sign > 0 else "BUY", pos.remaining_lots, pos.pending_exit_reason, price,
                     closing_all=True))
-            elif self.cfg.strategy == "p2":
+            elif self.cfg.strategy == "p2" or (self.cfg.strategy == "p3" and self.cfg.p3_mode == "fixed_s1"):
                 if (price - pos.initial_stop) * sign <= 0.0:
                     pos.closing_all_sent = True
                     instructions.append(OrderInstruction(
@@ -1380,6 +1429,81 @@ class NPatternBacktestEngine:
                         closing_all=True,
                     ))
                 continue
+            elif self.cfg.strategy == "p3" and self.cfg.p3_mode == "hybrid_s1":
+                if p2_is_pre_weekend_exit(pos.logical_symbol, quote.datetime):
+                    pos.closing_all_sent = True
+                    instructions.append(OrderInstruction(
+                        intent="close",
+                        ref_id=pos.pos_id,
+                        logical_symbol=pos.logical_symbol,
+                        actual_symbol=pos.actual_symbol,
+                        direction="SELL" if sign > 0 else "BUY",
+                        volume=pos.remaining_lots,
+                        reason="pre_weekend",
+                        trigger_price=price,
+                        is_lot1=False,
+                        closing_all=True,
+                    ))
+                    continue
+
+                stop_price = pos.current_stop
+                if pos.lot1_closed:
+                    peak = max(pos.max_mfe_r, (price - pos.open_fill_price) * sign / risk)
+                    cand = (pos.open_fill_price + sign * (peak - 0.8) * risk) if peak >= 1.6 else pos.open_fill_price
+                    cand = round_to_tick(cand, quote.price_tick)
+                    stop_price = max(stop_price, cand) if sign > 0.0 else min(stop_price, cand)
+                    pos.current_stop = stop_price
+
+                if (price - stop_price) * sign <= 0.0:
+                    pos.closing_all_sent = True
+                    reason = "stop"
+                    if pos.lot1_closed:
+                        reason = "trailing" if (stop_price - pos.open_fill_price) * sign > 0.0 else "breakeven"
+                    instructions.append(OrderInstruction(
+                        intent="close",
+                        ref_id=pos.pos_id,
+                        logical_symbol=pos.logical_symbol,
+                        actual_symbol=pos.actual_symbol,
+                        direction="SELL" if sign > 0 else "BUY",
+                        volume=pos.remaining_lots,
+                        reason=reason,
+                        trigger_price=price,
+                        is_lot1=False,
+                        closing_all=True,
+                    ))
+                    continue
+
+                if (not pos.lot1_closed) and (price - pos.target) * sign >= 0.0:
+                    if pos.remaining_lots == 2:
+                        pos.lot1_exit_sent = True
+                        pos.pending_lot1_exit = True
+                        instructions.append(OrderInstruction(
+                            intent="close",
+                            ref_id=pos.pos_id,
+                            logical_symbol=pos.logical_symbol,
+                            actual_symbol=pos.actual_symbol,
+                            direction="SELL" if sign > 0 else "BUY",
+                            volume=1,
+                            reason="p3_first_s1",
+                            trigger_price=price,
+                            is_lot1=True,
+                            closing_all=False,
+                        ))
+                    else:
+                        pos.closing_all_sent = True
+                        instructions.append(OrderInstruction(
+                            intent="close",
+                            ref_id=pos.pos_id,
+                            logical_symbol=pos.logical_symbol,
+                            actual_symbol=pos.actual_symbol,
+                            direction="SELL" if sign > 0 else "BUY",
+                            volume=pos.remaining_lots,
+                            reason="target_s1",
+                            trigger_price=price,
+                            is_lot1=False,
+                            closing_all=True,
+                        ))
+                    continue
             elif (price - pos.current_stop) * sign <= 0.0:
                 if not pos.lot1_closed:
                     reason = "stop"
@@ -1480,20 +1604,37 @@ class NPatternBacktestEngine:
                 self.analytics.inc_counter(cond.logical_symbol, "slot_blocked_skipped")
                 continue
 
-            if self.cfg.strategy == "p2":
+            if self.cfg.strategy in ("p2", "p3"):
                 actual_risk = abs(price - cond.stop)
                 if actual_risk / quote.price_tick + 1e-6 < 10.0:
                     cond.state = "cancelled"
                     cond.reject_reason = "filtered_actual_risk"
-                    self.analytics.inc_counter(cond.logical_symbol, "p2_actual_risk_blocked")
+                    self.analytics.inc_counter(cond.logical_symbol, f"{self.cfg.strategy}_actual_risk_blocked")
                     self.event(quote.datetime, "entry_cancelled", cond.cond_id, reason="filtered_actual_risk")
                     continue
-                if not p2_net_space(cond.logical_symbol, cond.direction, cond.entry, cond.target, cond.stop, quote.price_tick, cond.multiplier, price):
+                min_rr = self.cfg.p3_min_net_rr if self.cfg.strategy == "p3" else 1.0
+                if not p2_net_space(cond.logical_symbol, cond.direction, cond.entry, cond.target, cond.stop, quote.price_tick, cond.multiplier, price, min_rr=min_rr):
                     cond.state = "cancelled"
                     cond.reject_reason = "filtered_net_rr_fill"
-                    self.analytics.inc_counter(cond.logical_symbol, "p2_net_rr_fill_blocked")
+                    self.analytics.inc_counter(cond.logical_symbol, f"{self.cfg.strategy}_net_rr_fill_blocked")
                     self.event(quote.datetime, "entry_cancelled", cond.cond_id, reason="filtered_net_rr_fill")
                     continue
+                if self.cfg.strategy == "p3":
+                    actual_unit_loss = p3_unit_loss(cond.logical_symbol, price, cond.stop, quote.price_tick, cond.multiplier, 1.0 if cond.direction == "up" else -1.0)
+                    if actual_unit_loss <= 0:
+                        cond.state = "cancelled"
+                        cond.reject_reason = "invalid_actual_risk"
+                        continue
+                    budget_cents = int(self.cfg.p3_budget * 100.0)
+                    loss_cents = int(actual_unit_loss * 100.0)
+                    max_allowed = min(2, budget_cents // loss_cents)
+                    if max_allowed <= 0:
+                        cond.state = "cancelled"
+                        cond.reject_reason = "risk_budget_exceeded"
+                        self.analytics.inc_counter(cond.logical_symbol, "p3_risk_budget_fill_exceeded")
+                        self.event(quote.datetime, "entry_cancelled", cond.cond_id, reason="risk_budget_exceeded")
+                        continue
+                    cond.lots = min(cond.lots, max_allowed)
 
             if self.cfg.max_positions is not None:
                 active_and_submitting = len(self.active_positions) + sum(
@@ -1684,13 +1825,14 @@ class NPatternBacktestEngine:
             pos.current_stop = max(pos.current_stop, pos.open_fill_price) if sign > 0 else min(
                 pos.current_stop, pos.open_fill_price
             )
-            pos.current_stop = continuous_stop_price(
-                pos.open_fill_price,
-                pos.management_risk,
-                sign,
-                pos.max_mfe_r,
-                pos.current_stop,
-            )
+            if self.cfg.strategy != "p3":
+                pos.current_stop = continuous_stop_price(
+                    pos.open_fill_price,
+                    pos.management_risk,
+                    sign,
+                    pos.max_mfe_r,
+                    pos.current_stop,
+                )
         return leg
 
     def on_close_rejected(self, pos_id: str) -> None:
@@ -2855,7 +2997,10 @@ def load_symbols_from_db(db_path: str | Path) -> list[str]:
 # ===== CLI =====
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtest n-core N-pattern strategy on TQSDK.")
-    p.add_argument("--strategy", choices=["n_pattern", "p2"], default="n_pattern", help="Strategy variant: n_pattern (default) or p2 (candidate strategy with ATR, friction, net RR filters and fixed S1 exit)")
+    p.add_argument("--strategy", choices=["n_pattern", "p2", "p3"], default="n_pattern", help="Strategy variant: n_pattern (default), p2 (candidate S1), or p3 (risk budget + fixed_s1/hybrid_s1)")
+    p.add_argument("--p3-mode", choices=["fixed_s1", "hybrid_s1"], default="fixed_s1", help="P3 exit mode: fixed_s1 or hybrid_s1")
+    p.add_argument("--p3-budget", type=float, default=600.0, help="P3 risk budget in CNY (default 600.0)")
+    p.add_argument("--p3-min-net-rr", type=float, default=1.0, help="P3 minimum net risk-reward ratio (default 1.0)")
     p.add_argument("--symbols", default="", help="Comma-separated symbols, e.g. RB0,EG0,AU0")
     p.add_argument("--symbols-db", default=None, help="Load enabled symbols from SQLite DB (e.g. data-dev/ntrend.db)")
     p.add_argument("--start", required=True, help="Backtest start time YYYY-MM-DD or 'YYYY-MM-DD HH:MM(:SS)'")
@@ -2916,6 +3061,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cfg = BacktestConfig(
         strategy=args.strategy,
+        p3_mode=args.p3_mode,
+        p3_budget=args.p3_budget,
+        p3_min_net_rr=args.p3_min_net_rr,
         symbols=symbols,
         start=parse_cli_datetime(args.start, is_end=False),
         end=parse_cli_datetime(args.end, is_end=True),

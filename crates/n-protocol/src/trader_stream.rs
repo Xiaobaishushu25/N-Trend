@@ -17,6 +17,25 @@ pub struct TraderPublisher {
 }
 
 fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
+    if key == "strategy_diagnostics" {
+        // Calendar countdowns change every second. They must not retransmit the
+        // entire strategy archive; status/coverage transitions still publish.
+        // update() keeps the complete countdown fresh in the REST baseline.
+        if let (Some(left), Some(right)) = (left.as_object(), right.as_object()) {
+            if !object_fields_eq(left, right, &["calendar_health"]) {
+                return false;
+            }
+            return match (left.get("calendar_health"), right.get("calendar_health")) {
+                (Some(Value::Array(left)), Some(Value::Array(right))) => {
+                    left.len() == right.len()
+                        && left.iter().zip(right).all(|(left, right)| {
+                            value_fields_eq(left, right, &["remaining_seconds"])
+                        })
+                }
+                (left, right) => left == right,
+            };
+        }
+    }
     let ignored: &[&str] = match key {
         "health" => &[
             "uptime",
@@ -31,20 +50,30 @@ fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
     if ignored.is_empty() {
         return left == right;
     }
+    value_fields_eq(left, right, ignored)
+}
+
+fn object_fields_eq(
+    left: &Map<String, Value>,
+    right: &Map<String, Value>,
+    ignored: &[&str],
+) -> bool {
+    left.iter()
+        .filter(|(key, _)| !ignored.contains(&key.as_str()))
+        .all(|(key, value)| right.get(key) == Some(value))
+        && left
+            .keys()
+            .filter(|key| !ignored.contains(&key.as_str()))
+            .count()
+            == right
+                .keys()
+                .filter(|key| !ignored.contains(&key.as_str()))
+                .count()
+}
+
+fn value_fields_eq(left: &Value, right: &Value, ignored: &[&str]) -> bool {
     match (left.as_object(), right.as_object()) {
-        (Some(left), Some(right)) => {
-            left.iter()
-                .filter(|(key, _)| !ignored.contains(&key.as_str()))
-                .all(|(key, value)| right.get(key) == Some(value))
-                && left
-                    .keys()
-                    .filter(|key| !ignored.contains(&key.as_str()))
-                    .count()
-                    == right
-                        .keys()
-                        .filter(|key| !ignored.contains(&key.as_str()))
-                        .count()
-        }
+        (Some(left), Some(right)) => object_fields_eq(left, right, ignored),
         _ => left == right,
     }
 }
@@ -272,6 +301,101 @@ mod tests {
         assert_eq!(refreshed["account"]["updated_at"], 200);
         assert_eq!(refreshed["account"]["balance"], 1000);
         assert_eq!(refreshed["broker_positions"][0]["position"], 2);
+    }
+
+    #[test]
+    fn calendar_countdown_does_not_resend_large_strategy_diagnostics() {
+        let mut publisher = TraderPublisher::new("boot".into());
+        let mut current = snapshot();
+        current["strategy_diagnostics"] = json!({
+            "states":{"revision":{"decisions":vec![json!({"reason":"filtered", "evidence":"frozen strategy evidence"});20000]}},
+            "entry_decisions":{}, "symbol_slots":{},
+            "calendar_health":[{"revision":"revision","status":"ok","coverage_end":"2026-12-31 23:59:59", "remaining_seconds":300000}]
+        });
+        assert!(
+            serde_json::to_vec(&current["strategy_diagnostics"])
+                .unwrap()
+                .len()
+                > 1_000_000
+        );
+        current["runtime_diagnostics"] = json!({"processed_quotes":0});
+        let (baseline, _) = publisher.update(current.clone());
+        let mut cache = TraderSnapshotCache::default();
+        cache.replace(baseline);
+        let mut wire_bytes = 0;
+        for second in 1..=20 {
+            current["strategy_diagnostics"]["calendar_health"][0]["remaining_seconds"] =
+                json!(300000 - second);
+            let (baseline, delta) = publisher.update(current.clone());
+            assert!(delta.is_none(), "a countdown-only tick is metadata");
+            assert_eq!(
+                baseline["strategy_diagnostics"],
+                current["strategy_diagnostics"]
+            );
+            current["runtime_diagnostics"]["processed_quotes"] = json!(second);
+            let (_, delta) = publisher.update(current.clone());
+            let delta = delta.unwrap();
+            assert_eq!(delta.changes.len(), 1);
+            assert!(delta.changes.contains_key("runtime_diagnostics"));
+            wire_bytes += serde_json::to_vec(&delta).unwrap().len();
+            cache.apply(delta).unwrap();
+        }
+        assert!(
+            wire_bytes < 4096,
+            "small counters must not carry the strategy archive"
+        );
+        // Business changes must still replace diagnostics atomically in existing clients.
+        for path in ["states", "entry_decisions", "symbol_slots"] {
+            current["strategy_diagnostics"][path] = json!({"changed":true});
+            let (_, delta) = publisher.update(current.clone());
+            let merged = cache.apply(delta.unwrap()).unwrap().unwrap();
+            assert_eq!(
+                merged["strategy_diagnostics"],
+                current["strategy_diagnostics"]
+            );
+        }
+    }
+
+    #[test]
+    fn calendar_status_coverage_and_unknown_fields_are_never_ignored() {
+        let base = json!({"states":{},"calendar_health":[{
+            "revision":"a","status":"ok","coverage_end":"2026-12-31", "remaining_seconds":300000
+        }]});
+        let mut countdown = base.clone();
+        countdown["calendar_health"][0]["remaining_seconds"] = json!(299999);
+        assert!(semantic_field_eq("strategy_diagnostics", &base, &countdown));
+        for (key, value) in [
+            ("status", json!("expiring")),
+            ("revision", json!("b")),
+            ("coverage_end", json!("2027-01-01")),
+            ("new_health_field", json!(true)),
+        ] {
+            let mut next = countdown.clone();
+            next["calendar_health"][0][key] = value;
+            assert!(
+                !semantic_field_eq("strategy_diagnostics", &base, &next),
+                "{key}"
+            );
+        }
+        for calendars in [
+            Value::Null,
+            json!([]),
+            json!([{}, {}]),
+            json!([1]),
+            json!({}),
+        ] {
+            let mut next = base.clone();
+            next["calendar_health"] = calendars;
+            assert!(!semantic_field_eq("strategy_diagnostics", &base, &next));
+        }
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("calendar_health");
+        assert!(!semantic_field_eq("strategy_diagnostics", &base, &missing));
+        assert!(!semantic_field_eq(
+            "strategy_diagnostics",
+            &base,
+            &Value::Null
+        ));
     }
 
     #[test]

@@ -18,6 +18,7 @@ from backtest_n_pattern import (
     compute_slippage_limit_price,
     export_report,
     load_symbols_from_db,
+    p3_unit_loss,
     parse_cli_datetime,
     tq_bar_end_datetime,
 )
@@ -698,6 +699,28 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
         with redirect_stdout(buf):
             print_report(report)
         self.assertIn("RB0", buf.getvalue())
+
+
+class TestP3Strategy(unittest.TestCase):
+    def test_p3_config_validation(self):
+        cfg = BacktestConfig(
+            strategy="p3",
+            symbols=["RB0"],
+            start=date(2025, 1, 2),
+            end=date(2025, 2, 1),
+            p3_mode="fixed_s1",
+            p3_budget=600.0,
+        )
+        self.assertEqual(cfg.min_score, 2.5)
+        self.assertTrue(cfg.one_per_symbol)
+
+    def test_p3_unit_loss(self):
+        # RB0: tick 1.0, multiplier 10.0
+        # Long entry=3500.0, stop=3490.0, sign=1.0
+        # forecast fill = 3501.0, stop_adj = 3489.0 -> points = 12.0
+        # points * mult = 120.0
+        loss = p3_unit_loss("RB0", fill=3501.0, stop=3490.0, tick=1.0, multiplier=10.0, sign=1.0)
+        self.assertGreater(loss, 120.0)
 
 
 if __name__ == "__main__":

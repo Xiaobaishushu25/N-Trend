@@ -930,7 +930,7 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                 </div>
                   <div class="form-row">
                     <label class="form-label">S1 最低净盈亏比</label>
-                    <input v-model.number="p3MinNetRr" type="number" min="0.01" step="0.1" class="form-input" :disabled="strategy?.code_version !== '2'" required>
+                    <input v-model.number="p3MinNetRr" type="number" min="0.01" step="0.01" class="form-input" :disabled="strategy?.code_version !== '2'" required>
                     <span class="field-hint">调高通常减少交易；调低会增加候选。旧版实例需先加载新版 P3 预设。</span>
                   </div>
               </div>

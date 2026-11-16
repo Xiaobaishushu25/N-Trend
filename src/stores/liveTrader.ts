@@ -239,8 +239,11 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     resolveEventId(): (item?: { event_id?: number | null; condition_order_id?: string; signal_evidence?: unknown } | null) => number | null {
       return (item) => {
         if (!item) return null
-        if (item.signal_evidence) return null
+        const evidence = item.signal_evidence as { origin?: string; id?: number; event_id?: number } | undefined | null
+        if (evidence && evidence.origin === 'pre-v3-archive') return null
         if (item.event_id != null) return item.event_id
+        if (evidence && typeof evidence.id === 'number') return evidence.id
+        if (evidence && typeof evidence.event_id === 'number') return evidence.event_id
         return this.conditionMap[item.condition_order_id || '']?.event_id ?? null
       }
     },
