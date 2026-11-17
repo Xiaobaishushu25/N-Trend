@@ -136,6 +136,7 @@ const exitReasonOptions = [
   { label: '⚖ 柜台对齐核销', value: 'reconciled_broker' },
   { label: '🏖 周末前平仓', value: 'pre_weekend' },
   { label: '🎯 P3 首手 S1 止盈', value: 'p3_first_s1' },
+  { label: '🎯 P3 首手 1R 止盈', value: 'p3_first_1r' },
   { label: '🎯 第一手 1.0R 止盈', value: 'target_1r' },
   { label: '📈 第二手阶梯追踪', value: 'trailing' },
   { label: '🛡️ 成本线保本出场', value: 'breakeven' },
@@ -608,6 +609,8 @@ function conditionBadgeType(state?: string | null): 'default' | 'primary' | 'inf
 
 function exitReasonBadge(reason: string) {
   switch (reason) {
+    case 'p3_first_1r':
+      return { text: '🎯 P3 首手 1R', type: 'success' as const, tip: '近目标修正：首手以初始风险 1R 为止盈目标，成交后余仓进入保本与追踪管理；实际盈亏受成交价和费用影响' }
     case 'p3_first_s1':
       return { text: '🎯 P3 首手 S1', type: 'success' as const, tip: '首手在结构 S1 成交，余仓转入保本与追踪管理' }
     case 'contract_expiry':

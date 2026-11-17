@@ -708,6 +708,11 @@ export const useLiveTraderStore = defineStore('liveTrader', {
             exit_reason: exitReason,
           })
         }
+        const rec = this.history.find((h) => h.id === tradeId)
+        if (rec) {
+          if (userNote !== undefined) rec.user_note = userNote
+          if (exitReason !== undefined) rec.exit_reason = exitReason
+        }
         notify.success('备注已更新')
         await this.refresh()
       } catch (e: any) {

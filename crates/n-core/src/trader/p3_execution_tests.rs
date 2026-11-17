@@ -206,11 +206,11 @@ async fn p3_single_lot_skips_narrow_s1_and_exits_at_actual_one_r_after_restart()
 }
 
 #[tokio::test]
-async fn p3_second_entry_fill_restores_narrow_s1_and_hybrid_remainder_keeps_tracking() {
+async fn p3_second_entry_fill_reprices_one_r_floor_and_hybrid_remainder_keeps_tracking() {
     for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
         for short in [false, true] {
             let counter = Counter::new();
-            let e = engine(&counter, mode).await;
+            let mut e = engine(&counter, mode).await;
             let mut params = parameters(mode);
             params.min_net_rr = 0.1;
             e.configure_strategy(p3::definition(params), e.get_config().await)
@@ -243,11 +243,43 @@ async fn p3_second_entry_fill_restores_narrow_s1_and_hybrid_remainder_keeps_trac
             )
             .await;
             assert_eq!(e.list_positions().await[0].volume, 2);
-            assert_eq!(e.list_positions().await[0].target_price, native_target);
+            let one_r = 1000. + sign * 46.; // average cost 1000 +/- 3, initial R = 43
+            assert_eq!(e.list_positions().await[0].risk, 43.);
+            assert_eq!(e.list_positions().await[0].target_price, one_r);
             quote(&e, native_target).await;
+            assert_eq!(
+                counter.inserts().len(),
+                1,
+                "second fill must not restore a near S1"
+            );
+            drop(e);
+            e = counter.engine(ExecutionMode::FullAuto, 2);
+            e.registry = registry();
+            ready(
+                &e,
+                vec![order(&open, "all_traded", 2)],
+                vec![first.clone(), second.clone()],
+            )
+            .await;
+            assert_eq!(e.list_positions().await[0].target_price, one_r);
+            age(&e).await;
+            quote(&e, one_r - sign).await;
+            assert_eq!(counter.inserts().len(), 1);
+            quote(&e, one_r).await;
             let close = counter.inserts()[1].clone();
             let exit_volume = if mode == ExitMode::HybridS1 { 1 } else { 2 };
             assert_eq!(close["volume"], exit_volume);
+            let reason = if mode == ExitMode::HybridS1 {
+                "p3_first_1r"
+            } else {
+                "target_1r"
+            };
+            let id = e.list_positions().await[0].id.clone();
+            assert_eq!(e.state.lock().await.closes[&id].reason, reason);
+            assert!(
+                !e.list_positions().await[0].lot1_closed,
+                "protection waits for actual fill"
+            );
             ready(
                 &e,
                 vec![
@@ -257,18 +289,22 @@ async fn p3_second_entry_fill_restores_narrow_s1_and_hybrid_remainder_keeps_trac
                 vec![
                     first,
                     second,
-                    trade(&close, "s1-exit", exit_volume, native_target),
+                    trade(&close, "one-r-exit", exit_volume, one_r),
                 ],
             )
             .await;
+            let history = e.get_trade_history().await;
+            assert_eq!(history[0].exit_reason, reason);
+            assert_eq!(history[0].r_multiple, 1.);
+            assert_eq!(history[0].target_price, one_r);
             let remaining = e.list_positions().await.remove(0);
             if mode == ExitMode::HybridS1 {
                 assert_eq!(remaining.volume, 1);
                 assert!(remaining.lot1_closed);
-                assert_eq!(remaining.target_price, native_target);
+                assert_eq!(remaining.target_price, one_r);
                 assert_eq!(remaining.current_stop_price, 1000. + sign * 3.);
                 age(&e).await;
-                quote(&e, native_target + sign).await;
+                quote(&e, one_r + sign).await;
                 assert_eq!(
                     counter.inserts().len(),
                     2,
@@ -281,7 +317,7 @@ async fn p3_second_entry_fill_restores_narrow_s1_and_hybrid_remainder_keeps_trac
                 );
             } else {
                 assert!(remaining.is_closed);
-                assert_eq!(e.get_trade_history().await[0].exit_reason, "target_s1");
+                assert_eq!(e.get_trade_history().await[0].exit_reason, "target_1r");
             }
         }
     }

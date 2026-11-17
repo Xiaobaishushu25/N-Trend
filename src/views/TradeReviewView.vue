@@ -115,6 +115,8 @@ function levelLabel(level: string): string {
 
 function exitReasonBadge(reason: string) {
   switch (reason) {
+    case 'p3_first_1r':
+      return { text: '🎯 P3 首手 1R', type: 'error' as const, tip: '近目标修正：首手以初始风险 1R 为止盈目标，成交后余仓进入保本追踪' }
     case 'p3_first_s1':
       return { text: '🎯 P3 首手 S1', type: 'error' as const, tip: '首手结构目标止盈，余仓进入保本追踪' }
     case 'target':

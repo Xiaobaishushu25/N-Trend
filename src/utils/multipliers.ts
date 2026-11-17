@@ -243,9 +243,9 @@ export function calcSlippage(
   if (Math.abs(adversePts) < 1e-4) {
     label = '零滑点'
   } else if (isAdverse) {
-    label = `滑点 +${diffPts.toFixed(1)}点 (${ticks}跳)`
+    label = `不利滑点 ${diffPts.toFixed(1)}点 (${ticks}跳)`
   } else {
-    label = `优于计划 -${diffPts.toFixed(1)}点 (${ticks}跳)`
+    label = `有利滑点 ${diffPts.toFixed(1)}点 (${ticks}跳)`
   }
 
   return {

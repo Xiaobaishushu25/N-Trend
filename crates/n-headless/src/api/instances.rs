@@ -234,6 +234,7 @@ pub async fn action(
                     r.engine
                         .close_managed_position(&position_id, volume, reason, note)
                         .await?;
+                    *r.published.write().await = Value::Null;
                 }
                 Action::UpdateTradeRecord {
                     trade_id,
@@ -243,9 +244,11 @@ pub async fn action(
                     r.engine
                         .update_trade_record(&trade_id, user_note, exit_reason)
                         .await?;
+                    *r.published.write().await = Value::Null;
                 }
                 Action::SyncBrokerPositions => {
                     r.engine.sync_broker_positions().await?;
+                    *r.published.write().await = Value::Null;
                 }
             }
             Ok(json!({"instance_id":id,"accepted":true}))

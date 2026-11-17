@@ -518,7 +518,7 @@ fn sizing_rechecks_actual_notional_multiplier_and_remaining_budget() {
 }
 
 #[test]
-fn single_entry_lot_has_a_one_r_floor_without_changing_native_s1_or_two_lot_exits() {
+fn entry_target_has_one_r_floor_for_one_and_two_lots_preserving_native_s1() {
     for short in [false, true] {
         let sign = if short { -1. } else { 1. };
         for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
@@ -534,7 +534,9 @@ fn single_entry_lot_has_a_one_r_floor_without_changing_native_s1_or_two_lot_exit
                     plan.target_price = Some(native_target);
                     p.target_price = P3Exit.target_on_fill(&p, &plan).unwrap();
                     assert_eq!(plan.target_price, Some(native_target));
-                    if volume == 1 && native_r < 1. {
+                    let expected_target = p.fill_price + sign * native_r.max(1.) * p.risk;
+                    assert_eq!(p.target_price, expected_target);
+                    if native_r < 1. {
                         assert!(P3Exit
                             .on_quote(&p, &quote(native_target), &params)
                             .close
@@ -543,31 +545,51 @@ fn single_entry_lot_has_a_one_r_floor_without_changing_native_s1_or_two_lot_exit
                             .on_quote(&p, &quote(p.fill_price + sign * (p.risk - 1.)), &params)
                             .close
                             .is_none());
-                        let exit =
-                            P3Exit.on_quote(&p, &quote(p.fill_price + sign * p.risk), &params);
-                        assert_eq!(exit.close.unwrap(), ("target_1r".into(), None));
-                    } else {
-                        assert_eq!(p.target_price, native_target);
-                        let reason = if volume == 2 && mode == ExitMode::HybridS1 {
-                            (FIRST_S1.into(), Some(1))
-                        } else if volume == 1 && native_r == 1. {
-                            ("target_1r".into(), None)
-                        } else {
-                            ("target_s1".into(), None)
-                        };
-                        assert_eq!(
-                            P3Exit
-                                .on_quote(&p, &quote(native_target), &params)
-                                .close
-                                .unwrap(),
-                            reason
-                        );
                     }
+                    let reason = if volume == 2 && mode == ExitMode::HybridS1 {
+                        (
+                            if native_r <= 1. { FIRST_1R } else { FIRST_S1 }.into(),
+                            Some(1),
+                        )
+                    } else if native_r <= 1. {
+                        ("target_1r".into(), None)
+                    } else {
+                        ("target_s1".into(), None)
+                    };
+                    assert_eq!(
+                        P3Exit
+                            .on_quote(&p, &quote(expected_target), &params)
+                            .close
+                            .unwrap(),
+                        reason
+                    );
                     let stop_exit = P3Exit.on_quote(&p, &quote(p.initial_stop_price), &params);
                     assert_eq!(stop_exit.close.unwrap(), ("stop".into(), None));
                 }
             }
         }
+    }
+}
+
+#[test]
+fn near_target_remainder_keeps_target_and_protection_after_later_fill_hook() {
+    for short in [false, true] {
+        let mut p = position(short);
+        let sign = if short { -1. } else { 1. };
+        p.volume = 1;
+        p.lot1_closed = true;
+        p.target_price = p.fill_price + sign * p.risk;
+        p.current_stop_price = p.fill_price;
+        let mut plan = make_plan(signal());
+        plan.target_price = Some(p.fill_price + sign * 0.4 * p.risk);
+        assert_eq!(P3Exit.target_on_fill(&p, &plan), Some(p.target_price));
+        let mut params = parameters();
+        params.exit_mode = ExitMode::HybridS1;
+        let params = serde_json::to_value(params).unwrap();
+        assert!(P3Exit
+            .on_quote(&p, &quote(p.target_price), &params)
+            .close
+            .is_none());
     }
 }
 

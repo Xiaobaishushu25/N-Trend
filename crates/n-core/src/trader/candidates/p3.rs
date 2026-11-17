@@ -16,6 +16,7 @@ const PREVIOUS_VERSION: &str = "1";
 pub const EXIT: &str = "p3_exit_v1";
 pub const SIZING: &str = "risk_budget_v1";
 const FIRST_S1: &str = "p3_first_s1";
+const FIRST_1R: &str = "p3_first_1r";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -337,15 +338,17 @@ impl ExitPolicy for P3Exit {
     fn target_on_fill(&self, p: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
         let native_target = plan.target_price?;
         let sign = if p.direction == "up" { 1. } else { -1. };
-        // Keep the frozen S1 for admission/audit. Only a single actual entry lot
-        // gets the 1R floor; a later second fill restores the native S1 target.
-        Some(
-            if p.volume == 1 && !p.lot1_closed && (native_target - p.fill_price) * sign <= p.risk {
-                p.fill_price + sign * p.risk
-            } else {
-                native_target
-            },
-        )
+        // Keep the frozen S1 for admission/audit. Every entry gets the 1R floor,
+        // recalculated from actual average cost after each partial entry fill.
+        // A remainder already in protection/trailing keeps its existing target.
+        if p.lot1_closed {
+            return Some(p.target_price);
+        }
+        Some(if (native_target - p.fill_price) * sign <= p.risk {
+            p.fill_price + sign * p.risk
+        } else {
+            native_target
+        })
     }
     fn on_quote(&self, p: &ManagedPosition, q: &ExecutionQuote, parameters: &Value) -> ExitUpdate {
         let sign = if p.direction == "up" { 1. } else { -1. };
@@ -376,11 +379,13 @@ impl ExitPolicy for P3Exit {
                 None,
             ))
         } else if !p.lot1_closed && (q.last - p.target_price) * sign >= 0. {
+            let one_r_target = ((p.target_price - p.fill_price) * sign - p.risk).abs() <= 1e-6;
             if mode == ExitMode::HybridS1 && p.volume == 2 {
-                Some((FIRST_S1.into(), Some(1)))
+                Some((
+                    if one_r_target { FIRST_1R } else { FIRST_S1 }.into(),
+                    Some(1),
+                ))
             } else {
-                let one_r_target = p.volume == 1
-                    && ((p.target_price - p.fill_price) * sign - p.risk).abs() <= 1e-6;
                 Some((
                     if one_r_target {
                         "target_1r"
@@ -405,7 +410,7 @@ impl ExitPolicy for P3Exit {
         quote: Option<&ExecutionQuote>,
     ) -> PartialExitUpdate {
         let first = mode(parameters).is_ok_and(|m| m == ExitMode::HybridS1)
-            && reason == FIRST_S1
+            && matches!(reason, FIRST_S1 | FIRST_1R)
             && filled == 1;
         let sign = if p.direction == "up" { 1. } else { -1. };
         let be = quote
