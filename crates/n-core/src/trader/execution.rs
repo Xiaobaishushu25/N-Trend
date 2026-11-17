@@ -20,8 +20,14 @@ use std::sync::Arc;
 
 #[path = "execution_safety.rs"]
 mod execution_safety;
+#[path = "execution_trade_time.rs"]
+mod execution_trade_time;
 #[path = "strategy_runtime.rs"]
 mod strategy_runtime;
+pub use execution_trade_time::normalize_archive as normalize_execution_archive;
+#[cfg(test)]
+#[path = "execution_trade_time_tests.rs"]
+mod trade_time_tests;
 
 const MARKET_CONNECTION_ERROR: &str = "执行行情连接中断，暂停新报单并保留未完成任务";
 
@@ -375,6 +381,8 @@ struct ExecutionState {
     orders: HashMap<String, ExecutionOrder>,
     closes: HashMap<String, CloseTask>,
     seen_trades: HashSet<String>,
+    trade_times: HashMap<String, super::trade_time::TradeTimeEvidence>,
+    time_normalization_version: u32,
     aborted_entries: HashSet<String>,
     authorized_entries: HashSet<String>,
     last_ref: u64,
@@ -419,6 +427,8 @@ struct ExecutionState {
     entry_started_conditions: HashSet<String>,
     #[serde(skip)]
     unsettled_orders: HashSet<String>,
+    #[serde(skip)]
+    started_at: i64,
 }
 
 impl ExecutionState {
@@ -594,6 +604,19 @@ pub fn extract_date_and_time(ts: &str) -> (String, String) {
 
 /// Returns true if trade occurs strictly after position open time chronologically.
 pub fn trade_is_after_position_open(trade: &TraderTradeRecord, pos: &ManagedPosition) -> bool {
+    let resolved = super::trade_time::resolve(
+        &trade.instrument_id,
+        &trade.trade_date,
+        &trade.trade_time,
+        &trade.trading_day,
+        None,
+    );
+    if let (Some(ts), Ok(opened)) = (
+        resolved.timestamp.as_deref(),
+        super::candidates::parse_time(&pos.open_ts),
+    ) {
+        return super::candidates::parse_time(ts).is_ok_and(|closed| closed > opened);
+    }
     let fill_day = if trade.trading_day.is_empty() {
         &trade.trade_date
     } else {
@@ -679,6 +702,8 @@ impl ExecutionEngine {
             None => ExecutionState::default(),
         };
         state.rebuild_indices();
+        state.normalize_legacy_trade_times();
+        state.started_at = chrono::Utc::now().timestamp();
         if lock_error.is_some() {
             state.persistence_error = lock_error;
         }
@@ -952,7 +977,9 @@ impl ExecutionEngine {
             .collect();
 
         for pos in open_positions {
-            if let Some(checkpoint_type) = check_pre_close_checkpoint(&pos.symbol, &now.with_timezone(&chrono::Local), 2) {
+            if let Some(checkpoint_type) =
+                check_pre_close_checkpoint(&pos.symbol, &now.with_timezone(&chrono::Local), 2)
+            {
                 let checkpoint_key = format!("{}:{}:{:?}", pos.id, s.trading_day, checkpoint_type);
                 if !s.recorded_checkpoints.contains(&checkpoint_key) {
                     if let Some(quote) = s
@@ -960,8 +987,10 @@ impl ExecutionEngine {
                         .get(&pos.instrument_id.to_uppercase())
                         .filter(|q| q.valid_at(self.now_utc().timestamp()))
                     {
-                        let snap =
+                        let mut snap =
                             OvernightSnapshot::create(&pos, quote, checkpoint_type, &s.trading_day);
+                        snap.checkpoint_ts = super::candidates::label(self.now_utc().timestamp());
+                        snap.created_at = self.now_utc().timestamp();
                         tracing::info!(
                             "🌙 [影子跟踪] 记录收盘前2分钟快照: 合约={} 方向={} 最新={:.2} 假设平仓价={:.2} 盈亏={:+.2}点({:+.2}R)",
                             snap.instrument_id,
@@ -985,31 +1014,21 @@ impl ExecutionEngine {
     }
 
     fn update_overnight_next_open(&self, s: &mut ExecutionState) {
-        let now = self.now_local();
-        let now_ts = now.timestamp();
+        let now_ts = self.now_utc().timestamp();
         let tracking_path = self.overnight_tracking_path();
-
-        for (pos_id, snap) in s.overnight_snapshots.iter_mut() {
-            if snap.next_open_price.is_none() && now_ts - snap.created_at >= 180 {
-                if let Some(_pos) = s.positions.get(pos_id).filter(|p| !p.is_closed) {
-                    if let Some(quote) = s
-                        .quotes
-                        .get(&snap.instrument_id.to_uppercase())
-                        .filter(|q| q.valid_at(self.now_utc().timestamp()))
-                    {
-                        let open_ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
-                        snap.update_next_open(quote.last, &open_ts);
-                        tracing::info!(
-                            "🌅 [影子跟踪] 记录次时段开盘跳空: 合约={} 开盘价={:.2} 跳空点数={:+.2} 跳空R={:+.2}R 击穿止损={:?}",
-                            snap.instrument_id,
-                            snap.next_open_price.unwrap_or_default(),
-                            snap.gap_pts.unwrap_or_default(),
-                            snap.gap_r.unwrap_or_default(),
-                            snap.gap_penetrated_stop.unwrap_or_default(),
-                        );
-                        if let Some(ref path) = tracking_path {
-                            let _ = append_snapshot_jsonl(path, snap);
-                        }
+        let last_gap = s.quote_gaps.iter().copied().max();
+        for snap in s.overnight_snapshots.values_mut() {
+            let quote = s.quotes.get(&snap.instrument_id.to_uppercase());
+            if snap.observe_next_session(quote, now_ts, s.started_at, last_gap) {
+                tracing::info!(instrument = %snap.instrument_id, status = %snap.open_observation_status,
+                    expected_open = ?snap.expected_next_open_ts, observed_at = ?snap.first_observed_ts,
+                    "隔夜开盘观测状态已更新");
+                if let Some(ref path) = tracking_path {
+                    let _ = append_snapshot_jsonl(path, snap);
+                }
+                if snap.actual_exit_ts.is_some() {
+                    if let Some(path) = self.overnight_attribution_path() {
+                        let _ = append_snapshot_jsonl(&path, snap);
                     }
                 }
             }
@@ -1195,7 +1214,8 @@ impl ExecutionEngine {
         snapshot: &serde_json::Value,
     ) -> Result<()> {
         s.account_snapshot = serde_json::from_value(snapshot["account"].clone()).ok();
-        s.broker_positions = serde_json::from_value(snapshot["broker_positions"].clone()).unwrap_or_default();
+        s.broker_positions =
+            serde_json::from_value(snapshot["broker_positions"].clone()).unwrap_or_default();
         let h = &snapshot["health"];
         s.broker_connected = h["logged_in"].as_bool().unwrap_or(false)
             && h["settlement_confirmed"]
@@ -1309,6 +1329,25 @@ impl ExecutionEngine {
                 "{}:{}:{}:{}:{}",
                 fill_day, trade.exchange_id, trade.instrument_id, trade.direction, trade.trade_id
             );
+            let resolved = super::trade_time::resolve(
+                &trade.instrument_id,
+                &trade.trade_date,
+                &trade.trade_time,
+                &trade.trading_day,
+                s.orders
+                    .get(&trade.order_ref)
+                    .map(|o| o.submitted_at)
+                    .filter(|t| *t > 0),
+            );
+            let natural_ts = resolved.timestamp.clone().unwrap_or_default();
+            if s.trade_times.get(&key) != Some(&resolved) {
+                s.repair_trade_time(&key, &trade, &resolved);
+            }
+            if !s.trade_times.contains_key(&key) && resolved.timestamp.is_none() {
+                tracing::warn!(instrument = %trade.instrument_id, order_ref = %trade.order_ref,
+                    "成交自然时间无法确认，保留原始字段；价格保护继续，禁止猜测日期");
+            }
+            s.trade_times.insert(key.clone(), resolved);
             let Some(order) = s.orders.get(&trade.order_ref).cloned() else {
                 // If it's a close trade from outside (e.g. mobile app) matching an open position:
                 if trade.offset != "open"
@@ -1317,19 +1356,25 @@ impl ExecutionEngine {
                     && trade.price.is_finite()
                     && trade.price > 0.0
                 {
-                    let matching_pos_id = s.positions.iter().find(|(_, p)| {
-                        !p.is_closed
-                            && p.volume > 0
-                            && p.instrument_id.eq_ignore_ascii_case(&trade.instrument_id)
-                            && (if p.direction == "up" { "sell" } else { "buy" }) == trade.direction
-                            && trade_is_after_position_open(&trade, p)
-                    }).map(|(id, _)| id.clone());
+                    let matching_pos_id = s
+                        .positions
+                        .iter()
+                        .find(|(_, p)| {
+                            !p.is_closed
+                                && p.volume > 0
+                                && p.instrument_id.eq_ignore_ascii_case(&trade.instrument_id)
+                                && (if p.direction == "up" { "sell" } else { "buy" })
+                                    == trade.direction
+                                && trade_is_after_position_open(&trade, p)
+                        })
+                        .map(|(id, _)| id.clone());
 
                     if let Some(pos_id) = matching_pos_id {
                         s.seen_trades.insert(key.clone());
                         let pos = s.positions.get_mut(&pos_id).unwrap();
                         let close_vol = trade.volume.min(pos.volume);
-                        let points = (trade.price - pos.fill_price) * if pos.direction == "up" { 1.0 } else { -1.0 };
+                        let points = (trade.price - pos.fill_price)
+                            * if pos.direction == "up" { 1.0 } else { -1.0 };
                         pos.volume -= close_vol;
                         pos.is_closed = pos.volume == 0;
                         pos.exit_price = Some(trade.price);
@@ -1340,7 +1385,14 @@ impl ExecutionEngine {
                         let cond = s.conditions.get(&pos_id).cloned();
                         let rec = TradeRecord {
                             origin: pos.origin.clone(),
-                            signal_evidence: cond.as_ref().and_then(|c| c.frozen.as_ref()).filter(|f| f.definition.strategy_id != N_STRATEGY && !f.plan.evidence.is_null()).map(|f| f.plan.evidence.clone()),
+                            signal_evidence: cond
+                                .as_ref()
+                                .and_then(|c| c.frozen.as_ref())
+                                .filter(|f| {
+                                    f.definition.strategy_id != N_STRATEGY
+                                        && !f.plan.evidence.is_null()
+                                })
+                                .map(|f| f.plan.evidence.clone()),
                             id: key.clone(),
                             condition_order_id: pos.id.clone(),
                             symbol: pos.symbol.clone(),
@@ -1354,7 +1406,7 @@ impl ExecutionEngine {
                             initial_stop_price: pos.initial_stop_price,
                             target_price: pos.target_price,
                             open_ts: pos.open_ts.clone(),
-                            exit_ts: format!("{} {}", trade.trade_date, trade.trade_time),
+                            exit_ts: natural_ts.clone(),
                             exit_reason: "external_manual".into(),
                             realized_pnl_pts: points,
                             realized_pnl_amount: pnl_amount,
@@ -1363,10 +1415,19 @@ impl ExecutionEngine {
                             max_mae_r: pos.max_mae_r,
                             bars_held: pos.bars_held,
                             event_id: cond.as_ref().and_then(|c| c.event_id).or(pos.event_id),
-                            planned_entry_price: cond.as_ref().map(|c| c.entry_price).or(pos.planned_entry_price),
+                            planned_entry_price: cond
+                                .as_ref()
+                                .map(|c| c.entry_price)
+                                .or(pos.planned_entry_price),
                             score: cond.as_ref().map(|c| c.score).or(pos.score),
-                            warning_bar_ts: cond.as_ref().map(|c| c.warning_bar_ts.clone()).or_else(|| pos.warning_bar_ts.clone()),
-                            trigger_ts: cond.as_ref().and_then(|c| c.trigger_ts.clone()).or_else(|| pos.trigger_ts.clone()),
+                            warning_bar_ts: cond
+                                .as_ref()
+                                .map(|c| c.warning_bar_ts.clone())
+                                .or_else(|| pos.warning_bar_ts.clone()),
+                            trigger_ts: cond
+                                .as_ref()
+                                .and_then(|c| c.trigger_ts.clone())
+                                .or_else(|| pos.trigger_ts.clone()),
                             order_insert_ts: pos.order_insert_ts.clone(),
                             user_note: Some("手机/外部平仓".into()),
                             is_manual: true,
@@ -1449,7 +1510,7 @@ impl ExecutionEngine {
                         target_price: cond.target_price,
                         risk: cond.risk,
                         volume: 0,
-                        open_ts: format!("{} {}", trade.trade_date, trade.trade_time),
+                        open_ts: natural_ts.clone(),
                         bars_held: 0,
                         max_mfe_r: 0.0,
                         max_mae_r: 0.0,
@@ -1564,7 +1625,7 @@ impl ExecutionEngine {
                     initial_stop_price: pos.initial_stop_price,
                     target_price: pos.target_price,
                     open_ts: pos.open_ts.clone(),
-                    exit_ts: format!("{} {}", trade.trade_date, trade.trade_time),
+                    exit_ts: natural_ts.clone(),
                     exit_reason: order.reason.clone().unwrap(),
                     realized_pnl_pts: points,
                     realized_pnl_amount: pnl_amount,
@@ -1580,7 +1641,10 @@ impl ExecutionEngine {
                     trigger_ts: cond.trigger_ts.clone().or_else(|| pos.trigger_ts.clone()),
                     order_insert_ts: pos.order_insert_ts.clone(),
                     user_note: s.closes.get(&cond.id).and_then(|t| t.note.clone()),
-                    is_manual: order.reason.as_deref().is_some_and(|r| r.starts_with("manual"))
+                    is_manual: order
+                        .reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("manual"))
                         || s.closes.get(&cond.id).is_some_and(|t| t.note.is_some()),
                 };
                 if r < 0.0 && *fill_day == s.trading_day {
@@ -1597,16 +1661,10 @@ impl ExecutionEngine {
                         rec.realized_pnl_pts,
                         rec.r_multiple,
                     );
-                    tracing::info!(
-                        "📊 [影子跟踪] 隔夜持仓归因完成: 合约={} 真实出场={:.2}({:+.2}R) 假设平仓={:.2}({:+.2}R) => 隔夜超额收益={:+.2}点 ({:+.2}R)",
-                        snap.instrument_id,
-                        snap.actual_exit_price.unwrap_or_default(),
-                        snap.actual_realized_pnl_r.unwrap_or_default(),
-                        snap.hypo_exit_price,
-                        snap.hypo_pnl_r,
-                        snap.overnight_delta_pts.unwrap_or_default(),
-                        snap.overnight_delta_r.unwrap_or_default(),
-                    );
+                    tracing::info!(instrument = %snap.instrument_id, exit_price = ?snap.actual_exit_price,
+                        execution_gap = snap.execution_gap, open_status = %snap.open_observation_status,
+                        hold_vs_checkpoint_pts = ?snap.hold_vs_checkpoint_delta_pts,
+                        overnight_delta_pts = ?snap.overnight_delta_pts, "跨时段持仓结果已更新；缺失开盘或执行中断不计有效隔夜归因");
                     if let Some(path) = self.overnight_attribution_path() {
                         if let Err(e) = append_snapshot_jsonl(&path, snap) {
                             tracing::warn!("写入隔夜归因记录失败: {e}");
@@ -1913,7 +1971,10 @@ impl ExecutionEngine {
                 s.quotes.insert(code.to_uppercase(), q.clone());
             }
         }
-        for quote in quotes.values().filter(|q| q.valid_at(self.now_utc().timestamp())) {
+        for quote in quotes
+            .values()
+            .filter(|q| q.valid_at(self.now_utc().timestamp()))
+        {
             if let Err(e) = self
                 .dispatch_observation(StrategyEvent::Quote(quote.clone()), persist)
                 .await
@@ -1934,7 +1995,10 @@ impl ExecutionEngine {
             *s.quote_sequences.entry(instrument.clone()).or_default() += 1;
         }
         Self::release_symbol_slots(&mut s, &observed);
-        if quotes.values().any(|q| q.valid_at(self.now_utc().timestamp())) {
+        if quotes
+            .values()
+            .any(|q| q.valid_at(self.now_utc().timestamp()))
+        {
             s.market_error = None;
         }
         let state = &mut *s;
@@ -2004,7 +2068,10 @@ impl ExecutionEngine {
                 .quotes
                 .get(&cond.instrument_id.to_uppercase())
                 .cloned()
-                .filter(|q| q.valid_at(self.now_utc().timestamp()) && q.instrument_id.eq_ignore_ascii_case(&cond.instrument_id))
+                .filter(|q| {
+                    q.valid_at(self.now_utc().timestamp())
+                        && q.instrument_id.eq_ignore_ascii_case(&cond.instrument_id)
+                })
             else {
                 continue;
             };

@@ -24,6 +24,31 @@ pub enum CheckpointType {
 /// 跨时段/隔夜影子跟踪快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OvernightSnapshot {
+    #[serde(default)]
+    pub open_observation_version: u32,
+    #[serde(default)]
+    pub open_observation_status: String,
+    #[serde(default)]
+    pub expected_next_open_ts: Option<String>,
+    #[serde(default)]
+    pub first_observed_ts: Option<String>,
+    #[serde(default)]
+    pub first_observed_price: Option<f64>,
+    #[serde(default)]
+    /// Missing opening coverage (including recovery after a process/stream gap).
+    pub execution_gap: bool,
+    /// Preserve pre-fix values for audit; they are not verified opening prices.
+    #[serde(default)]
+    pub legacy_open_observation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub hold_vs_checkpoint_delta_pts: Option<f64>,
+    #[serde(default)]
+    pub hold_vs_checkpoint_delta_r: Option<f64>,
+    /// Opening price versus the T-2m hypothetical exit quote, not a close/open gap.
+    #[serde(default)]
+    pub open_vs_checkpoint_pts: Option<f64>,
+    #[serde(default)]
+    pub open_vs_checkpoint_r: Option<f64>,
     /// 唯一标识: format!("{}:{}:{:?}", position_id, trading_day, checkpoint_type)
     pub id: String,
     pub position_id: String,
@@ -78,6 +103,55 @@ pub struct OvernightSnapshot {
 }
 
 impl OvernightSnapshot {
+    /// Produce a correction record for an old JSONL snapshot. Consumers use the
+    /// latest record per ID; retain the original journal instead of rewriting it.
+    pub fn correct_archive(
+        mut self,
+        canonical_state: &serde_json::Value,
+        now: i64,
+        opens: &[serde_json::Value],
+    ) -> Self {
+        if let Some(opened) = canonical_state["positions"][&self.position_id]["open_ts"]
+            .as_str()
+            .filter(|t| super::candidates::parse_time(t).is_ok())
+        {
+            self.open_ts = opened.into();
+        }
+        if let Some(exit) = self.actual_exit_ts.as_deref() {
+            let clock = super::trade_time::split_timestamp(exit).1;
+            if let Some(record) = canonical_state["history"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|h| {
+                    h["condition_order_id"].as_str() == Some(self.position_id.as_str())
+                        && h["exit_price"].as_f64() == self.actual_exit_price
+                        && h["exit_ts"]
+                            .as_str()
+                            .is_some_and(|t| super::trade_time::split_timestamp(t).1 == clock)
+                })
+            {
+                self.actual_exit_ts = record["exit_ts"].as_str().map(str::to_owned);
+            }
+        }
+        self.observe_next_session(None, now, now, None);
+        for open in opens {
+            if let (Some(instrument), Some(time), Some(price)) = (
+                open["instrument_id"].as_str(),
+                open["open_ts"].as_str(),
+                open["price"].as_f64(),
+            ) {
+                self.backfill_contract_open(instrument, time, price);
+                if let (Some(time), Some(price)) = (
+                    open["previous_close_ts"].as_str(),
+                    open["previous_close"].as_f64(),
+                ) {
+                    self.backfill_contract_close(instrument, time, price);
+                }
+            }
+        }
+        self
+    }
     /// 从当前持仓与盘口行情构建收盘前快照
     pub fn create(
         pos: &ManagedPosition,
@@ -110,6 +184,17 @@ impl OvernightSnapshot {
         let id = format!("{}:{}:{:?}", pos.id, trading_day, checkpoint_type);
 
         Self {
+            open_observation_version: 1,
+            open_observation_status: "pending".into(),
+            expected_next_open_ts: None,
+            first_observed_ts: None,
+            first_observed_price: None,
+            execution_gap: false,
+            legacy_open_observation: None,
+            hold_vs_checkpoint_delta_pts: None,
+            hold_vs_checkpoint_delta_r: None,
+            open_vs_checkpoint_pts: None,
+            open_vs_checkpoint_r: None,
             id,
             position_id: pos.id.clone(),
             symbol: pos.symbol.clone(),
@@ -149,16 +234,17 @@ impl OvernightSnapshot {
 
     /// 回填收盘价（观察最后 2 分钟价格漂移）
     pub fn update_close_price(&mut self, close_price: f64) {
-        if close_price > 0.0 {
+        if close_price.is_finite() && close_price > 0.0 {
             let sign = if self.direction == "up" { 1.0 } else { -1.0 };
             self.session_close_price = Some(close_price);
             self.late_drift_pts = Some((close_price - self.hypo_exit_price) * sign);
+            self.refresh_open_differences();
         }
     }
 
     /// 回填下一时段开盘跳空
     pub fn update_next_open(&mut self, open_price: f64, open_ts: &str) {
-        if open_price > 0.0 && self.next_open_price.is_none() {
+        if open_price.is_finite() && open_price > 0.0 && self.next_open_price.is_none() {
             let sign = if self.direction == "up" { 1.0 } else { -1.0 };
             let gap_pts = (open_price - self.hypo_exit_price) * sign;
             let risk = self.risk.max(1e-6);
@@ -173,9 +259,12 @@ impl OvernightSnapshot {
 
             self.next_open_ts = Some(open_ts.to_string());
             self.next_open_price = Some(open_price);
-            self.gap_pts = Some(gap_pts);
-            self.gap_r = Some(gap_r);
+            self.open_vs_checkpoint_pts = Some(gap_pts);
+            self.open_vs_checkpoint_r = Some(gap_r);
+            self.refresh_open_differences();
             self.gap_penetrated_stop = Some(stop_penetrated);
+            self.open_observation_status = "opening_quote".into();
+            self.refresh_attribution();
         }
     }
 
@@ -197,8 +286,254 @@ impl OvernightSnapshot {
         // 计算差额: 实际持仓收益 - 假设平仓收益
         let delta_pts = realized_pnl_pts - self.hypo_pnl_pts;
         let delta_r = realized_pnl_r - self.hypo_pnl_r;
-        self.overnight_delta_pts = Some(delta_pts);
-        self.overnight_delta_r = Some(delta_r);
+        self.hold_vs_checkpoint_delta_pts = Some(delta_pts);
+        self.hold_vs_checkpoint_delta_r = Some(delta_r);
+        self.refresh_attribution();
+    }
+
+    fn refresh_attribution(&mut self) {
+        let verified = !self.execution_gap
+            && matches!(
+                self.open_observation_status.as_str(),
+                "opening_quote" | "legacy_opening_quote" | "historical_contract_bar"
+            );
+        self.overnight_delta_pts = verified
+            .then_some(self.hold_vs_checkpoint_delta_pts)
+            .flatten();
+        self.overnight_delta_r = verified
+            .then_some(self.hold_vs_checkpoint_delta_r)
+            .flatten();
+    }
+
+    fn refresh_open_differences(&mut self) {
+        let sign = if self.direction == "up" { 1.0 } else { -1.0 };
+        self.open_vs_checkpoint_pts = self
+            .next_open_price
+            .map(|p| (p - self.hypo_exit_price) * sign);
+        self.open_vs_checkpoint_r = self.open_vs_checkpoint_pts.map(|p| p / self.risk.max(1e-6));
+        self.gap_pts = self
+            .next_open_price
+            .zip(self.session_close_price)
+            .map(|(open, close)| (open - close) * sign);
+        self.gap_r = self.gap_pts.map(|p| p / self.risk.max(1e-6));
+    }
+
+    /// Next full evening/day session, not an arbitrary three-minute delay and
+    /// not the intraday tea/lunch break. All dates are Shanghai calendar dates.
+    pub fn expected_next_open(&self) -> Option<i64> {
+        let checkpoint = super::candidates::parse_time(&self.checkpoint_ts).ok()?;
+        let offset = chrono::FixedOffset::east_opt(28800)?;
+        let date = chrono::DateTime::from_timestamp(checkpoint, 0)?
+            .with_timezone(&offset)
+            .date_naive();
+        use chrono::TimeZone;
+        for n in 0..=20 {
+            let day = date.checked_add_days(Days::new(n))?;
+            for hour in [9, 21] {
+                let allowed = if hour == 9 {
+                    is_trading_day(&day)
+                } else {
+                    classify_night_session(&self.instrument_id) != NightSessionType::None
+                        && has_night_session_tonight(&day)
+                };
+                let candidate = offset
+                    .from_local_datetime(&day.and_hms_opt(hour, 0, 0)?)
+                    .single()?
+                    .timestamp();
+                if allowed && candidate > checkpoint {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns whether the snapshot changed. A recovery quote is retained as an
+    /// observation but never backdated or presented as the exchange opening price.
+    pub fn observe_next_session(
+        &mut self,
+        quote: Option<&ExecutionQuote>,
+        now: i64,
+        started_at: i64,
+        last_gap: Option<i64>,
+    ) -> bool {
+        let before = (
+            self.open_observation_version,
+            self.open_observation_status.clone(),
+            self.expected_next_open_ts.clone(),
+            self.first_observed_ts.clone(),
+            self.next_open_ts.clone(),
+            self.overnight_delta_pts,
+            self.overnight_delta_r,
+        );
+        if self.open_observation_version == 0 {
+            let legacy_open = self
+                .next_open_ts
+                .as_deref()
+                .and_then(|ts| super::candidates::parse_time(ts).ok())
+                .zip(
+                    self.next_open_price
+                        .filter(|price| price.is_finite() && *price > 0.0),
+                );
+            let scheduled = self.expected_next_open();
+            self.legacy_open_observation = Some(
+                serde_json::json!({"next_open_ts":self.next_open_ts,"next_open_price":self.next_open_price,
+                "gap_pts":self.gap_pts,"gap_r":self.gap_r,"gap_penetrated_stop":self.gap_penetrated_stop,
+                "overnight_delta_pts":self.overnight_delta_pts,"overnight_delta_r":self.overnight_delta_r}),
+            );
+            self.hold_vs_checkpoint_delta_pts =
+                self.actual_realized_pnl_pts.map(|p| p - self.hypo_pnl_pts);
+            self.hold_vs_checkpoint_delta_r =
+                self.actual_realized_pnl_r.map(|r| r - self.hypo_pnl_r);
+            self.next_open_ts = None;
+            self.next_open_price = None;
+            self.gap_pts = None;
+            self.gap_r = None;
+            self.gap_penetrated_stop = None;
+            self.open_vs_checkpoint_pts = None;
+            self.open_vs_checkpoint_r = None;
+            self.open_observation_status = if legacy_open.is_some() {
+                "legacy_unverified"
+            } else {
+                "pending"
+            }
+            .into();
+            self.open_observation_version = 1;
+            if let (Some((observed, price)), Some(expected)) = (legacy_open, scheduled) {
+                if observed >= expected {
+                    self.first_observed_ts = Some(super::candidates::label(observed));
+                    self.first_observed_price = Some(price);
+                }
+                // Old records at the actual session boundary remain usable;
+                // do not invalidate all history merely because the schema is old.
+                if (expected..=expected + 5).contains(&observed) {
+                    self.update_next_open(price, &super::candidates::label(observed));
+                    self.open_observation_status = "legacy_opening_quote".into();
+                }
+            }
+        }
+        let Some(expected) = self
+            .expected_next_open_ts
+            .as_deref()
+            .and_then(|ts| super::candidates::parse_time(ts).ok())
+            .or_else(|| self.expected_next_open())
+        else {
+            self.refresh_attribution();
+            return before
+                != (
+                    self.open_observation_version,
+                    self.open_observation_status.clone(),
+                    self.expected_next_open_ts.clone(),
+                    self.first_observed_ts.clone(),
+                    self.next_open_ts.clone(),
+                    self.overnight_delta_pts,
+                    self.overnight_delta_r,
+                );
+        };
+        self.expected_next_open_ts = Some(super::candidates::label(expected));
+        if self.next_open_price.is_none()
+            && self
+                .actual_exit_ts
+                .as_deref()
+                .and_then(|ts| super::candidates::parse_time(ts).ok())
+                .is_some_and(|exit| exit < expected)
+        {
+            self.open_observation_status = "closed_before_open".into();
+            self.refresh_attribution();
+            return before
+                != (
+                    self.open_observation_version,
+                    self.open_observation_status.clone(),
+                    self.expected_next_open_ts.clone(),
+                    self.first_observed_ts.clone(),
+                    self.next_open_ts.clone(),
+                    self.overnight_delta_pts,
+                    self.overnight_delta_r,
+                );
+        }
+        if self.next_open_price.is_none() && now >= expected {
+            if let Some(q) = quote.filter(|q| {
+                q.instrument_id.eq_ignore_ascii_case(&self.instrument_id)
+                    && q.valid_at(now)
+                    && q.timestamp >= expected
+            }) {
+                if self.first_observed_ts.is_none() {
+                    self.first_observed_ts = Some(super::candidates::label(q.timestamp));
+                    self.first_observed_price = Some(q.last);
+                }
+                if q.timestamp <= expected + 5
+                    && started_at < expected
+                    && !last_gap.is_some_and(|gap| gap >= expected - 5)
+                    && self.open_observation_status == "pending"
+                {
+                    self.update_next_open(q.last, &super::candidates::label(q.timestamp));
+                } else {
+                    self.open_observation_status = "missed_open".into();
+                    self.execution_gap = true;
+                }
+            } else if now > expected + 5 {
+                self.open_observation_status = "missed_open".into();
+                self.execution_gap = true;
+            }
+        }
+        self.refresh_attribution();
+        before
+            != (
+                self.open_observation_version,
+                self.open_observation_status.clone(),
+                self.expected_next_open_ts.clone(),
+                self.first_observed_ts.clone(),
+                self.next_open_ts.clone(),
+                self.overnight_delta_pts,
+                self.overnight_delta_r,
+            )
+    }
+
+    /// Exact-contract bar evidence repairs statistics, never an imagined fill.
+    pub fn backfill_contract_open(&mut self, instrument: &str, open_ts: &str, price: f64) -> bool {
+        if !instrument.eq_ignore_ascii_case(&self.instrument_id)
+            || !price.is_finite()
+            || price <= 0.0
+            || super::candidates::parse_time(open_ts).ok() != self.expected_next_open()
+        {
+            return false;
+        }
+        if self
+            .actual_exit_ts
+            .as_deref()
+            .and_then(|ts| super::candidates::parse_time(ts).ok())
+            .zip(self.expected_next_open())
+            .is_some_and(|(exit, opening)| exit < opening)
+        {
+            return false;
+        }
+        self.next_open_ts = None;
+        self.next_open_price = None;
+        self.update_next_open(price, open_ts);
+        self.open_observation_status = "historical_contract_bar".into();
+        self.refresh_attribution();
+        true
+    }
+
+    pub fn backfill_contract_close(
+        &mut self,
+        instrument: &str,
+        close_ts: &str,
+        price: f64,
+    ) -> bool {
+        let expected = super::candidates::parse_time(&self.checkpoint_ts)
+            .ok()
+            .map(|t| (t / 60) * 60 + 120);
+        if !instrument.eq_ignore_ascii_case(&self.instrument_id)
+            || expected.is_none()
+            || super::candidates::parse_time(close_ts).ok() != expected
+            || !price.is_finite()
+            || price <= 0.0
+        {
+            return false;
+        }
+        self.update_close_price(price);
+        true
     }
 }
 
@@ -283,6 +618,133 @@ pub fn check_pre_close_checkpoint(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn snapshot_at(checkpoint: &str, kind: &str) -> OvernightSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id":"snap","position_id":"p","symbol":"PP0","instrument_id":"pp2701","direction":"down",
+            "volume":1,"fill_price":9087.,"current_stop_price":9154.755,"risk":67.755,"open_ts":"2026-11-16 21:45:59",
+            "trading_day":"20261117","checkpoint_type":kind,"checkpoint_ts":checkpoint,
+            "checkpoint_last":9083.,"checkpoint_bid":9083.,"checkpoint_ask":9084.,"hypo_exit_price":9084.,"hypo_pnl_pts":3.,"hypo_pnl_r":3./67.755,
+            "session_close_price":null,"late_drift_pts":null,"next_open_ts":null,"next_open_price":null,"gap_pts":null,"gap_r":null,
+            "gap_penetrated_stop":null,"actual_exit_ts":null,"actual_exit_price":null,"actual_exit_reason":null,
+            "actual_realized_pnl_pts":null,"actual_realized_pnl_r":null,"overnight_delta_pts":null,"overnight_delta_r":null,
+            "created_at":super::super::candidates::parse_time(checkpoint).unwrap(),"open_observation_version":1,"open_observation_status":"pending"
+        })).unwrap()
+    }
+    fn quote_at(ts: &str) -> ExecutionQuote {
+        ExecutionQuote {
+            instrument_id: "pp2701".into(),
+            exchange_id: "DCE".into(),
+            underlying_symbol: "PP0".into(),
+            last: 9040.,
+            bid: 9039.,
+            ask: 9040.,
+            tick: 1.,
+            lower: 8500.,
+            upper: 9800.,
+            timestamp: super::super::candidates::parse_time(ts).unwrap(),
+        }
+    }
+    #[test]
+    fn late_restart_is_an_observation_not_an_opening_or_uninterrupted_attribution() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        let q = quote_at("2026-11-17 10:59:49");
+        let started = super::super::candidates::parse_time("2026-11-17 10:59:41").unwrap();
+        assert!(snap.observe_next_session(Some(&q), q.timestamp + 1, started, None));
+        assert_eq!(
+            snap.expected_next_open_ts.as_deref(),
+            Some("2026-11-17 09:00:00")
+        );
+        assert_eq!(snap.open_observation_status, "missed_open");
+        assert_eq!(snap.first_observed_price, Some(9040.));
+        assert_eq!(snap.next_open_price, None);
+        assert_eq!(snap.gap_pts, None);
+        snap.finalize_actual_exit(9040., "2026-11-17 10:59:51", "target_s1", 47., 47. / 67.755);
+        assert_eq!(snap.hold_vs_checkpoint_delta_pts, Some(44.));
+        assert_eq!(snap.overnight_delta_pts, None);
+        assert!(!snap.backfill_contract_open("pp2705", "2026-11-17 09:00:00", 9000.));
+        assert!(!snap.backfill_contract_open("pp2701", "2026-11-17 10:30:00", 9000.));
+        assert!(snap.backfill_contract_open("pp2701", "2026-11-17 09:00:00", 9000.));
+        assert_eq!(snap.next_open_price, Some(9000.));
+        assert_eq!(snap.open_vs_checkpoint_pts, Some(84.));
+        assert_eq!(snap.gap_pts, None); // exact preceding session close is still unknown
+        assert!(snap.backfill_contract_close("pp2701", "2026-11-16 23:00:00", 9076.));
+        assert_eq!(snap.gap_pts, Some(76.));
+        assert_eq!(snap.overnight_delta_pts, None); // historical bars do not undo the execution interruption
+    }
+    #[test]
+    fn no_three_minute_fake_open_and_normal_open_is_captured() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        let q = quote_at("2026-11-16 23:01:00");
+        snap.observe_next_session(Some(&q), q.timestamp, q.timestamp - 3600, None);
+        assert!(snap.next_open_price.is_none());
+        let q = quote_at("2026-11-17 09:00:01");
+        snap.observe_next_session(Some(&q), q.timestamp, q.timestamp - 3600, None);
+        assert_eq!(snap.open_observation_status, "opening_quote");
+        assert_eq!(snap.next_open_price, Some(9040.));
+        assert!(!snap.execution_gap);
+    }
+    #[test]
+    fn legacy_fake_open_is_preserved_for_audit_but_removed_from_statistics() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        snap.open_observation_version = 0;
+        snap.next_open_ts = Some("2026-11-17 10:59:50".into());
+        snap.next_open_price = Some(9040.);
+        snap.gap_pts = Some(44.);
+        snap.overnight_delta_pts = Some(44.);
+        let now = super::super::candidates::parse_time("2026-11-17 15:00:00").unwrap();
+        snap.observe_next_session(None, now, now, None);
+        assert_eq!(
+            snap.legacy_open_observation.as_ref().unwrap()["next_open_price"],
+            9040.
+        );
+        assert_eq!(snap.next_open_price, None);
+        assert_eq!(snap.overnight_delta_pts, None);
+        assert!(!snap.observe_next_session(None, now, now, None));
+        let weekend = snapshot_at("2026-11-20 22:58:00", "night_close");
+        assert_eq!(
+            weekend
+                .expected_next_open()
+                .map(super::super::candidates::label)
+                .as_deref(),
+            Some("2026-11-23 09:00:00")
+        );
+    }
+
+    #[test]
+    fn legacy_opening_boundary_quote_is_preserved_and_not_mislabeled_as_an_outage() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        snap.open_observation_version = 0;
+        snap.next_open_ts = Some("2026-11-17 09:00:01".into());
+        snap.next_open_price = Some(9000.);
+        let now = super::super::candidates::parse_time("2026-11-17 15:00:00").unwrap();
+        snap.observe_next_session(None, now, now, None);
+        assert_eq!(snap.open_observation_status, "legacy_opening_quote");
+        assert_eq!(snap.next_open_price, Some(9000.));
+        assert!(!snap.execution_gap);
+    }
+
+    #[test]
+    fn migrating_pending_snapshot_can_still_observe_the_upcoming_session() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        snap.open_observation_version = 0;
+        let q = quote_at("2026-11-17 09:00:01");
+        snap.observe_next_session(None, q.timestamp - 60, q.timestamp - 120, None);
+        assert_eq!(snap.open_observation_status, "pending");
+        snap.observe_next_session(Some(&q), q.timestamp, q.timestamp - 120, None);
+        assert_eq!(snap.open_observation_status, "opening_quote");
+    }
+
+    #[test]
+    fn position_closed_before_next_session_is_not_an_overnight_holding() {
+        let mut snap = snapshot_at("2026-11-16 22:58:00", "night_close");
+        snap.actual_exit_ts = Some("2026-11-16 22:59:11".into());
+        let q = quote_at("2026-11-17 09:00:01");
+        snap.observe_next_session(Some(&q), q.timestamp, q.timestamp - 120, None);
+        assert_eq!(snap.open_observation_status, "closed_before_open");
+        assert!(!snap.execution_gap);
+        assert!(!snap.backfill_contract_open("pp2701", "2026-11-17 09:00:00", 9000.));
+    }
 
     fn local_dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
         Local.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
@@ -404,6 +866,7 @@ mod tests {
         assert_eq!(snap.hypo_pnl_r, 14.0 / 20.0); // 0.7R
 
         // 模拟下一时段跳空高开到 3530
+        snap.update_close_price(3514.0);
         snap.update_next_open(3530.0, "2026-09-24 21:00:00");
         assert_eq!(snap.next_open_price, Some(3530.0));
         assert_eq!(snap.gap_pts, Some(16.0)); // 3530 - 3514 = +16 点跳空获利

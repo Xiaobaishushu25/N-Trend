@@ -2,6 +2,7 @@ use super::*;
 impl ExecutionEngine {
     /// Set before use; never changes the clock of other/live executors.
     pub fn with_clock(mut self, clock: Arc<dyn ExecutionClock>) -> Self {
+        self.state.get_mut().started_at = clock.now_utc().timestamp();
         self.clock = clock;
         self
     }

@@ -6,6 +6,10 @@ const ts = require('typescript')
 
 // Exercise the actual store with mocked native IPC; no Tauri or trading connection.
 function setup(listenOverride) {
+  const timeModule = { exports: {}, Date, Intl, require: () => ({ calcTradeRecordPnlAmount: () => 0 }) }
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/utils/tradeTime.ts', 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText, timeModule)
   const poolModule = { exports: {} }
   vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/utils/conditionPool.ts', 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -33,6 +37,7 @@ function setup(listenOverride) {
       if (name === '../utils/notify') return { notify: { success() {}, error() {} } }
       if (name === '../utils/tradingHours') return { isMarketTradingWindow: () => true }
       if (name === '../utils/conditionPool') return poolModule.exports
+      if (name === '../utils/tradeTime') return timeModule.exports
       if (name === '../utils/multipliers') return {
         DEFAULT_MULTIPLIERS: { PB: 5 }, getSymbolPrefix: (s) => s.match(/^[a-z]+/i)?.[0].toUpperCase(),
       }
@@ -381,6 +386,20 @@ function candidateAudit(reason = 'risk_ticks_below_min') {
     accepted: { reason: 'accepted_warning', values: {} },
   } }, p3: { decisions: { other: { reason: 'score_below_min', values: {} } } } } }
 }
+
+test('history calendar and sorting use backend natural close dates without anchoring to entry', () => {
+  const { store } = setup()
+  store.history = [
+    { id: 'night', open_ts: '2026-11-16 21:45:59', exit_ts: '2026-11-16 22:59:11', realized_pnl_amount: 235 },
+    { id: 'next-night', open_ts: '2026-11-16 21:45:59', exit_ts: '2026-11-17 21:05:00', realized_pnl_amount: -50 },
+  ]
+  assert.equal(store.dailyPnlMap['2026-11-16'].totalPnl, 235)
+  assert.equal(store.dailyPnlMap['2026-11-17'].totalPnl, -50)
+  assert.equal(store.filteredHistory[0].id, 'next-night')
+  store.filterDate = '2026-11-16'
+  assert.equal(store.filteredHistory.length, 1)
+  assert.equal(store.filteredHistory[0].id, 'night')
+})
 
 test('P2 pool lists filtered signals with concrete reasons without creating executable conditions', () => {
   const { store } = setup()

@@ -56,16 +56,52 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
 
 // Audit rows never enter the execution engine or its confirm/cancel actions.
 export function filteredConditionRows(diagnostics: StrategyDiagnostics | null, revision?: string): ConditionPoolRow[] {
-  if (!revision) return []
-  const decisions = diagnostics?.states?.[revision]?.decisions || {}
-  return Object.entries(decisions).flatMap(([key, decision]) => {
-    if (decision.reason === 'accepted_warning') return []
+  const states = diagnostics?.states
+  if (!states || typeof states !== 'object') return []
+
+  // Collect decisions across all revisions for this instance.
+  // Prioritize decisions from the current active revision, then by latest timestamp.
+  const decisionMap = new Map<string, {
+    revision: string
+    decision: { reason: string; values: Record<string, any> }
+    isCurrent: boolean
+    timestamp: number
+  }>()
+
+  for (const [rev, state] of Object.entries(states)) {
+    const isCurrent = Boolean(revision && rev === revision)
+    const decisions = state?.decisions || {}
+
+    for (const [key, decision] of Object.entries(decisions)) {
+      if (!decision || typeof decision !== 'object') continue
+      const values = decision.values || {}
+      const s = values.snapshot || {}
+      const warning = values.warning || values
+      const ts = number(s.available_at ?? warning.created_at_epoch) || 0
+
+      const existing = decisionMap.get(key)
+      if (!existing) {
+        decisionMap.set(key, { revision: rev, decision, isCurrent, timestamp: ts })
+      } else if (isCurrent && !existing.isCurrent) {
+        decisionMap.set(key, { revision: rev, decision, isCurrent, timestamp: ts })
+      } else if (!existing.isCurrent && ts >= existing.timestamp) {
+        decisionMap.set(key, { revision: rev, decision, isCurrent, timestamp: ts })
+      }
+    }
+  }
+
+  const rows: ConditionPoolRow[] = []
+  for (const [key, entry] of decisionMap.entries()) {
+    const { revision: decRevision, decision } = entry
+    if (decision.reason === 'accepted_warning') continue
+
     const values = decision.values || {}
     const s = values.snapshot || {}
     const warning = values.warning || values
     const [symbol, direction, , , , warningTs] = key.split('|')
-    return [{
-      id: `filtered:${revision}:${key}`,
+
+    rows.push({
+      id: `filtered:${decRevision}:${key}`,
       signal_key: key,
       event_id: typeof warning.id === 'number' ? warning.id : null,
       symbol: s.symbol || warning.symbol || symbol || '',
@@ -84,6 +120,8 @@ export function filteredConditionRows(diagnostics: StrategyDiagnostics | null, r
       state: 'filtered' as const,
       display_only: true,
       note: rejectionNote(decision.reason, values),
-    }]
-  })
+    })
+  }
+
+  return rows
 }

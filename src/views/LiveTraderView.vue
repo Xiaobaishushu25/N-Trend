@@ -48,6 +48,7 @@ import {
 } from '@vicons/tabler'
 import { useLiveTraderStore } from '../stores/liveTrader'
 import StrategyComparisonPanel from '../components/StrategyComparisonPanel.vue'
+import TradePnlCalendarPopover from '../components/TradePnlCalendarPopover.vue'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import {
@@ -58,11 +59,59 @@ import {
   formatRMultiple,
   getSymbolMultiplier,
 } from '../utils/multipliers'
+import { getTradeRecordPnl, formatTradeDateTime } from '../utils/tradeTime'
 import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from '../types'
 
 const trader = useLiveTraderStore()
 const selectedInstance = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
 const executionLabel = computed(() => selectedInstance.value?.account.kind === 'paper' ? '模拟' : '实盘')
+
+// 平仓流水分页与统计状态
+const historyPage = ref(1)
+const historyPageSize = ref(10)
+
+function onFilterDateChange() {
+  historyPage.value = 1
+}
+
+function clearHistoryFilters() {
+  trader.filterDate = ''
+  trader.filterReason = ''
+  historyPage.value = 1
+}
+
+function getExitReasonLabel(reason: string): string {
+  const item = exitReasonOptions.find((o) => o.value === reason)
+  return item?.label || reason
+}
+
+watch(() => trader.filterReason, () => {
+  historyPage.value = 1
+})
+
+watch(() => trader.filterDate, () => {
+  historyPage.value = 1
+})
+
+watch(() => trader.selectedInstanceId, () => {
+  historyPage.value = 1
+})
+
+watch([() => trader.filteredHistory.length, historyPageSize], () => {
+  const maxPage = Math.max(1, Math.ceil(trader.filteredHistory.length / historyPageSize.value))
+  if (historyPage.value > maxPage) {
+    historyPage.value = maxPage
+  }
+})
+
+const paginatedHistory = computed(() => {
+  const start = (historyPage.value - 1) * historyPageSize.value
+  return trader.filteredHistory.slice(start, start + historyPageSize.value)
+})
+
+const filteredTotalPnl = computed(() => {
+  return trader.filteredHistory.reduce((sum, rec) => sum + getTradeRecordPnl(rec), 0)
+})
 watch(() => trader.activeTab, (tab) => {
   if (tab === 'orders') void trader.loadExecutionOrders(1)
 })
@@ -596,13 +645,6 @@ function exitReasonBadge(reason: string) {
 
 
 
-function getTradeRecordPnl(rec: LiveTradeRecord): number {
-  if (rec.realized_pnl_amount != null && !Number.isNaN(rec.realized_pnl_amount) && rec.realized_pnl_amount !== 0) {
-    return rec.realized_pnl_amount
-  }
-  return calcTradeRecordPnlAmount(rec.instrument_id || rec.symbol, rec.realized_pnl_pts, rec.volume)
-}
-
 const router = useRouter()
 const route = useRoute()
 
@@ -988,6 +1030,12 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
       <!-- 仅在流水页显示的过滤器 -->
       <div v-if="trader.activeTab === 'history'" class="history-filter">
+        <TradePnlCalendarPopover
+          v-model="trader.filterDate"
+          :daily-pnl-map="trader.dailyPnlMap"
+          :latest-exit-ts="trader.history[0] ? formatTradeDateTime(trader.history[0].exit_ts) : undefined"
+          @change="onFilterDateChange"
+        />
         <n-select
           v-model:value="trader.filterReason"
           :options="exitReasonOptions"
@@ -1094,7 +1142,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <div class="plan-divider" />
                 <div class="plan-item">
                   <span class="plan-lbl">柜台成交时间</span>
-                  <span class="plan-val font-num highlight-fill">{{ pos.managed.open_ts }}</span>
+                  <span class="plan-val font-num highlight-fill">{{ formatTradeDateTime(pos.managed.open_ts) }}</span>
                 </div>
                 <div class="plan-divider" />
                 <div class="plan-item">
@@ -1457,12 +1505,23 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
       <!-- C. 真实成交平仓流水标签页 -->
       <section v-else-if="trader.activeTab === 'history'" class="tab-pane">
         <div v-if="!trader.filteredHistory.length" class="empty-holder">
-          <n-empty description="暂无符合筛选条件的真实平仓成交记录" />
+          <n-empty :description="trader.filterDate ? `${trader.filterDate} 暂无平仓流水记录` : '暂无符合筛选条件的真实平仓成交记录'">
+            <template v-if="trader.filterDate || trader.filterReason" #extra>
+              <n-button
+                size="small"
+                secondary
+                type="primary"
+                @click="clearHistoryFilters"
+              >
+                清除筛选条件
+              </n-button>
+            </template>
+          </n-empty>
         </div>
 
         <div v-else class="history-list">
           <div
-            v-for="rec in trader.filteredHistory"
+            v-for="rec in paginatedHistory"
             :key="rec.id"
             class="history-card"
             :class="rec.r_multiple > 0 ? 'hist-win' : rec.r_multiple < 0 ? 'hist-loss' : 'hist-breakeven'"
@@ -1546,7 +1605,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <div class="timeline-node node-open">
                   <div class="node-title">
                     <span class="node-badge">2. 突破开仓</span>
-                    <span class="node-ts font-num">{{ rec.open_ts }}</span>
+                    <span class="node-ts font-num">{{ formatTradeDateTime(rec.open_ts) }}</span>
                   </div>
                   <div class="node-content">
                     <div v-if="trader.resolveOrderInsertTs(rec)" class="node-field">
@@ -1555,7 +1614,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                     </div>
                     <div class="node-field">
                       <span class="field-lbl">实际成交时间</span>
-                      <span class="field-val font-num">{{ rec.open_ts }}</span>
+                      <span class="field-val font-num">{{ formatTradeDateTime(rec.open_ts) }}</span>
                     </div>
                     <div class="node-field">
                       <span class="field-lbl">实际成交均价</span>
@@ -1585,7 +1644,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <div class="timeline-node node-exit">
                   <div class="node-title">
                     <span class="node-badge">3. 动态平仓</span>
-                    <span class="node-ts font-num">{{ rec.exit_ts }}</span>
+                    <span class="node-ts font-num">{{ formatTradeDateTime(rec.exit_ts) }}</span>
                   </div>
                   <div class="node-content">
                     <div class="node-field">
@@ -1638,6 +1697,35 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <span class="note-txt">{{ rec.user_note }}</span>
               </div>
             </div>
+          </div>
+
+          <!-- 平仓流水分页栏 -->
+          <div class="history-pagination-bar">
+            <div class="history-pagination-info">
+              共 <span class="font-num font-bold">{{ trader.filteredHistory.length }}</span> 笔平仓
+              <template v-if="trader.filterDate">
+                · 日期: <span class="font-num font-bold filter-tag-text">{{ trader.filterDate }}</span>
+              </template>
+              <template v-if="trader.filterReason">
+                · 原因: <span class="font-bold filter-tag-text">{{ getExitReasonLabel(trader.filterReason) }}</span>
+              </template>
+              · 筛选盈亏:
+              <span
+                class="font-num font-bold"
+                :class="filteredTotalPnl >= 0 ? 'is-up' : 'is-down'"
+              >
+                {{ formatPnlAmount(filteredTotalPnl, { decimals: 2 }) }}
+              </span>
+            </div>
+
+            <n-pagination
+              v-model:page="historyPage"
+              v-model:page-size="historyPageSize"
+              :item-count="trader.filteredHistory.length"
+              show-size-picker
+              :page-sizes="[10, 20, 50, 100]"
+              size="medium"
+            />
           </div>
         </div>
       </section>
@@ -2607,6 +2695,41 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   align-items: center;
   justify-content: flex-end;
   flex-shrink: 0;
+}
+
+/* 平仓过滤器 */
+.history-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 平仓流水分页栏 */
+.history-pagination-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: #ffffff;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.history-pagination-info {
+  font-size: 13px;
+  color: #475569;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filter-tag-text {
+  color: #2563eb;
 }
 
 /* 流水卡片 */

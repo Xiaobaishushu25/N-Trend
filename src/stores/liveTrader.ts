@@ -5,6 +5,7 @@ import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { isMarketTradingWindow } from '../utils/tradingHours'
 import { filteredConditionRows } from '../utils/conditionPool'
+import { parseTradeTimestamp, extractTradeDate, getTradeRecordPnl } from '../utils/tradeTime'
 import type {
   CtpHealth,
   LiveTraderSnapshot,
@@ -58,6 +59,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     refreshing: false,
     activeTab: 'positions' as LiveTraderTab,
     filterReason: '' as string,
+    filterDate: '' as string,
     errorMsg: null as string | null,
     pollTimer: null as ReturnType<typeof setInterval> | null,
     realtimeListeners: [] as UnlistenFn[],
@@ -190,7 +192,18 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       })
     },
     filteredConditions(): ConditionPoolRow[] {
-      return filteredConditionRows(this.strategyDiagnostics, this.currentStrategy?.revision)
+      const rows = filteredConditionRows(this.strategyDiagnostics, this.currentStrategy?.revision)
+      const activeKeys = new Set(this.activeConditions.map((c) => c.signal_key).filter(Boolean))
+      const activeEvents = new Set(
+        this.activeConditions
+          .map((c) => c.event_id)
+          .filter((id): id is number => typeof id === 'number'),
+      )
+      return rows.filter((r) => {
+        if (r.signal_key && activeKeys.has(r.signal_key)) return false
+        if (r.event_id && activeEvents.has(r.event_id)) return false
+        return true
+      })
     },
     conditionPool(): ConditionPoolRow[] {
       const time = (row: ConditionPoolRow) => row.trigger_ts || row.warning_bar_ts || row.created_at || 0
@@ -205,14 +218,35 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       return this.conditions.filter((c) => c.state === 'waiting_confirm' || c.state === 'WaitingConfirm')
     },
     filteredHistory(): LiveTradeRecord[] {
-      const list = this.filterReason
-        ? this.history.filter((h) => h.exit_reason === this.filterReason)
-        : [...this.history]
-      return list.sort((a, b) => {
-        const timeDiff = (b.exit_ts || '').localeCompare(a.exit_ts || '')
-        if (timeDiff !== 0) return timeDiff
+      let list = this.history
+      if (this.filterReason) {
+        list = list.filter((h) => h.exit_reason === this.filterReason)
+      }
+      if (this.filterDate) {
+        list = list.filter((h) => extractTradeDate(h.exit_ts) === this.filterDate)
+      }
+      return [...list].sort((a, b) => {
+        const diff = parseTradeTimestamp(b.exit_ts) -
+                     parseTradeTimestamp(a.exit_ts)
+        if (diff !== 0) return diff
         return (b.id || '').localeCompare(a.id || '')
       })
+    },
+    dailyPnlMap(): Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number }> {
+      const map: Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number }> = {}
+      for (const rec of this.history) {
+        const d = extractTradeDate(rec.exit_ts)
+        if (!d) continue
+        const pnl = getTradeRecordPnl(rec)
+        if (!map[d]) {
+          map[d] = { totalPnl: 0, count: 0, winCount: 0, lossCount: 0 }
+        }
+        map[d].totalPnl += pnl
+        map[d].count += 1
+        if (pnl > 0) map[d].winCount += 1
+        else if (pnl < 0) map[d].lossCount += 1
+      }
+      return map
     },
     totalRealizedPnlAmount(): number {
       if (this.statistics?.total_pnl != null && this.statistics.total_pnl !== 0) {
@@ -360,6 +394,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.currentStrategy = null; this.strategyDiagnostics = null
       this.executionOrdersSeq++; this.executionOrders = []; this.executionOrdersTotal = 0
       this.executionOrdersPage = 1; this.executionOrdersError = ''; this.executionOrdersLoading = false
+      this.filterDate = ''; this.filterReason = ''
       this.errorMsg = null; this.bridgeOnline = false; this.lastPushAt = 0
       this.instanceStreamId = ''; this.instanceRevision = 0
       await this.refresh()

@@ -518,6 +518,60 @@ fn sizing_rechecks_actual_notional_multiplier_and_remaining_budget() {
 }
 
 #[test]
+fn single_entry_lot_has_a_one_r_floor_without_changing_native_s1_or_two_lot_exits() {
+    for short in [false, true] {
+        let sign = if short { -1. } else { 1. };
+        for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+            let mut params = parameters();
+            params.exit_mode = mode;
+            let params = serde_json::to_value(params).unwrap();
+            for native_r in [0.4, 1., 1.5] {
+                for volume in [1, 2] {
+                    let mut p = position(short);
+                    p.volume = volume;
+                    let mut plan = make_plan(signal());
+                    let native_target = p.fill_price + sign * native_r * p.risk;
+                    plan.target_price = Some(native_target);
+                    p.target_price = P3Exit.target_on_fill(&p, &plan).unwrap();
+                    assert_eq!(plan.target_price, Some(native_target));
+                    if volume == 1 && native_r < 1. {
+                        assert!(P3Exit
+                            .on_quote(&p, &quote(native_target), &params)
+                            .close
+                            .is_none());
+                        assert!(P3Exit
+                            .on_quote(&p, &quote(p.fill_price + sign * (p.risk - 1.)), &params)
+                            .close
+                            .is_none());
+                        let exit =
+                            P3Exit.on_quote(&p, &quote(p.fill_price + sign * p.risk), &params);
+                        assert_eq!(exit.close.unwrap(), ("target_1r".into(), None));
+                    } else {
+                        assert_eq!(p.target_price, native_target);
+                        let reason = if volume == 2 && mode == ExitMode::HybridS1 {
+                            (FIRST_S1.into(), Some(1))
+                        } else if volume == 1 && native_r == 1. {
+                            ("target_1r".into(), None)
+                        } else {
+                            ("target_s1".into(), None)
+                        };
+                        assert_eq!(
+                            P3Exit
+                                .on_quote(&p, &quote(native_target), &params)
+                                .close
+                                .unwrap(),
+                            reason
+                        );
+                    }
+                    let stop_exit = P3Exit.on_quote(&p, &quote(p.initial_stop_price), &params);
+                    assert_eq!(stop_exit.close.unwrap(), ("stop".into(), None));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fixed_and_hybrid_exits_mirror_and_protection_requires_first_fill() {
     for short in [false, true] {
         let mut p = position(short);

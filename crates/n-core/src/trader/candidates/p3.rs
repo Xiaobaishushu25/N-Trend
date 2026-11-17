@@ -334,8 +334,18 @@ fn mode(parameters: &Value) -> Result<ExitMode> {
 }
 struct P3Exit;
 impl ExitPolicy for P3Exit {
-    fn target_on_fill(&self, _: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
-        plan.target_price
+    fn target_on_fill(&self, p: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
+        let native_target = plan.target_price?;
+        let sign = if p.direction == "up" { 1. } else { -1. };
+        // Keep the frozen S1 for admission/audit. Only a single actual entry lot
+        // gets the 1R floor; a later second fill restores the native S1 target.
+        Some(
+            if p.volume == 1 && !p.lot1_closed && (native_target - p.fill_price) * sign <= p.risk {
+                p.fill_price + sign * p.risk
+            } else {
+                native_target
+            },
+        )
     }
     fn on_quote(&self, p: &ManagedPosition, q: &ExecutionQuote, parameters: &Value) -> ExitUpdate {
         let sign = if p.direction == "up" { 1. } else { -1. };
@@ -369,7 +379,17 @@ impl ExitPolicy for P3Exit {
             if mode == ExitMode::HybridS1 && p.volume == 2 {
                 Some((FIRST_S1.into(), Some(1)))
             } else {
-                Some(("target_s1".into(), None))
+                let one_r_target = p.volume == 1
+                    && ((p.target_price - p.fill_price) * sign - p.risk).abs() <= 1e-6;
+                Some((
+                    if one_r_target {
+                        "target_1r"
+                    } else {
+                        "target_s1"
+                    }
+                    .into(),
+                    None,
+                ))
             }
         } else {
             None

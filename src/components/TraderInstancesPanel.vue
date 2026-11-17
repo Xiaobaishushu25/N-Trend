@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { api } from '../services/api'
 import { useLiveTraderStore } from '../stores/liveTrader'
@@ -72,6 +72,7 @@ watch(dialog, value => {
 watch(() => trader.selectedInstanceId, () => {
   error.value = ''
   notice.value = ''
+  scrollToActiveTab()
 })
 const broker = ref('')
 const user = ref('')
@@ -362,6 +363,82 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
     ],
   })
 }
+
+// 标签栏横向滚动、滚轮平滑响应与激活实例视口自适应
+const tabsTrackRef = ref<HTMLElement | null>(null)
+const canScrollLeft = ref(false)
+const canScrollRight = ref(false)
+const hasOverflow = ref(false)
+
+function updateScrollState() {
+  const el = tabsTrackRef.value
+  if (!el) return
+  const { scrollLeft, scrollWidth, clientWidth } = el
+  hasOverflow.value = scrollWidth > clientWidth + 2
+  canScrollLeft.value = scrollLeft > 2
+  canScrollRight.value = scrollLeft + clientWidth < scrollWidth - 2
+}
+
+function scrollTabs(direction: 'left' | 'right') {
+  const el = tabsTrackRef.value
+  if (!el) return
+  const offset = direction === 'left' ? -220 : 220
+  el.scrollBy({ left: offset, behavior: 'smooth' })
+}
+
+function scrollToActiveTab() {
+  nextTick(() => {
+    const el = tabsTrackRef.value?.querySelector('.instance-tab-item.is-active') as HTMLElement | null
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
+    }
+  })
+}
+
+function handleTabsWheel(e: WheelEvent) {
+  const el = tabsTrackRef.value
+  if (!el) return
+  // 当存在横向溢出且常规垂直滚轮滚动时，直接转化为横向滑动，手感更顺畅
+  if (e.deltaY !== 0 && el.scrollWidth > el.clientWidth) {
+    el.scrollLeft += e.deltaY
+    e.preventDefault()
+    updateScrollState()
+  }
+}
+
+let tabsResizeObserver: ResizeObserver | null = null
+
+onMounted(() => {
+  const el = tabsTrackRef.value
+  if (el) {
+    el.addEventListener('wheel', handleTabsWheel, { passive: false })
+    tabsResizeObserver = new ResizeObserver(() => {
+      updateScrollState()
+    })
+    tabsResizeObserver.observe(el)
+    updateScrollState()
+    scrollToActiveTab()
+  }
+})
+
+onBeforeUnmount(() => {
+  const el = tabsTrackRef.value
+  if (el) {
+    el.removeEventListener('wheel', handleTabsWheel)
+  }
+  tabsResizeObserver?.disconnect()
+  tabsResizeObserver = null
+})
+
+watch(
+  () => trader.instanceCatalog?.instances,
+  () => {
+    nextTick(() => {
+      updateScrollState()
+    })
+  },
+  { deep: true },
+)
 </script>
 
 <template>
@@ -385,83 +462,115 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
     <template v-if="trader.instancesSupported">
       <!-- 1. 实盘多 Tab 标签栏 -->
       <div class="instance-tabs-bar">
-        <div class="instance-tabs-track">
+        <div class="instance-tabs-wrapper" :class="{ 'has-overflow-left': canScrollLeft, 'has-overflow-right': canScrollRight }">
           <div
-            v-for="row in trader.instanceCatalog?.instances"
-            :key="row.instance.id"
-            class="instance-tab-item"
-            :class="{
-              'is-active': row.instance.id === trader.selectedInstanceId,
-              'is-paused': row.paused,
-              'is-error': !!row.error,
-            }"
-            :title="`右键查看更多操作\n实例：${row.instance.name}\n账号：${row.account.user_id || row.account.name || '本地模拟'}`"
-            @click="trader.selectInstance(row.instance.id)"
-            @contextmenu="onTabContextMenu(row, $event)"
+            ref="tabsTrackRef"
+            class="instance-tabs-track"
+            @scroll="updateScrollState"
           >
-            <!-- 运行状态指示点 -->
-            <span
-              class="tab-dot"
+            <div
+              v-for="row in trader.instanceCatalog?.instances"
+              :key="row.instance.id"
+              class="instance-tab-item"
               :class="{
-                'is-running': !row.paused && !row.error,
+                'is-active': row.instance.id === trader.selectedInstanceId,
                 'is-paused': row.paused,
                 'is-error': !!row.error,
               }"
-            />
-
-            <!-- 实例名称与账号 -->
-            <span class="tab-name" :title="row.instance.name">{{ row.instance.name }}</span>
-            <span class="tab-user font-num">
-              ({{ row.account.user_id || row.account.name || '模拟' }})
-            </span>
-
-            <!-- 账户类型小徽标 -->
-            <span class="tab-kind" :class="row.account.kind">
-              {{ row.account.kind === 'paper' ? '模拟' : row.account.broker_id === '9999' ? 'SimNow' : 'CTP' }}
-            </span>
-
-            <!-- 在手持仓数量角标 -->
-            <span
-              v-if="getActivePositionCount(row.instance.id) > 0"
-              class="tab-pos-badge font-num"
-              title="当前活跃在手持仓"
+              :title="`右键查看更多操作\n实例：${row.instance.name}\n账号：${row.account.user_id || row.account.name || '本地模拟'}`"
+              @click="trader.selectInstance(row.instance.id)"
+              @contextmenu="onTabContextMenu(row, $event)"
             >
-              {{ getActivePositionCount(row.instance.id) }}仓
-            </span>
+              <!-- 运行状态指示点 -->
+              <span
+                class="tab-dot"
+                :class="{
+                  'is-running': !row.paused && !row.error,
+                  'is-paused': row.paused,
+                  'is-error': !!row.error,
+                }"
+              />
 
-            <!-- 独立新窗口弹出盯盘小按钮 -->
+              <!-- 实例名称与账号 -->
+              <span class="tab-name" :title="row.instance.name">{{ row.instance.name }}</span>
+              <span class="tab-user font-num">
+                ({{ row.account.user_id || row.account.name || '模拟' }})
+              </span>
+
+              <!-- 账户类型小徽标 -->
+              <span class="tab-kind" :class="row.account.kind">
+                {{ row.account.kind === 'paper' ? '模拟' : row.account.broker_id === '9999' ? 'SimNow' : 'CTP' }}
+              </span>
+
+              <!-- 在手持仓数量角标 -->
+              <span
+                v-if="getActivePositionCount(row.instance.id) > 0"
+                class="tab-pos-badge font-num"
+                title="当前活跃在手持仓"
+              >
+                {{ getActivePositionCount(row.instance.id) }}仓
+              </span>
+
+              <!-- 独立新窗口弹出盯盘小按钮 -->
+              <button
+                type="button"
+                class="tab-popout-btn"
+                title="在独立新窗口打开此账户盯盘"
+                @click.stop="popOutWindow(row.instance.id, row.instance.name)"
+              >
+                <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" />
+                  <path d="M11 13l9 -9" />
+                  <path d="M15 4h5v5" />
+                </svg>
+              </button>
+            </div>
+
+            <!-- + 新建实盘快捷按钮 -->
             <button
               type="button"
-              class="tab-popout-btn"
-              title="在独立新窗口打开此账户盯盘"
-              @click.stop="popOutWindow(row.instance.id, row.instance.name)"
+              class="tab-new-btn"
+              title="新建策略实例与交易账户"
+              :disabled="busy"
+              @click="openCreate(false)"
             >
               <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 6h-6a2 2 0 0 0 -2 2v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-6" />
-                <path d="M11 13l9 -9" />
-                <path d="M15 4h5v5" />
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
               </svg>
+              <span>新建实例</span>
             </button>
           </div>
-
-          <!-- + 新建实盘快捷按钮 -->
-          <button
-            type="button"
-            class="tab-new-btn"
-            title="新建策略实例与交易账户"
-            :disabled="busy"
-            @click="openCreate(false)"
-          >
-            <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-            <span>新建实例</span>
-          </button>
         </div>
 
         <!-- 标签栏右侧全局操作 -->
         <div class="tabs-bar-right">
+          <!-- 左右快速滚动翻页小按钮（仅在产生横向溢出时优雅呈现） -->
+          <div v-if="hasOverflow" class="tab-scroll-nav-group">
+            <button
+              type="button"
+              class="btn-tab-scroll"
+              :disabled="!canScrollLeft"
+              title="向左滚动实例标签"
+              @click="scrollTabs('left')"
+            >
+              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="btn-tab-scroll"
+              :disabled="!canScrollRight"
+              title="向右滚动实例标签"
+              @click="scrollTabs('right')"
+            >
+              <svg class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </button>
+          </div>
+
           <button
             type="button"
             class="btn btn-sm btn-action"
@@ -916,9 +1025,10 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
                 <div class="form-row">
                   <label class="form-label">P3 出场方式</label>
                   <select v-model="p3ExitMode" class="form-select">
-                    <option value="fixed_s1">模式 A：全部在 S1 退出</option>
-                    <option value="hybrid_s1">模式 B：首手 S1，余仓保本追踪</option>
+                    <option value="fixed_s1">模式 A：全部在目标位退出</option>
+                    <option value="hybrid_s1">模式 B：双手首手 S1，余仓保本追踪</option>
                   </select>
+                  <span class="field-hint">仅开成一手时，S1 空间不足或等于 1R，止盈目标外推到 1R；双手仍按原生 S1 执行。</span>
                 </div>
                 <div class="form-row">
                   <label class="form-label">单笔计划风险预算（元）</label>
@@ -941,7 +1051,7 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
               </div>
 
               <p v-if="isB5" class="field-hint">六品种 B5：最近合格 A、不合并摆点、目标成本比≤10%、A 净实体同向；小时不顺向同组同向最多两单，同 A 两次原止损后停试。固定一手，独立生成新预警。</p>
-              <p v-else-if="isP3" class="field-hint">P3 按含成本风险预算开 0～2 手，入场委托三秒未全成撤销剩余量。单手均在 S1 退出；分批模式确认首手成交后才保护余仓。修改配置只影响之后的新信号。</p>
+              <p v-else-if="isP3" class="field-hint">P3 按含成本风险预算开 0～2 手，入场委托三秒未全成撤销剩余量。单手按 S1 与 1R 中更远的目标退出；双手分批模式确认首手成交后才保护余仓。S1 净盈亏比准入仍按原生结构计算。修改配置只影响之后的新信号。</p>
               <p v-else-if="isCandidate" class="field-hint">候选策略固定一手、原结构止损和 S1 目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
             </template>
           </div>
@@ -995,10 +1105,50 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding-bottom: 6px;
+  gap: 8px;
+  padding-bottom: 4px;
   margin-bottom: 6px;
   border-bottom: 1px solid #e2e8f0;
+}
+
+.instance-tabs-wrapper {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* 左右两端平滑渐变遮罩指示器 */
+.instance-tabs-wrapper::before,
+.instance-tabs-wrapper::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 6px;
+  width: 24px;
+  pointer-events: none;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.instance-tabs-wrapper::before {
+  left: 0;
+  background: linear-gradient(to right, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0));
+}
+
+.instance-tabs-wrapper::after {
+  right: 0;
+  background: linear-gradient(to left, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0));
+}
+
+.instance-tabs-wrapper.has-overflow-left::before {
+  opacity: 1;
+}
+
+.instance-tabs-wrapper.has-overflow-right::after {
+  opacity: 1;
 }
 
 .instance-tabs-track {
@@ -1006,13 +1156,36 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
   align-items: center;
   gap: 6px;
   overflow-x: auto;
-  scrollbar-width: none;
   flex: 1;
   min-width: 0;
-  padding: 1px 0;
+  padding: 2px 2px 5px 2px;
+  /* 现代优雅精简横向滚动条 */
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+  scroll-behavior: smooth;
 }
+
 .instance-tabs-track::-webkit-scrollbar {
-  display: none;
+  height: 5px;
+}
+
+.instance-tabs-track::-webkit-scrollbar-track {
+  background: transparent;
+  border-radius: 999px;
+}
+
+.instance-tabs-track::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 999px;
+  transition: background 0.15s ease;
+}
+
+.instance-tabs-track::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.instance-tabs-track::-webkit-scrollbar-thumb:active {
+  background: #64748b;
 }
 
 .instance-tab-item {
@@ -1156,7 +1329,50 @@ function onTabContextMenu(row: TraderInstanceRow, e: MouseEvent) {
 .tabs-bar-right {
   display: flex;
   align-items: center;
+  gap: 6px;
   flex-shrink: 0;
+}
+
+/* 左右翻页微调按钮组 */
+.tab-scroll-nav-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 1px;
+}
+
+.btn-tab-scroll {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: #64748b;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  padding: 0;
+}
+
+.btn-tab-scroll:hover:not(:disabled) {
+  background: #ffffff;
+  color: #2563eb;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.btn-tab-scroll:disabled {
+  color: #cbd5e1;
+  cursor: not-allowed;
+}
+
+.btn-tab-scroll .icon-svg {
+  width: 12px;
+  height: 12px;
 }
 
 /* 当前选中实盘工具栏 (Active Toolbar) */

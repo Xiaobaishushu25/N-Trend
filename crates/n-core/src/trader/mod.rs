@@ -10,6 +10,7 @@ pub mod overnight;
 pub mod policy;
 pub mod strategy;
 mod trailing;
+pub mod trade_time;
 
 pub use client::{
     CtpMarketBatch, CtpMarketEvent, CtpMarketEventStream, CtpMarketHealth, CtpTraderClient,

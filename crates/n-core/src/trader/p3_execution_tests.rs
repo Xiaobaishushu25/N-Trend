@@ -132,6 +132,162 @@ async fn opened(counter: &Counter, e: &ExecutionEngine, short: bool) -> (String,
 }
 
 #[tokio::test]
+async fn p3_single_lot_skips_narrow_s1_and_exits_at_actual_one_r_after_restart() {
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        for short in [false, true] {
+            let counter = Counter::new();
+            let mut e = engine(&counter, mode).await;
+            let mut params = parameters(mode);
+            params.min_net_rr = 0.1;
+            e.configure_strategy(p3::definition(params), e.get_config().await)
+                .await
+                .unwrap();
+            send(&e, signal("one-lot-narrow-s1", short, 60., 24.)).await;
+            let sign = if short { -1. } else { 1. };
+            let native_target = 1000. + sign * 24.;
+            let conditions = e.list_conditions().await;
+            assert_eq!(conditions[0].volume, 1);
+            assert_eq!(conditions[0].target_price, native_target);
+            assert_eq!(
+                conditions[0].frozen.as_ref().unwrap().plan.target_price,
+                Some(native_target)
+            );
+            quote(&e, 1000.).await;
+            age(&e).await;
+            quote(&e, 1000. + sign).await;
+            let open = counter.inserts()[0].clone();
+            assert_eq!(open["volume"], 1);
+            // Slippage changes both the entry cost and the initial risk.
+            let cost = 1000. + sign * 2.;
+            let fill = trade(&open, "one-lot-entry", 1, cost);
+            let orders = vec![order(&open, "all_traded", 1)];
+            ready(&e, orders.clone(), vec![fill.clone()]).await;
+            let position = e.list_positions().await.remove(0);
+            let id = position.id.clone();
+            let one_r = cost + sign * 62.;
+            assert_eq!(position.risk, 62.);
+            assert_eq!(position.target_price, one_r);
+            age(&e).await;
+            quote(&e, native_target).await;
+            assert_eq!(
+                counter.inserts().len(),
+                1,
+                "native S1 must not close the single lot"
+            );
+
+            drop(e);
+            e = counter.engine(ExecutionMode::FullAuto, 2);
+            e.registry = registry();
+            ready(&e, orders, vec![fill.clone()]).await;
+            assert_eq!(e.list_positions().await[0].target_price, one_r);
+            age(&e).await;
+            quote(&e, one_r - sign).await;
+            assert_eq!(counter.inserts().len(), 1);
+            quote(&e, one_r).await;
+            let close = counter.inserts()[1].clone();
+            assert_eq!(close["volume"], 1);
+            assert_eq!(e.state.lock().await.closes[&id].reason, "target_1r");
+            ready(
+                &e,
+                vec![
+                    order(&open, "all_traded", 1),
+                    order(&close, "all_traded", 1),
+                ],
+                vec![fill, trade(&close, "one-r-exit", 1, one_r)],
+            )
+            .await;
+            let history = e.get_trade_history().await;
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].exit_reason, "target_1r");
+            assert_eq!(history[0].r_multiple, 1.);
+            assert_eq!(history[0].target_price, one_r);
+        }
+    }
+}
+
+#[tokio::test]
+async fn p3_second_entry_fill_restores_narrow_s1_and_hybrid_remainder_keeps_tracking() {
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        for short in [false, true] {
+            let counter = Counter::new();
+            let e = engine(&counter, mode).await;
+            let mut params = parameters(mode);
+            params.min_net_rr = 0.1;
+            e.configure_strategy(p3::definition(params), e.get_config().await)
+                .await
+                .unwrap();
+            send(&e, signal("two-lot-narrow-s1", short, 40., 20.)).await;
+            let sign = if short { -1. } else { 1. };
+            let native_target = 1000. + sign * 20.;
+            quote(&e, 1000.).await;
+            age(&e).await;
+            quote(&e, 1000. + sign).await;
+            let open = counter.inserts()[0].clone();
+            assert_eq!(open["volume"], 2);
+            let first = trade(&open, "first-entry", 1, 1000. + sign * 2.);
+            ready(
+                &e,
+                vec![order(&open, "part_traded", 1)],
+                vec![first.clone()],
+            )
+            .await;
+            assert_eq!(e.list_positions().await[0].target_price, 1000. + sign * 44.);
+            age(&e).await;
+            quote(&e, native_target).await;
+            assert_eq!(counter.inserts().len(), 1);
+            let second = trade(&open, "second-entry", 1, 1000. + sign * 4.);
+            ready(
+                &e,
+                vec![order(&open, "all_traded", 2)],
+                vec![first.clone(), second.clone()],
+            )
+            .await;
+            assert_eq!(e.list_positions().await[0].volume, 2);
+            assert_eq!(e.list_positions().await[0].target_price, native_target);
+            quote(&e, native_target).await;
+            let close = counter.inserts()[1].clone();
+            let exit_volume = if mode == ExitMode::HybridS1 { 1 } else { 2 };
+            assert_eq!(close["volume"], exit_volume);
+            ready(
+                &e,
+                vec![
+                    order(&open, "all_traded", 2),
+                    order(&close, "all_traded", exit_volume),
+                ],
+                vec![
+                    first,
+                    second,
+                    trade(&close, "s1-exit", exit_volume, native_target),
+                ],
+            )
+            .await;
+            let remaining = e.list_positions().await.remove(0);
+            if mode == ExitMode::HybridS1 {
+                assert_eq!(remaining.volume, 1);
+                assert!(remaining.lot1_closed);
+                assert_eq!(remaining.target_price, native_target);
+                assert_eq!(remaining.current_stop_price, 1000. + sign * 3.);
+                age(&e).await;
+                quote(&e, native_target + sign).await;
+                assert_eq!(
+                    counter.inserts().len(),
+                    2,
+                    "remaining lot must keep its hybrid exit"
+                );
+                quote(&e, remaining.current_stop_price).await;
+                assert_eq!(
+                    e.state.lock().await.closes[&remaining.id].reason,
+                    "breakeven"
+                );
+            } else {
+                assert!(remaining.is_closed);
+                assert_eq!(e.get_trade_history().await[0].exit_reason, "target_s1");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn p3_fixed_mode_uses_money_not_score_for_zero_one_two_lots() {
     for (risk, qty) in [(20., 2), (60., 1), (120., 0)] {
         let counter = Counter::new();
