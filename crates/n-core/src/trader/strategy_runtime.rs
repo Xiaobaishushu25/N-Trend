@@ -637,6 +637,7 @@ impl ExecutionEngine {
                     c.note = "手动平仓已完成".into();
                 }
             }
+            s.p3_runner.record_intervention(&rec);
             s.history.push(rec);
             s.rebuild_indices();
             s.error = None;
@@ -720,6 +721,7 @@ impl ExecutionEngine {
                         c.note = "按柜台真实持仓核销完成".into();
                     }
                 }
+                s.p3_runner.record_intervention(&rec);
                 s.history.push(rec);
                 reconciled += 1;
             }
@@ -756,6 +758,7 @@ impl ExecutionEngine {
                         cond.note = format!("按柜台真实持仓恢复托管 ({}手)", diff);
                     }
                     s.history.retain(|t| !(t.condition_order_id == revive_id && t.exit_reason == "external_manual"));
+                    s.p3_runner.remove_reconciled_interventions(&revive_id);
                     reconciled += 1;
                     tracing::info!(instrument_id = %bp.instrument_id, revive_id = %revive_id, "按柜台真实持仓恢复被误平的持仓");
                 }

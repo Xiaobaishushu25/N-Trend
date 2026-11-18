@@ -7,6 +7,7 @@ pub mod execution;
 pub mod instances;
 pub mod model;
 pub mod overnight;
+mod p3_comparison;
 pub mod policy;
 pub mod strategy;
 mod trailing;

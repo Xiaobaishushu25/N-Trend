@@ -153,6 +153,9 @@ pub enum Action {
         config: ExecutionConfig,
         strategy: StrategyDefinition,
     },
+    P3RunnerComparison {
+        enabled: bool,
+    },
     Confirm {
         condition_id: String,
     },
@@ -202,6 +205,10 @@ pub async fn action(
                 }
                 Action::Configure { config } => r.engine.update_config(config).await?,
                 Action::Strategy { strategy } => r.engine.set_definition(strategy).await?,
+                Action::P3RunnerComparison { enabled } => {
+                    r.engine.set_p3_runner_comparison(enabled).await?;
+                    *r.published.write().await = Value::Null;
+                }
                 Action::Confirm { condition_id } => {
                     anyhow::ensure!(
                         r.engine.confirm_open(&condition_id).await?,

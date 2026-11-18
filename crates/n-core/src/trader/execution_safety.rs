@@ -156,11 +156,13 @@ impl ExecutionEngine {
             );
             match limit {
                 Ok(limit) if limit < filled => {
+                    s.p3_runner.invalidate_entry(&id, "risk_budget");
                     Self::latch_exit(s, &id, "risk_budget", price, true);
                     changed = true;
                 }
                 Err(error) => {
                     // A policy failure must never roll back an observed real fill.
+                    s.p3_runner.invalidate_entry(&id, "risk_budget");
                     s.paused = true;
                     s.strategy_error = Some(error.to_string());
                     Self::latch_exit(s, &id, "risk_budget", price, true);

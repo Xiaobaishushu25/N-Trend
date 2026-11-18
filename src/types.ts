@@ -1070,6 +1070,7 @@ export interface ExecutionOrdersPage {
 }
 
 export interface StrategyComparisonSummary {
+  p3_runner?: P3RunnerComparison
   archive_error?: string | null
   active_run: string | null
   archived_runs: number
@@ -1094,6 +1095,46 @@ export interface StrategyComparisonSummary {
       variants: Array<{ id: string; status: string; reason: string }>
     }>
   }>
+}
+
+export interface P3RunnerComparison {
+  version: string
+  eligible: boolean
+  enabled: boolean
+  started_at: number | null
+  paired: number
+  active: number
+  unavailable: number
+  no_runner: number
+  delta_yuan: number
+  interrupted_pairs: number
+  interrupted_delta_yuan: number
+  recent: Array<{
+    id: string
+    event_id: number | null
+    instrument: string
+    started_at: number
+    first_fill: P3ShadowExit | null
+    common_exit: P3ShadowExit | null
+    active: boolean
+    invalid: string | null
+    atr: [number, number] | null
+    base: P3ShadowExit | null
+    dynamic: P3ShadowExit | null
+    delta_yuan: number | null
+    interventions: Array<{ at: string; price: number; lots: number; reason: string; broker_fill: boolean }>
+  }>
+}
+
+export interface P3ShadowExit {
+  at: number
+  price: number
+  reason: string
+  net_yuan: number
+  realized_r: number
+  giveback_r: number
+  atr_at: number | null
+  atr: number | null
 }
 
 export interface LiveConditionOrder {

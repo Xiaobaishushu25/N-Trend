@@ -37,7 +37,7 @@ pub fn parse_time(s: &str) -> Result<i64> {
         .context("invalid Shanghai timestamp")?
         .timestamp())
 }
-fn local(ts: i64) -> chrono::DateTime<FixedOffset> {
+pub(super) fn local(ts: i64) -> chrono::DateTime<FixedOffset> {
     chrono::DateTime::from_timestamp(ts, 0)
         .unwrap()
         .with_timezone(&shanghai())
@@ -86,7 +86,7 @@ impl Fees {
                     .max(self.close_yesterday.as_ref().unwrap().charge(close, mult))
         })
     }
-    fn valid(&self) -> bool {
+    pub(in crate::trader) fn valid(&self) -> bool {
         [&self.open, &self.close_today, &self.close_yesterday]
             .iter()
             .all(|r| r.as_ref().is_none_or(FeeRule::valid))

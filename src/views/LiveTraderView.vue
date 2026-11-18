@@ -48,6 +48,7 @@ import {
 } from '@vicons/tabler'
 import { useLiveTraderStore } from '../stores/liveTrader'
 import StrategyComparisonPanel from '../components/StrategyComparisonPanel.vue'
+import P3RunnerComparisonPanel from '../components/P3RunnerComparisonPanel.vue'
 import TradePnlCalendarPopover from '../components/TradePnlCalendarPopover.vue'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
@@ -1052,7 +1053,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
     <!-- 5. 视图主体内容区（浅色背景卡片流） -->
     <main class="trader-content-box">
       <section v-if="trader.activeTab === 'comparison'" class="tab-pane">
-        <StrategyComparisonPanel :comparison="trader.strategyComparison" :live-config="trader.config"
+        <P3RunnerComparisonPanel v-if="trader.currentStrategy?.strategy_id === 'n_p3_v1'"
+          :comparison="trader.strategyComparison?.p3_runner" :updating="trader.updatingP3Runner"
+          @change="trader.setP3RunnerComparison" />
+        <StrategyComparisonPanel v-else :comparison="trader.strategyComparison" :live-config="trader.config"
           :updating="trader.updatingEntryFilter" @change-filter="trader.setEntryRiskFilter" />
       </section>
 

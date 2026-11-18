@@ -170,7 +170,71 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
+    spawn_p3_runner_history(ctx.clone());
     crate::instance_runtime::spawn(ctx);
+}
+
+fn spawn_p3_runner_history(ctx: Arc<ServerContext>) {
+    use std::collections::{BTreeMap, HashMap};
+
+    use n_core::fetch::kline::Kline;
+    use n_core::session::SessionCalendar;
+    use n_core::trader::ExecutionEngine;
+
+    tokio::spawn(async move {
+        let mut history = HashMap::<String, (i64, Vec<Kline>)>::new();
+        let mut retry_at = HashMap::<String, Instant>::new();
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let shanghai = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        loop {
+            interval.tick().await;
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let engines = if let Some(manager) = ctx.instances.get() {
+                manager.all().await.into_iter().map(|r| r.engine.clone()).collect::<Vec<_>>()
+            } else {
+                vec![ctx.execution_engine.clone()]
+            };
+            let mut subscriptions = BTreeMap::<String, Vec<Arc<ExecutionEngine>>>::new();
+            for engine in engines {
+                for symbol in engine.p3_runner_history_symbols().await {
+                    subscriptions.entry(symbol).or_default().push(engine.clone());
+                }
+            }
+            history.retain(|symbol, _| subscriptions.contains_key(symbol));
+            retry_at.retain(|symbol, _| subscriptions.contains_key(symbol));
+
+            let now = chrono::Utc::now().timestamp();
+            let bucket = now - now.rem_euclid(900);
+            let before_close = chrono::DateTime::from_timestamp(bucket - 1, 0).unwrap()
+                .with_timezone(&shanghai).naive_local();
+            for (symbol, watchers) in subscriptions {
+                let instrument = symbol.split_once('.').map_or(symbol.as_str(), |(_, code)| code);
+                let due = history.get(&symbol).is_none_or(|(loaded, _)| {
+                    *loaded < bucket && SessionCalendar::get(instrument).is_in_trading_time_naive(&before_close)
+                });
+                if due && retry_at.get(&symbol).is_none_or(|time| Instant::now() >= *time) {
+                    retry_at.insert(symbol.clone(), Instant::now() + Duration::from_secs(10));
+                    let fetch = ctx.services.data_source.fetch_tq_minute(&symbol, "5m", 240);
+                    if let Ok(Ok(raw)) = tokio::time::timeout(Duration::from_secs(5), fetch).await {
+                        let latest = raw.last().and_then(|bar| n_core::trader::candidates::parse_time(&bar.datetime).ok());
+                        if let Some(latest) = latest {
+                            history.insert(symbol.clone(), (latest, raw));
+                        }
+                    }
+                }
+                if let Some((_, bars)) = history.get(&symbol) {
+                    for engine in watchers {
+                        if let Err(error) = engine.on_p3_runner_history(&symbol, bars).await {
+                            tracing::warn!(%symbol, %error, "P3余仓影子收盘行情保存失败");
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn spawn_review_worker(ctx: Arc<ServerContext>) {

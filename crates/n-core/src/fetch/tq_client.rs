@@ -353,6 +353,9 @@ fn finalized_klines(
     count: usize,
     now: chrono::NaiveDateTime,
 ) -> Vec<Kline> {
+    let calendar_symbol = symbol
+        .rsplit_once('.')
+        .map_or(symbol, |(_, contract)| contract);
     // A session's last 5m bar remains the SDK tail throughout the break.
     // Event delivery is the fast path; a fresh TQ fetch after the close settlement
     // period must also recover that bar after a missed event or a restart.
@@ -363,10 +366,14 @@ fn finalized_klines(
                 .ok()
                 .is_some_and(|end| {
                     crate::session::SessionCalendar::is_session_close(
-                        symbol,
+                        calendar_symbol,
                         end.hour(),
                         end.minute(),
-                    ) && crate::finality::FinalityJudger::default().is_bar_final(symbol, &end, &now)
+                    ) && crate::finality::FinalityJudger::default().is_bar_final(
+                        calendar_symbol,
+                        &end,
+                        &now,
+                    )
                 })
         });
     if !settled_session_tail {
@@ -644,6 +651,17 @@ mod tests {
                 1
             );
         }
+        assert_eq!(
+            finalized_klines(
+                "SHFE.ss2701",
+                "5m",
+                vec![bar("2026-10-31 01:00:00", 100.0)],
+                10,
+                dt("2026-10-31 01:02:00"),
+            )
+            .len(),
+            1
+        );
         // A stalled ordinary intraday tail is never finalized just because it is old.
         assert!(finalized_klines(
             "RB0",

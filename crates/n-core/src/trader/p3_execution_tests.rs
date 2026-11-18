@@ -508,6 +508,131 @@ async fn p3_hybrid_confirms_first_s1_then_tracks_and_restores_frozen_mode() {
 }
 
 #[tokio::test]
+async fn p3_runner_comparison_continues_both_lanes_after_external_close() {
+    use crate::fetch::kline::Kline;
+
+    let counter = Counter::new();
+    let mut e = engine(&counter, ExitMode::HybridS1).await;
+    let at = candidates::parse_time("2026-10-16 10:00:00").unwrap();
+    let clock = Arc::new(ReplayClock::new(at));
+    e.clock = clock.clone();
+    e.state.lock().await.entry_funds = None;
+    let book = |price, timestamp| {
+        [(
+            "PB2611".into(),
+            ExecutionQuote {
+                instrument_id: "pb2611".into(),
+                exchange_id: "SHFE".into(),
+                underlying_symbol: "PB0".into(),
+                last: price,
+                bid: price - 1.,
+                ask: price + 1.,
+                tick: 1.,
+                lower: 500.,
+                upper: 2000.,
+                timestamp,
+            },
+        )]
+        .into_iter()
+        .collect()
+    };
+    let snapshot = |orders, fills| {
+        json!({"bridge_online": true,
+        "health":{"ready":true,"logged_in":true,"sync_pending":false,"trading_day":"20261016","broker_id":"fake","user_id":"offline-test"},
+        "account":{"available":50000.,"curr_margin":0.,"updated_at":at},
+        "orders":orders,"trades":fills,"broker_positions":[]})
+    };
+    e.reconcile(&snapshot(Vec::<Value>::new(), Vec::<Value>::new()))
+        .await
+        .unwrap();
+    e.set_p3_runner_comparison(true).await.unwrap();
+    let mut payload = signal("shadow-manual", true, 20., 30.);
+    let warning = candidates::label(at - 900);
+    payload["created_at_epoch"] = json!(at);
+    payload["warning_ts"] = json!(warning);
+    payload["warning_context"]["as_of"] = json!(warning);
+    send(&e, payload).await;
+    e.on_quotes(book(1000., at)).await.unwrap();
+    e.drive().await.unwrap();
+    clock.advance(at + 1).unwrap();
+    age(&e).await;
+    e.on_quotes(book(999., at + 1)).await.unwrap();
+    e.drive().await.unwrap();
+    assert_eq!(
+        counter.inserts().len(),
+        1,
+        "{:?}",
+        e.list_conditions().await
+    );
+    let open = counter.inserts()[0].clone();
+    assert_eq!(open["volume"], 2);
+    let entry = trade(&open, "runner-entry", 2, 998.);
+    let orders = vec![order(&open, "all_traded", 2)];
+    e.reconcile(&snapshot(orders.clone(), vec![entry.clone()]))
+        .await
+        .unwrap();
+    assert_eq!(e.comparison_summary().await["p3_runner"]["active"], 1);
+    let mut disconnected = e.state.lock().await.p3_runner.clone();
+    disconnected.invalidate_active("quote_gap");
+    assert_eq!(disconnected.summary(true)["unavailable"], 1);
+    assert_eq!(disconnected.summary(true)["paired"], 0);
+
+    let bars: Vec<Kline> = (0..46)
+        .rev()
+        .map(|n| Kline {
+            datetime: candidates::label(at - 300 * n),
+            open: 1000.,
+            high: 1020.,
+            low: 980.,
+            close: 1000.,
+            volume: 1.,
+            hold: 1.,
+        })
+        .collect();
+    e.on_p3_runner_history("SHFE.pb2611", &bars).await.unwrap();
+    clock.advance(at + 2).unwrap();
+    let mut external = trade(
+        &json!({"order_ref":"external", "direction":"buy", "offset":"close"}),
+        "phone-exit",
+        2,
+        988.,
+    );
+    external["trade_time"] = json!("10:00:02");
+    let interrupted = snapshot(orders, vec![entry, external]);
+    e.reconcile(&interrupted).await.unwrap();
+    e.reconcile(&interrupted).await.unwrap();
+    assert!(e.list_positions().await[0].is_closed);
+    assert_eq!(e.get_trade_history().await.len(), 1);
+    assert!(e.requested_contracts().await.iter().any(|s| s == "pb2611"));
+
+    // Disabling registration retains the already armed observation, through both exits.
+    e.set_p3_runner_comparison(false).await.unwrap();
+    for (seconds, price) in [(3, 970.), (4, 930.), (5, 950.), (6, 850.), (7, 931.)] {
+        clock.advance(at + seconds).unwrap();
+        e.on_quotes(book(price, at + seconds)).await.unwrap();
+        e.drive().await.unwrap();
+    }
+    let comparison = &e.comparison_summary().await["p3_runner"];
+    assert_eq!(comparison["paired"], 0);
+    assert_eq!(comparison["interrupted_pairs"], 1);
+    assert_eq!(comparison["interrupted_delta_yuan"], 95.);
+    let row = &comparison["recent"][0];
+    assert_eq!(row["interventions"].as_array().unwrap().len(), 1);
+    assert_eq!(row["interventions"][0]["price"], 988.);
+    assert_eq!(row["first_fill"]["price"], 971.);
+    assert_eq!(row["base"]["price"], 951.);
+    assert_eq!(row["dynamic"]["price"], 932.);
+    assert!(e.p3_runner_history_symbols().await.is_empty());
+    assert_eq!(counter.inserts().len(), 1);
+    drop(e);
+    let restarted = counter.engine(ExecutionMode::FullAuto, 2);
+    assert_eq!(
+        restarted.comparison_summary().await["p3_runner"],
+        *comparison
+    );
+}
+
+#[tokio::test]
 async fn p3_one_actual_lot_at_s1_never_waits_for_a_second_lot() {
     let counter = Counter::new();
     let e = engine(&counter, ExitMode::HybridS1).await;

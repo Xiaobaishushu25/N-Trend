@@ -52,6 +52,7 @@ impl ExecutionState {
         // Missing historical quotes cannot be recreated by a timestamp repair.
         // Do not manufacture a zero-MFE no-follow failure during recovery.
         if date_changed && !position.is_closed {
+            self.p3_runner.invalidate_entry(id, "entry_time_corrected");
             for state in self.strategy_states.values_mut().filter(|v| v.is_object()) {
                 if state.get("holding").is_some() {
                     state["holding"][id] =
@@ -99,6 +100,7 @@ impl ExecutionState {
                 }
             }
         } else {
+            self.p3_runner.repair_intervention_time(key, timestamp);
             for history in self.history.iter_mut().filter(|h| h.id == key) {
                 history.exit_ts = timestamp.into();
                 if let Some(snapshot) = self

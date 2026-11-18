@@ -52,6 +52,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     executionOrdersSeq: 0,
     statistics: null as LiveTradeStatistics | null,
     strategyComparison: null as LiveTraderSnapshot['strategy_comparison'],
+    updatingP3Runner: false,
     currentStrategy: null as StrategyDefinition | null,
     strategyDiagnostics: null as StrategyDiagnostics | null,
     updatingEntryFilter: false,
@@ -632,6 +633,18 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         notify.error(`修改入场过滤失败: ${e}`)
       } finally {
         this.updatingEntryFilter = false
+      }
+    },
+
+    async setP3RunnerComparison(enabled: boolean) {
+      if (this.updatingP3Runner) return
+      this.updatingP3Runner = true
+      try {
+        await this.instanceAction({ action: 'p3_runner_comparison', enabled })
+      } catch (error) {
+        notify.error(`保存 P3 余仓对比失败: ${error}`)
+      } finally {
+        this.updatingP3Runner = false
       }
     },
 

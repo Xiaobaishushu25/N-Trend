@@ -15,8 +15,8 @@ pub const VERSION: &str = "2";
 const PREVIOUS_VERSION: &str = "1";
 pub const EXIT: &str = "p3_exit_v1";
 pub const SIZING: &str = "risk_budget_v1";
-const FIRST_S1: &str = "p3_first_s1";
-const FIRST_1R: &str = "p3_first_1r";
+pub(in crate::trader) const FIRST_S1: &str = "p3_first_s1";
+pub(in crate::trader) const FIRST_1R: &str = "p3_first_1r";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +183,39 @@ impl P3Strategy {
             None
         }
     }
+
+    pub(in crate::trader) fn comparison_flat_boundary(
+        &self,
+        instrument: &str,
+        opened: i64,
+    ) -> Option<(i64, &'static str)> {
+        let params = &self.base.parameters;
+        let holiday = params.calendar.windows.iter().filter_map(|window| {
+            (opened < parse_time(&window.reopen).ok()?)
+                .then(|| {
+                    parse_time(&window.flat_at)
+                        .ok()
+                        .map(|at| (at, "pre_holiday"))
+                })
+                .flatten()
+        });
+        let weekend = params
+            .weekend_windows(instrument, opened + 7 * 86400)
+            .into_iter()
+            .filter(move |&(_, reopen)| opened < reopen)
+            .map(|(cutoff, _)| (cutoff, "pre_weekend"));
+        let expiry = self
+            .expiry_cutoff(instrument, opened)
+            .map(|at| (at, "contract_expiry"));
+        let calendar_end = parse_time(&params.calendar.coverage_end)
+            .ok()
+            .map(|at| (at - 600, "pre_calendar_end"));
+        holiday
+            .chain(weekend)
+            .chain(calendar_end)
+            .chain(expiry)
+            .min_by_key(|&(at, _)| at)
+    }
     fn contract_block(&self, instrument: &str, now: i64) -> Option<&'static str> {
         let Some((year, month)) = Self::contract_month(instrument, now) else {
             return Some("invalid_actual_contract");
@@ -334,6 +367,28 @@ fn mode(parameters: &Value) -> Result<ExitMode> {
     Ok(serde_json::from_value(parameters["exit_mode"].clone())?)
 }
 struct P3Exit;
+
+pub(in crate::trader) fn runner_stop(
+    p: &ManagedPosition,
+    q: &ExecutionQuote,
+    peak: f64,
+    current_stop: f64,
+    distance_r: f64,
+) -> f64 {
+    let sign = if p.direction == "up" { 1. } else { -1. };
+    let candidate = if peak >= super::super::trailing::TRAIL_ACTIVATE_R {
+        p.fill_price + sign * (peak - distance_r) * p.risk
+    } else {
+        p.fill_price
+    };
+    let candidate = align_protection(candidate, sign, q.tick);
+    if sign > 0. {
+        current_stop.max(candidate)
+    } else {
+        current_stop.min(candidate)
+    }
+}
+
 impl ExitPolicy for P3Exit {
     fn target_on_fill(&self, p: &ManagedPosition, plan: &EntryPlan) -> Option<f64> {
         let native_target = plan.target_price?;
@@ -361,17 +416,7 @@ impl ExitPolicy for P3Exit {
         let mut stop = p.current_stop_price;
         if mode == ExitMode::HybridS1 && p.lot1_closed {
             let peak = p.max_mfe_r.max((q.last - p.fill_price) * sign / p.risk);
-            let candidate = if peak >= 1.6 {
-                p.fill_price + sign * (peak - 0.8) * p.risk
-            } else {
-                p.fill_price
-            };
-            let candidate = align_protection(candidate, sign, q.tick);
-            stop = if sign > 0. {
-                stop.max(candidate)
-            } else {
-                stop.min(candidate)
-            };
+            stop = runner_stop(p, q, peak, stop, super::super::trailing::TRAIL_DISTANCE_R);
         }
         let close = if (q.last - stop) * sign <= 0. {
             Some((

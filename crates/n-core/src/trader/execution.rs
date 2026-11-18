@@ -411,6 +411,8 @@ struct ExecutionState {
     symbol_release_after: HashMap<String, u64>,
     entry_decisions: HashMap<String, serde_json::Value>,
     comparison: super::comparison::ComparisonBook,
+    #[serde(skip_serializing_if = "super::p3_comparison::P3RunnerBook::is_empty")]
+    p3_runner: super::p3_comparison::P3RunnerBook,
     #[serde(skip)]
     entry_funds: Option<EntryFunds>,
     #[serde(skip)]
@@ -442,6 +444,12 @@ struct ExecutionState {
 }
 
 impl ExecutionState {
+    fn p3_runner_eligible(&self) -> bool {
+        self.definition.strategy_id == super::candidates::p3::ID
+            && self.definition.parameters["exit_mode"] == "hybrid_s1"
+            && self.definition.parameters["max_lots"].as_i64() == Some(2)
+    }
+
     fn abort_entry(&mut self, id: &str) -> bool {
         self.entry_timeouts.remove(id).is_some() | self.aborted_entries.insert(id.into())
     }
@@ -717,6 +725,7 @@ impl ExecutionEngine {
         };
         state.rebuild_indices();
         state.normalize_legacy_trade_times();
+        state.p3_runner.invalidate_active("execution_restarted");
         state.started_at = chrono::Utc::now().timestamp();
         if lock_error.is_some() {
             state.persistence_error = lock_error;
@@ -847,13 +856,46 @@ impl ExecutionEngine {
     }
 
     pub async fn comparison_summary(&self) -> serde_json::Value {
-        self.state.lock().await.comparison.summary()
+        let state = self.state.lock().await;
+        let mut summary = state.comparison.summary();
+        if state.definition.strategy_id == super::candidates::p3::ID || !state.p3_runner.is_empty() {
+            summary["p3_runner"] = state.p3_runner.summary(state.p3_runner_eligible());
+        }
+        summary
     }
 
     pub async fn comparison_details(&self) -> serde_json::Value {
-        serde_json::json!({"active_and_aggregate": &self.state.lock().await.comparison,
+        let state = self.state.lock().await;
+        serde_json::json!({"active_and_aggregate": &state.comparison, "p3_runner": &state.p3_runner,
             "archive_file":self.state_path.as_ref().map(|p|p.with_file_name("strategy_comparison.jsonl")),
             "archive_dedup_key":"archive_id"})
+    }
+
+    pub async fn set_p3_runner_comparison(&self, enabled: bool) -> Result<()> {
+        let mut state = self.state.lock().await;
+        anyhow::ensure!(!enabled || state.p3_runner_eligible(), "余仓对比需要 P3 两手分批追踪模式");
+        if enabled != state.p3_runner.enabled {
+            state.p3_runner.enabled = enabled;
+            if enabled {
+                let now = self.now_utc().timestamp();
+                state.p3_runner.started_at.get_or_insert(now);
+                state.p3_runner.enabled_since = Some(now);
+            }
+            self.save(&mut state)?;
+        }
+        Ok(())
+    }
+
+    pub async fn p3_runner_history_symbols(&self) -> std::collections::BTreeSet<String> {
+        self.state.lock().await.p3_runner.history_symbols()
+    }
+
+    pub async fn on_p3_runner_history(&self, symbol: &str, raw: &[crate::fetch::kline::Kline]) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.p3_runner.on_history(symbol, raw, self.now_utc().timestamp()) {
+            self.save(&mut state)?;
+        }
+        Ok(())
     }
 
     pub async fn execution_error(&self) -> Option<String> {
@@ -1474,6 +1516,7 @@ impl ExecutionEngine {
                             }
                             s.closes.remove(&pos_id);
                         }
+                        s.p3_runner.record_intervention(&rec);
                         s.history.push(rec);
                     } else {
                         // Mark external close trade as seen if no matching open position exists,
@@ -1633,6 +1676,12 @@ impl ExecutionEngine {
                 {
                     Self::latch_exit(s, &cond.id, "stop", cond.stop_price, true);
                 }
+                if !s.closes.contains_key(&cond.id) {
+                    s.p3_runner.register(
+                        &cond, &s.positions[&cond.id], &trade.exchange_id,
+                        super::candidates::parse_time(&natural_ts).ok(), self.now_utc().timestamp(),
+                    );
+                }
             } else if let Some(pos) = s.positions.get_mut(&cond.id) {
                 anyhow::ensure!(
                     trade.volume <= pos.volume,
@@ -1715,6 +1764,7 @@ impl ExecutionEngine {
                         }
                     }
                 }
+                s.p3_runner.record_intervention(&rec);
                 s.history.push(rec);
             }
         }
@@ -1839,6 +1889,7 @@ impl ExecutionEngine {
                     .map(|p| p.instrument_id.clone()),
             )
             .chain(s.comparison.contracts())
+            .chain(s.p3_runner.contracts().into_iter().map(str::to_owned))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -1934,6 +1985,7 @@ impl ExecutionEngine {
         if s.market_error.is_none() {
             s.quote_gaps.push(self.now_utc().timestamp());
             s.comparison.mark_quote_gap();
+            s.p3_runner.invalidate_active("quote_gap");
         }
         s.quotes.clear();
         s.market_error = Some(MARKET_CONNECTION_ERROR.into());
@@ -1962,6 +2014,7 @@ impl ExecutionEngine {
         let mut s = self.state.lock().await;
         s.quote_gaps.push(self.now_utc().timestamp());
         s.comparison.mark_quote_gap();
+        s.p3_runner.invalidate_active("quote_gap");
         let ids = s
             .orders
             .values()
@@ -2068,6 +2121,10 @@ impl ExecutionEngine {
         let comparison_changed = state
             .comparison
             .advance(&state.quotes, self.now_utc().timestamp());
+        let now = self.now_utc().timestamp();
+        for quote in quotes.values() {
+            state.p3_runner.on_quote(quote, now);
+        }
         // Normal quote batches commit ordinary observations at batch end.
         // A counter update has no such batch, so save any changes here.
         let counter_recheck = quotes.is_empty();
