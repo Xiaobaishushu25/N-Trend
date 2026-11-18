@@ -56,12 +56,79 @@ pub async fn ensure(db: &DatabaseConnection) -> Result<()> {
     )
     .await
     .context("创建 R5a 同事务信号及品种修订触发器失败")?;
+    ensure_history_revisions(db).await?;
     Ok(())
+}
+
+async fn ensure_history_revisions(db: &DatabaseConnection) -> Result<()> {
+    db.execute_unprepared(
+        r#"CREATE TABLE IF NOT EXISTS market_history_revisions (
+            symbol TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL
+        ) WITHOUT ROWID;"#,
+    )
+    .await?;
+    // The revision is only an invalidation token. Every committed change to
+    // prices or rollovers must invalidate even if the latest timestamp is unchanged.
+    for (table, changed) in [
+        (
+            "klines",
+            "OLD.timeframe IS NOT NEW.timeframe OR OLD.ts IS NOT NEW.ts OR
+             OLD.open IS NOT NEW.open OR OLD.high IS NOT NEW.high OR
+             OLD.low IS NOT NEW.low OR OLD.close IS NOT NEW.close OR
+             OLD.volume IS NOT NEW.volume OR OLD.hold IS NOT NEW.hold OR
+             OLD.source IS NOT NEW.source",
+        ),
+        (
+            "rollovers",
+            "OLD.ts IS NOT NEW.ts OR OLD.from_contract IS NOT NEW.from_contract OR
+             OLD.to_contract IS NOT NEW.to_contract OR OLD.confirmed IS NOT NEW.confirmed",
+        ),
+    ] {
+        let bump = |row| {
+            format!(
+                "INSERT INTO market_history_revisions (symbol, revision) VALUES ({row}.symbol, 1)
+                 ON CONFLICT(symbol) DO UPDATE SET revision = revision + 1;"
+            )
+        };
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER IF NOT EXISTS market_history_{table}_insert AFTER INSERT ON {table}
+             BEGIN {new} END;
+             CREATE TRIGGER IF NOT EXISTS market_history_{table}_delete AFTER DELETE ON {table}
+             BEGIN {old} END;
+             CREATE TRIGGER IF NOT EXISTS market_history_{table}_update AFTER UPDATE ON {table}
+             WHEN OLD.symbol IS NOT NEW.symbol OR ({changed})
+             BEGIN
+                 {new}
+                 INSERT INTO market_history_revisions (symbol, revision)
+                     SELECT OLD.symbol, 1 WHERE OLD.symbol IS NOT NEW.symbol
+                     ON CONFLICT(symbol) DO UPDATE SET revision = revision + 1;
+             END;",
+            new = bump("NEW"),
+            old = bump("OLD"),
+        ))
+        .await
+        .context("创建行情历史版本触发器失败")?;
+    }
+    Ok(())
+}
+
+pub async fn market_history_revision(db: &DatabaseConnection, symbol: &str) -> Result<i64> {
+    use sea_orm::{DbBackend, Statement};
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT revision FROM market_history_revisions WHERE symbol = ?",
+            [symbol.into()],
+        ))
+        .await?;
+    row.map(|row| row.try_get("", "revision"))
+        .transpose()
+        .context("读取行情历史版本失败")
+        .map(|revision| revision.unwrap_or(0))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::storage::repo;
     use sea_orm::ConnectionTrait;
 

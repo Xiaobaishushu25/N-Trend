@@ -3,6 +3,58 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 #[tokio::test]
+async fn unchanged_counter_replay_updates_funds_without_rewriting_state() {
+    let counter = Counter::new();
+    let e = setup(&counter, "fixed_v1", "protect_only_v1", registry()).await;
+    let id = e
+        .register_plan(
+            plan("persist-on-changes", Direction::Long, 990.),
+            e.definition().await,
+            e.get_config().await,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    quote(&e, 1000.).await;
+    let open = counter.inserts()[0].clone();
+    let working = vec![order(&open, "queueing", 0)];
+    ready(&e, working.clone(), vec![]).await;
+    let path = counter.directory.join("trader_execution.json");
+    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    let mark_state_file = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+    };
+    let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
+    mark_state_file();
+    ready_with_funds(&e, working, vec![], 49000., 20.).await;
+    assert_eq!(modified(), stamp);
+    assert_eq!(
+        e.state.lock().await.entry_funds.as_ref().unwrap().available,
+        49000.
+    );
+
+    // A terminal order that precedes the fill is itself a durable change.
+    let filled = vec![order(&open, "all_traded", 2)];
+    ready(&e, filled.clone(), vec![]).await;
+    assert_ne!(modified(), stamp);
+    let fill = trade(&open, "counter-fill", 2, 1000.);
+    mark_state_file();
+    ready(&e, filled.clone(), vec![fill.clone()]).await;
+    assert_ne!(modified(), stamp);
+    mark_state_file();
+    ready(&e, filled, vec![fill]).await;
+    assert_eq!(modified(), stamp);
+    drop(e);
+    let restored = counter.engine(ExecutionMode::FullAuto, 2);
+    assert_eq!(restored.state.lock().await.positions[&id].volume, 2);
+}
+
+#[tokio::test]
 async fn zero_sizing_through_dispatch_commits_strategy_state_without_pausing() {
     struct EmitZero;
     impl Strategy for EmitZero {

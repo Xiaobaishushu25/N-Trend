@@ -365,6 +365,12 @@ struct CloseTask {
     note: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct EntryTimeout {
+    order_ref: String,
+    deadline: i64,
+}
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ExecutionState {
@@ -384,6 +390,10 @@ struct ExecutionState {
     trade_times: HashMap<String, super::trade_time::TradeTimeEvidence>,
     time_normalization_version: u32,
     aborted_entries: HashSet<String>,
+    // Only an ordinary timeout can accept a delayed pre-deadline fill. Old
+    // aborted entries without this evidence keep their protective behavior.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    entry_timeouts: HashMap<String, EntryTimeout>,
     authorized_entries: HashSet<String>,
     last_ref: u64,
     last_bars: HashMap<String, String>,
@@ -432,6 +442,10 @@ struct ExecutionState {
 }
 
 impl ExecutionState {
+    fn abort_entry(&mut self, id: &str) -> bool {
+        self.entry_timeouts.remove(id).is_some() | self.aborted_entries.insert(id.into())
+    }
+
     pub(crate) fn rebuild_indices(&mut self) {
         self.entry_started_conditions = self
             .orders
@@ -1159,7 +1173,7 @@ impl ExecutionEngine {
         }) {
             return Ok(false);
         }
-        s.aborted_entries.insert(id.into());
+        s.abort_entry(id);
         if let Some(o) = s.conditions.get_mut(id) {
             o.state = ConditionState::Canceled;
             o.note = "已取消后续开仓，正在处理剩余委托".into();
@@ -1198,7 +1212,8 @@ impl ExecutionEngine {
             Ok(()) => {
                 *guard = next;
                 drop(guard);
-                self.on_quotes(HashMap::new()).await
+                // Recheck the last book, committing only changes made by this recheck.
+                self.observe_quotes(HashMap::new(), false).await
             }
             Err(e) => {
                 guard.broker_ready = false;
@@ -1238,7 +1253,10 @@ impl ExecutionEngine {
             s.error = Some("柜台账户与持久化执行状态不一致，禁止交易".into());
             return Ok(());
         }
-        s.account = Some(account);
+        let mut durable_changed = s.account.as_deref() != Some(account.as_str());
+        if durable_changed {
+            s.account = Some(account);
+        }
         if let (Some(available), Some(margin), Some(updated_at)) = (
             snapshot["account"]["available"].as_f64(),
             snapshot["account"]["curr_margin"]
@@ -1264,6 +1282,7 @@ impl ExecutionEngine {
         if !day.is_empty() && h["logged_in"].as_bool().unwrap_or(false) && s.trading_day != day {
             s.trading_day = day.clone();
             s.loss_r = 0.0;
+            durable_changed = true;
         }
         for raw in snapshot["orders"].as_array().into_iter().flatten() {
             let r = raw["order_ref"].as_str().unwrap_or("");
@@ -1275,10 +1294,11 @@ impl ExecutionEngine {
                 {
                     continue;
                 }
-                if let Some(qty) = raw["volume_total_original"].as_i64().filter(|qty| *qty > 0) {
-                    order.request.volume = qty as i32;
-                }
-                order.reported_filled = order
+                let volume = raw["volume_total_original"]
+                    .as_i64()
+                    .filter(|qty| *qty > 0)
+                    .map_or(order.request.volume, |qty| qty as i32);
+                let reported_filled = order
                     .reported_filled
                     .max(raw["volume_traded"].as_i64().unwrap_or(0) as i32);
                 let status = raw["status"].as_str().unwrap_or("");
@@ -1287,14 +1307,27 @@ impl ExecutionEngine {
                     "rejected" => OrderPhase::Rejected,
                     _ => OrderPhase::Working,
                 };
-                if order.phase != OrderPhase::Terminal
+                let phase = if order.phase != OrderPhase::Terminal
                     && (order.phase != OrderPhase::CancelPending
                         || phase == OrderPhase::Terminal
                         || phase == OrderPhase::Rejected)
                 {
+                    phase
+                } else {
+                    order.phase.clone()
+                };
+                let note = raw["status_msg"].as_str().unwrap_or("");
+                if order.request.volume != volume
+                    || order.reported_filled != reported_filled
+                    || order.phase != phase
+                    || order.note != note
+                {
+                    order.request.volume = volume;
+                    order.reported_filled = reported_filled;
                     order.phase = phase;
+                    note.clone_into(&mut order.note);
+                    durable_changed = true;
                 }
-                order.note = raw["status_msg"].as_str().unwrap_or("").into();
             }
         }
         let mut trades = snapshot["trades"]
@@ -1341,13 +1374,14 @@ impl ExecutionEngine {
             );
             let natural_ts = resolved.timestamp.clone().unwrap_or_default();
             if s.trade_times.get(&key) != Some(&resolved) {
+                if !s.trade_times.contains_key(&key) && resolved.timestamp.is_none() {
+                    tracing::warn!(instrument = %trade.instrument_id, order_ref = %trade.order_ref,
+                        "成交自然时间无法确认，保留原始字段；价格保护继续，禁止猜测日期");
+                }
                 s.repair_trade_time(&key, &trade, &resolved);
+                s.trade_times.insert(key.clone(), resolved);
+                durable_changed = true;
             }
-            if !s.trade_times.contains_key(&key) && resolved.timestamp.is_none() {
-                tracing::warn!(instrument = %trade.instrument_id, order_ref = %trade.order_ref,
-                    "成交自然时间无法确认，保留原始字段；价格保护继续，禁止猜测日期");
-            }
-            s.trade_times.insert(key.clone(), resolved);
             let Some(order) = s.orders.get(&trade.order_ref).cloned() else {
                 // If it's a close trade from outside (e.g. mobile app) matching an open position:
                 if trade.offset != "open"
@@ -1356,6 +1390,7 @@ impl ExecutionEngine {
                     && trade.price.is_finite()
                     && trade.price > 0.0
                 {
+                    durable_changed = true;
                     let matching_pos_id = s
                         .positions
                         .iter()
@@ -1478,6 +1513,7 @@ impl ExecutionEngine {
                 );
             }
             s.seen_trades.insert(key.clone());
+            durable_changed = true;
             let ord = s.orders.get_mut(&trade.order_ref).unwrap();
             ord.filled += trade.volume;
             if order.reason.is_none() {
@@ -1493,7 +1529,15 @@ impl ExecutionEngine {
                     .get(&trade.order_ref)
                     .filter(|o| o.submitted_at > 0)
                     .map(|o| super::candidates::label(o.submitted_at));
-                let entry_aborted = s.aborted_entries.contains(&cond.id);
+                let timely_fill_after_timeout = s.entry_timeouts.get(&cond.id).is_some_and(|t| {
+                    t.order_ref == trade.order_ref
+                        && !order.trading_day.is_empty()
+                        && normalize_date_key(fill_day) == normalize_date_key(&order.trading_day)
+                        && s.trade_times[&key]
+                            .is_within_order_window(order.submitted_at, t.deadline)
+                });
+                let entry_aborted =
+                    s.aborted_entries.contains(&cond.id) && !timely_fill_after_timeout;
                 let pos = s
                     .positions
                     .entry(cond.id.clone())
@@ -1674,54 +1718,60 @@ impl ExecutionEngine {
                 s.history.push(rec);
             }
         }
-        self.recheck_filled_sizing(s);
-        self.complete_partial_exits(s);
+        durable_changed |= self.recheck_filled_sizing(s);
+        durable_changed |= self.complete_partial_exits(s);
         // A terminal order may precede its trade callbacks: wait for every reported fill.
-        for id in s.conditions.keys().cloned().collect::<Vec<_>>() {
-            let open_filled: i32 = s
-                .orders
-                .values()
-                .filter(|o| o.condition_id == id && o.reason.is_none())
-                .map(|o| o.filled)
-                .sum();
-            let closing = s.closes.contains_key(&id);
-            let pos = s.positions.get(&id);
-            let orders_settled = s.orders.values().filter(|o| o.condition_id == id).all(|o| {
-                matches!(o.phase, OrderPhase::Terminal | OrderPhase::Rejected)
-                    && o.filled >= o.reported_filled
-            });
-            let entry_settled = s
-                .orders
-                .values()
-                .filter(|o| o.condition_id == id && o.reason.is_none())
-                .all(ExecutionOrder::settled);
-            if open_filled > 0 && entry_settled && s.aborted_entries.contains(&id) {
+        #[derive(Clone, Copy, Default)]
+        struct OrderProgress {
+            open_filled: i32,
+            entry_unsettled: bool,
+            any_unsettled: bool,
+            any_working: bool,
+        }
+        let mut progress = HashMap::<&str, OrderProgress>::new();
+        for order in s.orders.values() {
+            let p = progress.entry(&order.condition_id).or_default();
+            let unsettled = !order.settled();
+            p.any_unsettled |= unsettled;
+            p.any_working |= order.phase == OrderPhase::Working;
+            if order.reason.is_none() {
+                p.open_filled += order.filled;
+                p.entry_unsettled |= unsettled;
+            }
+        }
+        for (id, condition) in &mut s.conditions {
+            let p = progress.get(id.as_str()).copied().unwrap_or_default();
+            let closing = s.closes.contains_key(id);
+            let pos = s.positions.get(id);
+            if !p.entry_unsettled {
+                // Only keep the exception while the broker still owes order or fill evidence.
+                durable_changed |= s.entry_timeouts.remove(id).is_some();
+            }
+            if p.open_filled > 0 && !p.entry_unsettled && s.aborted_entries.contains(id) {
                 // Freeze the actual entry quantity after the remainder is cancelled.
                 // The original plan and sizing configuration remain frozen.
-                let c = s.conditions.get_mut(&id).unwrap();
-                c.volume = c.volume.min(open_filled);
+                let volume = condition.volume.min(p.open_filled);
+                durable_changed |= condition.volume != volume;
+                condition.volume = volume;
             }
-            let phase = if pos.is_some_and(|p| p.is_closed) && orders_settled {
+            let phase = if pos.is_some_and(|p| p.is_closed) && !p.any_unsettled {
                 Some(ConditionState::Closed)
-            } else if closing && pos.is_none() && orders_settled {
+            } else if closing && pos.is_none() && !p.any_unsettled {
                 Some(ConditionState::Canceled)
             } else if closing {
                 Some(ConditionState::Closing)
-            } else if open_filled >= s.conditions[&id].volume {
+            } else if p.open_filled >= condition.volume {
                 Some(ConditionState::Filled)
-            } else if open_filled > 0 {
+            } else if p.open_filled > 0 {
                 Some(ConditionState::PartFilled)
-            } else if s
-                .orders
-                .values()
-                .any(|o| o.condition_id == id && o.phase == OrderPhase::Working)
-            {
+            } else if p.any_working {
                 Some(ConditionState::Working)
             } else {
                 None
             };
             if let Some(phase) = phase {
-                s.conditions.get_mut(&id).unwrap().state = phase;
+                durable_changed |= condition.state != phase;
+                condition.state = phase;
             }
         }
         // Never rewrite strategy quantities from an ambiguous aggregate snapshot.
@@ -1760,8 +1810,12 @@ impl ExecutionEngine {
                 }
             }
         }
-        s.rebuild_indices();
-        self.save(s)
+        if durable_changed || s.persistence_error.is_some() || s.comparison.archive_error.is_some()
+        {
+            s.rebuild_indices();
+            self.save(s)?;
+        }
+        Ok(())
     }
 
     pub async fn requested_contracts(&self) -> Vec<String> {
@@ -1802,6 +1856,7 @@ impl ExecutionEngine {
         }
         let mut s = self.state.lock().await;
         let mut expired = Vec::new();
+        let mut durable_changed = false;
         for o in s.conditions.values_mut().filter(|o| o.symbol == symbol) {
             if matches!(
                 o.state,
@@ -1810,11 +1865,13 @@ impl ExecutionEngine {
                     | ConditionState::Triggered
                     | ConditionState::Rejected
             ) {
-                o.bars_waited = o.bars_waited.max(
+                let waited = o.bars_waited.max(
                     bars.iter()
                         .filter(|ts| ts.as_str() > o.warning_bar_ts.as_str())
                         .count(),
                 );
+                durable_changed |= o.bars_waited != waited;
+                o.bars_waited = waited;
                 if o.frozen
                     .as_ref()
                     .is_none_or(|f| f.definition.strategy_id == N_STRATEGY)
@@ -1825,8 +1882,14 @@ impl ExecutionEngine {
                 }
             }
         }
-        s.aborted_entries.extend(expired);
-        self.save(&mut s)?;
+        durable_changed |= !expired.is_empty();
+        for id in expired {
+            s.abort_entry(&id);
+        }
+        if durable_changed || s.persistence_error.is_some() || s.comparison.archive_error.is_some()
+        {
+            self.save(&mut s)?;
+        }
         s.entry_symbols_ready.insert(symbol.into());
         Ok(())
     }
@@ -1994,7 +2057,7 @@ impl ExecutionEngine {
         for instrument in &observed {
             *s.quote_sequences.entry(instrument.clone()).or_default() += 1;
         }
-        Self::release_symbol_slots(&mut s, &observed);
+        let slots_changed = Self::release_symbol_slots(&mut s, &observed);
         if quotes
             .values()
             .any(|q| q.valid_at(self.now_utc().timestamp()))
@@ -2002,9 +2065,13 @@ impl ExecutionEngine {
             s.market_error = None;
         }
         let state = &mut *s;
-        state
+        let comparison_changed = state
             .comparison
             .advance(&state.quotes, self.now_utc().timestamp());
+        // Normal quote batches commit ordinary observations at batch end.
+        // A counter update has no such batch, so save any changes here.
+        let counter_recheck = quotes.is_empty();
+        must_persist |= counter_recheck && (slots_changed || comparison_changed);
         let mut candidate_ids: Vec<String> = s
             .conditions
             .values()
@@ -2051,7 +2118,8 @@ impl ExecutionEngine {
                     .expires_at
                     .is_some_and(|t| self.now_utc().timestamp() > t)
             }) {
-                s.aborted_entries.insert(cond.id.clone());
+                let changed = s.abort_entry(&cond.id);
+                must_persist |= counter_recheck && changed;
                 if let Some(c) = s.conditions.get_mut(&cond.id).filter(|c| {
                     matches!(
                         c.state,
@@ -2131,7 +2199,8 @@ impl ExecutionEngine {
                         match self.portfolio_decision(&s, &cond, self.now_utc().timestamp()) {
                             EntryDecision::Allow => {}
                             EntryDecision::Wait(reason) => {
-                                Self::set_entry_note(&mut s, &cond.id, reason);
+                                let changed = Self::set_entry_note(&mut s, &cond.id, reason);
+                                must_persist |= counter_recheck && changed;
                                 continue;
                             }
                             EntryDecision::Reject(reason) => {
@@ -2149,7 +2218,8 @@ impl ExecutionEngine {
                             self.now_utc().timestamp(),
                         ) {
                             EntryDecision::Wait(reason) => {
-                                Self::set_entry_note(&mut s, &cond.id, reason);
+                                let changed = Self::set_entry_note(&mut s, &cond.id, reason);
+                                must_persist |= counter_recheck && changed;
                                 continue;
                             }
                             EntryDecision::Reject(reason) => {
@@ -2161,6 +2231,7 @@ impl ExecutionEngine {
                         }
                         if Self::symbol_slot_blocked(&s, &cond) {
                             self.reject_strategy_entry(&mut s, &cond.id, "blocked_symbol_slot");
+                            must_persist |= counter_recheck;
                             continue;
                         }
                         s.symbol_slots.insert(cond.symbol.clone(), cond.id.clone());
@@ -2209,7 +2280,7 @@ impl ExecutionEngine {
                 && !s.aborted_entries.contains(&cond.id)
                 && stop_hit
             {
-                s.aborted_entries.insert(cond.id.clone());
+                s.abort_entry(&cond.id);
                 let o = s.conditions.get_mut(&cond.id).unwrap();
                 o.state = ConditionState::Canceled;
                 o.note = "报单前行情已越过止损，终止本次入场".into();
@@ -2224,6 +2295,7 @@ impl ExecutionEngine {
             };
             let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
             let r = (q.last - pos.fill_price) * sign / pos.risk.max(1e-9);
+            must_persist |= counter_recheck && (r > pos.max_mfe_r || r < pos.max_mae_r);
             pos.max_mfe_r = pos.max_mfe_r.max(r);
             pos.max_mae_r = pos.max_mae_r.min(r);
             if pos.current_stop_price > 0.0 && (q.last - pos.current_stop_price) * sign <= 0.0 {
@@ -2301,7 +2373,8 @@ impl ExecutionEngine {
                     q.tick,
                 ) == "trailing"
                 {
-                    pos.trailing_grade = pos.trailing_grade.max(2)
+                    must_persist |= counter_recheck && pos.trailing_grade < 2;
+                    pos.trailing_grade = pos.trailing_grade.max(2);
                 }
                 if let Some((reason, volume)) = update.close {
                     must_persist = true;
@@ -2348,13 +2421,13 @@ impl ExecutionEngine {
                 c.frozen
                     .as_ref()
                     .is_some_and(|f| f.plan.expires_at.is_some_and(|t| now > t))
-                    && !s.aborted_entries.contains(&c.id)
+                    && (!s.aborted_entries.contains(&c.id) || s.entry_timeouts.contains_key(&c.id))
             })
             .map(|c| c.id.clone())
             .collect::<Vec<_>>();
         if !expired.is_empty() {
             for id in expired {
-                s.aborted_entries.insert(id.clone());
+                s.abort_entry(&id);
                 if let Some(c) = s.conditions.get_mut(&id).filter(|c| {
                     matches!(
                         c.state,
@@ -2392,10 +2465,14 @@ impl ExecutionEngine {
 
         let timed_out = s
             .orders
-            .values()
-            .filter(|o| {
-                if o.reason.is_some() || o.settled() || o.reported_filled >= o.request.volume {
-                    return false;
+            .iter()
+            .filter_map(|(reference, o)| {
+                if o.reason.is_some()
+                    || o.settled()
+                    || o.reported_filled >= o.request.volume
+                    || s.aborted_entries.contains(&o.condition_id)
+                {
+                    return None;
                 }
                 let frozen_cfg = s
                     .conditions
@@ -2403,14 +2480,23 @@ impl ExecutionEngine {
                     .and_then(|c| c.frozen.as_ref())
                     .map(|f| &f.execution)
                     .unwrap_or(&cfg);
-                now >= o
+                let deadline = o
                     .submitted_at
-                    .saturating_add(frozen_cfg.order_wait_seconds.max(1) as i64)
+                    .saturating_add(frozen_cfg.order_wait_seconds.max(1) as i64);
+                (now >= deadline).then(|| {
+                    (
+                        o.condition_id.clone(),
+                        EntryTimeout {
+                            order_ref: reference.clone(),
+                            deadline,
+                        },
+                    )
+                })
             })
-            .map(|o| o.condition_id.clone())
-            .collect::<HashSet<_>>();
-        for id in timed_out {
+            .collect::<Vec<_>>();
+        for (id, timeout) in timed_out {
             if s.aborted_entries.insert(id.clone()) {
+                s.entry_timeouts.insert(id.clone(), timeout);
                 let has_position = s.positions.get(&id).is_some_and(|p| p.volume > 0);
                 if let Some(c) = s.conditions.get_mut(&id) {
                     c.note = "entry_timeout: 停止开仓并撤销未成交剩余量".into();
@@ -2719,7 +2805,7 @@ impl ExecutionEngine {
                         continue;
                     }
                     Ok(total) if total <= filled => {
-                        s.aborted_entries.insert(cond.id.clone());
+                        s.abort_entry(&cond.id);
                         if total < filled {
                             Self::latch_exit(&mut s, &cond.id, "risk_budget", price, true);
                         }
@@ -2929,7 +3015,9 @@ impl ExecutionEngine {
                 expired.push(o.id.clone());
             }
         }
-        s.aborted_entries.extend(expired);
+        for id in expired {
+            s.abort_entry(&id);
+        }
         let ids = s
             .positions
             .values()

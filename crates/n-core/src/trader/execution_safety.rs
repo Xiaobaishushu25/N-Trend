@@ -44,7 +44,7 @@ impl ExecutionEngine {
         reference: f64,
         volume: Option<i32>,
     ) {
-        s.aborted_entries.insert(id.into());
+        s.abort_entry(id);
         let qty = s.positions.get(id).map(|p| p.volume).unwrap_or(0);
         let all = volume.is_none();
         let task = s.closes.entry(id.into()).or_insert_with(|| CloseTask {
@@ -130,7 +130,8 @@ impl ExecutionEngine {
         Ok(result.min(c.volume))
     }
 
-    pub(super) fn recheck_filled_sizing(&self, s: &mut ExecutionState) {
+    pub(super) fn recheck_filled_sizing(&self, s: &mut ExecutionState) -> bool {
+        let mut changed = false;
         for id in s
             .positions
             .values()
@@ -154,19 +155,24 @@ impl ExecutionEngine {
                 SizingPhase::ConfirmedFill,
             );
             match limit {
-                Ok(limit) if limit < filled => Self::latch_exit(s, &id, "risk_budget", price, true),
+                Ok(limit) if limit < filled => {
+                    Self::latch_exit(s, &id, "risk_budget", price, true);
+                    changed = true;
+                }
                 Err(error) => {
                     // A policy failure must never roll back an observed real fill.
                     s.paused = true;
                     s.strategy_error = Some(error.to_string());
                     Self::latch_exit(s, &id, "risk_budget", price, true);
+                    changed = true;
                 }
                 _ => {}
             }
         }
+        changed
     }
 
-    pub(super) fn complete_partial_exits(&self, s: &mut ExecutionState) {
+    pub(super) fn complete_partial_exits(&self, s: &mut ExecutionState) -> bool {
         let complete = s
             .closes
             .iter()
@@ -181,6 +187,7 @@ impl ExecutionEngine {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        let changed = !complete.is_empty();
         for id in complete {
             let task = s.closes.remove(&id).unwrap();
             let Some(p) = s
@@ -226,6 +233,7 @@ impl ExecutionEngine {
                 s.strategy_error = Some("部分平仓完成处理异常，保留已有保护价".into());
             }
         }
+        changed
     }
 
     pub(super) async fn request_cancel(&self, reference: String, now: i64) -> Result<()> {

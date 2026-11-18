@@ -39,16 +39,26 @@ research-runs/
 /src-tauri/gen/android/release-keystore.jks
 
 # CTP runtime flow caches
+flow_*/
 flow_md/
 flow_td/
 flow_ctp/
 *.con
 python-bridge/flow_ctp/
+**/flow_ctp/
 
-
+# Research modules and backtest artifacts
+research/
 research-protocols/
 research-strategies/
 .s1-deps/
+
+# Backtest intermediate data & cache
+*.pkl
+*.parquet
+scratch_*
+*.cpuprofile
+.codex-attachments/
 
 # Temporary patches, bundles, and research output artifacts
 *.patch

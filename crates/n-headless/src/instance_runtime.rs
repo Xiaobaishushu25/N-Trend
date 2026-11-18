@@ -7,37 +7,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot, RwLock};
-
-pub(crate) type HistoryRevision = Vec<(String, Option<String>, i64)>;
-
-/// A cheap revision check avoids loading and allocating the complete history
-/// every five seconds. Row counts also detect older bars being backfilled.
-pub(crate) async fn market_history_revision(
-    db: &n_core::sea_orm::DatabaseConnection,
-    symbol: &str,
-    timeframe: &str,
-) -> anyhow::Result<HistoryRevision> {
-    use n_core::sea_orm::{ConnectionTrait, DbBackend, Statement};
-    let rows = db
-        .query_all(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT timeframe, MAX(ts) AS latest, COUNT(*) AS row_count FROM klines \
-         WHERE symbol=? AND timeframe IN ('5m', ?) AND (timeframe != '5m' OR source='raw') \
-         GROUP BY timeframe ORDER BY timeframe",
-            [symbol.into(), timeframe.into()],
-        ))
-        .await?;
-    rows.into_iter()
-        .map(|row| {
-            Ok((
-                row.try_get("", "timeframe")?,
-                row.try_get("", "latest")?,
-                row.try_get("", "row_count")?,
-            ))
-        })
-        .collect()
-}
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 pub fn spawn(ctx: Arc<ServerContext>) {
     tokio::spawn(async move {
@@ -182,13 +152,111 @@ pub fn spawn(ctx: Arc<ServerContext>) {
 }
 
 type HistoryKey = (String, String);
-type HistoryVersion = (String, HistoryRevision);
+type HistoryVersion = (String, i64, HistoryRequirements);
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct HistoryRequirements {
+    raw: bool,
+    rollovers: bool,
+}
+
+#[derive(Clone)]
+struct MarketHistory {
+    bars: Arc<Vec<n_core::analyze::model::Bar>>,
+    raw: Option<Arc<Vec<n_core::fetch::kline::Kline>>>,
+    rollovers: Option<Arc<Vec<n_core::derive::rollover::RolloverRecord>>>,
+}
 
 struct LoadedHistory {
     version: HistoryVersion,
-    bars: Vec<n_core::analyze::model::Bar>,
-    raw: Option<Vec<n_core::fetch::kline::Kline>>,
-    rollovers: Vec<n_core::derive::rollover::RolloverRecord>,
+    data: MarketHistory,
+}
+
+type HistorySlot = Arc<Mutex<Option<(i64, MarketHistory)>>>;
+
+/// One cached history per symbol and timeframe, shared by all accounts.
+/// The per-key lock prevents duplicate loads without delaying other symbols.
+#[derive(Default)]
+pub(crate) struct HistoryCache {
+    slots: Mutex<HashMap<HistoryKey, HistorySlot>>,
+}
+
+impl HistoryCache {
+    async fn load(
+        &self,
+        db: &n_core::sea_orm::DatabaseConnection,
+        services: &n_core::service::Services,
+        key: &HistoryKey,
+        strategy_revision: &str,
+        needs: HistoryRequirements,
+        applied: Option<&HistoryVersion>,
+    ) -> anyhow::Result<Option<LoadedHistory>> {
+        use n_core::storage::{cache_revisions::market_history_revision, repo};
+        let (symbol, timeframe) = key;
+        let slot = self
+            .slots
+            .lock()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().await;
+        for _ in 0..3 {
+            let revision = market_history_revision(db, symbol).await?;
+            let version = (strategy_revision.to_owned(), revision, needs);
+            if applied == Some(&version) {
+                return Ok(None);
+            }
+            let cached = slot.as_ref().filter(|(rev, _)| *rev == revision);
+            if let Some((_, data)) = cached.filter(|(_, data)| {
+                (!needs.raw || data.raw.is_some()) && (!needs.rollovers || data.rollovers.is_some())
+            }) {
+                return Ok(Some(LoadedHistory {
+                    version,
+                    data: data.clone(),
+                }));
+            }
+
+            let mut data = match cached {
+                Some((_, data)) => data.clone(),
+                None => MarketHistory {
+                    bars: Arc::new(services.bars_for(symbol, timeframe).await?),
+                    raw: None,
+                    rollovers: None,
+                },
+            };
+            if needs.raw && data.raw.is_none() {
+                data.raw = Some(Arc::new(
+                    repo::raw_klines(db, symbol)
+                        .await?
+                        .iter()
+                        .map(n_core::service::model_to_fetch)
+                        .collect(),
+                ));
+            }
+            if needs.rollovers && data.rollovers.is_none() {
+                data.rollovers = Some(Arc::new(
+                    repo::symbol_rollovers(db, symbol)
+                        .await?
+                        .into_iter()
+                        .map(|v| n_core::derive::rollover::RolloverRecord {
+                            symbol: v.symbol,
+                            ts: v.ts,
+                            from_contract: v.from_contract,
+                            to_contract: v.to_contract,
+                            confirmed: v.confirmed,
+                        })
+                        .collect(),
+                ));
+            }
+            // A write during the reads may have mixed two database versions.
+            if market_history_revision(db, symbol).await? == revision {
+                *slot = Some((revision, data.clone()));
+                return Ok(Some(LoadedHistory { version, data }));
+            }
+        }
+        anyhow::bail!("行情历史加载期间持续更新，稍后重试: {symbol}/{timeframe}")
+    }
 }
 
 struct HistoryMessage {
@@ -259,54 +327,30 @@ impl HistoryLoader {
                 subscriptions.sort();
                 subscriptions.dedup();
                 let strategy_revision = r.engine.definition().await.revision;
+                let needs_raw = r.engine.needs_completed_15m().await;
+                let needs_rollovers = needs_raw && r.engine.needs_market_history().await;
                 for key in subscriptions {
                     let started = Instant::now();
-                    let result: anyhow::Result<Option<LoadedHistory>> = async {
-                        let version = (
-                            strategy_revision.clone(),
-                            market_history_revision(&ctx.db, &key.0, &key.1).await?,
-                        );
-                        if versions.get(&key) == Some(&version) {
-                            return Ok(None);
-                        }
-                        let mut raw = None;
-                        let mut rollovers = Vec::new();
-                        if key.1 == "15m" && r.engine.needs_completed_15m().await {
-                            raw = Some(
-                                n_core::storage::repo::raw_klines(&ctx.db, &key.0)
-                                    .await?
-                                    .iter()
-                                    .map(n_core::service::model_to_fetch)
-                                    .collect(),
-                            );
-                            if r.engine.needs_market_history().await {
-                                rollovers =
-                                    n_core::storage::repo::symbol_rollovers(&ctx.db, &key.0)
-                                        .await?
-                                        .into_iter()
-                                        .map(|v| n_core::derive::rollover::RolloverRecord {
-                                            symbol: v.symbol,
-                                            ts: v.ts,
-                                            from_contract: v.from_contract,
-                                            to_contract: v.to_contract,
-                                            confirmed: v.confirmed,
-                                        })
-                                        .collect();
-                            }
-                        }
-                        let bars = ctx.services.bars_for(&key.0, &key.1).await?;
-                        Ok(Some(LoadedHistory {
-                            version,
-                            bars,
-                            raw,
-                            rollovers,
-                        }))
-                    }
-                    .await;
-                    if matches!(result, Ok(None)) {
-                        continue;
-                    }
-                    let result = result.map(|v| v.expect("unchanged history already skipped"));
+                    let needs = HistoryRequirements {
+                        raw: key.1 == "15m" && needs_raw,
+                        rollovers: key.1 == "15m" && needs_rollovers,
+                    };
+                    let result = match ctx
+                        .history_cache
+                        .load(
+                            &ctx.db,
+                            &ctx.services,
+                            &key,
+                            &strategy_revision,
+                            needs,
+                            versions.get(&key),
+                        )
+                        .await
+                    {
+                        Ok(None) => continue,
+                        Ok(Some(update)) => Ok(update),
+                        Err(err) => Err(err),
+                    };
                     let version = result.as_ref().ok().map(|v| v.version.clone());
                     let (applied, acknowledgment) = oneshot::channel();
                     if started.elapsed() >= Duration::from_millis(250) {
@@ -377,11 +421,25 @@ async fn apply_history(
     if engine.definition().await.revision != update.version.0 {
         return Ok(false);
     }
-    if let Some(raw) = update.raw {
-        engine
-            .on_market_history(&key.0, &raw, update.rollovers)
-            .await?;
-        engine.on_completed_15m(&key.0, &raw).await?;
+    let needs = update.version.2;
+    if needs.raw {
+        let raw = update
+            .data
+            .raw
+            .as_ref()
+            .expect("requested raw history was loaded");
+        let rollovers = if needs.rollovers {
+            update
+                .data
+                .rollovers
+                .as_deref()
+                .expect("requested rollovers were loaded")
+                .clone()
+        } else {
+            Vec::new()
+        };
+        engine.on_market_history(&key.0, raw, rollovers).await?;
+        engine.on_completed_15m(&key.0, raw).await?;
     }
     let last = match last_bars.get(key) {
         Some(last) => Some(last.clone()),
@@ -390,11 +448,12 @@ async fn apply_history(
     };
     let pending = match last {
         Some(last) => update
+            .data
             .bars
             .iter()
             .filter(|b| b.dt.to_bar_ts() > last)
             .collect::<Vec<_>>(),
-        None => update.bars.last().into_iter().collect(),
+        None => update.data.bars.last().into_iter().collect(),
     };
     for bar in pending {
         let timestamp = bar.dt.to_bar_ts();
@@ -421,6 +480,7 @@ async fn apply_history(
             .reconcile_entry_age(
                 &key.0,
                 &update
+                    .data
                     .bars
                     .iter()
                     .map(|b| b.dt.to_bar_ts())
@@ -672,7 +732,7 @@ mod market_load_tests;
 #[cfg(test)]
 mod history_revision_tests {
     use super::*;
-    use n_core::sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    use n_core::sea_orm::ConnectionTrait;
 
     #[tokio::test]
     async fn pending_history_reads_do_not_block_quotes_or_risk_timers() {
@@ -750,10 +810,16 @@ mod history_revision_tests {
             &engine,
             &key,
             LoadedHistory {
-                version: ("retired-strategy-revision".into(), Vec::new()),
-                bars: Vec::new(),
-                raw: None,
-                rollovers: Vec::new(),
+                version: (
+                    "retired-strategy-revision".into(),
+                    0,
+                    HistoryRequirements::default()
+                ),
+                data: MarketHistory {
+                    bars: Arc::default(),
+                    raw: None,
+                    rollovers: None,
+                },
             },
             &mut cursors
         )
@@ -773,49 +839,97 @@ mod history_revision_tests {
     }
 
     #[tokio::test]
-    async fn revision_detects_backfill_and_derived_updates_without_loading_bar_payloads() {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        db.execute(Statement::from_string(
-            DbBackend::Sqlite,
-            "CREATE TABLE klines(symbol TEXT,timeframe TEXT,ts TEXT,source TEXT)".to_owned(),
-        ))
+    async fn accounts_share_history_across_strategy_revisions_until_market_data_changes() {
+        let db = n_core::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut cfg = n_core::config::Config::default();
+        cfg.data_source.primary_source = "offline".into();
+        cfg.data_source.auto_spawn_bridge = false;
+        let services =
+            n_core::service::Services::new(db.clone(), cfg, "offline-config.json".into())
+                .await
+                .unwrap();
+        db.execute_unprepared(
+            "INSERT INTO klines VALUES
+                ('PB0','5m','2026-10-27 10:00:00',100,101,99,100,9,5,'raw');",
+        )
         .await
         .unwrap();
-        let empty = market_history_revision(&db, "PB0", "15m").await.unwrap();
-        assert!(empty.is_empty());
-        db.execute(Statement::from_string(DbBackend::Sqlite,
-            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:05:00','raw'),('PB0','15m','2026-10-27 10:00:00','derived')".to_owned()
-        )).await.unwrap();
-        let initial = market_history_revision(&db, "PB0", "15m").await.unwrap();
-        assert_eq!(
-            initial,
-            market_history_revision(&db, "PB0", "15m").await.unwrap()
+        let cache = HistoryCache::default();
+        let key = ("PB0".to_owned(), "15m".to_owned());
+        let bars_only = cache
+            .load(
+                &db,
+                &services,
+                &key,
+                "a",
+                HistoryRequirements::default(),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bars_only.data.raw.is_none());
+        let needs = HistoryRequirements {
+            raw: true,
+            rollovers: true,
+        };
+        let (a, b) = tokio::join!(
+            cache.load(&db, &services, &key, "a", needs, Some(&bars_only.version)),
+            cache.load(&db, &services, &key, "b", needs, None),
         );
-        db.execute(Statement::from_string(
-            DbBackend::Sqlite,
-            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:00:00','raw')".to_owned(),
-        ))
+        let a = a.unwrap().unwrap();
+        let b = b.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&a.data.bars, &bars_only.data.bars));
+        assert!(Arc::ptr_eq(&a.data.bars, &b.data.bars));
+        assert!(Arc::ptr_eq(
+            a.data.raw.as_ref().unwrap(),
+            b.data.raw.as_ref().unwrap()
+        ));
+        assert!(a.data.rollovers.as_ref().unwrap().is_empty());
+        assert_eq!(b.data.raw.as_ref().unwrap()[0].close, 100.);
+        db.execute_unprepared(
+            "UPDATE klines SET close=close WHERE symbol='PB0';
+             INSERT INTO klines VALUES
+                ('CU0','5m','2026-10-27 10:00:00',100,101,99,100,9,5,'raw');",
+        )
         .await
         .unwrap();
-        let backfilled = market_history_revision(&db, "PB0", "15m").await.unwrap();
-        assert_ne!(initial, backfilled);
-        assert_eq!(initial[1].1, backfilled[1].1);
-        db.execute(Statement::from_string(DbBackend::Sqlite,
-            "INSERT INTO klines VALUES('PB0','5m','2026-10-27 10:10:00','derived'),('CU0','5m','2026-10-27 10:10:00','raw')".to_owned()
-        )).await.unwrap();
-        assert_eq!(
-            backfilled,
-            market_history_revision(&db, "PB0", "15m").await.unwrap()
-        );
-        db.execute(Statement::from_string(
-            DbBackend::Sqlite,
-            "INSERT INTO klines VALUES('PB0','15m','2026-10-27 10:15:00','derived')".to_owned(),
-        ))
+        assert!(cache
+            .load(&db, &services, &key, "b", needs, Some(&b.version))
+            .await
+            .unwrap()
+            .is_none());
+
+        // An in-place price correction must invalidate even with the same count and timestamp.
+        db.execute_unprepared("UPDATE klines SET close=101 WHERE symbol='PB0'")
+            .await
+            .unwrap();
+        let corrected = cache
+            .load(&db, &services, &key, "b", needs, Some(&b.version))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(corrected.version.1, b.version.1);
+        assert_eq!(corrected.data.raw.as_ref().unwrap()[0].close, 101.);
+        assert_eq!(b.data.raw.as_ref().unwrap()[0].close, 100.);
+
+        db.execute_unprepared(
+            "INSERT INTO klines VALUES
+                ('PB0','5m','2026-10-27 09:55:00',100,101,99,100,9,5,'raw');
+             INSERT INTO rollovers
+                (symbol, ts, from_contract, to_contract, confirmed, created_at, updated_at)
+             VALUES ('PB0','2026-10-27 09:55:00','pb2611','pb2612',1,'','');",
+        )
         .await
         .unwrap();
-        assert_ne!(
-            backfilled,
-            market_history_revision(&db, "PB0", "15m").await.unwrap()
-        );
+        let backfill = cache
+            .load(&db, &services, &key, "b", needs, Some(&corrected.version))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(backfill.data.raw.unwrap().len(), 2);
+        assert_eq!(backfill.data.rollovers.unwrap().len(), 1);
     }
 }

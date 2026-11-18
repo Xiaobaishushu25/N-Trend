@@ -185,7 +185,7 @@ impl ExecutionEngine {
             "symbol_slots":s.symbol_slots,"calendar_health":calendars})
     }
     pub(super) fn reject_strategy_entry(&self, s: &mut ExecutionState, id: &str, reason: &str) {
-        s.aborted_entries.insert(id.into());
+        s.abort_entry(id);
         if let Some(c) = s.conditions.get_mut(id) {
             c.state = if reason == "invalidated" {
                 ConditionState::Invalidated
@@ -217,7 +217,7 @@ impl ExecutionEngine {
                         || o.filled < o.reported_filled)
             })
     }
-    pub(super) fn release_symbol_slots(s: &mut ExecutionState, observed: &HashSet<String>) {
+    pub(super) fn release_symbol_slots(s: &mut ExecutionState, observed: &HashSet<String>) -> bool {
         let release = s
             .symbol_slots
             .iter()
@@ -253,10 +253,12 @@ impl ExecutionEngine {
                 ))
             })
             .collect::<Vec<_>>();
+        let changed = !release.is_empty();
         for (symbol, seq) in release {
             s.symbol_slots.remove(&symbol);
             s.symbol_release_after.insert(symbol, seq);
         }
+        changed
     }
     pub fn validate_saved_state(bytes: &[u8]) -> Result<()> {
         let _: ExecutionState = serde_json::from_slice(bytes)?;
@@ -452,7 +454,9 @@ impl ExecutionEngine {
         // Pause also prevents a working entry order from adding exposure.
         if paused {
             let ids = s.active_entry_condition_ids();
-            s.aborted_entries.extend(ids);
+            for id in ids {
+                s.abort_entry(&id);
+            }
         }
         self.save(&mut s)
     }
@@ -465,7 +469,9 @@ impl ExecutionEngine {
             .cloned()
             .collect::<Vec<_>>();
         let ids = s.conditions.keys().cloned().collect::<Vec<_>>();
-        s.aborted_entries.extend(ids);
+        for id in ids {
+            s.abort_entry(&id);
+        }
         for c in s.conditions.values_mut().filter(|c| {
             matches!(
                 c.state,
@@ -1262,7 +1268,7 @@ impl ExecutionEngine {
                 condition_id,
                 reason,
             } => {
-                s.aborted_entries.insert(condition_id.clone());
+                s.abort_entry(&condition_id);
                 if let Some(c) = s.conditions.get_mut(&condition_id) {
                     c.note = reason;
                     c.state = ConditionState::Canceled;

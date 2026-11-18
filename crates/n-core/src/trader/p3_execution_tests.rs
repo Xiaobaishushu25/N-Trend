@@ -10,6 +10,79 @@ use crate::trader::{
 use std::collections::BTreeMap;
 
 #[tokio::test]
+async fn p3_timeout_distinguishes_a_delayed_report_from_an_actual_late_fill() {
+    for (risk, terminal_status, trade_time, market_gap, expected_exit) in [
+        (60., "all_traded", "10:00:00", false, None),
+        (20., "canceled", "10:00:02", false, None),
+        (
+            60.,
+            "all_traded",
+            "10:00:03",
+            false,
+            Some("late_entry_fill"),
+        ),
+        (60., "all_traded", "", false, Some("late_entry_fill")),
+        (60., "all_traded", "10:00:00", true, Some("market_gap")),
+    ] {
+        let counter = Counter::new();
+        let e = engine(&counter, ExitMode::HybridS1).await;
+        send(&e, signal("entry-timeout", true, risk, 2. * risk)).await;
+        quote(&e, 1000.).await;
+        age(&e).await;
+        quote(&e, 999.).await;
+        let open = counter.inserts()[0].clone();
+        let id = e.list_conditions().await[0].id.clone();
+        let submitted = candidates::parse_time("2026-10-16 10:00:00").unwrap();
+        {
+            let mut s = e.state.lock().await;
+            s.orders.values_mut().next().unwrap().submitted_at = submitted;
+        }
+        e.drive().await.unwrap();
+        assert_eq!(
+            counter.requests.lock().unwrap().last().unwrap().0,
+            "/order/cancel"
+        );
+        assert!(e.state.lock().await.entry_timeouts.contains_key(&id));
+        let order_status = vec![order(&open, terminal_status, 1)];
+        // The terminal order report may arrive before its trade, even across a restart.
+        ready(&e, order_status.clone(), vec![]).await;
+        assert!(e.state.lock().await.entry_timeouts.contains_key(&id));
+        if market_gap {
+            e.quote_gap().await.unwrap();
+        }
+        drop(e);
+
+        let mut e = counter.engine(ExecutionMode::FullAuto, 2);
+        e.registry = registry();
+        let mut fill = trade(&open, "delayed-open-report", 1, 998.);
+        fill["trade_time"] = json!(trade_time);
+        ready(&e, order_status.clone(), vec![fill.clone()]).await;
+        ready(&e, order_status, vec![fill]).await;
+        {
+            let s = e.state.lock().await;
+            assert_eq!(s.positions[&id].volume, 1);
+            assert_eq!(
+                s.closes.get(&id).map(|task| task.reason.as_str()),
+                expected_exit
+            );
+            assert!(!s.entry_timeouts.contains_key(&id));
+        }
+        quote(&e, 999.).await;
+        assert_eq!(
+            counter.inserts().len(),
+            if expected_exit.is_some() { 2 } else { 1 }
+        );
+        if expected_exit.is_none() {
+            assert_eq!(e.list_conditions().await[0].volume, 1);
+            age(&e).await;
+            quote(&e, 1000. + risk).await;
+            assert_eq!(e.state.lock().await.closes[&id].reason, "stop");
+            assert_eq!(counter.inserts()[1]["volume"], 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn p3_delayed_first_fill_uses_latest_quote_and_exits_an_already_crossed_breakeven() {
     let counter = Counter::new();
     let e = engine(&counter, ExitMode::HybridS1).await;

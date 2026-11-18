@@ -13,6 +13,21 @@ pub struct TradeTimeEvidence {
     pub source: String,
 }
 
+impl TradeTimeEvidence {
+    pub(super) fn is_within_order_window(&self, submitted_at: i64, deadline: i64) -> bool {
+        if submitted_at <= 0 || self.source != "order_submission" {
+            return false;
+        }
+        let tz = FixedOffset::east_opt(8 * 3600).unwrap();
+        self.timestamp
+            .as_deref()
+            .and_then(|ts| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok())
+            .and_then(|ts| ts.and_local_timezone(tz).single())
+            // The exchange clock is second-resolution. The cutoff second is already late.
+            .is_some_and(|ts| (submitted_at..deadline).contains(&ts.timestamp()))
+    }
+}
+
 fn date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value, "%Y%m%d")
         .or_else(|_| NaiveDate::parse_from_str(value, "%Y-%m-%d"))
