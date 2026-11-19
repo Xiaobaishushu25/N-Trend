@@ -52,6 +52,7 @@ import P3RunnerComparisonPanel from '../components/P3RunnerComparisonPanel.vue'
 import TradePnlCalendarPopover from '../components/TradePnlCalendarPopover.vue'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
+import { chaseRejectionFallback } from '../utils/conditionPool'
 import {
   calcSlippage,
   calcTradeRecordPnlAmount,
@@ -379,11 +380,7 @@ const STRATEGY_NOTE_MAP: Record<string, StrategyNoteMeta> = {
   contract_rollover: { category: '换月保护', text: '主力合约已切换，撤销待开仓单', tooltip: '待开仓信号绑定的实际合约与当前主力合约不同，撤销剩余开仓意图。' },
   delivery_month: { category: '合约过滤', text: '避开交割月及过期合约', tooltip: 'P3 主动限制交割月及已过期月份合约开仓。' },
   outside_trading_session: { category: '会话保护', text: '等待实际合约交易会话', tooltip: '当前不在实际合约的连续交易会话，等待新鲜盘口。' },
-  unfilled: {
-    category: '滑点保护',
-    text: '跳空/滑点超追价上限(放弃入场)',
-    tooltip: '【滑点保护拦截】盘口突破瞬间价格超出策略允许的最大追价滑点容差（例如超20%计划风险或2 tick），系统主动放弃追单，避免在不利价位追单接盘。',
-  },
+  unfilled: chaseRejectionFallback,
   blocked_symbol_slot: {
     category: '品种风控',
     text: '同品种持仓或条件单槽位已占用',
@@ -553,7 +550,7 @@ function getNoteTooltip(note?: string | null): string {
     return '【资金风控拦截】当前账户可用资金低于该合约开仓1手所需保证金与安全缓冲金，暂缓报单以保障账户免于透支与强平风险。'
   }
   if (/超入场滑点限制/i.test(trimmed)) {
-    return '【滑点保护拦截】盘口瞬时突破幅度过大，对价已超出策略允许的追单容差上限，系统主动放弃追高/追空，避免在不利高位追价接盘。'
+    return '当前盘口超出追价范围，暂缓报单，条件单继续等待符合限价的行情。'
   }
   if (/越过止损/i.test(trimmed)) {
     return '【极速反向拦截】条件单触发瞬间盘口剧烈跳空，价格在发出报单前已跌破/涨破止损保护线，紧急终止本次入场，避免开仓即深套。'
@@ -1405,7 +1402,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                     <n-icon :component="isWarningNote(cond.note) ? AlertTriangle : InfoCircle" class="note-icon" />
                     <div class="note-content">
                       <span class="note-tag">{{ getNoteCategory(cond.note) }}</span>
-                      <span class="note-text">{{ formatNoteText(cond.note) }}</span>
+                      <span class="note-text">{{ cond.chase_rejection_note?.text ?? formatNoteText(cond.note) }}</span>
                     </div>
                   </div>
                 </template>
@@ -1414,9 +1411,9 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                     <span class="note-tooltip-badge" :class="isWarningNote(cond.note) ? 'is-warning' : 'is-info'">
                       {{ getNoteCategory(cond.note) }}
                     </span>
-                    <span class="note-tooltip-title">{{ formatNoteText(cond.note) }}</span>
+                    <span class="note-tooltip-title">{{ cond.chase_rejection_note?.text ?? formatNoteText(cond.note) }}</span>
                   </div>
-                  <div class="note-tooltip-body">{{ getNoteTooltip(cond.note) }}</div>
+                  <div class="note-tooltip-body">{{ cond.chase_rejection_note?.tooltip ?? getNoteTooltip(cond.note) }}</div>
                 </div>
               </n-tooltip>
               <div v-else class="cond-footer-spacer" />

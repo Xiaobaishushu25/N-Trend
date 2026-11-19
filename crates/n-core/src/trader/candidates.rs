@@ -1,6 +1,6 @@
 //! Frozen P2 decisions on the common multi-account executor.
 //! Live book execution is versioned separately from research-v5 OHLC replay.
-use super::{strategy::*, ConditionState, ManagedPosition};
+use super::{model::max_entry_price_deviation, strategy::*, ConditionState, ManagedPosition};
 use crate::{
     analyze::outcome::{NO_FOLLOW_BAR, NO_FOLLOW_MFE_R, TIME_HORIZON_BARS},
     fetch::kline::Kline,
@@ -50,6 +50,20 @@ fn bucket(ts: i64) -> String {
     let dt = local(ts);
     let secs = dt.num_seconds_from_midnight() as i64;
     label(ts - secs + ((secs + 899) / 900) * 900)
+}
+
+fn observation_bucket(ts: i64, instrument: &str) -> String {
+    let dt = local(ts);
+    if dt.second() == 0 && dt.minute() % 15 == 0 {
+        let session = SessionCalendar::get(instrument);
+        if session.is_in_trading_time_naive(&dt.naive_local())
+            && !session.is_in_trading_time_naive(&(dt - Duration::minutes(1)).naive_local())
+        {
+            // The reopening quote belongs to the first interval after the break.
+            return bucket(ts + 1);
+        }
+    }
+    bucket(ts)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -406,8 +420,22 @@ struct Clock {
     no_follow_checked: bool,
     #[serde(default)]
     basis: Option<(f64, f64)>,
+    #[serde(default)]
+    session_open_buckets_corrected: bool,
 }
 impl Clock {
+    fn correct_session_open_buckets(&mut self, instrument: &str) {
+        if self.session_open_buckets_corrected {
+            return;
+        }
+        for (end, mfe) in std::mem::take(&mut self.buckets) {
+            let corrected = parse_time(&end).map_or(end, |ts| observation_bucket(ts, instrument));
+            let current = self.buckets.entry(corrected).or_insert(0.0);
+            *current = current.max(mfe);
+        }
+        self.session_open_buckets_corrected = true;
+    }
+
     fn align_holding(&mut self, p: &ManagedPosition) {
         if let Some((fill, risk)) = self.basis {
             if fill != p.fill_price || risk != p.risk {
@@ -713,7 +741,7 @@ impl Strategy for CandidateStrategy {
             return EntryDecision::Reject(reason.into());
         }
         if !fill.is_finite()
-            || (fill - s.entry) * s.sign() > (0.20 * s.risk).max(2. * s.tick) + 1e-6
+            || (fill - s.entry) * s.sign() > max_entry_price_deviation(s.risk, s.tick) + 1e-6
         {
             return EntryDecision::Reject("unfilled".into());
         }
@@ -770,7 +798,11 @@ impl Strategy for CandidateStrategy {
                         .pending
                         .entry(cond.origin.signal_id.clone())
                         .or_default();
-                    clock.buckets.entry(bucket(q.timestamp)).or_insert(0.);
+                    clock.correct_session_open_buckets(&cond.instrument_id);
+                    clock
+                        .buckets
+                        .entry(observation_bucket(q.timestamp, &cond.instrument_id))
+                        .or_insert(0.);
                     if clock.buckets.len() > 12 {
                         actions.push(TradeIntent::CancelEntry {
                             condition_id: cond.id.clone(),
@@ -786,8 +818,12 @@ impl Strategy for CandidateStrategy {
                             * if p.direction == "up" { 1. } else { -1. }
                             / p.risk;
                         let clock = state.holding.entry(p.id.clone()).or_default();
+                        clock.correct_session_open_buckets(&p.instrument_id);
                         clock.align_holding(p);
-                        let mfe = clock.buckets.entry(bucket(q.timestamp)).or_insert(0.);
+                        let mfe = clock
+                            .buckets
+                            .entry(observation_bucket(q.timestamp, &p.instrument_id))
+                            .or_insert(0.);
                         *mfe = mfe.max(r);
                     }
                 }
@@ -815,6 +851,7 @@ impl Strategy for CandidateStrategy {
                             .pending
                             .entry(cond.origin.signal_id.clone())
                             .or_default();
+                        clock.correct_session_open_buckets(&cond.instrument_id);
                         clock.buckets.entry(timestamp.clone()).or_insert(0.);
                         if clock.buckets.len() > 12 {
                             actions.push(TradeIntent::CancelEntry {
@@ -829,11 +866,12 @@ impl Strategy for CandidateStrategy {
                     .iter()
                     .filter(|p| !p.is_closed && p.symbol == *symbol)
                 {
-                    let start = bucket(parse_time(&p.open_ts)?);
+                    let start = observation_bucket(parse_time(&p.open_ts)?, &p.instrument_id);
                     if timestamp < &start {
                         continue;
                     }
                     let clock = state.holding.entry(p.id.clone()).or_default();
+                    clock.correct_session_open_buckets(&p.instrument_id);
                     clock.align_holding(p);
                     clock.buckets.entry(start).or_insert(0.);
                     clock.buckets.entry(timestamp.clone()).or_insert(0.);

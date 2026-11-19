@@ -283,12 +283,28 @@ async fn competing_signals_have_deterministic_single_slot_and_failed_entry_canno
         s.last_action_at = 0;
     }
     e.drive().await.unwrap();
+    let (id, original_at) = {
+        let mut s = e.state.lock().await;
+        assert_eq!(s.orders.len(), 1);
+        let (id, decision) = s
+            .entry_decisions
+            .iter_mut()
+            .find(|(_, decision)| decision["reason"] == "broker_rejected")
+            .unwrap();
+        let id = id.clone();
+        let original_at = decision["at"].as_i64().unwrap() - 60;
+        decision["at"] = json!(original_at);
+        assert!(!s.authorized_entries.contains(&id));
+        // Older ledgers could retain authorization after the rejection.
+        s.authorized_entries.insert(id.clone());
+        (id, original_at)
+    };
+    e.drive().await.unwrap();
+    e.drive().await.unwrap();
     let s = e.state.lock().await;
     assert_eq!(s.orders.len(), 1);
-    assert!(s
-        .entry_decisions
-        .values()
-        .any(|d| d["reason"] == "broker_rejected"));
+    assert_eq!(s.entry_decisions[&id]["at"], original_at);
+    assert!(!s.authorized_entries.contains(&id));
 }
 
 #[tokio::test]

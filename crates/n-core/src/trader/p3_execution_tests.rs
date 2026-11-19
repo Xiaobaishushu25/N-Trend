@@ -205,6 +205,68 @@ async fn opened(counter: &Counter, e: &ExecutionEngine, short: bool) -> (String,
 }
 
 #[tokio::test]
+async fn p3_chase_rejection_keeps_the_checked_price_and_never_submits() {
+    for short in [false, true] {
+        let sign = if short { -1.0 } else { 1.0 };
+        for (phase, trigger_first, last_offset) in [
+            ("trigger_quote", false, 4.0),
+            ("pre_submit_quote", true, 4.0),
+            ("proposed_limit", true, 3.0),
+        ] {
+            let counter = Counter::new();
+            let e = engine(&counter, ExitMode::HybridS1).await;
+            let mut cfg = e.get_config().await;
+            cfg.slippage_ticks = 1;
+            e.update_config(cfg).await.unwrap();
+            send(&e, signal("chase-limit", short, 22.5, 60.0)).await;
+            let id = e.list_conditions().await[0].id.clone();
+            if trigger_first {
+                quote(&e, 1000.0).await;
+                assert_eq!(
+                    e.list_conditions().await[0].state,
+                    ConditionState::Triggered
+                );
+            }
+            quote(&e, 1000.0 + sign * last_offset).await;
+            let condition = &e.list_conditions().await[0];
+            assert_eq!(condition.state, ConditionState::Rejected);
+            assert_eq!(condition.note, "unfilled");
+            let decision = e.strategy_diagnostics().await["entry_decisions"][&id].clone();
+            let audit = &decision["chase_limit"];
+            assert_eq!(decision["reason"], "unfilled");
+            assert_eq!(audit["phase"], phase);
+            assert_eq!(audit["side"], if short { "sell" } else { "buy" });
+            let book_side = if short { "bid" } else { "ask" };
+            let price_source = if phase == "proposed_limit" {
+                "limit"
+            } else {
+                book_side
+            };
+            assert_eq!(audit["price_source"], price_source);
+            assert_eq!(audit["reference_price"], 1000.0);
+            assert_eq!(audit["checked_price"], 1000.0 + sign * 5.0);
+            assert_eq!(audit["limit_price"], 1000.0 + sign * 4.5);
+            assert_eq!(audit["max_deviation"], 4.5);
+            assert_eq!(audit["excess"], 0.5);
+            assert_eq!(
+                audit["quote"][book_side],
+                1000.0 + sign * (last_offset + 1.0)
+            );
+            assert!(audit["quote_sequence"].as_u64().unwrap() > 0);
+
+            quote(&e, 1000.0).await;
+            assert!(counter.inserts().is_empty());
+            drop(e);
+            let restored = counter.engine(ExecutionMode::FullAuto, 2);
+            assert_eq!(
+                restored.strategy_diagnostics().await["entry_decisions"][&id],
+                decision
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn p3_single_lot_skips_narrow_s1_and_exits_at_actual_one_r_after_restart() {
     for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
         for short in [false, true] {

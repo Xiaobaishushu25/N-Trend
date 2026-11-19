@@ -7,6 +7,10 @@ pub fn is_actual_futures_contract(code: &str) -> bool {
         && code.as_bytes()[prefix..].iter().all(u8::is_ascii_digit)
 }
 
+pub(super) fn max_entry_price_deviation(risk: f64, tick: f64) -> f64 {
+    (risk * 0.2).max(2.0 * tick)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionQuote {
     pub instrument_id: String,

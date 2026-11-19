@@ -31,6 +31,14 @@ mod trade_time_tests;
 
 const MARKET_CONNECTION_ERROR: &str = "执行行情连接中断，暂停新报单并保留未完成任务";
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EntryPriceCheckPhase {
+    TriggerQuote,
+    PreSubmitQuote,
+    ProposedLimit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionTier {
@@ -2280,7 +2288,14 @@ impl ExecutionEngine {
                                 continue;
                             }
                             EntryDecision::Reject(reason) => {
-                                self.reject_strategy_entry(&mut s, &cond.id, &reason);
+                                self.reject_strategy_entry_at_price(
+                                    &mut s,
+                                    &cond,
+                                    &reason,
+                                    EntryPriceCheckPhase::TriggerQuote,
+                                    &q,
+                                    proposed,
+                                );
                                 must_persist = true;
                                 continue;
                             }
@@ -2686,8 +2701,16 @@ impl ExecutionEngine {
                         && o.reported_filled == 0
                 })
             {
-                self.reject_strategy_entry(&mut s, &cond.id, "broker_rejected");
-                entry_state_changed = true;
+                let recorded = cond.state == ConditionState::Rejected
+                    && s.aborted_entries.contains(&cond.id)
+                    && s.entry_decisions
+                        .get(&cond.id)
+                        .is_some_and(|decision| decision["reason"] == "broker_rejected");
+                if !recorded {
+                    self.reject_strategy_entry(&mut s, &cond.id, "broker_rejected");
+                    entry_state_changed = true;
+                }
+                entry_state_changed |= s.authorized_entries.remove(&cond.id);
                 continue;
             }
             if !s.closes.contains_key(&cond.id) && s.is_order_blocked(&cond.id) {
@@ -2781,7 +2804,7 @@ impl ExecutionEngine {
                 cfg.max_exit_slippage_ticks
             } else {
                 // 入场最大允许滑点：max(止损空间 * 0.2, 2 * tick)
-                let max_entry_slippage = (cond.risk * 0.2).max(2.0 * q.tick);
+                let max_entry_slippage = max_entry_price_deviation(cond.risk, q.tick);
                 let market_price = if buy { q.ask } else { q.bid };
                 let market_price = if market_price.is_finite() && market_price > 0.0 {
                     market_price
@@ -2795,7 +2818,14 @@ impl ExecutionEngine {
                 };
                 if overshot {
                     if constraints.terminal_rejections {
-                        self.reject_strategy_entry(&mut s, &cond.id, "unfilled");
+                        self.reject_strategy_entry_at_price(
+                            &mut s,
+                            &cond,
+                            "unfilled",
+                            EntryPriceCheckPhase::PreSubmitQuote,
+                            &q,
+                            market_price,
+                        );
                         entry_state_changed = true;
                         continue;
                     }
@@ -2847,7 +2877,14 @@ impl ExecutionEngine {
                             continue;
                         }
                         EntryDecision::Reject(reason) => {
-                            self.reject_strategy_entry(&mut s, &cond.id, &reason);
+                            self.reject_strategy_entry_at_price(
+                                &mut s,
+                                &cond,
+                                &reason,
+                                EntryPriceCheckPhase::ProposedLimit,
+                                &q,
+                                price,
+                            );
                             entry_state_changed = true;
                             continue;
                         }

@@ -47,7 +47,7 @@ function setup(listenOverride) {
   const source = fs.readFileSync('src/stores/liveTrader.ts', 'utf8')
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } })
   vm.runInNewContext(compiled.outputText, context)
-  return { store: context.exports.useLiveTraderStore(), events, api }
+  return { store: context.exports.useLiveTraderStore(), events, api, pool: poolModule.exports }
 }
 
 function snapshot() {
@@ -544,7 +544,7 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
   const Vue = require('vue')
   const { compile } = require('@vue/compiler-dom')
   const { renderToString } = require('@vue/server-renderer')
-  const { store } = setup()
+  const { store, pool } = setup()
   store.activeTab = 'conditions'
   store.conditions = [
     {
@@ -569,6 +569,27 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
       display_only: false,
     },
   ]
+  store.conditions.push({
+    ...store.conditions[0], id: 'bu2701-long-rejected', symbol: 'bu2701', instrument_id: 'bu2701', direction: 'up',
+  }, {
+    ...store.conditions[0], id: 'legacy-rejected',
+  })
+  store.strategyDiagnostics = {
+    states: {},
+    entry_decisions: {
+      'v2701-short-rejected': {
+        reason: 'unfilled',
+        chase_limit: { phase: 'proposed_limit', side: 'sell', price_source: 'limit',
+          checked_price: 5112, reference_price: 5117, limit_price: 5112.7, max_deviation: 4.3, excess: 0.7 },
+      },
+      'bu2701-long-rejected': {
+        reason: 'unfilled',
+        chase_limit: { phase: 'trigger_quote', side: 'buy', price_source: 'ask',
+          checked_price: 4199, reference_price: 4187, limit_price: 4193.219, max_deviation: 6.219, excess: 5.781 },
+      },
+      'legacy-rejected': { reason: 'unfilled', stage: 'entry', at: 1795066202 },
+    },
+  }
 
   const source = fs.readFileSync('src/views/LiveTraderView.vue', 'utf8')
   const template = source.match(/<section v-else-if="trader.activeTab === 'conditions'"[\s\S]*?<\/section>/)[0]
@@ -592,15 +613,15 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
     return (state || '').toLowerCase() === 'rejected'
   }
   function getNoteCategory(note) {
-    if (note === 'unfilled') return '滑点保护'
+    if (note === 'unfilled') return pool.chaseRejectionFallback.category
     return '说明'
   }
   function formatNoteText(note) {
-    if (note === 'unfilled') return '跳空/滑点超追价上限(放弃入场)'
+    if (note === 'unfilled') return pool.chaseRejectionFallback.text
     return note
   }
   function getNoteTooltip(note) {
-    if (note === 'unfilled') return '【滑点保护拦截】盘口突破瞬间价格超出策略允许的最大追价滑点容差'
+    if (note === 'unfilled') return pool.chaseRejectionFallback.tooltip
     return note
   }
 
@@ -629,7 +650,7 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
   for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
     app.component(name, {
       setup(_, { slots }) {
-        return () => Vue.h('span', slots.trigger ? slots.trigger() : slots.default?.())
+        return () => Vue.h('span', [...(slots.trigger?.() || []), ...(slots.default?.() || [])])
       },
     })
   }
@@ -640,8 +661,11 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
   assert.ok(!html.includes('等待重试'), 'Should not display misleading 等待重试')
   assert.match(html, /已等待 1 根K线 \(不限\)/)
   assert.ok(!html.includes('18446744073709552000'), 'Should not leak overflowed usize::MAX')
-  assert.match(html, /滑点保护/)
-  assert.match(html, /跳空\/滑点超追价上限\(放弃入场\)/)
+  assert.match(html, /追价保护/)
+  assert.match(html, /报单前价格超追价限制，信号终止/)
+  assert.match(html, /拟报限价 5112 低于追价下限 5112\.7，信号终止/)
+  assert.match(html, /卖一价 4199 高于追价上限 4193\.219，信号终止/)
+  assert.match(html, /触价检查。计划入场价 4187，允许偏离 6\.219 点，本次超出 5\.781 点。/)
   assert.match(html, /触价后被拒/)
 })
 

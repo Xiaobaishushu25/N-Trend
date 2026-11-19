@@ -636,6 +636,44 @@ fn no_follow_keeps_a_position_that_reached_half_r_then_retraced() {
 }
 
 #[test]
+fn session_reopening_quote_cannot_trigger_no_follow_one_bucket_early() {
+    let s = CandidateStrategy::new(parameters()).unwrap();
+    let mut p = position();
+    p.open_ts = "2026-10-21 10:49:54".into();
+    for restored in [false, true] {
+        let mut state = Value::Null;
+        for end in ["11:00:00", "11:15:00", "11:30:00"] {
+            assert!(run(
+                &s,
+                closed(&format!("2026-10-21 {end}")),
+                &mut state,
+                std::slice::from_ref(&p)
+            )
+            .is_empty());
+        }
+        if restored {
+            let buckets = state["holding"]["position"].as_object_mut().unwrap();
+            buckets.remove("session_open_buckets_corrected");
+            buckets.get_mut("buckets").unwrap()["2026-10-21 13:30:00"] = json!(0.1);
+        } else {
+            let q = quote(parse_time("2026-10-21 13:30:00").unwrap(), p.fill_price);
+            assert!(run(&s, StrategyEvent::Quote(q), &mut state, std::slice::from_ref(&p)).is_empty());
+        }
+        assert!(run(&s, closed("2026-10-21 13:45:00"), &mut state, std::slice::from_ref(&p)).is_empty());
+        assert!(state["holding"]["position"]["buckets"].get("2026-10-21 13:30:00").is_none());
+        let actions = run(&s, closed("2026-10-21 14:00:00"), &mut state, std::slice::from_ref(&p));
+        assert!(matches!(&actions[..], [TradeIntent::Close { reason, .. }] if reason == "no_follow"));
+    }
+    for (time, expected) in [
+        ("09:00:00", "09:15:00"), ("10:30:00", "10:45:00"), ("13:30:00", "13:45:00"),
+        ("21:00:00", "21:15:00"), ("11:30:00", "11:30:00"), ("00:00:00", "00:00:00"),
+    ] {
+        let ts = parse_time(&format!("2026-10-21 {time}")).unwrap();
+        assert_eq!(observation_bucket(ts, "pb2611"), format!("2026-10-21 {expected}"));
+    }
+}
+
+#[test]
 fn pending_expiry_counts_observed_buckets_without_filling_session_gaps() {
     let s = CandidateStrategy::new(parameters()).unwrap();
     let mut state = Value::Null;

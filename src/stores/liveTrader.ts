@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { isMarketTradingWindow } from '../utils/tradingHours'
-import { filteredConditionRows } from '../utils/conditionPool'
+import { chaseRejectionNote, filteredConditionRows } from '../utils/conditionPool'
 import { parseTradeTimestamp, extractTradeDate, getTradeRecordPnl } from '../utils/tradeTime'
 import type {
   CtpHealth,
@@ -208,7 +208,13 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     },
     conditionPool(): ConditionPoolRow[] {
       const time = (row: ConditionPoolRow) => row.trigger_ts || row.warning_bar_ts || row.created_at || 0
-      return [...this.activeConditions, ...this.filteredConditions].sort((a, b) => {
+      const decisions = this.strategyDiagnostics?.entry_decisions
+      const activeRows = this.activeConditions.map((condition) => {
+        if (condition.note !== 'unfilled' || condition.state.toLowerCase() !== 'rejected') return condition
+        const note = chaseRejectionNote(decisions?.[condition.id])
+        return note ? { ...condition, chase_rejection_note: note } : condition
+      })
+      return [...activeRows, ...this.filteredConditions].sort((a, b) => {
         const ta = time(a), tb = time(b)
         if (typeof ta === 'string' && typeof tb === 'string') return tb.localeCompare(ta)
         const epoch = (t: string | number) => typeof t === 'number' ? t * 1000 : Date.parse(t) || 0

@@ -1045,11 +1045,27 @@ export interface LiveTraderSnapshot {
 
 export interface StrategyDiagnostics {
   states: Record<string, { decisions?: Record<string, { reason: string; values: Record<string, any> }> }>
+  entry_decisions?: Record<string, StrategyEntryDecision>
+}
+
+export interface StrategyEntryDecision {
+  reason: string
+  chase_limit?: {
+    phase: 'trigger_quote' | 'pre_submit_quote' | 'proposed_limit'
+    side: 'buy' | 'sell'
+    price_source: 'ask' | 'bid' | 'last' | 'limit'
+    checked_price: number
+    reference_price: number
+    limit_price: number
+    max_deviation: number
+    excess: number
+  }
 }
 
 export type ConditionPoolRow = Omit<LiveConditionOrder, 'state'> & {
   state: LiveConditionOrder['state'] | 'filtered'
   display_only?: boolean
+  chase_rejection_note?: { text: string; tooltip: string }
 }
 
 export interface ExecutionOrder {

@@ -184,7 +184,12 @@ impl ExecutionEngine {
         serde_json::json!({"states":s.strategy_states,"entry_decisions":s.entry_decisions,
             "symbol_slots":s.symbol_slots,"calendar_health":calendars})
     }
-    pub(super) fn reject_strategy_entry(&self, s: &mut ExecutionState, id: &str, reason: &str) {
+    pub(super) fn reject_strategy_entry<'a>(
+        &self,
+        s: &'a mut ExecutionState,
+        id: &str,
+        reason: &str,
+    ) -> &'a mut serde_json::Value {
         s.abort_entry(id);
         if let Some(c) = s.conditions.get_mut(id) {
             c.state = if reason == "invalidated" {
@@ -194,7 +199,59 @@ impl ExecutionEngine {
             };
             c.note = reason.into();
         }
-        s.entry_decisions.insert(id.into(),serde_json::json!({"stage":"entry","reason":reason,"at":self.now_utc().timestamp()}));
+        s.entry_decisions
+            .entry(id.into())
+            .insert_entry(serde_json::json!({
+                "stage": "entry", "reason": reason, "at": self.now_utc().timestamp()
+            }))
+            .into_mut()
+    }
+    pub(super) fn reject_strategy_entry_at_price(
+        &self,
+        s: &mut ExecutionState,
+        cond: &ConditionOrder,
+        reason: &str,
+        phase: EntryPriceCheckPhase,
+        quote: &ExecutionQuote,
+        checked_price: f64,
+    ) {
+        if reason != "unfilled" {
+            self.reject_strategy_entry(s, &cond.id, reason);
+            return;
+        }
+
+        let buy = cond.direction == "up";
+        let (side, sign, book_side, book_price) = if buy {
+            ("buy", 1.0, "ask", quote.ask)
+        } else {
+            ("sell", -1.0, "bid", quote.bid)
+        };
+        let price_source = match phase {
+            EntryPriceCheckPhase::ProposedLimit => "limit",
+            EntryPriceCheckPhase::PreSubmitQuote
+                if !book_price.is_finite() || book_price <= 0.0 =>
+            {
+                "last"
+            }
+            _ => book_side,
+        };
+        let max_deviation = max_entry_price_deviation(cond.risk, quote.tick);
+        let quote_sequence = s
+            .quote_sequences
+            .get(&quote.instrument_id.to_uppercase())
+            .copied();
+        self.reject_strategy_entry(s, &cond.id, reason)["chase_limit"] = serde_json::json!({
+            "phase": phase,
+            "side": side,
+            "price_source": price_source,
+            "checked_price": checked_price,
+            "reference_price": cond.entry_price,
+            "limit_price": cond.entry_price + sign * max_deviation,
+            "max_deviation": max_deviation,
+            "excess": sign * (checked_price - cond.entry_price) - max_deviation,
+            "quote_sequence": quote_sequence,
+            "quote": quote,
+        });
     }
     pub(super) fn symbol_slot_blocked(s: &ExecutionState, c: &ConditionOrder) -> bool {
         s.symbol_slots.get(&c.symbol).is_some_and(|id| id != &c.id)

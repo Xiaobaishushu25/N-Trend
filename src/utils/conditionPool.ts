@@ -1,4 +1,35 @@
-import type { ConditionPoolRow, StrategyDiagnostics } from '../types'
+import type { ConditionPoolRow, StrategyDiagnostics, StrategyEntryDecision } from '../types'
+
+export const chaseRejectionFallback = {
+  category: '追价保护',
+  text: '报单前价格超追价限制，信号终止',
+  tooltip: '报单前检查发现价格超出允许的追价范围，本信号已终止。',
+}
+
+const chasePriceFormat = new Intl.NumberFormat('zh-CN', { useGrouping: false, maximumFractionDigits: 6 })
+
+export function chaseRejectionNote(decision?: StrategyEntryDecision): ConditionPoolRow['chase_rejection_note'] {
+  const detail = decision?.reason === 'unfilled' ? decision.chase_limit : undefined
+  if (!detail) return undefined
+
+  const phase = {
+    trigger_quote: '触价检查',
+    pre_submit_quote: '报单前盘口复核',
+    proposed_limit: '拟报限价复核',
+  }[detail.phase]
+  const priceSource = { ask: '卖一价', bid: '买一价', last: '最新价', limit: '拟报限价' }[detail.price_source]
+  const { checked_price, reference_price, limit_price, max_deviation, excess } = detail
+  if (!phase || !priceSource || ![checked_price, reference_price, limit_price, max_deviation, excess].every(Number.isFinite)) {
+    return undefined
+  }
+
+  const format = (price: number) => chasePriceFormat.format(price)
+  const comparison = detail.side === 'buy' ? '高于追价上限' : '低于追价下限'
+  return {
+    text: `${priceSource} ${format(checked_price)} ${comparison} ${format(limit_price)}，信号终止`,
+    tooltip: `${phase}。计划入场价 ${format(reference_price)}，允许偏离 ${format(max_deviation)} 点，本次超出 ${format(excess)} 点。`,
+  }
+}
 
 function number(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : NaN
