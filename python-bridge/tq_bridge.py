@@ -290,11 +290,12 @@ class TqDataWorker:
                 # 长时间饿死 WebSocket，健康检查误判为心跳超时。
                 for _ in range(8):
                     try:
-                        request_id, cmd, args, resp_q, expires_at, cancelled = self.cmd_queue.get_nowait()
+                        request_id, cmd, args, resp_q, queued_at, expires_at, cancelled = self.cmd_queue.get_nowait()
                     except queue.Empty:
                         break
 
-                    if cancelled.is_set() or time.monotonic() >= expires_at:
+                    started_at = time.monotonic()
+                    if cancelled.is_set() or started_at >= expires_at:
                         logger.warning("Discarding expired command id=%s cmd=%s", request_id, cmd)
                         continue
                     try:
@@ -309,6 +310,16 @@ class TqDataWorker:
                             )
                         if not cancelled.is_set():
                             resp_q.put_nowait((False, f"{type(ex).__name__}: {ex}"))
+                    finally:
+                        if cmd == "get_kline":
+                            logger.info(
+                                "[TQ_KLINE_COMMAND] id=%s symbol=%s period_s=%s queue_ms=%.1f command_ms=%.1f",
+                                request_id,
+                                args.get("tq_symbol", "-"),
+                                args.get("duration_seconds", "-"),
+                                (started_at - queued_at) * 1000,
+                                (time.monotonic() - started_at) * 1000,
+                            )
 
                 if self.reconnect_requested.is_set():
                     continue
@@ -896,10 +907,11 @@ class TqDataWorker:
         request_id = next(self.command_ids)
         resp_q = queue.Queue(maxsize=1)
         cancelled = threading.Event()
-        expires_at = time.monotonic() + timeout
+        queued_at = time.monotonic()
+        expires_at = queued_at + timeout
         try:
             self.cmd_queue.put(
-                (request_id, cmd, args, resp_q, expires_at, cancelled),
+                (request_id, cmd, args, resp_q, queued_at, expires_at, cancelled),
                 timeout=min(timeout, 0.25),
             )
         except queue.Full as exc:

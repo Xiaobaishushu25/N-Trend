@@ -11,8 +11,10 @@ mod risk_budget;
 use risk_budget::{BudgetSettings, RiskBudget};
 
 pub const ID: &str = "n_p3_v1";
-pub const VERSION: &str = "2";
-const PREVIOUS_VERSION: &str = "1";
+pub const VERSION: &str = "3";
+const PREVIOUS_VERSION: &str = "2";
+const ATR_FLOOR_VERSION: &str = "1";
+const MAX_TARGET_ATR: f64 = 3.5;
 pub const EXIT: &str = "p3_exit_v1";
 pub const SIZING: &str = "risk_budget_v1";
 pub(in crate::trader) const FIRST_S1: &str = "p3_first_s1";
@@ -98,30 +100,31 @@ pub struct P3Strategy {
     budget: BudgetSettings,
     exit_mode: ExitMode,
     entry_cutoffs: BTreeMap<String, String>,
+    max_target_atr: Option<f64>,
 }
 impl P3Strategy {
     pub fn new(p: P3Parameters) -> Result<Self> {
-        Self::with_atr_floor(p, false)
+        Self::for_version(p, VERSION)
     }
-    fn with_atr_floor(p: P3Parameters, keep_floor: bool) -> Result<Self> {
+    fn for_version(p: P3Parameters, version: &str) -> Result<Self> {
         p.validate()?;
-        if keep_floor {
+        if version == ATR_FLOOR_VERSION {
             ensure!(
                 p.min_net_rr == 1.,
                 "P3代码版本1的净盈亏比门槛固定为1，请加载新版预设"
             );
         }
-        let base =
+        let mut base =
             CandidateStrategy::with_min_score(p.common(), 2.5)?.with_min_net_rr(p.min_net_rr)?;
+        if version != ATR_FLOOR_VERSION {
+            base = base.without_atr_floor();
+        }
         Ok(Self {
-            base: if keep_floor {
-                base
-            } else {
-                base.without_atr_floor()
-            },
+            base,
             budget: p.budget()?,
             exit_mode: p.exit_mode,
             entry_cutoffs: p.entry_cutoffs,
+            max_target_atr: (version == VERSION).then_some(MAX_TARGET_ATR),
         })
     }
     #[cfg(test)]
@@ -295,12 +298,25 @@ impl Strategy for P3Strategy {
                 )
             };
             let lots = risk_budget::initial_volume(&snapshot, &self.budget)?;
-            if reason.is_some() || lots == 0 {
+            let target_atr = (snapshot.target - snapshot.entry) * snapshot.sign() / snapshot.atr14;
+            let reason = reason
+                .or((lots == 0).then_some("risk_budget_exceeded"))
+                .or_else(|| {
+                    // Allow equality despite rounding in the frozen ATR and signal prices.
+                    self.max_target_atr
+                        .filter(|max| target_atr - max > 1e-9)
+                        .map(|_| "target_atr_above_max")
+                });
+            if let Some(reason) = reason {
                 let mut audit: State = serde_json::from_value(state.clone())?;
                 if let Some(decision) = audit.decisions.get_mut(&plan.signal_id) {
-                    decision["reason"] = json!(reason.unwrap_or("risk_budget_exceeded"));
+                    decision["reason"] = json!(reason);
                     decision["values"]["risk_budget_yuan"] = json!(self.budget.yuan());
                     decision["values"]["min_score"] = json!(2.5);
+                    if let Some(max) = self.max_target_atr {
+                        decision["values"]["target_atr"] = json!(target_atr);
+                        decision["values"]["max_target_atr"] = json!(max);
+                    }
                 }
                 audit.pending.remove(&plan.signal_id);
                 *state = serde_json::to_value(audit)?;
@@ -493,14 +509,14 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     }
     if d.strategy_id == ID {
         ensure!(
-            [PREVIOUS_VERSION, VERSION].contains(&d.code_version.as_str())
+            [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION].contains(&d.code_version.as_str())
                 && d.exit_policy == EXIT
                 && d.sizing_policy == SIZING,
             "P3必须使用配套金额预算和退出模块"
         );
         let parameters = serde_json::from_value::<P3Parameters>(d.parameters.clone())?;
         parameters.validate()?;
-        if d.code_version == PREVIOUS_VERSION {
+        if d.code_version == ATR_FLOOR_VERSION {
             ensure!(
                 parameters.min_net_rr == 1.,
                 "P3代码版本1的净盈亏比门槛固定为1，请加载新版预设"
@@ -510,18 +526,14 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     Ok(())
 }
 pub fn register(r: &mut StrategyRegistry) {
-    // Frozen v1 conditions must not acquire v2 admission rules after restart.
-    r.register_strategy(ID, PREVIOUS_VERSION, |p| {
-        Ok(Box::new(P3Strategy::with_atr_floor(
-            serde_json::from_value(p.clone())?,
-            true,
-        )?))
-    });
-    r.register_strategy(ID, VERSION, |p| {
-        Ok(Box::new(P3Strategy::new(serde_json::from_value(
-            p.clone(),
-        )?)?))
-    });
+    for version in [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION] {
+        r.register_strategy(ID, version, move |p| {
+            Ok(Box::new(P3Strategy::for_version(
+                serde_json::from_value(p.clone())?,
+                version,
+            )?))
+        });
+    }
     r.register_sizing(SIZING, Arc::new(RiskBudget));
     r.register_exit(EXIT, Arc::new(P3Exit));
 }

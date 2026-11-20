@@ -172,6 +172,7 @@ impl Config {
                     d.scheduler.scan_interval_secs,
                 ),
                 trading_only: get_bool(map, "trading_only", d.scheduler.trading_only),
+                ..d.scheduler
             },
             fetch: FetchConfig {
                 request_interval_ms: get_u64(

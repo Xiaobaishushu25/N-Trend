@@ -70,9 +70,16 @@ impl<T> AnalysisHistory<T> {
                 slots.entry(key).or_default().clone()
             }
         };
+        let slot_started = Instant::now();
         let mut slot = slot.lock().await;
+        let slot_wait_ms = slot_started.elapsed().as_millis();
         let revision = market_history_revision(db, symbol).await?;
         if let Some((_, bars)) = slot.as_ref().filter(|(cached, _)| *cached == revision) {
+            tracing::debug!(
+                target: "scan_perf",
+                symbol, timeframe, revision, slot_wait_ms,
+                "[HISTORY] cache hit"
+            );
             return Ok(bars.clone());
         }
 
@@ -81,15 +88,21 @@ impl<T> AnalysisHistory<T> {
         let started = Instant::now();
         for _ in 0..3 {
             let revision = market_history_revision(db, symbol).await?;
+            let load_started = Instant::now();
             let bars = Arc::new(load().await?);
+            let load_ms = load_started.elapsed().as_millis();
             if market_history_revision(db, symbol).await? == revision {
-                if queued.elapsed() >= Duration::from_millis(500) {
+                if slot_started.elapsed() >= Duration::from_millis(500) {
                     tracing::info!(
+                        target: "scan_perf",
                         symbol,
                         timeframe,
+                        revision,
                         rows = bars.len(),
+                        slot_wait_ms,
                         queue_ms = started.duration_since(queued).as_millis(),
-                        load_ms = started.elapsed().as_millis(),
+                        load_ms,
+                        total_ms = slot_started.elapsed().as_millis(),
                         "后台分析历史读取较慢"
                     );
                 }

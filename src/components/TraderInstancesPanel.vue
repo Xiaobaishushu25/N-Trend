@@ -86,6 +86,7 @@ const strategy = ref<StrategyDefinition | null>(null)
 const parameters = ref('{}')
 const createPreset = ref('')
 const presets = computed(() => trader.instanceCatalog?.modules?.presets || [])
+const strategyIds = computed(() => [...new Set(trader.instanceCatalog?.modules?.strategies?.map(s => s.id))])
 const isCandidate = computed(() => ['n_p2', 'n_b5_six', 'n_p3_v1'].includes(strategy.value?.strategy_id || ''))
 const isB5 = computed(() => strategy.value?.strategy_id === 'n_b5_six')
 const isP3 = computed(() => strategy.value?.strategy_id === 'n_p3_v1')
@@ -964,7 +965,7 @@ watch(
                 <div class="form-row">
                   <label class="form-label">信号模块</label>
                   <select v-model="strategy.strategy_id" class="form-select" @change="applyPreset(strategy.strategy_id)">
-                    <option v-for="s in trader.instanceCatalog?.modules.strategies" :key="s.id" :value="s.id">{{ moduleLabel(s.id) }}</option>
+                    <option v-for="id in strategyIds" :key="id" :value="id">{{ moduleLabel(id) }}</option>
                   </select>
                 </div>
 
@@ -973,6 +974,7 @@ watch(
                   <select v-model="strategy.code_version" class="form-select">
                     <option v-for="s in trader.instanceCatalog?.modules.strategies.filter(s => s.id === strategy?.strategy_id)" :key="s.version" :value="s.version">{{ s.version }}</option>
                   </select>
+                  <span v-if="isP3 && strategy.code_version === '3'" class="field-hint">计划目标距离大于 3.5 ATR 时过滤新开仓信号。</span>
                 </div>
 
                 <div class="form-row">
@@ -1028,7 +1030,7 @@ watch(
                     <option value="fixed_s1">模式 A：全部在目标位退出</option>
                     <option value="hybrid_s1">模式 B：双手首手 S1，余仓保本追踪</option>
                   </select>
-                  <span class="field-hint">仅开成一手时，S1 空间不足或等于 1R，止盈目标外推到 1R；双手仍按原生 S1 执行。</span>
+                  <span class="field-hint">首个执行止盈取原生 S1 与实际初始 1R 中较远的位置。</span>
                 </div>
                 <div class="form-row">
                   <label class="form-label">单笔计划风险预算（元）</label>
@@ -1040,8 +1042,8 @@ watch(
                 </div>
                   <div class="form-row">
                     <label class="form-label">S1 最低净盈亏比</label>
-                    <input v-model.number="p3MinNetRr" type="number" min="0.01" step="0.01" class="form-input" :disabled="strategy?.code_version !== '2'" required>
-                    <span class="field-hint">调高通常减少交易；调低会增加候选。旧版实例需先加载新版 P3 预设。</span>
+                    <input v-model.number="p3MinNetRr" type="number" min="0.01" step="0.01" class="form-input" :disabled="strategy.code_version === '1'" required>
+                    <span class="field-hint">调高通常减少交易。P3 代码版本 1 的门槛固定为 1.0。</span>
                   </div>
               </div>
 
@@ -1051,7 +1053,7 @@ watch(
               </div>
 
               <p v-if="isB5" class="field-hint">六品种 B5：最近合格 A、不合并摆点、目标成本比≤10%、A 净实体同向；小时不顺向同组同向最多两单，同 A 两次原止损后停试。固定一手，独立生成新预警。</p>
-              <p v-else-if="isP3" class="field-hint">P3 按含成本风险预算开 0～2 手，入场委托三秒未全成撤销剩余量。单手按 S1 与 1R 中更远的目标退出；双手分批模式确认首手成交后才保护余仓。S1 净盈亏比准入仍按原生结构计算。修改配置只影响之后的新信号。</p>
+              <p v-else-if="isP3" class="field-hint">P3 按含成本风险预算开 0～2 手，入场委托三秒未全成撤销剩余量。双手分批模式确认首手成交后才保护余仓。S1 净盈亏比准入按原生结构计算。修改配置只影响之后的新信号。</p>
               <p v-else-if="isCandidate" class="field-hint">候选策略固定一手、原结构止损和 S1 目标。修改参数仅对保存后产生的新信号生效，已有条件单和持仓保留原版本运行。</p>
             </template>
           </div>

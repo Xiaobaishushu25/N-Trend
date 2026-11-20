@@ -23,7 +23,8 @@ use crate::fetch::{
     ClosedBarEvent, HybridDataSource, MarketDataSource, SinaClient, TqBridgeClient,
 };
 use crate::process::SidecarManager;
-use crate::scheduler::SchedulerConfig;
+use crate::scheduler::{CloseScanMode, SchedulerConfig};
+use crate::storage::cache_revisions::market_history_revision;
 use crate::storage::entities::{
     klines, manual_level_events, manual_levels, pattern_events, preclose_candidates,
     preclose_signals, symbols,
@@ -1368,6 +1369,84 @@ fn advance_event_model_indexed(
     changed
 }
 
+const EVENT_WRITE_ATTEMPTS: usize = 3;
+
+async fn reload_same_event(
+    db: &DatabaseConnection,
+    previous: &pattern_events::Model,
+) -> Result<Option<pattern_events::Model>> {
+    Ok(repo::pattern_event_by_id(db, previous.id)
+        .await?
+        .filter(|row| {
+            row.symbol == previous.symbol
+                && row.direction == previous.direction
+                && row.warning_ts == previous.warning_ts
+                && row.created_at == previous.created_at
+        }))
+}
+
+struct EventReplayWrite {
+    event: pattern_events::Model,
+    changed: bool,
+    was_triggered: bool,
+    had_trigger_bar: bool,
+}
+
+async fn persist_event_replay(
+    db: &DatabaseConnection,
+    mut previous: pattern_events::Model,
+    mut advance: impl FnMut(&mut pattern_events::Model) -> bool,
+) -> Result<Option<EventReplayWrite>> {
+    for _ in 0..EVENT_WRITE_ATTEMPTS {
+        let mut event = previous.clone();
+        let changed = advance(&mut event);
+        if !changed || repo::update_pattern_event_if_current(db, &previous, event.clone()).await? {
+            return Ok(Some(EventReplayWrite {
+                event,
+                changed,
+                was_triggered: previous.trigger_ts.is_some(),
+                had_trigger_bar: previous.trigger_bar_ts.is_some(),
+            }));
+        }
+        let Some(current) = reload_same_event(db, &previous).await? else {
+            return Ok(None);
+        };
+        previous = current;
+    }
+    Err(anyhow!("信号 {} 持续变化，扫描推进将重试", previous.id))
+}
+
+fn pending_event_crossed(event: &pattern_events::Model, latest: f64) -> bool {
+    event.state == "pending"
+        && event.trigger_ts.is_none()
+        && match event_dir(event) {
+            Dir::Down => latest < event.entry,
+            Dir::Up => latest > event.entry,
+        }
+}
+
+fn quote_event_is_expired(row: &pattern_events::Model, bars: Option<&[Bar]>) -> bool {
+    let Some(bars) = bars else {
+        let now = chrono::Utc::now().naive_utc() + ChronoDuration::hours(8);
+        return parse_local_ts(&row.warning_ts)
+            .is_some_and(|warning| (now - warning).num_hours() > 48);
+    };
+    let Some(warning) = bars.iter().position(|bar| bar_ts(bar) == row.warning_ts) else {
+        return true;
+    };
+    if bars.len() > warning + outcome::PENDING_BARS {
+        return true;
+    }
+    let stop = (warning + 1 + outcome::PENDING_BARS).min(bars.len());
+    bars[warning + 1..stop].iter().any(|bar| {
+        bar.rollover
+            || match event_dir(row) {
+                Dir::Up => bar.low <= row.stop,
+                Dir::Down => bar.high >= row.stop,
+            }
+    })
+}
+
 /// 单个品种的行情快照（最新价 + 相对上一交易日的涨跌幅）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MarketSnapshot {
@@ -1507,7 +1586,7 @@ pub struct Services {
     /// 图表临时新浪数据缓存；只存在内存，不进入 RawPipeline。
     chart_fallback_cache: Mutex<HashMap<String, ChartFallbackCache>>,
     /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
-    scan_lock: Mutex<()>,
+    scan_lock: RwLock<()>,
     /// 串行化全量行情刷新与扫描，避免启动刷新尚未完成时扫描读取半批新、半批旧数据。
     data_cycle_lock: Mutex<()>,
     /// 统一原子化行情写入与派生管道（Issue 02）。
@@ -1644,7 +1723,7 @@ impl Services {
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
             chart_fallback_cache: Mutex::new(HashMap::new()),
-            scan_lock: Mutex::new(()),
+            scan_lock: RwLock::new(()),
             data_cycle_lock: Mutex::new(()),
             pipeline,
             active_single_bars: Arc::new(RwLock::new(HashMap::new())),
@@ -1796,18 +1875,11 @@ impl Services {
             .collect();
         let mut bars_by_symbol: HashMap<String, Option<Vec<Bar>>> = HashMap::new();
         let mut hits = Vec::new();
-        for row in rows.iter().cloned() {
-            if row.state != "pending" || row.trigger_ts.is_some() {
-                continue;
-            }
+        for row in rows.iter() {
             let Some(latest) = by_code.get(row.symbol.as_str()).copied() else {
                 continue;
             };
-            let crossed = match row.direction.as_str() {
-                "down" => latest < row.entry,
-                _ => latest > row.entry,
-            };
-            if !crossed {
+            if !pending_event_crossed(row, latest) {
                 continue;
             }
 
@@ -1823,116 +1895,101 @@ impl Services {
             }
             let bars = bars_by_symbol.get(&row.symbol).and_then(Option::as_deref);
 
-            let now = now_ts();
-
-            let is_stale_or_expired = if let Some(bars) = bars {
-                if let Some(w) = bars.iter().position(|b| bar_ts(b) == row.warning_ts) {
-                    if bars.len() > w + outcome::PENDING_BARS {
-                        true
-                    } else {
-                        let scan_end = (w + 1 + outcome::PENDING_BARS).min(bars.len());
-                        let mut invalid = false;
-                        for j in w + 1..scan_end {
-                            if bars[j].rollover {
-                                invalid = true;
-                                break;
-                            }
-                            let stop_hit = match event_dir(&row) {
-                                Dir::Up => bars[j].low <= row.stop,
-                                Dir::Down => bars[j].high >= row.stop,
-                            };
-                            if stop_hit {
-                                invalid = true;
-                                break;
-                            }
-                        }
-                        invalid
-                    }
-                } else {
-                    true
-                }
-            } else {
-                if let Ok(w_dt) =
-                    chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M:%S")
-                        .or_else(|_| {
-                            chrono::NaiveDateTime::parse_from_str(&row.warning_ts, "%Y-%m-%d %H:%M")
-                        })
-                {
-                    let now_dt = chrono::Utc::now().naive_utc() + chrono::Duration::hours(8);
-                    (now_dt - w_dt).num_hours() > 48
-                } else {
-                    false
+            let observed_at = now_ts();
+            let next = match self
+                .apply_entry_quote(row.clone(), latest, bars, &observed_at)
+                .await
+            {
+                Ok(Some(next)) => next,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::warn!(symbol = %row.symbol, event_id = row.id, "记录实时触发失败: {error:#}");
+                    continue;
                 }
             };
-
-            if is_stale_or_expired {
-                let mut expired_ev = row.clone();
-                expired_ev.state = "expired".to_string();
-                expired_ev.outcome = Some("no_trigger".to_string());
-                expired_ev.exit_reason = Some("no_trigger".to_string());
-                expired_ev.updated_at = now;
-                let _ = repo::update_pattern_event(&self.db, expired_ev).await;
-                continue;
-            }
-
-            let name = name_by_code.get(&row.symbol).cloned().unwrap_or_default();
-            let key = (
-                row.symbol.clone(),
-                row.direction.clone(),
-                row.level.clone(),
-                row.entry.to_bits(),
-            );
-            if self.entry_notified.write().await.insert(key.clone()) {
-                let mut next = row.clone();
-                next.state = "triggered".to_string();
-                next.trigger_ts = Some(now.clone());
-                next.trigger_price = Some(row.entry);
-                next.updated_at = now;
-
-                if let Some(bars) = bars {
-                    let _ = advance_event_model(&mut next, bars);
+            if let Some(bars) = bars {
+                if next.trigger_bar_ts.is_some() {
+                    if let Err(error) =
+                        crate::v2::prediction::predict_event(&self.db, &next, bars).await
+                    {
+                        tracing::warn!(event_id = next.id, "V2 实时触发预测写入失败: {error:#}");
+                    }
                 }
-                if next.state == "filtered" || next.state == "unfilled" {
+            }
+            if next.state == "triggered" && next.entry_score >= min_score {
+                let name = name_by_code.get(&next.symbol).cloned().unwrap_or_default();
+                hits.push(EntryTriggerHit {
+                    event_id: next.id,
+                    symbol: next.symbol,
+                    name,
+                    direction: next.direction,
+                    level: next.level,
+                    grade: next.grade,
+                    entry: next.entry,
+                    latest,
+                });
+            }
+        }
+        Ok(hits)
+    }
+
+    async fn apply_entry_quote(
+        &self,
+        mut previous: pattern_events::Model,
+        latest: f64,
+        bars: Option<&[Bar]>,
+        observed_at: &str,
+    ) -> Result<Option<pattern_events::Model>> {
+        for _ in 0..EVENT_WRITE_ATTEMPTS {
+            if !pending_event_crossed(&previous, latest) {
+                return Ok(None);
+            }
+            let expired = quote_event_is_expired(&previous, bars);
+            let mut next = previous.clone();
+            next.updated_at = observed_at.to_string();
+            let notification_key = if expired {
+                next.state = "expired".into();
+                next.outcome = Some("no_trigger".into());
+                next.exit_reason = Some("no_trigger".into());
+                None
+            } else {
+                let key = (
+                    previous.symbol.clone(),
+                    previous.direction.clone(),
+                    previous.level.clone(),
+                    previous.entry.to_bits(),
+                );
+                if !self.entry_notified.write().await.insert(key.clone()) {
+                    return Ok(None);
+                }
+                next.state = "triggered".into();
+                next.trigger_ts = Some(observed_at.to_string());
+                next.trigger_price = Some(previous.entry);
+                if let Some(bars) = bars {
+                    advance_event_model(&mut next, bars);
+                }
+                if matches!(next.state.as_str(), "filtered" | "unfilled") {
                     next.trigger_ts = None;
                     next.trigger_price = None;
                 }
                 next.updated_at = now_ts();
-                match repo::update_pattern_event(&self.db, next.clone()).await {
-                    Ok(_) => {
-                        if let Some(bars) = bars {
-                            if next.trigger_bar_ts.is_some() {
-                                if let Err(e) =
-                                    crate::v2::prediction::predict_event(&self.db, &next, bars)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        event_id = next.id,
-                                        "V2 实时触发预测写入失败: {e:#}"
-                                    );
-                                }
-                            }
-                        }
-                        if next.state == "triggered" && row.entry_score >= min_score {
-                            hits.push(EntryTriggerHit {
-                                event_id: row.id,
-                                symbol: row.symbol,
-                                name,
-                                direction: row.direction,
-                                level: row.level,
-                                grade: row.grade,
-                                entry: row.entry,
-                                latest,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        self.entry_notified.write().await.remove(&key);
-                        tracing::warn!("记录实时触发失败 {} {}: {e}", row.symbol, row.id);
-                    }
-                }
+                Some(key)
+            };
+            let write =
+                repo::update_pattern_event_if_current(&self.db, &previous, next.clone()).await;
+            if matches!(&write, Ok(true)) {
+                return Ok((!expired).then_some(next));
             }
+            if let Some(key) = notification_key {
+                self.entry_notified.write().await.remove(&key);
+            }
+            write?;
+            let Some(current) = reload_same_event(&self.db, &previous).await? else {
+                return Ok(None);
+            };
+            previous = current;
         }
-        Ok(hits)
+        Err(anyhow!("信号 {} 持续变化，实时入场未提交", previous.id))
     }
 
     async fn refresh_manual_level_state(
@@ -2681,6 +2738,18 @@ impl Services {
                 &row.warning_ts,
             )
             .await?;
+            if parent.is_none()
+                && !repo::completed_scan_watermark(
+                    &self.db,
+                    &row.symbol,
+                    &close.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    EVENT_LOGIC_VERSION,
+                )
+                .await?
+            {
+                // A queued scan may still be waiting for that symbol's close.
+                continue;
+            }
             row.updated_at = now_ts();
             if let Some(parent) = parent {
                 row.state = "confirmed".to_string();
@@ -3039,6 +3108,9 @@ impl Services {
 
     /// 删除品种及其K线数据。
     pub async fn remove_symbol(&self, code: &str) -> Result<()> {
+        let _scan_guard = self.scan_lock.read().await;
+        let symbol_lock = self.pipeline.symbol_locks().get(code);
+        let _symbol_guard = symbol_lock.lock().await;
         repo::remove_symbol(&self.db, code).await?;
         repo::delete_symbol_klines(&self.db, code).await?;
         repo::delete_symbol_rollovers(&self.db, code).await?;
@@ -3067,7 +3139,14 @@ impl Services {
         force_backfill: bool,
         extra: &[String],
     ) -> Result<RefreshStats> {
+        let lock_started = Instant::now();
         let _cycle_guard = self.data_cycle_lock.lock().await;
+        tracing::info!(
+            target: "scan_perf",
+            force_backfill,
+            data_lock_wait_ms = lock_started.elapsed().as_millis(),
+            "[REFRESH] data cycle lock acquired"
+        );
         let mut symbols = repo::list_symbols(&self.db, true).await?;
         if !extra.is_empty() {
             for sym in repo::list_symbols(&self.db, false).await? {
@@ -3097,6 +3176,7 @@ impl Services {
 
     async fn refresh_symbol_data(&self, code: &str, force_backfill: bool) -> Result<()> {
         let s = self.config().await;
+        let integrity_started = Instant::now();
         let mut oldest_recoverable_gap: Option<String> = None;
         let mut recoverable_missing_count = 0usize;
         let mut integrity_check_failed = false;
@@ -3160,6 +3240,8 @@ impl Services {
             }
         }
 
+        let integrity_ms = integrity_started.elapsed().as_millis();
+        let history_started = Instant::now();
         let latest = repo::latest_ts(&self.db, code, "5m").await?;
         let stored = repo::raw_kline_count(&self.db, code).await?;
 
@@ -3209,7 +3291,10 @@ impl Services {
         } else {
             needed
         };
+        let history_ms = history_started.elapsed().as_millis();
+        let fetch_started = Instant::now();
         let fetched = self.data_source.fetch_minute(code, "5", count).await?;
+        let fetch_ms = fetch_started.elapsed().as_millis();
         if count >= s.fetch.backfill_count {
             self.deep_backfilled.write().await.insert(code.to_string());
         }
@@ -3230,7 +3315,20 @@ impl Services {
                 }
             }
         }
-        self.pipeline.process_raw_batch(code, &fetched).await?;
+        let persist_started = Instant::now();
+        let changed = self.pipeline.process_raw_batch(code, &fetched).await?;
+        tracing::info!(
+            target: "scan_perf",
+            symbol = code,
+            force_backfill,
+            integrity_ms,
+            history_ms,
+            fetch_ms,
+            persist_ms = persist_started.elapsed().as_millis(),
+            rows = fetched.len(),
+            changed,
+            "[REFRESH] symbol complete"
+        );
 
         // --- 5分钟收盘结算窗口的延迟补拉（修复 CJ0 15m 11:30 L8265/L8260、PB0 11:30 16085/16095 等偏差）---
         // 背景：fetch/kline.rs::settled_kline_rows 会丢弃 now - bar_ts < MINUTE_BAR_SETTLE_SECS(30秒) 的K线，
@@ -3411,11 +3509,106 @@ impl Services {
         symbol: &str,
         bar_end: &str,
     ) -> Result<(Option<ScanResult>, bool)> {
+        self.scan_queued_15m_symbol(symbol, bar_end, CloseScanMode::Serial)
+            .await
+    }
+
+    pub async fn scan_queued_15m_symbol(
+        &self,
+        symbol: &str,
+        bar_end: &str,
+        mode: CloseScanMode,
+    ) -> Result<(Option<ScanResult>, bool)> {
         let dt = NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")?;
         if dt.minute() % 15 != 0 || dt.second() != 0 {
             return Err(anyhow!("非15分钟闭合边界: {symbol}/{bar_end}"));
         }
-        self.run_event_scan_symbol(symbol, bar_end).await
+        self.run_event_scan_symbol(symbol, bar_end, mode).await
+    }
+
+    /// Fetch only when an expected input of the target bucket is missing.
+    /// The source applies its normal finality rules and the pipeline only fills holes.
+    pub async fn repair_closed_scan_inputs(&self, symbol: &str, bar_end: &str) -> Result<()> {
+        let end = NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")?;
+        let missing = self.missing_closed_scan_inputs(symbol, end).await?;
+        if missing.is_empty() {
+            if !repo::has_closed_15m(&self.db, symbol, bar_end).await? {
+                self.pipeline.rebuild_derived(symbol).await?;
+                anyhow::ensure!(
+                    repo::has_closed_15m(&self.db, symbol, bar_end).await?,
+                    "{symbol}/{bar_end} 无法恢复派生 15 分钟 K 线"
+                );
+            }
+            return Ok(());
+        }
+        let now = Local::now().naive_local();
+        anyhow::ensure!(
+            crate::scheduler::symbol_scan_settled(symbol, end, now),
+            "{symbol}/{bar_end} 尚未到达定时补拉时间"
+        );
+        let config = self.config().await;
+        let oldest = parse_local_ts(&missing[0]).expect("formatted scan input timestamp");
+        let count = (now.signed_duration_since(oldest).num_minutes().max(0) as usize / 5 + 3)
+            .max(config.fetch.incremental_count)
+            .min(config.fetch.backfill_count.max(3));
+        let started = Instant::now();
+        let mut rows = self.data_source.fetch_minute(symbol, "5", count).await?;
+        rows.retain(|row| missing.contains(&row.datetime));
+        let saved = self
+            .pipeline
+            .process_missing_raw_batch(symbol, &rows)
+            .await?;
+        tracing::info!(
+            target: "scan_perf",
+            symbol, bar_end, missing = missing.len(), saved,
+            repair_ms = started.elapsed().as_millis(),
+            "[SCAN] targeted input repair"
+        );
+        let remaining = self.missing_closed_scan_inputs(symbol, end).await?;
+        anyhow::ensure!(
+            remaining.is_empty(),
+            "{symbol}/{bar_end} 补拉后仍缺少闭合 K 线 {remaining:?}"
+        );
+        Ok(())
+    }
+
+    pub async fn closed_scan_inputs_ready(&self, symbol: &str, bar_end: &str) -> Result<bool> {
+        let end = NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")?;
+        Ok(self
+            .missing_closed_scan_inputs(symbol, end)
+            .await?
+            .is_empty()
+            && repo::has_closed_15m(&self.db, symbol, bar_end).await?)
+    }
+
+    async fn missing_closed_scan_inputs(
+        &self,
+        symbol: &str,
+        end: NaiveDateTime,
+    ) -> Result<Vec<String>> {
+        anyhow::ensure!(
+            end.minute() % 15 == 0
+                && end.second() == 0
+                && crate::scheduler::expected_5m_close(symbol, end),
+            "{symbol}/{end} 不是交易日历上的 15 分钟闭合点"
+        );
+        let expected: Vec<_> = [10, 5, 0]
+            .into_iter()
+            .map(|offset| end - ChronoDuration::minutes(offset))
+            .filter(|slot| crate::scheduler::expected_5m_close(symbol, *slot))
+            .map(|slot| slot.format("%Y-%m-%d %H:%M:%S").to_string())
+            .collect();
+        let rows = repo::raw_klines_window(
+            &self.db,
+            symbol,
+            &expected[0],
+            expected.last().expect("the close was validated"),
+        )
+        .await?;
+        Ok(expected
+            .into_iter()
+            .filter(|slot| !rows.iter().any(|row| row.ts == *slot))
+            .collect())
     }
 
     /// Persist the final 5m bar before chart publication or scan dispatch.
@@ -3499,28 +3692,61 @@ impl Services {
     /// 低频换月扫描入口：只处理有新增断点或仍待确认的品种，
     /// 首次会按本地连续 5m 全量回扫，之后按进度增量扫描。
     pub async fn sync_rollovers_if_needed(&self) -> Result<()> {
+        self.sync_rollovers(false).await
+    }
+
+    async fn sync_rollovers(&self, scan_gate_held: bool) -> Result<()> {
         let symbols = repo::list_symbols(&self.db, true).await?;
         let codes: Vec<String> = symbols.into_iter().map(|s| s.code).collect();
-        self.sync_rollovers_for_symbols(&codes).await
+        self.sync_rollovers_for_symbols_inner(&codes, scan_gate_held)
+            .await
     }
 
     /// 只扫描指定品种（测试/运维用）。
     pub async fn sync_rollovers_for_symbols(&self, symbols: &[String]) -> Result<()> {
+        self.sync_rollovers_for_symbols_inner(symbols, false).await
+    }
+
+    async fn sync_rollovers_for_symbols_inner(
+        &self,
+        symbols: &[String],
+        scan_gate_held: bool,
+    ) -> Result<()> {
         for code in symbols {
-            if let Err(e) = self.sync_symbol_rollovers_if_needed(code).await {
+            if let Err(e) = self
+                .sync_symbol_rollovers_if_needed(code, scan_gate_held)
+                .await
+            {
                 tracing::warn!("{} 换月扫描失败: {e}", code);
             }
         }
         Ok(())
     }
 
-    async fn sync_symbol_rollovers_if_needed(&self, symbol: &str) -> Result<()> {
-        let raw = repo::raw_klines(&self.db, symbol).await?;
-        if raw.len() < 3 {
-            return Ok(());
-        }
-        let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
-        let candidates = rollover::detect_candidates(symbol, &bars);
+    async fn sync_symbol_rollovers_if_needed(
+        &self,
+        symbol: &str,
+        scan_gate_held: bool,
+    ) -> Result<()> {
+        let history_started = Instant::now();
+        let revision = market_history_revision(&self.db, symbol).await?;
+        let bars = self.shared_raw_for(symbol).await?;
+        let history_ms = history_started.elapsed().as_millis();
+        let candidate_started = Instant::now();
+        let candidates = if bars.len() >= 3 {
+            rollover::detect_candidates(symbol, &bars)
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            target: "scan_perf",
+            symbol,
+            history_ms,
+            rows = bars.len(),
+            candidate_ms = candidate_started.elapsed().as_millis(),
+            candidates = candidates.len(),
+            "[ROLLOVER] candidates checked"
+        );
         if candidates.is_empty() {
             return Ok(());
         }
@@ -3556,13 +3782,19 @@ impl Services {
         }
 
         let prefix = contract_prefix(symbol);
+        let search_started = Instant::now();
         let contracts = match crate::fetch::symbols::search_contracts(&self.client, &prefix).await {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("{symbol} 换月确认跳过（合约列表获取失败）: {e}");
+                tracing::warn!(
+                    symbol,
+                    search_ms = search_started.elapsed().as_millis(),
+                    "换月确认跳过（合约列表获取失败）: {e}"
+                );
                 return Ok(());
             }
         };
+        let search_ms = search_started.elapsed().as_millis();
         let mut month_codes: Vec<String> = contracts
             .into_iter()
             .map(|r| r.code)
@@ -3579,6 +3811,7 @@ impl Services {
             .unwrap_or(300)
             .max(300);
         let mut month_bars: HashMap<String, Vec<Kline>> = HashMap::new();
+        let fetch_started = Instant::now();
         for code in &month_codes {
             match self.month_kline_cached(code, count).await {
                 Ok(rows) => {
@@ -3590,6 +3823,8 @@ impl Services {
             }
         }
 
+        let fetch_ms = fetch_started.elapsed().as_millis();
+        let confirm_started = Instant::now();
         let now = crate::analyze::time::now_display();
         let mut rows = Vec::new();
         let mut stale: Vec<(String, String)> = Vec::new();
@@ -3634,17 +3869,51 @@ impl Services {
                 }
             }
         }
-        for (sym, ts) in stale {
-            repo::delete_symbol_rollover(&self.db, &sym, &ts).await?;
+        let confirm_ms = confirm_started.elapsed().as_millis();
+        let persist_started = Instant::now();
+        // Work on the fetched history outside the symbol lock. Check that
+        // both price/rollover history and progress still match before writing.
+        let _scan_guard = if scan_gate_held {
+            None
+        } else {
+            Some(self.scan_lock.read().await)
+        };
+        let symbol_lock = self.pipeline.symbol_locks().get(symbol);
+        let _symbol_guard = symbol_lock.lock().await;
+        if market_history_revision(&self.db, symbol).await? != revision
+            || repo::get_setting(&self.db, &progress_key).await? != progress
+        {
+            tracing::debug!(
+                symbol,
+                "[ROLLOVER] history or progress changed; defer confirmation"
+            );
+            return Ok(());
         }
-        repo::upsert_rollovers(&self.db, rows).await?;
+        let tx = self.db.begin().await?;
+        for (sym, ts) in stale {
+            repo::delete_symbol_rollover(&tx, &sym, &ts).await?;
+        }
+        repo::upsert_rollovers(&tx, rows).await?;
 
         let latest = pending.iter().map(|c| c.ts.as_str()).max().unwrap_or("");
         if !latest.is_empty() {
             let mut map = HashMap::new();
             map.insert(progress_key, latest.to_string());
-            repo::set_settings(&self.db, &map).await?;
+            repo::set_settings(&tx, &map).await?;
         }
+        tx.commit().await?;
+        tracing::info!(
+            target: "scan_perf",
+            symbol,
+            pending = pending.len(),
+            contracts = month_codes.len(),
+            contracts_with_bars = month_bars.len(),
+            search_ms,
+            fetch_ms,
+            confirm_ms,
+            persist_ms = persist_started.elapsed().as_millis(),
+            "[ROLLOVER] confirmation complete"
+        );
         Ok(())
     }
 
@@ -4464,16 +4733,86 @@ impl Services {
 
     /// 全品种扫描：15m 前向重放识别预警，插入 pattern_events 并推进在途事件。
     pub async fn run_scan(&self) -> Result<ScanResult> {
-        let _guard = self.scan_lock.lock().await;
+        let scan_lock_started = Instant::now();
+        let _guard = self.scan_lock.write().await;
+        let scan_lock_wait_ms = scan_lock_started.elapsed().as_millis();
+        let data_lock_started = Instant::now();
         let _cycle_guard = self.data_cycle_lock.lock().await;
+        tracing::info!(
+            target: "scan_perf",
+            scan_lock_wait_ms,
+            data_lock_wait_ms = data_lock_started.elapsed().as_millis(),
+            "[SCAN] full scan locks acquired"
+        );
         self.run_scan_internal(true).await
+    }
+
+    /// Background maintenance has its own window and yields if scanning is busy.
+    pub async fn try_scan_maintenance(&self, mode: CloseScanMode) -> Result<bool> {
+        if !mode.uses_global_scan_locks() {
+            self.sync_rollovers(false).await?;
+            for symbol in repo::pattern_event_symbols(&self.db).await? {
+                let Ok(_scan_guard) = self.scan_lock.try_read() else {
+                    return Ok(true);
+                };
+                let lock = self.pipeline.symbol_locks().get(&symbol);
+                let Ok(_symbol_guard) = lock.try_lock() else {
+                    continue;
+                };
+                repo::delete_fast_pattern_events_by_symbol(&self.db, &symbol).await?;
+                let events = repo::pattern_events_by_symbol(&self.db, &symbol, None).await?;
+                self.cleanup_duplicate_event_rows(&events).await?;
+            }
+            return Ok(true);
+        }
+        let Ok(_scan_guard) = self.scan_lock.try_write() else {
+            return Ok(false);
+        };
+        let Ok(_cycle_guard) = self.data_cycle_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.sync_rollovers(true).await?;
+        repo::delete_fast_pattern_events(&self.db).await?;
+        self.cleanup_duplicate_events().await?;
+        Ok(true)
+    }
+
+    /// Read the full snapshot for the legacy round-completed event. Symbol
+    /// workers already applied and published the individual scan changes.
+    pub async fn scheduled_scan_snapshot(&self, scanned: i64) -> Result<ScanResult> {
+        let signals = repo::all_pattern_events(&self.db).await?;
+        let quality_by_event = crate::quality::store::display(&self.db, &signals).await;
+        let active_count = signals
+            .iter()
+            .filter(|event| matches!(event.state.as_str(), "pending" | "triggered"))
+            .count() as i64;
+        let single_bars = self
+            .active_single_bars
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        Ok(ScanResult {
+            summary: format!(
+                "15m 定时兜底完成，检查 {scanned} 个品种，活跃事件 {active_count} 条。"
+            ),
+            scanned,
+            active_count,
+            signals,
+            quality_by_event,
+            new_warnings: Vec::new(),
+            newly_triggered: Vec::new(),
+            failed: Vec::new(),
+            single_bars,
+        })
     }
 
     /// 手工完整扫描：保留换月同步，但忙时立即拒绝，绝不在锁前排队。
     pub async fn run_scan_try(&self) -> Result<ScanResult> {
         let _guard = self
             .scan_lock
-            .try_lock()
+            .try_write()
             .map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
         let _cycle_guard = self
             .data_cycle_lock
@@ -4486,7 +4825,7 @@ impl Services {
     pub async fn run_scan_fast(&self) -> Result<ScanResult> {
         let _guard = self
             .scan_lock
-            .try_lock()
+            .try_write()
             .map_err(|_| anyhow!("扫描进行中，请稍后再试"))?;
         let _cycle_guard = self
             .data_cycle_lock
@@ -4497,23 +4836,29 @@ impl Services {
 
     async fn run_scan_internal(&self, with_rollover: bool) -> Result<ScanResult> {
         if with_rollover {
-            self.sync_rollovers_if_needed().await?;
+            let started = Instant::now();
+            self.sync_rollovers(true).await?;
+            tracing::info!(
+                target: "scan_perf",
+                rollover_ms = started.elapsed().as_millis(),
+                "[SCAN] rollover synchronization complete"
+            );
         }
         let symbols = repo::list_symbols(&self.db, true).await?;
-        self.run_scan_models(symbols, true, true, ScanResultMode::Full)
+        self.run_scan_models(symbols, true, true, ScanResultMode::Full, None)
             .await
     }
 
     /// 天勤闭合事件快速路径：只扫描事件涉及的品种，不等待全市场最慢品种。
     pub async fn run_scan_symbols(&self, codes: &[String]) -> Result<ScanResult> {
-        let _guard = self.scan_lock.lock().await;
+        let _guard = self.scan_lock.write().await;
         let wanted: HashSet<&str> = codes.iter().map(String::as_str).collect();
         let symbols = repo::list_symbols(&self.db, true)
             .await?
             .into_iter()
             .filter(|symbol| wanted.contains(symbol.code.as_str()))
             .collect();
-        self.run_scan_models(symbols, false, false, ScanResultMode::Full)
+        self.run_scan_models(symbols, false, false, ScanResultMode::Full, None)
             .await
     }
 
@@ -4521,12 +4866,37 @@ impl Services {
         &self,
         symbol: &str,
         bar_end: &str,
+        mode: CloseScanMode,
     ) -> Result<(Option<ScanResult>, bool)> {
-        // Match scheduled scans' lock order: scan_lock -> data_cycle_lock.
-        // Prevent refresh/rollover edits from racing a scan of the final bar.
-        let _guard = self.scan_lock.lock().await;
-        let _cycle_guard = self.data_cycle_lock.lock().await;
-        let bars15 = self.bars_for(symbol, "15m").await?;
+        let scan_lock_started = Instant::now();
+        // Full scans/rebuilds take the exclusive gate. Automatic scans in
+        // symbol mode share it, then serialize only their symbol's history.
+        let (_read_guard, _write_guard) = if mode.uses_global_scan_locks() {
+            (None, Some(self.scan_lock.write().await))
+        } else {
+            (Some(self.scan_lock.read().await), None)
+        };
+        let scan_lock_wait_ms = scan_lock_started.elapsed().as_millis();
+        let data_lock_started = Instant::now();
+        let _cycle_guard = if mode.uses_global_scan_locks() {
+            Some(self.data_cycle_lock.lock().await)
+        } else {
+            None
+        };
+        let data_lock_wait_ms = data_lock_started.elapsed().as_millis();
+        let symbol_guard = self.pipeline.symbol_locks().get(symbol);
+        let symbol_lock_started = Instant::now();
+        let _symbol_guard = symbol_guard.lock().await;
+        let symbol_lock_wait_ms = symbol_lock_started.elapsed().as_millis();
+        let end = NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")?;
+        let missing = self.missing_closed_scan_inputs(symbol, end).await?;
+        anyhow::ensure!(
+            missing.is_empty(),
+            "{symbol}/{bar_end} 缺少闭合 K 线 {missing:?}"
+        );
+        let history_started = Instant::now();
+        let bars15 = self.shared_bars_for(symbol, "15m").await?;
+        let history_ms = history_started.elapsed().as_millis();
         let Some(index) = bars15.iter().position(|bar| bar.dt.to_bar_ts() == bar_end) else {
             return Err(anyhow!(
                 "闭合事件入库后未生成目标15m K线: {symbol}/{bar_end}"
@@ -4542,6 +4912,34 @@ impl Services {
         };
         let tick = crate::precision::effective_tick(sym.tick_size, &sym.code, &sym.variety);
         let fingerprint = r3_history_fingerprint(&bars15[..=index], tick);
+        tracing::info!(
+            target: "scan_perf",
+            symbol,
+            bar_end,
+            ?mode,
+            scan_lock_wait_ms,
+            data_lock_wait_ms,
+            symbol_lock_wait_ms,
+            history_ms,
+            rows = bars15.len(),
+            history_fingerprint = %fingerprint,
+            "[SCAN] closed event history ready"
+        );
+        // Late corrections must not advance event state on a prefix older
+        // than the one already committed. Replay through that committed
+        // endpoint only; later available candles still belong to other tasks.
+        let cursor_key = format!("r3_scan_cursor_v1:{EVENT_LOGIC_VERSION}:{symbol}");
+        let committed = repo::get_setting(&self.db, &cursor_key)
+            .await?
+            .and_then(|raw| serde_json::from_str::<R3ScanCursor>(&raw).ok());
+        let scan_len = match committed.filter(|cursor| cursor.last_bar_end.as_str() > bar_end) {
+            Some(cursor) => bars15
+                .iter()
+                .position(|bar| bar.dt.to_bar_ts() == cursor.last_bar_end)
+                .map(|i| i + 1)
+                .ok_or_else(|| anyhow!("{symbol} 已提交的扫描边界缺失: {}", cursor.last_bar_end))?,
+            None => index + 1,
+        };
         if !repo::claim_scan_watermark(
             &self.db,
             symbol,
@@ -4556,7 +4954,13 @@ impl Services {
         }
 
         match self
-            .run_scan_models(symbols, false, false, ScanResultMode::SymbolDelta)
+            .run_scan_models(
+                symbols,
+                false,
+                false,
+                ScanResultMode::SymbolDelta,
+                Some((symbol, bars15, scan_len)),
+            )
             .await
         {
             Ok(result) if result.scanned == 1 && result.failed.is_empty() => {
@@ -4601,6 +5005,7 @@ impl Services {
         delete_fast_events: bool,
         cleanup_duplicates: bool,
         mode: ScanResultMode,
+        preloaded_bars: Option<(&str, Arc<Vec<Bar>>, usize)>,
     ) -> Result<ScanResult> {
         let started = now_ts();
         let cfg = self.config().await;
@@ -4613,7 +5018,17 @@ impl Services {
         let mut single_bars: Vec<crate::analyze::model::SingleBarAlert> = Vec::new();
 
         for sym in symbols {
-            let bars15 = self.bars_for(&sym.code, "15m").await?;
+            let history_started = Instant::now();
+            let (history, scan_len) = match &preloaded_bars {
+                Some((symbol, bars, len)) if *symbol == sym.code => (Arc::clone(bars), *len),
+                _ => {
+                    let bars = self.shared_bars_for(&sym.code, "15m").await?;
+                    let len = bars.len();
+                    (bars, len)
+                }
+            };
+            let bars15 = &history[..scan_len];
+            let history_ms = history_started.elapsed().as_millis();
             if bars15.len() < ATR_PERIOD + 2 {
                 failed.push(SymbolFailure {
                     symbol: sym.code,
@@ -4682,15 +5097,23 @@ impl Services {
             let from = r3_scan_start_index(&bars15, saved.as_ref(), tick, &existing_event_hash);
             tracing::info!(
                 target: "scan_perf", symbol = %sym.code,
+                bar_end = %bars15.last().expect("bars15 length checked").dt.to_bar_ts(),
+                history_ms,
                 total_bars = bars15.len(), replayed_warning_bars = bars15.len() - from,
                 mode = if from == 0 { "full" } else { "incremental" },
                 "[R3_SCAN] forward-only candidate range"
             );
             let replay_symbol = sym.code.clone();
-            let replay_bars = bars15.clone();
+            let replay_bars = Arc::clone(&history);
             let replay_started = Instant::now();
             let candidates = tokio::task::spawn_blocking(move || {
-                event::selected_warnings(&replay_symbol, &replay_bars, tick, false, from)
+                event::selected_warnings(
+                    &replay_symbol,
+                    &replay_bars[..scan_len],
+                    tick,
+                    false,
+                    from,
+                )
             })
             .await?;
             tracing::info!(
@@ -4702,6 +5125,7 @@ impl Services {
                 .iter()
                 .map(|e| (e.direction.clone(), e.warning_ts.clone()))
                 .collect();
+            let mut warning_insert_ms = 0;
             for c in candidates {
                 let direction = if c.direction == Dir::Up { "up" } else { "down" };
                 let warning_ts = bar_ts(&bars15[c.warning_index]);
@@ -4709,7 +5133,9 @@ impl Services {
                 if seen.contains(&key) || has_similar_warning(&bars15, &c, &events)? {
                     continue;
                 }
+                let insert_started = Instant::now();
                 let model = insert_warning_event(&self.db, &sym.code, &bars15, &c).await?;
+                warning_insert_ms += insert_started.elapsed().as_millis();
                 seen.insert(key);
                 events.push(model.clone());
                 new_warnings.push(model);
@@ -4740,34 +5166,49 @@ impl Services {
             } else {
                 HashSet::new()
             };
-            for mut e in events {
-                let was_triggered = e.trigger_ts.is_some();
-                let had_trigger_bar = e.trigger_bar_ts.is_some();
+            let lifecycle_started = Instant::now();
+            for event in events {
+                let was_triggered = event.trigger_ts.is_some();
+                let had_trigger_bar = event.trigger_bar_ts.is_some();
                 let skip_replay = unchanged_history
-                    && e.state == "triggered"
-                    && e.last_advance_ts.as_deref() == Some(latest_bar_ts.as_str());
-                let changed = if skip_replay {
+                    && event.state == "triggered"
+                    && event.last_advance_ts.as_deref() == Some(latest_bar_ts.as_str());
+                if skip_replay {
                     replay_skipped += 1;
-                    false
-                } else if let Some(&warning_index) = bar_index.get(&e.warning_ts) {
-                    if matches!(e.state.as_str(), "pending" | "triggered")
-                        && prepared_replay.is_none()
-                    {
-                        prepared_replay = Some(PreparedEventReplay::new(&sym.code, &bars15));
-                    }
-                    advance_event_model_indexed(
-                        &mut e,
-                        &bars15,
-                        warning_index,
-                        prepared_replay.as_ref(),
-                    )
-                } else {
-                    false
-                };
-                if changed {
-                    lifecycle_updated += 1;
-                    repo::update_pattern_event(&self.db, e.clone()).await?;
                 }
+                let mut replayed = EventReplayWrite {
+                    changed: false,
+                    was_triggered,
+                    had_trigger_bar,
+                    event,
+                };
+                if !skip_replay {
+                    if let Some(&warning_index) = bar_index.get(&replayed.event.warning_ts) {
+                        let result = persist_event_replay(&self.db, replayed.event, |current| {
+                            if matches!(current.state.as_str(), "pending" | "triggered")
+                                && prepared_replay.is_none()
+                            {
+                                prepared_replay = Some(PreparedEventReplay::new(&sym.code, bars15));
+                            }
+                            advance_event_model_indexed(
+                                current,
+                                bars15,
+                                warning_index,
+                                prepared_replay.as_ref(),
+                            )
+                        })
+                        .await?;
+                        let Some(result) = result else { continue };
+                        replayed = result;
+                    }
+                }
+                let EventReplayWrite {
+                    event: e,
+                    changed,
+                    was_triggered,
+                    had_trigger_bar,
+                } = replayed;
+                lifecycle_updated += usize::from(changed);
                 // Quote-triggered events may already have trigger_ts before
                 // the first closed 15m bar is available.  Retry only this
                 // event when its trigger bar becomes available or its
@@ -4811,6 +5252,8 @@ impl Services {
             tracing::info!(
                 target: "scan_perf", symbol = %sym.code,
                 total_events = symbol_event_count, replay_skipped, lifecycle_updated,
+                warning_insert_ms,
+                lifecycle_ms = lifecycle_started.elapsed().as_millis(),
                 replay_input_bars = prepared_replay.as_ref().map_or(0, |p| p.raw.len()),
                 "[R4B_LIFECYCLE] per-symbol lifecycle pass finished"
             );
@@ -4823,6 +5266,7 @@ impl Services {
             };
             let mut settings = HashMap::new();
             settings.insert(cursor_key, serde_json::to_string(&cursor)?);
+            let persist_started = Instant::now();
             repo::set_settings(&self.db, &settings).await?;
             if let Some((bar_end, fingerprint)) = watermark {
                 repo::complete_scan_watermark(
@@ -4835,6 +5279,14 @@ impl Services {
                 )
                 .await?;
             }
+            tracing::info!(
+                target: "scan_perf",
+                symbol = %sym.code,
+                bar_end = %cursor.last_bar_end,
+                history_fingerprint = %cursor.history_hash,
+                cursor_write_ms = persist_started.elapsed().as_millis(),
+                "[SCAN] cursor persisted"
+            );
         }
 
         if cleanup_duplicates {
@@ -4966,11 +5418,18 @@ impl Services {
     /// 其余物理删除，保证K线右侧与复盘明细不会再出现被去重信号。
     async fn cleanup_duplicate_events(&self) -> Result<usize> {
         let events = repo::all_pattern_events(&self.db).await?;
+        self.cleanup_duplicate_event_rows(&events).await
+    }
+
+    async fn cleanup_duplicate_event_rows(
+        &self,
+        events: &[pattern_events::Model],
+    ) -> Result<usize> {
         if events.is_empty() {
             return Ok(0);
         }
         let mut symbols_with_events: Vec<&str> = Vec::new();
-        for e in &events {
+        for e in events {
             if !symbols_with_events.contains(&e.symbol.as_str()) {
                 symbols_with_events.push(e.symbol.as_str());
             }
@@ -4982,7 +5441,7 @@ impl Services {
                 warning_bar_index.insert((symbol.to_string(), bar_ts(bar)), idx);
             }
         }
-        let ids = duplicate_event_ids(&events, &warning_bar_index);
+        let ids = duplicate_event_ids(events, &warning_bar_index);
         let mut deleted = 0usize;
         for id in ids {
             repo::delete_pattern_event(&self.db, id).await?;
@@ -4994,7 +5453,7 @@ impl Services {
     /// 清空旧事件后按当前全部 15m K 线重建：前向识别预警并插入，
     /// 再把每个事件推进到现在的真实状态（触发/失效/已了结）。
     pub async fn rebuild_events(&self) -> Result<usize> {
-        let _guard = self.scan_lock.lock().await;
+        let _guard = self.scan_lock.write().await;
         let mut inserted = 0;
         for sym in repo::list_symbols(&self.db, true).await? {
             self.pipeline.rebuild_derived(&sym.code).await?;
@@ -5011,10 +5470,9 @@ impl Services {
                     inserted += 1;
                 }
             }
-            for mut old in repo::pattern_events_by_symbol(&self.db, &sym.code, None).await? {
-                if advance_event_model(&mut old, &bars) {
-                    repo::update_pattern_event(&self.db, old).await?;
-                }
+            for old in repo::pattern_events_by_symbol(&self.db, &sym.code, None).await? {
+                persist_event_replay(&self.db, old, |event| advance_event_model(event, &bars))
+                    .await?;
             }
         }
         Ok(inserted)
@@ -5024,7 +5482,7 @@ impl Services {
     // LEGACY_REVIEW_API: current UI store/workbench/chart; preserve original response and strategy semantics.
     // Replacement/removal gates: docs/review-api.md; regression: tests/reviewBrowser.test.cjs.
     pub async fn refresh_outcomes(&self) -> Result<OutcomeRefresh> {
-        let _scan_guard = self.scan_lock.lock().await;
+        let _scan_guard = self.scan_lock.write().await;
         repo::delete_fast_pattern_events(&self.db).await?;
         let events = repo::all_pattern_events(&self.db).await?;
         let mut by_symbol: HashMap<String, Vec<pattern_events::Model>> = HashMap::new();
@@ -5036,9 +5494,11 @@ impl Services {
         let mut updated = 0usize;
         for (symbol, list) in by_symbol {
             let bars15 = self.bars_for(&symbol, "15m").await?;
-            for mut e in list {
-                if advance_event_model(&mut e, &bars15) {
-                    repo::update_pattern_event(&self.db, e).await?;
+            for e in list {
+                if persist_event_replay(&self.db, e, |event| advance_event_model(event, &bars15))
+                    .await?
+                    .is_some_and(|result| result.changed)
+                {
                     updated += 1;
                 }
             }
@@ -5747,6 +6207,186 @@ fn parse_dt(s: &str) -> Option<DT> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_scans_in_symbol_mode_ignore_refresh_and_other_symbol_locks() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Arc::new(
+            Services::new(
+                db,
+                config,
+                std::env::temp_dir().join("symbol-scan-lock-test.json"),
+            )
+            .await
+            .unwrap(),
+        );
+        services.seed_symbols("MA0\nEG0").await.unwrap();
+        let mut bars = Vec::new();
+        for day in [19, 20] {
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+            for minute in (9 * 60 + 5..=14 * 60 + 45).step_by(5) {
+                let dt = date.and_hms_opt(minute / 60, minute % 60, 0).unwrap();
+                if crate::scheduler::expected_5m_close("MA0", dt) {
+                    bars.push(source_test_bar(
+                        &dt.to_string(),
+                        100.0 + (bars.len() % 7) as f64,
+                    ));
+                }
+            }
+        }
+        for symbol in ["MA0", "EG0"] {
+            services.process_raw_batch(symbol, &bars).await.unwrap();
+        }
+        let end = &*bars.last().unwrap().datetime;
+        let refresh = services.data_cycle_lock.lock().await;
+        let ma_lock = services.pipeline.symbol_locks().get("MA0");
+        let ma_write = ma_lock.lock().await;
+        let ma_scan = services.scan_queued_15m_symbol("MA0", end, CloseScanMode::Parallel);
+        tokio::pin!(ma_scan);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut ma_scan)
+                .await
+                .is_err()
+        );
+        let (eg, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            services.scan_queued_15m_symbol("EG0", end, CloseScanMode::Parallel),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(eg.is_some());
+        drop(ma_write);
+        assert!(tokio::time::timeout(Duration::from_secs(5), ma_scan)
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+            .is_some());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            services.scan_queued_15m_symbol("EG0", end, CloseScanMode::Serial),
+        )
+        .await
+        .is_err());
+        drop(refresh);
+        assert!(
+            services
+                .scan_queued_15m_symbol("EG0", end, CloseScanMode::Serial)
+                .await
+                .unwrap()
+                .1
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_scan_caps_the_snapshot_and_preserves_a_newer_committed_cursor() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db.clone(),
+            config,
+            std::env::temp_dir().join("closed-scan-prefix-test.json"),
+        )
+        .await
+        .unwrap();
+        services.seed_symbols("RB0").await.unwrap();
+        let mut raw = Vec::new();
+        for day in [19, 20] {
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
+            for minute in (9 * 60 + 5..=15 * 60).step_by(5) {
+                let timestamp = date.and_hms_opt(minute / 60, minute % 60, 0).unwrap();
+                if crate::scheduler::expected_5m_close("RB0", timestamp)
+                    && timestamp.to_string() != "2026-11-20 14:40:00"
+                {
+                    raw.push(source_test_bar(
+                        &timestamp.to_string(),
+                        100.0 + (raw.len() % 7) as f64,
+                    ));
+                }
+            }
+        }
+        services.process_raw_batch("RB0", &raw).await.unwrap();
+        let early = "2026-11-20 14:45:00";
+        let late = "2026-11-20 15:00:00";
+        let key = format!("r3_scan_cursor_v1:{EVENT_LOGIC_VERSION}:RB0");
+        assert!(!services
+            .closed_scan_inputs_ready("RB0", early)
+            .await
+            .unwrap());
+        assert!(services
+            .scan_tq_closed_15m_symbol("RB0", early)
+            .await
+            .is_err());
+        assert!(repo::get_setting(&db, &key).await.unwrap().is_none());
+        assert!(services
+            .repair_closed_scan_inputs("RB0", early)
+            .await
+            .is_err());
+
+        services
+            .pipeline
+            .process_missing_raw_batch(
+                "RB0",
+                &[
+                    source_test_bar("2026-11-20 14:40:00", 103.0),
+                    source_test_bar("2026-11-20 14:45:00", 999.0),
+                ],
+            )
+            .await
+            .unwrap();
+        let input = repo::raw_klines_window(&db, "RB0", early, early)
+            .await
+            .unwrap();
+        assert_ne!(input[0].close, 999.0);
+        assert!(services
+            .closed_scan_inputs_ready("RB0", early)
+            .await
+            .unwrap());
+        assert!(services
+            .scan_tq_closed_15m_symbol("RB0", early)
+            .await
+            .unwrap()
+            .0
+            .is_some());
+        let cursor: R3ScanCursor =
+            serde_json::from_str(&repo::get_setting(&db, &key).await.unwrap().unwrap()).unwrap();
+        assert_eq!(cursor.last_bar_end, early);
+        assert!(services
+            .scan_tq_closed_15m_symbol("RB0", late)
+            .await
+            .unwrap()
+            .0
+            .is_some());
+
+        services
+            .process_raw_batch("RB0", &[source_test_bar("2026-11-20 14:40:00", 104.0)])
+            .await
+            .unwrap();
+        assert!(services
+            .scan_tq_closed_15m_symbol("RB0", early)
+            .await
+            .unwrap()
+            .0
+            .is_some());
+        let cursor: R3ScanCursor =
+            serde_json::from_str(&repo::get_setting(&db, &key).await.unwrap().unwrap()).unwrap();
+        assert_eq!(cursor.last_bar_end, late);
+        assert!(
+            services
+                .scan_tq_closed_15m_symbol("RB0", early)
+                .await
+                .unwrap()
+                .1
+        );
+    }
 
     #[tokio::test]
     async fn chart_tail_and_ma_match_full_history_across_session_boundaries() {
@@ -6714,6 +7354,139 @@ mod tests {
         let (interval_ms, budget) = coordinator_limits_from_config(&cfg);
         assert_eq!(interval_ms, 200); // min(400, 200)
         assert_eq!(budget, 240); // 60 + 120 + 60 = 240
+    }
+
+    #[tokio::test]
+    async fn quote_trigger_and_closed_scan_recompute_from_the_winning_event_snapshot() {
+        use sea_orm::ActiveModelTrait;
+
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db.clone(),
+            config,
+            std::env::temp_dir().join("event-write-conflict-test.json"),
+        )
+        .await
+        .unwrap();
+        let now = Local::now().naive_local();
+        let end = now
+            .date()
+            .and_hms_opt(now.hour(), now.minute() / 15 * 15, 0)
+            .unwrap();
+        let warning = (end - ChronoDuration::minutes(15)).to_string();
+        let bar_end = end.to_string();
+        let quote_at = (end - ChronoDuration::seconds(5)).to_string();
+        let warning_bar = bar_model(&warning, 2572.0, 2576.0, 2566.0, 2570.0);
+        let bars = [
+            warning_bar.clone(),
+            bar_model(&bar_end, 2577.0, 2580.0, 2575.0, 2579.0),
+        ];
+        let mut pending = pattern_event(201, 3.8, "pending");
+        pending.warning_ts = warning.clone();
+        pending.detected_at = warning.clone();
+        pending.last_advance_ts = Some(warning.clone());
+        pending.created_at = warning.clone();
+        pending.updated_at = now_ts();
+        let model: pattern_events::ActiveModel = pending.clone().into();
+        repo::insert_pattern_event(&db, model.reset_all())
+            .await
+            .unwrap();
+
+        // The scanner read pending before the quote committed its trigger.
+        let stale_scan = pending.clone();
+        let triggered = services
+            .apply_entry_quote(pending.clone(), 2578.0, Some(&bars[..1]), &quote_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(triggered.trigger_ts.as_deref(), Some(quote_at.as_str()));
+        let mut attempted_states = Vec::new();
+        let replayed = persist_event_replay(&db, stale_scan, |event| {
+            attempted_states.push(event.state.clone());
+            advance_event_model(event, &bars)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(attempted_states, ["pending", "triggered"]);
+        assert!(replayed.changed && replayed.was_triggered && !replayed.had_trigger_bar);
+        let stored = repo::pattern_event_by_id(&db, pending.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "triggered");
+        assert_eq!(stored.trigger_ts.as_deref(), Some(quote_at.as_str()));
+        assert_eq!(stored.trigger_bar_ts.as_deref(), Some(bar_end.as_str()));
+
+        // A same-second change to replay progress also invalidates the snapshot.
+        let mut updated = stored.clone();
+        updated.last_advance_ts = Some((end + ChronoDuration::minutes(15)).to_string());
+        assert!(repo::update_pattern_event_if_current(&db, &stored, updated)
+            .await
+            .unwrap());
+        assert!(
+            !repo::update_pattern_event_if_current(&db, &stored, stored.clone())
+                .await
+                .unwrap()
+        );
+
+        // Reverse order: an old quote snapshot must not revive an expired setup.
+        let mut other = pending;
+        other.id = 202;
+        other.symbol = "FG0".into();
+        let model: pattern_events::ActiveModel = other.clone().into();
+        repo::insert_pattern_event(&db, model.reset_all())
+            .await
+            .unwrap();
+        let stop_bars = [
+            warning_bar,
+            bar_model(&bar_end, 2568.0, 2570.0, 2563.0, 2564.0),
+        ];
+        persist_event_replay(&db, other.clone(), |event| {
+            advance_event_model(event, &stop_bars)
+        })
+        .await
+        .unwrap();
+        assert!(services
+            .apply_entry_quote(other, 2578.0, Some(&stop_bars[..1]), &quote_at)
+            .await
+            .unwrap()
+            .is_none());
+        let expired = repo::pattern_event_by_id(&db, 202).await.unwrap().unwrap();
+        assert_eq!(expired.state, "expired");
+        assert!(expired.trigger_ts.is_none());
+
+        let rows = db
+            .query_all(sea_orm::Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT event_id, action FROM signal_delivery_outbox
+             WHERE action IN ('register_warning','notice_trigger','email_trigger')
+             ORDER BY event_id, action",
+            ))
+            .await
+            .unwrap();
+        let actions: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<i64>("", "event_id").unwrap(),
+                    row.try_get::<String>("", "action").unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                (201, "email_trigger".into()),
+                (201, "notice_trigger".into()),
+                (201, "register_warning".into()),
+                (202, "register_warning".into()),
+            ]
+        );
     }
 
     #[tokio::test]

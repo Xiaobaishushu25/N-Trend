@@ -25,6 +25,8 @@ pub struct ServerContext {
     pub execution_registration_lock: Mutex<()>,
     pub last_refresh: RwLock<Option<chrono::NaiveDateTime>>,
     pub last_scan: RwLock<Option<chrono::NaiveDateTime>>,
+    /// Order automatic snapshots and symbol deltas on the realtime stream.
+    pub(crate) scan_publication: Mutex<()>,
     pub scheduler_running: AtomicBool,
     pub execution_engine: Arc<n_core::trader::ExecutionEngine>,
     pub instances: tokio::sync::OnceCell<Arc<n_core::trader::instances::InstanceManager>>,
@@ -101,6 +103,7 @@ impl ServerContext {
             execution_registration_lock: Mutex::new(()),
             last_refresh: RwLock::new(None),
             last_scan: RwLock::new(None),
+            scan_publication: Mutex::new(()),
             scheduler_running: AtomicBool::new(true),
             execution_engine,
             instances: tokio::sync::OnceCell::new(),

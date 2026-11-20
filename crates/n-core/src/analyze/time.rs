@@ -43,7 +43,15 @@ pub fn now_parts() -> (u16, u16, u16, u16, u16) {
     }
     #[cfg(not(windows))]
     {
-        (1970, 1, 1, 0, 0)
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        (
+            now.year() as u16,
+            now.month() as u16,
+            now.day() as u16,
+            now.hour() as u16,
+            now.minute() as u16,
+        )
     }
 }
 
@@ -54,7 +62,16 @@ pub fn now_parts_with_seconds() -> (u16, u16, u16, u16, u16, u16) {
     }
     #[cfg(not(windows))]
     {
-        (1970, 1, 1, 0, 0, 0)
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        (
+            now.year() as u16,
+            now.month() as u16,
+            now.day() as u16,
+            now.hour() as u16,
+            now.minute() as u16,
+            now.second() as u16,
+        )
     }
 }
 

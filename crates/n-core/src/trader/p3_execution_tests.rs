@@ -463,7 +463,7 @@ async fn p3_fixed_mode_uses_money_not_score_for_zero_one_two_lots() {
     for (risk, qty) in [(20., 2), (60., 1), (120., 0)] {
         let counter = Counter::new();
         let e = engine(&counter, ExitMode::FixedS1).await;
-        send(&e, signal("sizing", false, risk, 200.)).await;
+        send(&e, signal("sizing", false, risk, 3. * risk)).await;
         quote(&e, 1000.).await;
         age(&e).await;
         quote(&e, 1001.).await;
@@ -730,7 +730,7 @@ async fn p3_one_actual_lot_at_s1_never_waits_for_a_second_lot() {
 async fn p3_proposed_price_reduces_lots_before_any_counter_submission() {
     let counter = Counter::new();
     let e = engine(&counter, ExitMode::FixedS1).await;
-    send(&e, signal("repriced", false, 56., 200.)).await;
+    send(&e, signal("repriced", false, 56., 190.)).await;
     assert_eq!(e.list_conditions().await[0].volume, 2); // 296 yuan per forecast lot
     quote(&e, 1000.).await;
     age(&e).await;
@@ -741,7 +741,36 @@ async fn p3_proposed_price_reduces_lots_before_any_counter_submission() {
 }
 
 #[tokio::test]
-async fn p3_v2_low_atr_signal_reaches_broker_and_keeps_s1_exit_modes() {
+async fn p3_v3_filters_a_far_target_without_creating_a_condition_or_order() {
+    let counter = Counter::new();
+    let e = engine(&counter, ExitMode::FixedS1).await;
+    send(&e, signal("far-target", true, 20., 71.)).await;
+    quote(&e, 1000.).await;
+    age(&e).await;
+    quote(&e, 999.).await;
+    assert!(counter.inserts().is_empty());
+    assert!(e.list_conditions().await.is_empty());
+    assert!(!e.paused().await);
+
+    let definition = e.definition().await;
+    let diagnostics = e.strategy_diagnostics().await;
+    let decisions = diagnostics["states"][&definition.revision]["decisions"]
+        .as_object()
+        .unwrap();
+    let decision = decisions.values().next().unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decision["reason"], "target_atr_above_max");
+    assert_eq!(decision["values"]["target_atr"], 3.55);
+    assert_eq!(decision["values"]["max_target_atr"], 3.5);
+
+    send(&e, signal("at-target-limit", true, 20., 70.)).await;
+    let conditions = e.list_conditions().await;
+    assert_eq!(conditions.len(), 1);
+    assert_eq!(conditions[0].target_price, 930.);
+}
+
+#[tokio::test]
+async fn p3_low_risk_atr_signal_reaches_broker_and_keeps_s1_exit_modes() {
     for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
         let counter = Counter::new();
         let e = engine(&counter, mode).await;
@@ -802,7 +831,7 @@ async fn p3_custom_rr_is_frozen_when_new_signals_switch_to_a_stricter_threshold(
 async fn p3_point_value_mismatch_cannot_open_and_invalid_execution_timeout_is_rejected() {
     let counter = Counter::new();
     let e = engine(&counter, ExitMode::FixedS1).await;
-    let mut bad = signal("metadata", false, 20., 200.);
+    let mut bad = signal("metadata", false, 20., 60.);
     bad["multiplier"] = json!(10.);
     send(&e, bad).await;
     quote(&e, 1000.).await;

@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{oneshot, Mutex, Notify, Semaphore};
@@ -356,7 +356,22 @@ async fn run_dispatcher_loop(
         }
 
         // 3. Acquire RateLimiter slot (enforces min_interval and sliding-window budget)
+        let rate_started = Instant::now();
         limiter.acquire().await;
+        let rate_wait = rate_started.elapsed();
+        if rate_wait >= Duration::from_millis(500) {
+            tracing::info!(
+                target: "market_trace",
+                rate_wait_ms = rate_wait.as_millis(),
+                "[SINA] rate limiter wait"
+            );
+        } else {
+            tracing::debug!(
+                target: "market_trace",
+                rate_wait_ms = rate_wait.as_millis(),
+                "[SINA] rate limiter wait"
+            );
+        }
 
         if shutdown.load(Ordering::Relaxed) {
             drop(permit);

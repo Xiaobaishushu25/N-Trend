@@ -1857,10 +1857,40 @@ impl ExecutionEngine {
                 {
                     let (planned_exit_price, planned_pnl_amount, slippage_pts, slippage_amount, pnl_diff_amount) = {
                         let planned_exit = match order.reason.as_deref() {
-                            Some("target") => Some(pos.target_price),
-                            Some("stop") => Some(pos.initial_stop_price),
-                            Some("trailing") | Some("breakeven") => Some(pos.current_stop_price),
-                            _ => None,
+                            Some("target") | Some("target_1r") | Some("target_s1") => {
+                                if pos.target_price > 0.0 {
+                                    Some(pos.target_price)
+                                } else if order.request.price > 0.0 {
+                                    Some(order.request.price)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some("stop") => {
+                                if pos.initial_stop_price > 0.0 {
+                                    Some(pos.initial_stop_price)
+                                } else if order.request.price > 0.0 {
+                                    Some(order.request.price)
+                                } else {
+                                    None
+                                }
+                            }
+                            Some("trailing") | Some("breakeven") => {
+                                if pos.current_stop_price > 0.0 {
+                                    Some(pos.current_stop_price)
+                                } else if order.request.price > 0.0 {
+                                    Some(order.request.price)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => {
+                                if order.request.price > 0.0 {
+                                    Some(order.request.price)
+                                } else {
+                                    None
+                                }
+                            }
                         };
                         if let Some(planned) = planned_exit {
                             let sign = if pos.direction == "up" { 1.0 } else { -1.0 };

@@ -229,11 +229,28 @@ async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<De
                 .map(|rate| (rate.model_id.as_str(), rate.p_win));
             let (subject, body) = event_email_payload_with_model(kind, &e, model);
             let email_cfg = cfg.email.clone();
-            tokio::task::spawn_blocking(move || {
-                n_core::notify::email::send_summary(&subject, &body, &email_cfg)
+            let queued_at = Instant::now();
+            let (smtp_worker_wait_ms, smtp_ms) = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                n_core::notify::email::send_summary(&subject, &body, &email_cfg)?;
+                Ok::<_, anyhow::Error>((
+                    started.duration_since(queued_at).as_millis(),
+                    started.elapsed().as_millis(),
+                ))
             })
             .await
             .context("SMTP 工作线程失败")??;
+            tracing::info!(
+                target: "scan_perf",
+                event_id = e.id,
+                symbol = %e.symbol,
+                warning_bar_end = %e.warning_ts,
+                trigger_bar_end = ?e.trigger_bar_ts,
+                action = %task.action,
+                smtp_worker_wait_ms,
+                smtp_ms,
+                "[SIGNAL_EMAIL] SMTP accepted"
+            );
             Ok(DeliveryResult::Done)
         }
         outbox::REGISTER_WARNING => deliver_registration(ctx, &e).await,

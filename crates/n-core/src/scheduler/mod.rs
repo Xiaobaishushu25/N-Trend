@@ -16,6 +16,33 @@ pub struct SchedulerConfig {
     pub refresh_interval_secs: u64,
     pub scan_interval_secs: u64,
     pub trading_only: bool,
+    pub close_scan_mode: CloseScanMode,
+}
+
+/// Selected at server startup. Serial preserves the phase-two lock order
+/// and shares the same durable jobs, watermarks and Outbox.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseScanMode {
+    PerSymbol,
+    Parallel,
+    #[default]
+    #[serde(other)]
+    Serial,
+}
+
+impl CloseScanMode {
+    pub fn workers(self) -> usize {
+        if self == Self::Parallel {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn uses_global_scan_locks(self) -> bool {
+        self == Self::Serial
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -24,6 +51,7 @@ impl Default for SchedulerConfig {
             refresh_interval_secs: 300,
             scan_interval_secs: 900,
             trading_only: true,
+            close_scan_mode: CloseScanMode::default(),
         }
     }
 }
@@ -47,11 +75,7 @@ pub fn next_action(
     if cfg.trading_only && !is_trading_time(&now) && !is_close_grace_due(now, last_scan) {
         return SchedulerAction::None;
     }
-    let align_min = (cfg.refresh_interval_secs / 60).max(1) as u32;
-    let normal_refresh_due = now.minute() % align_min == 0
-        && last_refresh.map_or(true, |t| {
-            (now - t).num_seconds() >= cfg.refresh_interval_secs as i64
-        });
+    let normal_refresh_due = aligned_refresh_due(now, cfg, last_refresh);
     let refresh_due = normal_refresh_due || settled_scan_due;
     let scan_due = settled_scan_due;
     match (refresh_due, scan_due) {
@@ -60,6 +84,45 @@ pub fn next_action(
         (false, true) => SchedulerAction::Scan,
         (false, false) => SchedulerAction::None,
     }
+}
+
+pub fn regular_refresh_due(
+    now: DateTime<Local>,
+    cfg: &SchedulerConfig,
+    last_refresh: Option<DateTime<Local>>,
+) -> bool {
+    (!cfg.trading_only || is_trading_time(&now)) && aligned_refresh_due(now, cfg, last_refresh)
+}
+
+fn aligned_refresh_due(
+    now: DateTime<Local>,
+    cfg: &SchedulerConfig,
+    last_refresh: Option<DateTime<Local>>,
+) -> bool {
+    let align_min = (cfg.refresh_interval_secs / 60).max(1) as u32;
+    now.minute() % align_min == 0
+        && last_refresh.is_none_or(|t| (now - t).num_seconds() >= cfg.refresh_interval_secs as i64)
+}
+
+/// Check the end of the preceding five-minute interval. Using the instant
+/// before the boundary excludes session opens and handles midnight closes.
+pub fn expected_5m_close(symbol: &str, end: NaiveDateTime) -> bool {
+    crate::session::SessionCalendar::get(symbol)
+        .is_in_trading_time_naive(&(end - chrono::Duration::seconds(1)))
+}
+
+pub fn symbol_scan_settled(symbol: &str, end: NaiveDateTime, now: NaiveDateTime) -> bool {
+    now >= symbol_scan_due_at(symbol, end)
+}
+
+pub fn symbol_scan_due_at(symbol: &str, end: NaiveDateTime) -> NaiveDateTime {
+    let settle_secs =
+        if crate::session::SessionCalendar::is_session_close(symbol, end.hour(), end.minute()) {
+            80
+        } else {
+            40
+        };
+    end + chrono::Duration::seconds(settle_secs)
 }
 
 const SCAN_WINDOW_SECS: i64 = 75;
@@ -141,6 +204,50 @@ pub fn is_symbol_trading_time(symbol: &str, now: &DateTime<Local>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_scan_rollout_defaults_to_serial_and_caps_parallel_at_two() {
+        let legacy: SchedulerConfig =
+            serde_json::from_str(r#"{"refresh_interval_secs":300}"#).unwrap();
+        let unknown: SchedulerConfig =
+            serde_json::from_str(r#"{"close_scan_mode":"future_mode"}"#).unwrap();
+        assert_eq!(unknown.close_scan_mode, CloseScanMode::Serial);
+        assert_eq!(legacy.close_scan_mode, CloseScanMode::Serial);
+        assert_eq!(legacy.close_scan_mode.workers(), 1);
+        assert!(legacy.close_scan_mode.uses_global_scan_locks());
+        let canary: SchedulerConfig =
+            serde_json::from_str(r#"{"close_scan_mode":"per_symbol"}"#).unwrap();
+        assert_eq!(canary.close_scan_mode.workers(), 1);
+        assert!(!canary.close_scan_mode.uses_global_scan_locks());
+        let parallel: SchedulerConfig =
+            serde_json::from_str(r#"{"close_scan_mode":"parallel"}"#).unwrap();
+        assert_eq!(parallel.close_scan_mode.workers(), 2);
+        assert!(!parallel.close_scan_mode.uses_global_scan_locks());
+    }
+    #[test]
+    fn symbol_boundaries_distinguish_settlement_and_session_open() {
+        let close = dt(2026, 11, 20, 23, 0).naive_local();
+        assert!(expected_5m_close("RB0", close));
+        assert!(!expected_5m_close("CJ0", close));
+        assert!(!symbol_scan_settled(
+            "RB0",
+            close,
+            close + chrono::Duration::seconds(40)
+        ));
+        assert!(symbol_scan_settled(
+            "AU0",
+            close,
+            close + chrono::Duration::seconds(40)
+        ));
+        assert!(expected_5m_close(
+            "AU0",
+            dt(2026, 11, 21, 0, 0).naive_local()
+        ));
+        assert!(!expected_5m_close(
+            "RB0",
+            dt(2026, 11, 20, 10, 30).naive_local()
+        ));
+    }
     fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
         chrono::NaiveDate::from_ymd_opt(y, m, d)
             .unwrap()

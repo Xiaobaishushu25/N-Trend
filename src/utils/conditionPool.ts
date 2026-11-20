@@ -63,6 +63,7 @@ function rejectionNote(reason: string, values: Record<string, any>): string {
     friction_above20: `预估往返摩擦成本 ${metric(values.friction_yuan)} 元，超过计划风险金额的 20%`,
     atr_unavailable: '预警时点的完整 ATR14 数据不可用',
     atr_out_of_range: `止损距离 / ATR14 为 ${metric(values.risk_atr)}，超出允许区间 ${atrRange}`,
+    target_atr_above_max: `P3 计划入场价到 S1 的距离为 ${metric(values.target_atr)} ATR，超过 ${metric(values.max_target_atr)} ATR 上限`,
     filtered_net_rr_plan: `扣除手续费及滑点后，S1 目标净空间不足 ${metric(values.min_net_rr ?? 1)}R`,
     filtered_holiday_window: '处于节假日禁止开仓窗口',
     filtered_weekend_window: '处于周末禁止开仓窗口',

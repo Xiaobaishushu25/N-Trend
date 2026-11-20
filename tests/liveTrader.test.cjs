@@ -407,7 +407,7 @@ function candidateAudit(reason = 'risk_ticks_below_min') {
         entry: 1000, stop: 991, target: 1100, risk: 9, tick: 1, score: 3.5 },
     } },
     accepted: { reason: 'accepted_warning', values: {} },
-  } }, p3: { decisions: { other: { reason: 'score_below_min', values: {} } } } } }
+  } } } }
 }
 
 test('history calendar and sorting use backend natural close dates without anchoring to entry', () => {
@@ -442,22 +442,28 @@ test('P2 pool lists filtered signals with concrete reasons without creating exec
   assert.match(row.note, /止损距离 9.00 tick.*10 tick.*不会开仓/)
 })
 
-test('filtered audit survives account deltas, clears on instance switch and excludes old strategy revisions', async () => {
+test('filtered audit survives account deltas, prefers the active revision and retains distinct old signals', async () => {
   const { store, api } = setup()
   store.instancesSupported = true
   store.selectedInstanceId = 'p2-account'
+  const audits = candidateAudit()
+  const [key, decision] = Object.entries(audits.states.p2.decisions)[0]
+  audits.states.p3 = { decisions: { [key]: { ...decision, reason: 'score_below_min' },
+    'EB0|up|s0|s1|s2|2026-10-26 10:00:00': { reason: 'friction_above20', values: {} } } }
   store.applySnapshot({ ...snapshot(), instance_id: 'p2-account', _stream_id: 'stream', _revision: 1,
-    strategy: { revision: 'p2' }, strategy_diagnostics: candidateAudit() })
+    strategy: { revision: 'p2' }, strategy_diagnostics: audits })
   store.applyInstanceDelta({ instance_id: 'p2-account', delta: {
     stream_id: 'stream', base_revision: 1, revision: 2, changes: { account: { balance: 2000 } },
   } })
-  assert.equal(store.conditionPool.length, 1)
+  assert.equal(store.conditionPool.length, 2)
+  assert.match(store.conditionPool[0].id, /filtered:p2:/)
   assert.equal(store.account.balance, 2000)
   store.applyInstanceDelta({ instance_id: 'p2-account', delta: {
     stream_id: 'stream', base_revision: 2, revision: 3, changes: { strategy: { revision: 'p3' } },
   } })
-  assert.equal(store.conditionPool.length, 1)
+  assert.equal(store.conditionPool.length, 2)
   assert.match(store.conditionPool[0].id, /filtered:p3:/)
+  assert.equal(store.conditionPool[1].symbol, 'EB0')
   api.traderInstanceRequest = async () => { throw Error('offline') }
   await store.selectInstance('other-account')
   assert.equal(store.conditionPool.length, 0)
@@ -525,6 +531,11 @@ test('P3 filter notes use the frozen net-RR threshold and ATR range', () => {
   Object.assign(Object.values(atr.states.p2.decisions)[0].values, { min_risk_atr: 0, max_risk_atr: 2.5, risk_atr: 3 })
   store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2' }, strategy_diagnostics: atr })
   assert.match(store.conditionPool[0].note, /大于 0 且不超过 2.50/)
+  const targetAtr = candidateAudit('target_atr_above_max')
+  Object.assign(Object.values(targetAtr.states.p2.decisions)[0].values, { target_atr: 3.58838, max_target_atr: 3.5 })
+  store.applySnapshot({ ...snapshot(), strategy: { revision: 'p2', strategy_id: 'n_p3_v1', code_version: '3' }, strategy_diagnostics: targetAtr })
+  assert.match(store.conditionPool[0].note, /P3 计划入场价到 S1 的距离为 3.59 ATR，超过 3.50 ATR 上限/)
+  assert.equal(store.conditionPool[0].display_only, true)
 })
 
 test('actual condition-pool template shows blocked reasons and omits execution controls', async () => {
@@ -545,13 +556,17 @@ test('actual condition-pool template shows blocked reasons and omits execution c
     getNoteCategory: () => '准入过滤', formatNoteText: identity, getNoteTooltip: identity,
     formatWaitBars: identity, isConditionRejected: () => false,
     AlertTriangle: {}, Bolt: {}, ExternalLink: {}, InfoCircle: {}, }
-  const app = Vue.createSSRApp({ render() { return render(context, []) } })
-  for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
-    app.component(name, { setup(_, { slots }) {
-      return () => Vue.h('span', slots.trigger ? slots.trigger() : slots.default?.())
-    } })
+  function renderPool() {
+    const app = Vue.createSSRApp({ render() { return render(context, []) } })
+    for (const name of ['n-tag', 'n-tooltip', 'n-icon', 'n-button', 'n-empty']) {
+      app.component(name, { setup(_, { slots }) {
+        return () => Vue.h('span', slots.trigger ? slots.trigger() : slots.default?.())
+      } })
+    }
+    return renderToString(app)
   }
-  const html = await renderToString(app)
+  const html = await renderPool()
+  assert.doesNotMatch(html, /P3 开仓过滤/)
   assert.match(html, /pb2611/)
   assert.match(html, /评分 3.50/)
   assert.match(html, /止损距离 9.00 tick/)
@@ -561,6 +576,12 @@ test('actual condition-pool template shows blocked reasons and omits execution c
   assert.ok(!html.includes('立即确认开仓'))
   assert.ok(!html.includes('取消剩余开仓'))
   assert.ok(!html.includes('当前实例暂无条件单'))
+  for (const [version, shown] of [['2', false], ['3', true]]) {
+    store.applySnapshot({ ...snapshot(), strategy: { revision: 'p3', strategy_id: 'n_p3_v1', code_version: version }, conditions: [] })
+    const emptyPool = await renderPool()
+    assert.match(emptyPool, /当前实例暂无条件单/)
+    assert.equal(emptyPool.includes('计划入场价到 S1 的距离大于 3.5 ATR 时过滤'), shown)
+  }
 })
 
 test('rejected conditions with unfilled reason show readable labels, no retry text and safe wait bars', async () => {

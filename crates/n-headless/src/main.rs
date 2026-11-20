@@ -288,7 +288,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 启动后台运行时任务（调度器、实时现价轮询、天勤闭合事件消费）
-    runtime::spawn_runtime_tasks(ctx.clone());
+    let close_scan_mode = ctx.services.scheduler_config().await.close_scan_mode;
+    runtime::spawn_runtime_tasks(ctx.clone(), close_scan_mode);
 
     // 构建 Axum REST API 与 WebSocket 路由
     let router = api::build_router(ctx.clone());

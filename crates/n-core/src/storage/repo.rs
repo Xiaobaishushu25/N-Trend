@@ -1,11 +1,12 @@
 //! Repository layer over the SeaORM entities.
 
 use anyhow::{anyhow, Context, Result};
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::ConnectionTrait;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbBackend, EntityTrait, Iterable,
+    ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -248,7 +249,11 @@ pub async fn delete_symbol_rollovers(db: &DatabaseConnection, symbol: &str) -> R
     Ok(())
 }
 
-pub async fn delete_symbol_rollover(db: &DatabaseConnection, symbol: &str, ts: &str) -> Result<()> {
+pub async fn delete_symbol_rollover(
+    db: &impl ConnectionTrait,
+    symbol: &str,
+    ts: &str,
+) -> Result<()> {
     rollovers::Entity::delete_many()
         .filter(rollovers::Column::Symbol.eq(symbol))
         .filter(rollovers::Column::Ts.eq(ts))
@@ -280,7 +285,7 @@ pub async fn all_rollovers(db: &DatabaseConnection) -> Result<Vec<rollovers::Mod
 
 /// 批量 upsert 换月记录：同一 symbol+ts 覆盖为最新确认结果。
 pub async fn upsert_rollovers(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     rows: Vec<rollovers::ActiveModel>,
 ) -> Result<()> {
     if rows.is_empty() {
@@ -352,6 +357,17 @@ pub async fn klines(
 
 pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<klines::Model>> {
     raw_klines_tail(db, symbol, None).await
+}
+
+pub async fn has_closed_15m(db: &DatabaseConnection, symbol: &str, bar_end: &str) -> Result<bool> {
+    Ok(db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM klines WHERE symbol=? AND timeframe='15m' AND ts=?",
+            [symbol.into(), bar_end.into()],
+        ))
+        .await?
+        .is_some())
 }
 
 /// Read only the requested raw history, preserving the raw-source filter.
@@ -470,6 +486,23 @@ pub async fn claim_scan_watermark(
     ))
     .await?;
     Ok(true)
+}
+
+pub async fn completed_scan_watermark(
+    db: &DatabaseConnection,
+    symbol: &str,
+    bar_end: &str,
+    logic_version: &str,
+) -> Result<bool> {
+    Ok(db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM scan_watermarks
+             WHERE symbol=? AND timeframe='15m' AND bar_end=? AND logic_version=? AND status='completed'",
+            [symbol.into(), bar_end.into(), logic_version.into()],
+        ))
+        .await?
+        .is_some())
 }
 
 pub async fn complete_scan_watermark(
@@ -1274,6 +1307,18 @@ pub async fn active_pattern_events(db: &DatabaseConnection) -> Result<Vec<patter
         .context("查询活跃信号事件失败")?)
 }
 
+pub async fn pattern_event_symbols(db: &DatabaseConnection) -> Result<Vec<String>> {
+    pattern_events::Entity::find()
+        .select_only()
+        .column(pattern_events::Column::Symbol)
+        .distinct()
+        .order_by_asc(pattern_events::Column::Symbol)
+        .into_tuple::<String>()
+        .all(db)
+        .await
+        .context("查询有形态事件的品种失败")
+}
+
 /// 全市场活跃信号计数：闭合事件增量广播无需反序列化所有历史事件。
 pub async fn count_active_pattern_events(db: &DatabaseConnection) -> Result<u64> {
     Ok(pattern_events::Entity::find()
@@ -1349,84 +1394,51 @@ pub async fn update_pattern_event(
     db: &DatabaseConnection,
     row: pattern_events::Model,
 ) -> Result<()> {
-    let res = db
-        .execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Sqlite,
-            r#"
-                UPDATE pattern_events SET
-                    symbol = ?1, direction = ?2, grade = ?3, level = ?4,
-                    s0_ts = ?5, s0_price = ?6, s1_ts = ?7, s1_price = ?8,
-                    s2_ts = ?9, s2_price = ?10, a_move = ?11, b_move = ?12,
-                    a_bars = ?13, b_bars = ?14, retracement = ?15,
-                    warning_ts = ?16, detected_at = ?17, warning_kind = ?18,
-                    entry_score = ?19, entry_score_dims = ?20, entry = ?21,
-                    stop = ?22, target = ?23, risk = ?24, rr = ?25,
-                    state = ?26, last_advance_ts = ?27, trigger_ts = ?28,
-                    trigger_bar_ts = ?29, trigger_price = ?30, trigger_score = ?31,
-                    trigger_volume_ratio = ?32, overshoot_r = ?33, hold_score = ?34,
-                    hold_score_history = ?35, outcome = ?36, exit_reason = ?37,
-                    exit_ts = ?38, exit_price = ?39, r_multiple = ?40, mfe_r = ?41,
-                    mae_r = ?42, created_at = ?43, updated_at = ?44
-                WHERE id = ?45
-                "#,
-            vec![
-                row.symbol.into(),
-                row.direction.into(),
-                row.grade.into(),
-                row.level.into(),
-                row.s0_ts.into(),
-                row.s0_price.into(),
-                row.s1_ts.into(),
-                row.s1_price.into(),
-                row.s2_ts.into(),
-                row.s2_price.into(),
-                row.a_move.into(),
-                row.b_move.into(),
-                row.a_bars.into(),
-                row.b_bars.into(),
-                row.retracement.into(),
-                row.warning_ts.into(),
-                row.detected_at.into(),
-                row.warning_kind.into(),
-                row.entry_score.into(),
-                row.entry_score_dims.into(),
-                row.entry.into(),
-                row.stop.into(),
-                row.target.into(),
-                row.risk.into(),
-                row.rr.into(),
-                row.state.into(),
-                row.last_advance_ts.into(),
-                row.trigger_ts.into(),
-                row.trigger_bar_ts.into(),
-                row.trigger_price.into(),
-                row.trigger_score.into(),
-                row.trigger_volume_ratio.into(),
-                row.overshoot_r.into(),
-                row.hold_score.into(),
-                row.hold_score_history.into(),
-                row.outcome.into(),
-                row.exit_reason.into(),
-                row.exit_ts.into(),
-                row.exit_price.into(),
-                row.r_multiple.into(),
-                row.mfe_r.into(),
-                row.mae_r.into(),
-                row.created_at.into(),
-                row.updated_at.into(),
-                row.id.into(),
-            ],
-        ))
+    anyhow::ensure!(
+        write_pattern_event(db, row, None).await?,
+        "更新信号事件失败: 记录不存在"
+    );
+    Ok(())
+}
+
+/// Update only if the stored event still matches the snapshot used to calculate
+/// the next state. Compare nullable values with SQLite IS. updated_at alone
+/// cannot distinguish a quote and a scan that write in the same second.
+pub(crate) async fn update_pattern_event_if_current(
+    db: &DatabaseConnection,
+    previous: &pattern_events::Model,
+    row: pattern_events::Model,
+) -> Result<bool> {
+    anyhow::ensure!(previous.id == row.id, "更新信号事件失败: 事件 ID 不一致");
+    write_pattern_event(db, row, Some(previous)).await
+}
+
+async fn write_pattern_event(
+    db: &DatabaseConnection,
+    row: pattern_events::Model,
+    previous: Option<&pattern_events::Model>,
+) -> Result<bool> {
+    use pattern_events::Column;
+
+    let mut update = pattern_events::Entity::update_many().filter(Column::Id.eq(row.id));
+    if let Some(previous) = previous {
+        for column in Column::iter().filter(|column| !matches!(column, Column::Id)) {
+            update = update.filter(Expr::col(column).is(previous.get(column)));
+        }
+    }
+    let values: pattern_events::ActiveModel = row.into();
+    let mut values = values.reset_all();
+    values.not_set(Column::Id);
+    let changed = update
+        .set(values)
+        .exec(db)
         .await
         .context("更新信号事件失败")?;
-    if res.rows_affected() != 1 {
-        return Err(anyhow!(
-            "更新信号事件失败: 影响行数 {}",
-            res.rows_affected()
-        ));
+    if changed.rows_affected == 0 {
+        return Ok(false);
     }
     r5a_mark_signals_dirty();
-    Ok(())
+    Ok(true)
 }
 
 /// 重建复盘数据时清空事件表。
@@ -1889,7 +1901,7 @@ pub async fn get_setting(db: &DatabaseConnection, key: &str) -> Result<Option<St
 }
 
 pub async fn set_settings(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     map: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let rows: Vec<settings::ActiveModel> = map
@@ -3277,7 +3289,10 @@ mod tests {
 
         let history = list_notification_history(&db, 10).await.unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].title.as_deref(), Some("RB0 收盘前预检测【做空】"));
+        assert_eq!(
+            history[0].title.as_deref(),
+            Some("RB0 收盘前预检测【做空】")
+        );
         assert!(history[0].preclose.is_some());
         assert_eq!(history[0].preclose.as_ref().unwrap().symbol, "RB0");
     }

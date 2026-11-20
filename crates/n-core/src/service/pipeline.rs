@@ -88,6 +88,25 @@ impl RawPipeline {
     /// 4. 单事务 upsert raw 与这些派生桶，保留其他历史与修订号；
     /// 5. 派生缓存缺失时才初始化全部派生历史。
     pub async fn process_raw_batch(&self, symbol: &str, incoming_bars: &[Kline]) -> Result<usize> {
+        self.write_raw_batch(symbol, incoming_bars, false).await
+    }
+
+    /// A delayed fallback fetch may race a closure event. Preserve rows the
+    /// event or a regular refresh already committed while the fetch was in flight.
+    pub(super) async fn process_missing_raw_batch(
+        &self,
+        symbol: &str,
+        incoming_bars: &[Kline],
+    ) -> Result<usize> {
+        self.write_raw_batch(symbol, incoming_bars, true).await
+    }
+
+    async fn write_raw_batch(
+        &self,
+        symbol: &str,
+        incoming_bars: &[Kline],
+        only_missing: bool,
+    ) -> Result<usize> {
         let lock = self.symbol_locks.get(symbol);
         let _guard = lock.lock().await;
 
@@ -108,12 +127,13 @@ impl RawPipeline {
             .values()
             .filter(|row| {
                 !previous.get(row.datetime.as_str()).is_some_and(|old| {
-                    old.open == row.open
-                        && old.high == row.high
-                        && old.low == row.low
-                        && old.close == row.close
-                        && old.volume == row.volume
-                        && old.hold == row.hold
+                    only_missing
+                        || (old.open == row.open
+                            && old.high == row.high
+                            && old.low == row.low
+                            && old.close == row.close
+                            && old.volume == row.volume
+                            && old.hold == row.hold)
                 })
             })
             .map(|row| (*row).clone())

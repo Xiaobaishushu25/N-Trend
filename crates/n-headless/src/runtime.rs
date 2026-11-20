@@ -1,11 +1,13 @@
 mod outbox_dispatch;
+mod scan_queue;
 
 use crate::state::ServerContext;
-use chrono::Local;
+use chrono::{Local, Timelike};
 use n_core::notify::email::{
     event_email_payload_with_model, preclose_candidate_email_payload, preclose_email_payload,
     single_bar_email_payload, EventEmailKind,
 };
+use n_core::scheduler::CloseScanMode;
 use n_core::service::{RefreshStats, ScanResult};
 use n_protocol::NewNotificationHistoryItem;
 use std::sync::Arc;
@@ -154,19 +156,18 @@ fn registered_event_ids(
         .collect()
 }
 
-pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>) {
+pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>, close_scan_mode: CloseScanMode) {
     if !n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
         outbox_dispatch::spawn(ctx.clone());
     }
-    // Scan work is isolated from the HTTP long-poll consumer, so a slow pattern
-    // replay cannot delay the next closed-bar event or chart broadcast.
-    let (scan_tx, scan_rx) = tokio::sync::mpsc::channel(512);
-    spawn_tq_closed_scan_worker(ctx.clone(), scan_rx);
+    let scan_wake = Arc::new(tokio::sync::Notify::new());
+    scan_queue::spawn(ctx.clone(), scan_wake.clone(), close_scan_mode);
     spawn_review_worker(ctx.clone());
     spawn_scheduler(ctx.clone());
+    spawn_scan_maintenance(ctx.clone(), close_scan_mode);
     spawn_quote_poller(ctx.clone());
     spawn_live_chart_publisher(ctx.clone());
-    spawn_tq_bar_event_consumer(ctx.clone(), scan_tx);
+    spawn_tq_bar_event_consumer(ctx.clone(), scan_wake);
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
@@ -908,7 +909,6 @@ fn spawn_scheduler(ctx: Arc<ServerContext>) {
         let mut startup_done = false;
         let mut last_trading_status: Option<n_core::session::TradingStatus> = None;
         let mut last_refresh: Option<chrono::DateTime<Local>> = None;
-        let mut last_scan: Option<chrono::DateTime<Local>> = None;
 
         loop {
             ticker.tick().await;
@@ -956,77 +956,52 @@ fn spawn_scheduler(ctx: Arc<ServerContext>) {
                 last_trading_status = Some(current_status);
             }
 
-            if !startup_done {
-                startup_done = true;
-                if n_core::scheduler::is_trading_time(&now) {
-                    if let Ok(stats) = run_refresh(&ctx).await {
-                        last_refresh = Some(now);
-                        let seq = ctx.next_event_seq();
-                        ctx.realtime_hub
-                            .broadcast(
-                                seq,
-                                "data.updated",
-                                serde_json::to_value(&stats).unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    continue;
+            let startup_refresh = !startup_done && n_core::scheduler::is_trading_time(&now);
+            startup_done = true;
+            if startup_refresh || n_core::scheduler::regular_refresh_due(now, &cfg, last_refresh) {
+                if let Ok(stats) = run_refresh(&ctx).await {
+                    last_refresh = Some(now);
+                    ctx.realtime_hub
+                        .broadcast(
+                            ctx.next_event_seq(),
+                            "data.updated",
+                            serde_json::to_value(&stats).unwrap_or_default(),
+                        )
+                        .await;
                 }
             }
 
-            let action = n_core::scheduler::next_action(now, &cfg, last_refresh, last_scan);
-            match action {
-                n_core::scheduler::SchedulerAction::None => {}
-                n_core::scheduler::SchedulerAction::Refresh => {
-                    if let Ok(stats) = run_refresh(&ctx).await {
-                        last_refresh = Some(now);
-                        let seq = ctx.next_event_seq();
-                        ctx.realtime_hub
-                            .broadcast(
-                                seq,
-                                "data.updated",
-                                serde_json::to_value(&stats).unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                }
-                n_core::scheduler::SchedulerAction::Scan => {
-                    let _ = run_refresh(&ctx).await;
-                    last_refresh = Some(now);
-                    if let Ok(scan_res) = run_scan(&ctx).await {
-                        last_scan = Some(now);
-                        let seq = ctx.next_event_seq();
-                        ctx.realtime_hub
-                            .broadcast(
-                                seq,
-                                "scan.completed",
-                                serde_json::to_value(&scan_res).unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                }
-                n_core::scheduler::SchedulerAction::RefreshAndScan => {
-                    if let Ok(stats) = run_refresh(&ctx).await {
-                        last_refresh = Some(now);
-                        let seq = ctx.next_event_seq();
-                        ctx.realtime_hub
-                            .broadcast(
-                                seq,
-                                "data.updated",
-                                serde_json::to_value(&stats).unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    if let Ok(scan_res) = run_scan(&ctx).await {
-                        last_scan = Some(now);
-                        let seq = ctx.next_event_seq();
-                        ctx.realtime_hub
-                            .broadcast(
-                                seq,
-                                "scan.completed",
-                                serde_json::to_value(&scan_res).unwrap_or_default(),
-                            )
-                            .await;
+        }
+    });
+}
+
+fn spawn_scan_maintenance(ctx: Arc<ServerContext>, mode: CloseScanMode) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_maintenance = None;
+        loop {
+            ticker.tick().await;
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if !ctx.scheduler_running.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            // Keep full-history maintenance away from the 15m close.
+            let now = Local::now();
+            let minute = now.minute() % 15;
+            let grid = now.timestamp() / 900;
+            if (6..10).contains(&minute)
+                && last_maintenance != Some(grid)
+                && n_core::scheduler::is_trading_time(&now)
+            {
+                match ctx.services.try_scan_maintenance(mode).await {
+                    Ok(true) => last_maintenance = Some(grid),
+                    Ok(false) => {}
+                    Err(err) => {
+                        last_maintenance = Some(grid);
+                        tracing::warn!("定时扫描维护失败: {err:#}");
                     }
                 }
             }
@@ -1074,28 +1049,8 @@ async fn run_refresh(ctx: &Arc<ServerContext>) -> anyhow::Result<RefreshStats> {
     }
 }
 
-async fn run_scan(ctx: &Arc<ServerContext>) -> anyhow::Result<ScanResult> {
-    let t0 = Instant::now();
-    tracing::info!("🔍 扫描触发 | {}", Local::now().format("%H:%M:%S"));
-    let res = ctx.services.run_scan().await?;
-    *ctx.last_scan.write().await = Some(Local::now().naive_local());
-
-    tracing::info!(
-        "✓ 扫描完成 {}ms | 扫描 {} 活跃 {} 新预警 {} 新触发 {}",
-        t0.elapsed().as_millis(),
-        res.scanned,
-        res.active_count,
-        res.new_warnings.len(),
-        res.newly_triggered.len()
-    );
-    publish_scan_signals(ctx, &res, true).await;
-    Ok(res)
-}
-
-/// One publisher for both scheduled and closed-bar scans. The scheduled path
-/// continues to own preclose reconciliation, which must not run per symbol.
-/// R4a: warning/trigger publishing is now driven by SQLite Outbox triggers.
-async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconcile: bool) {
+/// Warning and trigger delivery are driven by durable Outbox rows.
+async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult) {
     // Emergency rollback switch. Never run both pathways simultaneously.
     if n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
         register_execution_signals(ctx, &res.new_warnings).await;
@@ -1238,10 +1193,9 @@ async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconc
         }
     }
 
-    if !reconcile {
-        return;
-    }
-    // 收盘后对账结算 (机制一与机制二)
+}
+
+async fn reconcile_preclose(ctx: &Arc<ServerContext>) {
     let now_naive = Local::now().naive_local();
     match ctx.services.reconcile_preclose_signals(now_naive).await {
         Ok(updates) if !updates.is_empty() => {
@@ -1777,106 +1731,9 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
     });
 }
 
-#[derive(Debug)]
-struct ClosedScanTask {
-    symbol: String,
-    bar_end: String,
-    event_id: u64,
-    queued_at: Instant,
-}
-
 fn ends_fifteen_minute_bar(bar_end: &str) -> bool {
-    use chrono::Timelike;
     chrono::NaiveDateTime::parse_from_str(bar_end, "%Y-%m-%d %H:%M:%S")
         .is_ok_and(|dt| dt.minute() % 15 == 0 && dt.second() == 0)
-}
-
-fn spawn_tq_closed_scan_worker(
-    ctx: Arc<ServerContext>,
-    mut rx: tokio::sync::mpsc::Receiver<ClosedScanTask>,
-) {
-    let worker = async move {
-        while let Some(task) = rx.recv().await {
-            if ctx
-                .is_shutting_down
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                break;
-            }
-            let queued_ms = task.queued_at.elapsed().as_millis() as u64;
-            let started = Instant::now();
-            let mut outcome = None;
-            // Transient SQLite lock/refresh contention should not lose a scan.
-            // After bounded retries, the existing scheduled scan is the fallback.
-            for attempt in 0..3u64 {
-                match ctx
-                    .services
-                    .scan_tq_closed_15m_symbol(&task.symbol, &task.bar_end)
-                    .await
-                {
-                    Ok(result) => {
-                        outcome = Some(result);
-                        break;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            symbol = %task.symbol, bar_end = %task.bar_end,
-                            event_id = task.event_id, attempt = attempt + 1,
-                            "[R2_FAST_SCAN] 事件扫描失败: {error:#}"
-                        );
-                        if attempt < 2 {
-                            tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
-                        }
-                    }
-                }
-            }
-            let scan_ms = started.elapsed().as_millis() as u64;
-            match outcome {
-                Some((Some(res), false)) => {
-                    let publish_started = Instant::now();
-                    publish_scan_signals(&ctx, &res, false).await;
-                    let publish_ms = publish_started.elapsed().as_millis() as u64;
-                    // A symbol delta must never masquerade as the full snapshot
-                    // carried by the existing scan.completed channel.
-                    ctx.realtime_hub
-                        .broadcast(
-                            ctx.next_event_seq(),
-                            "scan.symbol_completed",
-                            serde_json::json!({
-                                "symbol": &task.symbol,
-                                "bar_end": &task.bar_end,
-                                "result": &res,
-                            }),
-                        )
-                        .await;
-                    tracing::info!(
-                        symbol = %task.symbol, bar_end = %task.bar_end,
-                        event_id = task.event_id, queued_ms, scan_ms, publish_ms,
-                        warnings = res.new_warnings.len(), triggered = res.newly_triggered.len(),
-                        "[R2_FAST_SCAN] 闭合事件扫描及信号发布完成"
-                    );
-                }
-                Some((None, true)) => {
-                    tracing::debug!(
-                        symbol = %task.symbol, bar_end = %task.bar_end,
-                        event_id = task.event_id, queued_ms, scan_ms,
-                        "[R2_FAST_SCAN] 已由定时扫描或先前事件处理"
-                    );
-                }
-                Some(_) => {
-                    tracing::warn!(symbol = %task.symbol, "[R2_FAST_SCAN] 非预期扫描结果，等待定时补偿");
-                }
-                None => {
-                    tracing::error!(
-                        symbol = %task.symbol, bar_end = %task.bar_end,
-                        event_id = task.event_id,
-                        "[R2_FAST_SCAN] 三次失败，保留定时扫描兜底；请检查日志"
-                    );
-                }
-            }
-        }
-    };
-    tokio::spawn(worker);
 }
 
 #[cfg(test)]
@@ -1896,7 +1753,7 @@ mod closed_scan_boundary_tests {
 
 fn spawn_tq_bar_event_consumer(
     ctx: Arc<ServerContext>,
-    scan_tx: tokio::sync::mpsc::Sender<ClosedScanTask>,
+    scan_wake: Arc<tokio::sync::Notify>,
 ) {
     tokio::spawn(async move {
         let mut is_first = true;
@@ -1973,18 +1830,19 @@ fn spawn_tq_bar_event_consumer(
                         break;
                     }
                     if ends_fifteen_minute_bar(&ev.bar_end) {
-                        // Backpressure instead of drop: a slow full-history scan must
-                        // never silently discard a closed-bar signal.
-                        let task = ClosedScanTask {
-                            symbol: ev.symbol.clone(),
-                            bar_end: ev.bar_end.clone(),
-                            event_id: ev.event_id,
-                            queued_at: Instant::now(),
-                        };
-                        if scan_tx.send(task).await.is_err() {
-                            // Keep chart delivery alive if the worker panics/exits;
-                            // the scheduled scanner is still the recovery path.
-                            tracing::error!("[R2_FAST_SCAN] 扫描工作队列停止，降级为定时扫描兜底");
+                        match n_core::storage::scan_jobs::enqueue(
+                            &ctx.db, &ev.symbol, &ev.bar_end, Local::now().timestamp(), true,
+                        ).await {
+                            Ok(true) => scan_wake.notify_waiters(),
+                            Ok(false) => {}
+                            Err(error) => {
+                                tracing::warn!(
+                                    symbol = %ev.symbol, bar_end = %ev.bar_end, event_id = ev.event_id,
+                                    "闭合扫描任务写入失败，将重试: {error:#}"
+                                );
+                                persist_failed = true;
+                                break;
+                            }
                         }
                     }
                     after_id = after_id.max(ev.event_id);

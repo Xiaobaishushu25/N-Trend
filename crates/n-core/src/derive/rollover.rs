@@ -7,6 +7,8 @@
 //!    并确认断点后的连续序列已经切到更晚的月份。持仓/成交不再作为一票否决，
 //!    避免新浪已提前切换但新合约持仓尚未反超时漏标。
 
+use std::collections::VecDeque;
+
 use anyhow::Result;
 use chrono::NaiveDateTime;
 
@@ -62,20 +64,42 @@ pub struct RolloverRecord {
 /// 在升序 5m 连续序列中找出所有会话断裂点。
 pub fn detect_candidates(symbol: &str, bars: &[Kline]) -> Vec<RolloverCandidate> {
     let mut out = Vec::new();
-    for i in 1..bars.len() {
-        let before = &bars[i - 1];
-        let after = &bars[i];
-        let Some(prev_dt) = parse_ts(&before.datetime) else {
-            continue;
-        };
-        let Some(dt) = parse_ts(&after.datetime) else {
+    let Some(first) = bars.first() else {
+        return out;
+    };
+    let mut recent_trs = VecDeque::with_capacity(ATR_WINDOW);
+    recent_trs.push_back(first.high - first.low);
+    let mut previous_dt = parse_ts(&first.datetime);
+    let mut valid_prefix = true;
+    for (before, after) in bars.iter().zip(bars.iter().skip(1)) {
+        let current_dt = parse_ts(&after.datetime);
+        let timestamps = (previous_dt, current_dt);
+        previous_dt = current_dt;
+        let (Some(prev_dt), Some(dt)) = timestamps else {
+            // The original ATR returned None if any timestamp in its prefix was invalid.
+            valid_prefix = false;
             continue;
         };
         let gap_minutes = (dt - prev_dt).num_minutes();
-        if gap_minutes <= SESSION_BREAK_MINUTES || gap_minutes <= ROLLOVER_BREAK_MIN_MINUTES {
+        if gap_minutes <= SESSION_BREAK_MINUTES {
+            if recent_trs.len() == ATR_WINDOW {
+                recent_trs.pop_front();
+            }
+            recent_trs.push_back(
+                (after.high - after.low)
+                    .max((after.high - before.close).abs())
+                    .max((after.low - before.close).abs()),
+            );
+        }
+        if gap_minutes <= ROLLOVER_BREAK_MIN_MINUTES {
             continue;
         }
-        let atr = local_atr(&bars[..i]).unwrap_or(0.0);
+        // Sum oldest to newest as before; the break itself never enters the ATR.
+        let atr = if valid_prefix {
+            recent_trs.iter().sum::<f64>() / recent_trs.len() as f64
+        } else {
+            0.0
+        };
         let gap = (after.open - before.close).abs();
         let gap_r = gap / atr.max(1e-9);
         let hold_change = if before.hold > 0.0 {
@@ -99,34 +123,6 @@ pub fn detect_candidates(symbol: &str, bars: &[Kline]) -> Vec<RolloverCandidate>
         });
     }
     out
-}
-
-/// 断点附近的 ATR：只统计同一会话内相邻 5m bar 的 TR，避免断点本身污染基准。
-fn local_atr(bars: &[Kline]) -> Option<f64> {
-    let mut trs = Vec::new();
-    for i in 0..bars.len() {
-        if i == 0 {
-            trs.push(bars[i].high - bars[i].low);
-            continue;
-        }
-        let prev_dt = parse_ts(&bars[i - 1].datetime)?;
-        let dt = parse_ts(&bars[i].datetime)?;
-        if (dt - prev_dt).num_minutes() > SESSION_BREAK_MINUTES {
-            continue;
-        }
-        let pc = bars[i - 1].close;
-        trs.push(
-            (bars[i].high - bars[i].low)
-                .max((bars[i].high - pc).abs())
-                .max((bars[i].low - pc).abs()),
-        );
-    }
-    let start = trs.len().saturating_sub(ATR_WINDOW);
-    if trs[start..].is_empty() {
-        return None;
-    }
-    let sum: f64 = trs[start..].iter().sum();
-    Some(sum / (trs.len() - start) as f64)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +308,67 @@ mod tests {
             out.push(bar(&h, open + i as f64, c, hold));
         }
         out
+    }
+
+    #[test]
+    fn rolling_atr_matches_historical_prefix_calculation() {
+        // The former implementation parsed and collected each entire prefix separately.
+        fn prefix_atr(bars: &[Kline]) -> Option<f64> {
+            let first = bars.first()?;
+            let mut trs = vec![first.high - first.low];
+            for pair in bars.windows(2) {
+                let before = &pair[0];
+                let after = &pair[1];
+                let gap = (parse_ts(&after.datetime)? - parse_ts(&before.datetime)?).num_minutes();
+                if gap <= SESSION_BREAK_MINUTES {
+                    trs.push(
+                        (after.high - after.low)
+                            .max((after.high - before.close).abs())
+                            .max((after.low - before.close).abs()),
+                    );
+                }
+            }
+            let tail = &trs[trs.len().saturating_sub(ATR_WINDOW)..];
+            Some(tail.iter().sum::<f64>() / tail.len() as f64)
+        }
+
+        let mut bars = Vec::new();
+        for day in 1..=12 {
+            for i in [540, 545, 550, 660, 665, 900, 905] {
+                let ts = format!("2026-01-{day:02} {:02}:{:02}:00", i / 60, i % 60);
+                let open = 100.0 + (bars.len() * 3 % 7) as f64 * 0.17;
+                bars.push(bar(&ts, open, open + 0.11, 1000.0));
+            }
+        }
+        for malformed_at in [None, Some(0), Some(32)] {
+            let mut input = bars.clone();
+            if let Some(index) = malformed_at {
+                input[index].datetime = "invalid".to_string();
+            }
+            let expected: Vec<_> = input
+                .windows(2)
+                .enumerate()
+                .filter_map(|(i, pair)| {
+                    let gap =
+                        (parse_ts(&pair[1].datetime)? - parse_ts(&pair[0].datetime)?).num_minutes();
+                    if gap <= ROLLOVER_BREAK_MIN_MINUTES {
+                        return None;
+                    }
+                    let atr = prefix_atr(&input[..=i]).unwrap_or(0.0);
+                    let gap_r = (pair[1].open - pair[0].close).abs() / atr.max(1e-9);
+                    Some((&pair[1].datetime, gap_r.to_bits()))
+                })
+                .collect();
+            let actual = detect_candidates("FG0", &input);
+            assert!(actual.len() > ATR_WINDOW);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|c| (&c.ts, c.gap_r.to_bits()))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]

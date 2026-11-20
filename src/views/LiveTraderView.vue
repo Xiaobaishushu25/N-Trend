@@ -1262,6 +1262,11 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
       <!-- B. 活跃条件单标签页 -->
       <section v-else-if="trader.activeTab === 'conditions'" class="tab-pane">
+        <div v-if="trader.currentStrategy?.strategy_id === 'n_p3_v1' && trader.currentStrategy.code_version === '3'"
+          class="condition-pool-rule">
+          <n-icon :component="InfoCircle" />
+          <span><strong>P3 开仓过滤</strong>　计划入场价到 S1 的距离大于 3.5 ATR 时过滤。ATR14 取预警时已收盘的 15 分钟 K 线。</span>
+        </div>
         <div v-if="!trader.conditionPool.length" class="empty-holder cond-empty-container">
           <n-empty description="当前实例暂无条件单或准入过滤记录">
             <template #extra>
@@ -2243,6 +2248,24 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
 .condition-pool-summary span {
   color: #94a3b8;
+}
+
+.condition-pool-rule {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #1e3a5f;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.condition-pool-rule .n-icon {
+  flex-shrink: 0;
+  align-self: center;
 }
 
 .empty-hint-box {

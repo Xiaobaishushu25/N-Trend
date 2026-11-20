@@ -14,6 +14,7 @@ pub mod cache_revisions;
 pub mod entities;
 pub mod outbox;
 pub mod repo;
+pub mod scan_jobs;
 
 pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
     let is_memory = path.to_string_lossy() == ":memory:";
@@ -34,6 +35,7 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
     let pool = sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(if is_memory { 1 } else { 8 })
         .acquire_timeout(Duration::from_secs(30))
+        .acquire_slow_threshold(Duration::from_millis(500))
         .connect_with(connect_opts)
         .await
         .map_err(|e| anyhow!("连接 SQLite 失败 ({:?}): {e}", path))?;
@@ -318,6 +320,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     migrate_pattern_event_unique(db).await?;
     create_finality_tables(db).await?;
     outbox::ensure(db).await?;
+    scan_jobs::ensure(db).await?;
     // Triggers capture writes from any connection; hot-path reads use in-process epochs.
     cache_revisions::ensure(db).await?;
     create_v2_tables(db).await?;

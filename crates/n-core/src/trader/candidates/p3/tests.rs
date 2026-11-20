@@ -114,7 +114,7 @@ fn signal() -> Value {
         "s0_ts":"s0","s1_ts":"s1","s2_ts":"s2","warning_ts":"2026-11-12 09:15:00",
         "created_at_epoch":parse_time("2026-11-12 09:15:00").unwrap(),"entry":1000.,"stop":980.,
         "target":1100.,"risk":20.,"tick_size":1.,"multiplier":10.,"entry_score":2.5,
-        "warning_context":{"as_of":"2026-11-12 09:15:00","complete":true,"atr14":20.}})
+        "warning_context":{"as_of":"2026-11-12 09:15:00","complete":true,"atr14":30.}})
 }
 fn run(
     strategy: &dyn Strategy,
@@ -276,8 +276,8 @@ fn v2_removes_only_atr_floor_for_both_exit_modes_and_directions() {
     for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
         let mut params = parameters();
         params.exit_mode = mode;
-        let current = P3Strategy::new(params.clone()).unwrap();
-        let previous = P3Strategy::with_atr_floor(params.clone(), true).unwrap();
+        let current = P3Strategy::for_version(params.clone(), PREVIOUS_VERSION).unwrap();
+        let previous = P3Strategy::for_version(params.clone(), ATR_FLOOR_VERSION).unwrap();
         let p2 = CandidateStrategy::new(params.common()).unwrap();
         for short in [false, true] {
             let mut payload = signal();
@@ -299,6 +299,50 @@ fn v2_removes_only_atr_floor_for_both_exit_modes_and_directions() {
             assert_eq!(
                 signal_decision(&p2, payload).1["reason"],
                 "atr_out_of_range"
+            );
+        }
+    }
+}
+
+#[test]
+fn v3_filters_large_planned_targets_in_both_directions_without_changing_v1_v2_or_p2() {
+    let registry = StrategyRegistry::default();
+    let mut legacy = definition(parameters());
+    let p2 = CandidateStrategy::new(parameters().common()).unwrap();
+    for mode in [ExitMode::FixedS1, ExitMode::HybridS1] {
+        let mut params = parameters();
+        params.exit_mode = mode;
+        let current = registry.strategy(&definition(params)).unwrap();
+        for sign in [-1., 1.] {
+            let mut payload = signal();
+            payload["entry_score"] = json!(4.);
+            payload["direction"] = json!(if sign > 0. { "up" } else { "down" });
+            payload["stop"] = json!(1000. - sign * 20.);
+            payload["warning_context"]["atr14"] = json!(20.);
+            for distance in [69., 70.] {
+                payload["target"] = json!(1000. + sign * distance);
+                let (intents, audit) = signal_decision(current.as_ref(), payload.clone());
+                assert_eq!(audit["reason"], "accepted_warning");
+                assert!(matches!(&intents[..], [TradeIntent::Open(plan)]
+                    if plan.target_price == Some(1000. + sign * distance)));
+            }
+            payload["target"] = json!(1000. + sign * 71.);
+            let (intents, audit) = signal_decision(current.as_ref(), payload.clone());
+            assert!(intents.is_empty());
+            assert_eq!(audit["reason"], "target_atr_above_max");
+            assert_eq!(audit["values"]["target_atr"], 3.55);
+            assert_eq!(audit["values"]["max_target_atr"], 3.5);
+            for version in [ATR_FLOOR_VERSION, PREVIOUS_VERSION] {
+                legacy.code_version = version.into();
+                let strategy = registry.strategy(&legacy).unwrap();
+                assert_eq!(
+                    signal_decision(strategy.as_ref(), payload.clone()).1["reason"],
+                    "accepted_warning"
+                );
+            }
+            assert_eq!(
+                signal_decision(&p2, payload).1["reason"],
+                "accepted_warning"
             );
         }
     }
@@ -350,7 +394,7 @@ fn configurable_rr_is_enforced_at_signal_and_proposed_price_in_both_modes_and_di
 }
 
 #[test]
-fn v2_keeps_atr_validity_friction_and_structural_risk_guards() {
+fn v3_keeps_atr_validity_friction_and_structural_risk_guards() {
     let strategy = P3Strategy::new(parameters()).unwrap();
     for atr in [json!(0), json!(null)] {
         let mut payload = signal();
@@ -388,7 +432,7 @@ fn v2_keeps_atr_validity_friction_and_structural_risk_guards() {
 fn frozen_v1_definitions_keep_their_floor_and_fixed_rr_after_roundtrip() {
     let registry = StrategyRegistry::default();
     let mut old = serde_json::to_value(definition(parameters())).unwrap();
-    old["code_version"] = json!(PREVIOUS_VERSION);
+    old["code_version"] = json!(ATR_FLOOR_VERSION);
     old["parameters"]
         .as_object_mut()
         .unwrap()
@@ -403,7 +447,7 @@ fn frozen_v1_definitions_keep_their_floor_and_fixed_rr_after_roundtrip() {
         "atr_out_of_range"
     );
     let current = definition(parameters());
-    assert_eq!(current.code_version, "2");
+    assert_eq!(current.code_version, "3");
     assert_eq!(
         signal_decision(registry.strategy(&current).unwrap().as_ref(), payload).1["reason"],
         "accepted_warning"
@@ -412,7 +456,7 @@ fn frozen_v1_definitions_keep_their_floor_and_fixed_rr_after_roundtrip() {
     altered_old.parameters["min_net_rr"] = json!(0.8);
     assert!(registry.validate(&altered_old).is_err());
     let mut unknown = current;
-    unknown.code_version = "3".into();
+    unknown.code_version = "4".into();
     assert!(registry.validate(&unknown).is_err());
     for bad in [0., -0.1, f64::NAN, f64::INFINITY] {
         let mut params = parameters();

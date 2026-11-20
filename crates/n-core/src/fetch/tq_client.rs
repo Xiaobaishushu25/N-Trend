@@ -1,7 +1,7 @@
 //! TianQin (TqSdk) Local HTTP Bridge Client.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -391,6 +391,7 @@ fn trace_kline_response(
     requested: usize,
     raw_text_len: usize,
     klines: &[KlineDto],
+    bridge_ms: u128,
 ) {
     tracing::info!(
         target: "market_trace",
@@ -400,6 +401,7 @@ fn trace_kline_response(
         requested,
         rows = klines.len(),
         raw_text_len,
+        bridge_ms,
         first = %klines.first().map(|k| k.datetime.as_str()).unwrap_or("-"),
         last = %klines.last().map(|k| k.datetime.as_str()).unwrap_or("-"),
         "KLINE_TRACE"
@@ -506,6 +508,7 @@ impl MarketDataSource for TqBridgeClient {
             "{}/api/kline?symbol={}&period={}&count={}",
             self.base_url, symbol, period, count
         );
+        let bridge_started = Instant::now();
         let resp = self
             .http
             .get(&url)
@@ -521,6 +524,7 @@ impl MarketDataSource for TqBridgeClient {
         }
 
         let raw_text = resp.text().await.context("读取天勤 K 线响应文本失败")?;
+        let bridge_ms = bridge_started.elapsed().as_millis();
         let body: KlineResponse =
             serde_json::from_str(&raw_text).context("天勤 K 线 JSON 解析失败")?;
 
@@ -528,7 +532,14 @@ impl MarketDataSource for TqBridgeClient {
             bail!("天勤接口未返回品种 {} 的 K 线数据", symbol);
         }
 
-        trace_kline_response(symbol, period, count, raw_text.len(), &body.klines);
+        trace_kline_response(
+            symbol,
+            period,
+            count,
+            raw_text.len(),
+            &body.klines,
+            bridge_ms,
+        );
 
         let klines = body
             .klines
