@@ -259,6 +259,7 @@ pub async fn persist_notice(
         entry_trigger: item.entry_trigger.clone(),
         single_bar: item.single_bar.clone(),
         manual_level: item.manual_level.clone(),
+        preclose: item.preclose.clone(),
         read_at: None,
     }))
 }
@@ -332,6 +333,7 @@ mod tests {
             entry_trigger: None,
             single_bar: None,
             manual_level: None,
+            preclose: None,
         };
         db.execute_unprepared(
             "CREATE TRIGGER deny_r4a_receipt BEFORE INSERT ON signal_delivery_receipts \

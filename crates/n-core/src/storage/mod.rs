@@ -252,6 +252,7 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     ensure_column(db, "symbols", "sort_index", "BIGINT NOT NULL DEFAULT 0").await?;
     ensure_column(db, "symbols", "tick_size", "REAL NOT NULL DEFAULT 0.0").await?;
     ensure_column(db, "symbols", "is_followed", "BOOLEAN NOT NULL DEFAULT 0").await?;
+    ensure_column(db, "notification_history", "preclose_json", "TEXT").await?;
     db.execute_unprepared(
         "CREATE INDEX IF NOT EXISTS idx_signal_annotations_event_id \
          ON signal_annotations(event_id)",
@@ -271,6 +272,12 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     .await
     .context("创建收盘前预检测状态索引失败")?;
     db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_preclose_signals_emitted \
+         ON preclose_signals(emitted_at)",
+    )
+    .await
+    .context("创建收盘前预检测生成时间索引失败")?;
+    db.execute_unprepared(
         "CREATE UNIQUE INDEX IF NOT EXISTS uniq_preclose_candidate_key \
          ON preclose_candidates(symbol, direction, warning_ts, session_close_ts)",
     )
@@ -282,6 +289,12 @@ pub async fn migrate_with_path(db: &DatabaseConnection, path: Option<&Path>) -> 
     )
     .await
     .context("创建临时未收盘候选状态索引失败")?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_preclose_candidates_emitted \
+         ON preclose_candidates(emitted_at)",
+    )
+    .await
+    .context("创建临时未收盘候选生成时间索引失败")?;
     db.execute_unprepared(
         "CREATE INDEX IF NOT EXISTS idx_manual_levels_symbol_tf \
          ON manual_levels(symbol, timeframe, status)",

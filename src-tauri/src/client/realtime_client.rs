@@ -304,6 +304,10 @@ impl RealtimeClient {
                 .insert("X-Ntrend-Trader-Delta", HeaderValue::from_static("1"));
             req.headers_mut()
                 .insert("X-Ntrend-Ws-Gzip", HeaderValue::from_static("1"));
+            req.headers_mut().insert(
+                "X-Ntrend-Trader-Compact-Diagnostics",
+                HeaderValue::from_static("1"),
+            );
             let connection = tokio::select! {
                 _ = &mut reconnect => { backoff_idx = 0; continue; }
                 result = tokio::time::timeout(Duration::from_secs(8), connect_async(req)) => result,

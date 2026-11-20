@@ -2989,7 +2989,6 @@ name = "n-trend-analyzer"
 version = "3.0.4"
 dependencies = [
  "anyhow",
- "bytes",
  "chrono",
  "flate2",
  "futures-util",

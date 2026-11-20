@@ -75,7 +75,6 @@ pub async fn get_preclose_signals(
     _device: AuthDevice,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
     let cutoff = n_core::storage::repo::preclose_retention_cutoff_ts();
-    let _ = n_core::storage::repo::prune_preclose_signals(&ctx.db, &cutoff).await;
     match n_core::storage::repo::recent_preclose_signals(&ctx.db, &cutoff).await {
         Ok(rows) => Ok(Json(serde_json::to_value(rows).unwrap_or_default())),
         Err(e) => {
@@ -91,7 +90,6 @@ pub async fn get_preclose_candidates(
     _device: AuthDevice,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiErrorResponse>)> {
     let cutoff = n_core::storage::repo::preclose_retention_cutoff_ts();
-    let _ = n_core::storage::repo::prune_preclose_candidates(&ctx.db, &cutoff).await;
     match n_core::storage::repo::recent_preclose_candidates(&ctx.db, &cutoff).await {
         Ok(rows) => Ok(Json(serde_json::to_value(rows).unwrap_or_default())),
         Err(e) => {

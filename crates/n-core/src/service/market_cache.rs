@@ -7,11 +7,12 @@
 use anyhow::{anyhow, Result};
 use sea_orm::DatabaseConnection;
 use std::{
+    collections::HashMap,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::storage::{
     entities::{pattern_events, symbols},
@@ -19,6 +20,86 @@ use crate::storage::{
 };
 
 const EXTERNAL_REVISION_POLL: Duration = Duration::from_secs(10);
+
+type HistorySlot<T> = Arc<Mutex<Option<(i64, Arc<Vec<T>>)>>>;
+
+/// Reuses closed analysis history across scans, review and trading instances.
+pub(super) struct AnalysisHistory<T> {
+    slots: Mutex<HashMap<(String, String), HistorySlot<T>>>,
+}
+
+impl<T> Default for AnalysisHistory<T> {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<T> AnalysisHistory<T> {
+    pub(super) async fn get<F, Fut>(
+        &self,
+        db: &DatabaseConnection,
+        reads: &Semaphore,
+        (symbol, timeframe): (&str, &str),
+        load: F,
+    ) -> Result<Arc<Vec<T>>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<Vec<T>>>,
+    {
+        use crate::storage::cache_revisions::market_history_revision;
+        let key = (symbol.to_owned(), timeframe.to_owned());
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            // Limit retained data on small servers and avoid evicting in-flight reads.
+            if slots.len() >= 64 && !slots.contains_key(&key) {
+                let idle = slots
+                    .iter()
+                    .find(|(_, slot)| Arc::strong_count(slot) == 1)
+                    .map(|(key, _)| key.clone());
+                if let Some(idle) = idle {
+                    slots.remove(&idle);
+                }
+            }
+            if slots.len() >= 64 && !slots.contains_key(&key) {
+                // All retained entries are in use. This read still uses the shared
+                // concurrency limit, but does not grow the retained cache.
+                HistorySlot::default()
+            } else {
+                slots.entry(key).or_default().clone()
+            }
+        };
+        let mut slot = slot.lock().await;
+        let revision = market_history_revision(db, symbol).await?;
+        if let Some((_, bars)) = slot.as_ref().filter(|(cached, _)| *cached == revision) {
+            return Ok(bars.clone());
+        }
+
+        let queued = Instant::now();
+        let _read = reads.acquire().await?;
+        let started = Instant::now();
+        for _ in 0..3 {
+            let revision = market_history_revision(db, symbol).await?;
+            let bars = Arc::new(load().await?);
+            if market_history_revision(db, symbol).await? == revision {
+                if queued.elapsed() >= Duration::from_millis(500) {
+                    tracing::info!(
+                        symbol,
+                        timeframe,
+                        rows = bars.len(),
+                        queue_ms = started.duration_since(queued).as_millis(),
+                        load_ms = started.elapsed().as_millis(),
+                        "后台分析历史读取较慢"
+                    );
+                }
+                *slot = Some((revision, bars.clone()));
+                return Ok(bars);
+            }
+        }
+        Err(anyhow!("读取分析历史时行情持续更新: {symbol}/{timeframe}"))
+    }
+}
 
 struct Snapshot<T> {
     rows: Arc<Vec<T>>,

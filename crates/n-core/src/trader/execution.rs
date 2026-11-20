@@ -211,6 +211,13 @@ pub struct TradeStatistics {
     pub total_pnl: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileEvents {
+    pub fills: Vec<crate::notify::email::LiveTradeOpenNotice>,
+    pub closes: Vec<crate::notify::email::LiveTradeCloseNotice>,
+    pub account: Option<TraderAccount>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteSource {
@@ -1255,15 +1262,16 @@ impl ExecutionEngine {
     }
 
     /// Complete counter snapshots are replayable. Only trade records change holdings.
-    pub async fn reconcile(&self, snapshot: &serde_json::Value) -> Result<()> {
+    pub async fn reconcile(&self, snapshot: &serde_json::Value) -> Result<ReconcileEvents> {
         let mut guard = self.state.lock().await;
         let mut next = guard.clone();
         match self.reconcile_snapshot(&mut next, snapshot) {
-            Ok(()) => {
+            Ok(events) => {
                 *guard = next;
                 drop(guard);
                 // Recheck the last book, committing only changes made by this recheck.
-                self.observe_quotes(HashMap::new(), false).await
+                self.observe_quotes(HashMap::new(), false).await?;
+                Ok(events)
             }
             Err(e) => {
                 guard.broker_ready = false;
@@ -1277,7 +1285,8 @@ impl ExecutionEngine {
         &self,
         s: &mut ExecutionState,
         snapshot: &serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<ReconcileEvents> {
+        let mut events = ReconcileEvents::default();
         s.account_snapshot = serde_json::from_value(snapshot["account"].clone()).ok();
         s.broker_positions =
             serde_json::from_value(snapshot["broker_positions"].clone()).unwrap_or_default();
@@ -1290,7 +1299,8 @@ impl ExecutionEngine {
         s.broker_ready = h["ready"].as_bool().unwrap_or(false)
             && snapshot["bridge_online"].as_bool().unwrap_or(true);
         if h["user_id"].as_str().unwrap_or("").is_empty() {
-            return Ok(());
+            events.account = s.account_snapshot.clone();
+            return Ok(events);
         }
         let account = format!(
             "{}:{}",
@@ -1301,7 +1311,8 @@ impl ExecutionEngine {
             s.broker_ready = false;
             s.broker_connected = false;
             s.error = Some("柜台账户与持久化执行状态不一致，禁止交易".into());
-            return Ok(());
+            events.account = s.account_snapshot.clone();
+            return Ok(events);
         }
         let mut durable_changed = s.account.as_deref() != Some(account.as_str());
         if durable_changed {
@@ -1525,6 +1536,29 @@ impl ExecutionEngine {
                             s.closes.remove(&pos_id);
                         }
                         s.p3_runner.record_intervention(&rec);
+                        events.closes.push(crate::notify::email::LiveTradeCloseNotice {
+                            instance_id: pos.origin.instance_id.clone(),
+                            instance_name: pos.origin.instance_id.clone(),
+                            symbol: pos.symbol.clone(),
+                            instrument_id: pos.instrument_id.clone(),
+                            signal_id: cond.as_ref().and_then(|c| c.event_id).or(pos.event_id),
+                            direction: pos.direction.clone(),
+                            volume: close_vol,
+                            fill_price: pos.fill_price,
+                            exit_price: trade.price,
+                            planned_exit_price: None,
+                            exit_reason: "external_manual".into(),
+                            slippage_pts: None,
+                            slippage_amount: None,
+                            realized_pnl_pts: points,
+                            realized_pnl_amount: pnl_amount,
+                            planned_pnl_amount: None,
+                            pnl_diff_amount: None,
+                            r_multiple: r,
+                            bars_held: pos.bars_held as i64,
+                            exit_ts: natural_ts.clone(),
+                            account: s.account_snapshot.clone(),
+                        });
                         s.history.push(rec);
                     } else {
                         // Mark external close trade as seen if no matching open position exists,
@@ -1690,6 +1724,53 @@ impl ExecutionEngine {
                         super::candidates::parse_time(&natural_ts).ok(), self.now_utc().timestamp(),
                     );
                 }
+                {
+                    let p = &s.positions[&cond.id];
+                    let mult = self.client.multiplier(&cond.instrument_id);
+                    let (slippage_pts, target_pts, stop_pts) = if cond.direction == "up" {
+                        (
+                            trade.price - cond.entry_price,
+                            p.target_price - trade.price,
+                            trade.price - p.initial_stop_price,
+                        )
+                    } else {
+                        (
+                            cond.entry_price - trade.price,
+                            trade.price - p.target_price,
+                            p.initial_stop_price - trade.price,
+                        )
+                    };
+                    let slippage_amount = slippage_pts.abs() * mult * trade.volume as f64;
+                    let target_amount = target_pts * mult * trade.volume as f64;
+                    let stop_amount = stop_pts * mult * trade.volume as f64;
+                    let rr = if stop_pts > 0.0 {
+                        target_pts / stop_pts
+                    } else {
+                        p.target_price / cond.risk.max(1e-9)
+                    };
+                    events.fills.push(crate::notify::email::LiveTradeOpenNotice {
+                        instance_id: cond.origin.instance_id.clone(),
+                        instance_name: cond.origin.instance_id.clone(),
+                        symbol: cond.symbol.clone(),
+                        instrument_id: cond.instrument_id.clone(),
+                        signal_id: cond.event_id,
+                        direction: cond.direction.clone(),
+                        volume: trade.volume,
+                        fill_price: trade.price,
+                        planned_entry_price: cond.entry_price,
+                        slippage_pts,
+                        slippage_amount,
+                        target_price: p.target_price,
+                        target_pts,
+                        target_amount,
+                        stop_price: p.initial_stop_price,
+                        stop_pts,
+                        stop_amount,
+                        rr,
+                        trade_time: natural_ts.clone(),
+                        account: s.account_snapshot.clone(),
+                    });
+                }
             } else if let Some(pos) = s.positions.get_mut(&cond.id) {
                 anyhow::ensure!(
                     trade.volume <= pos.volume,
@@ -1773,6 +1854,50 @@ impl ExecutionEngine {
                     }
                 }
                 s.p3_runner.record_intervention(&rec);
+                {
+                    let (planned_exit_price, planned_pnl_amount, slippage_pts, slippage_amount, pnl_diff_amount) = {
+                        let planned_exit = match order.reason.as_deref() {
+                            Some("target") => Some(pos.target_price),
+                            Some("stop") => Some(pos.initial_stop_price),
+                            Some("trailing") | Some("breakeven") => Some(pos.current_stop_price),
+                            _ => None,
+                        };
+                        if let Some(planned) = planned_exit {
+                            let sign = if pos.direction == "up" { 1.0 } else { -1.0 };
+                            let planned_pts = (planned - pos.fill_price) * sign;
+                            let planned_amt = planned_pts * mult * trade.volume as f64;
+                            let slip_pts = (planned - trade.price) * sign;
+                            let slip_amt = slip_pts.abs() * mult * trade.volume as f64;
+                            let diff_amt = pnl_amount - planned_amt;
+                            (Some(planned), Some(planned_amt), Some(slip_pts), Some(slip_amt), Some(diff_amt))
+                        } else {
+                            (None, None, None, None, None)
+                        }
+                    };
+                    events.closes.push(crate::notify::email::LiveTradeCloseNotice {
+                        instance_id: cond.origin.instance_id.clone(),
+                        instance_name: cond.origin.instance_id.clone(),
+                        symbol: pos.symbol.clone(),
+                        instrument_id: pos.instrument_id.clone(),
+                        signal_id: cond.event_id.or(pos.event_id),
+                        direction: pos.direction.clone(),
+                        volume: trade.volume,
+                        fill_price: pos.fill_price,
+                        exit_price: trade.price,
+                        planned_exit_price,
+                        exit_reason: order.reason.clone().unwrap_or_else(|| "strategy".into()),
+                        slippage_pts,
+                        slippage_amount,
+                        realized_pnl_pts: points,
+                        realized_pnl_amount: pnl_amount,
+                        planned_pnl_amount,
+                        pnl_diff_amount,
+                        r_multiple: r,
+                        bars_held: pos.bars_held as i64,
+                        exit_ts: natural_ts.clone(),
+                        account: s.account_snapshot.clone(),
+                    });
+                }
                 s.history.push(rec);
             }
         }
@@ -1873,7 +1998,8 @@ impl ExecutionEngine {
             s.rebuild_indices();
             self.save(s)?;
         }
-        Ok(())
+        events.account = s.account_snapshot.clone();
+        Ok(events)
     }
 
     pub async fn requested_contracts(&self) -> Vec<String> {

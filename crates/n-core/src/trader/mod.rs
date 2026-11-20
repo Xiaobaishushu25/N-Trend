@@ -18,7 +18,7 @@ pub use client::{
 };
 pub use execution::{
     ConditionOrder, ConditionState, ExecutionConfig, ExecutionEngine, ManagedPosition,
-    PositionTier, QuoteSource, TradeRecord, TradeStatistics,
+    PositionTier, QuoteSource, ReconcileEvents, TradeRecord, TradeStatistics,
 };
 pub use model::{
     ExecutionMode, OrderCancelRequest, OrderCancelResponse, OrderInsertRequest,

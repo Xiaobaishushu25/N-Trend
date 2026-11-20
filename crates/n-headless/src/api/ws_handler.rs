@@ -23,7 +23,12 @@ pub async fn ws_handler(
         .get("X-Ntrend-Ws-Gzip")
         .and_then(|v| v.to_str().ok())
         == Some("1");
-    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, trader_delta, gzip))
+    let compact_diagnostics = headers
+        .get("X-Ntrend-Trader-Compact-Diagnostics")
+        .is_some_and(|v| v == "1");
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, ctx, device, trader_delta, gzip, compact_diagnostics)
+    })
 }
 
 async fn handle_socket(
@@ -32,28 +37,25 @@ async fn handle_socket(
     device: AuthDevice,
     trader_delta: bool,
     gzip: bool,
+    compact_diagnostics: bool,
 ) {
-    let (client_id, mut rx, disconnect) = ctx
-        .realtime_hub
-        .register_client(device.id.clone(), device.role.clone())
-        .await;
-    ctx.realtime_hub
-        .set_trader_delta(client_id, trader_delta)
-        .await;
-    // Hold the baseline read guard until it is queued. The publisher writes the
-    // baseline before broadcasting, so a newer delta cannot overtake this snapshot.
-    {
+    // Keep the baseline before all deltas published to this client.
+    let (client_id, mut rx, disconnect) = {
         let snapshot = ctx.trader_snapshot.read().await;
-        if !snapshot.is_null() {
-            let event =
-                WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot);
-            if let Ok(text) = serde_json::to_string(&event) {
-                ctx.realtime_hub
-                    .send_to(client_id, Message::Text(text))
-                    .await;
-            }
-        }
-    }
+        let baseline = (!snapshot.is_null()).then(|| {
+            WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot)
+        });
+        ctx.realtime_hub
+            .register_with_baseline(
+                device.id.clone(),
+                device.role.clone(),
+                trader_delta,
+                gzip,
+                compact_diagnostics,
+                baseline,
+            )
+            .await
+    };
 
     tracing::info!(
         "🔌 WebSocket 客户端已建立连接 | ClientID: {} | 设备: {} ({})",
@@ -68,17 +70,9 @@ async fn handle_socket(
     let send_task = tokio::spawn(async move {
         while let Some(queued) = rx.recv().await {
             let (msg, _permit) = queued.into_parts();
-            // Preserve every field and event order. Only an opted-in client gets
-            // gzip binary frames; legacy clients continue to receive text JSON.
-            let msg = if gzip && matches!(&msg, Message::Text(text) if text.len() >= 8192) {
-                match tokio::task::spawn_blocking(move || gzip_message(msg)).await {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                }
-            } else {
-                msg
-            };
-            match tokio::time::timeout(Duration::from_secs(10), sender.send(msg)).await {
+            match tokio::time::timeout(Duration::from_secs(10), sender.send(msg.as_ref().clone()))
+                .await
+            {
                 Ok(Ok(())) => {}
                 _ => break,
             }
@@ -163,22 +157,6 @@ async fn handle_socket(
     );
 }
 
-fn gzip_message(msg: Message) -> Message {
-    use std::io::Write;
-    let Message::Text(text) = msg else {
-        return msg;
-    };
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    if encoder.write_all(text.as_bytes()).is_ok() {
-        if let Ok(bytes) = encoder.finish() {
-            if bytes.len() < text.len() {
-                return Message::Binary(bytes);
-            }
-        }
-    }
-    Message::Text(text)
-}
-
 async fn finish_connection(
     mut send_task: tokio::task::JoinHandle<()>,
     mut recv_task: tokio::task::JoinHandle<()>,
@@ -207,25 +185,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
-
-    #[test]
-    fn gzip_snapshot_keeps_all_fields_without_sending_megabytes_of_text() {
-        use std::io::Read;
-        let text=serde_json::json!({"topic":"trader.updated","payload":{"conditions":vec!["历史条件及完整信息";10000],"active":true}}).to_string();
-        let Message::Binary(bytes) = gzip_message(Message::Text(text.clone())) else {
-            panic!("large snapshot should compress")
-        };
-        assert!(bytes.len() < text.len() / 10);
-        let mut restored = String::new();
-        flate2::read::GzDecoder::new(bytes.as_slice())
-            .read_to_string(&mut restored)
-            .unwrap();
-        assert_eq!(restored, text);
-        assert!(matches!(
-            gzip_message(Message::Ping(vec![])),
-            Message::Ping(_)
-        ));
-    }
 
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {

@@ -107,7 +107,8 @@ pub fn spawn(ctx: Arc<ServerContext>) {
                                     manager
                                         .validate_snapshot(&account.definition.id, &s)
                                         .await?;
-                                    account.engine.reconcile(&s).await?;
+                                    let evs = account.engine.reconcile(&s).await?;
+                                    dispatch_live_trade_emails(&c, &account.definition.name, evs);
                                     account
                                         .engine
                                         .dispatch(StrategyEvent::ExecutionUpdate(s.clone()))
@@ -220,19 +221,13 @@ impl HistoryCache {
             let mut data = match cached {
                 Some((_, data)) => data.clone(),
                 None => MarketHistory {
-                    bars: Arc::new(services.bars_for(symbol, timeframe).await?),
+                    bars: services.shared_bars_for(symbol, timeframe).await?,
                     raw: None,
                     rollovers: None,
                 },
             };
             if needs.raw && data.raw.is_none() {
-                data.raw = Some(Arc::new(
-                    repo::raw_klines(db, symbol)
-                        .await?
-                        .iter()
-                        .map(n_core::service::model_to_fetch)
-                        .collect(),
-                ));
+                data.raw = Some(services.shared_raw_for(symbol).await?);
             }
             if needs.rollovers && data.rollovers.is_none() {
                 data.rollovers = Some(Arc::new(
@@ -557,13 +552,14 @@ impl InstancePublisher {
                     let mut snapshot = manager.build_snapshot(&r.definition.id).await?;
                     warn_calendar_coverage(&r.definition.id, &snapshot["strategy_diagnostics"], &mut calendar_warnings);
                     snapshot["runtime_diagnostics"] = diagnostics.read().await.clone();
-                    let (baseline, delta) = publisher.update(snapshot);
+                    let (baseline, delta, diagnostics) = publisher.update_instance(snapshot);
                     // Publish before potentially slow equity SQL, which must
                     // not hold up REST recovery or the quote/exit task either.
                     *r.published.write().await = baseline;
                     if let Some(delta) = delta {
-                        ctx.realtime_hub.broadcast(ctx.next_event_seq(), "trader.instance.delta",
-                            json!({"instance_id":r.definition.id,"delta":delta})).await;
+                        ctx.realtime_hub.broadcast_instance_delta(
+                            ctx.next_event_seq(), &r.definition.id, delta, diagnostics
+                        ).await;
                     }
                     if last_heartbeat.elapsed() >= Duration::from_secs(15) {
                         ctx.realtime_hub.broadcast(ctx.next_event_seq(), "trader.instance.heartbeat",
@@ -644,7 +640,8 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             if let Some(events) = quotes {
                 if let BrokerClient::Paper(p) = &r.broker {
                     p.on_quotes(&events)?;
-                    r.engine.reconcile(&p.snapshot()).await?;
+                    let evs = r.engine.reconcile(&p.snapshot()).await?;
+                    dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
                 }
                 r.engine.on_quote_batch(events).await?;
             }
@@ -663,7 +660,8 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             }
             if let BrokerClient::Paper(p) = &r.broker {
                 let s = p.snapshot();
-                r.engine.reconcile(&s).await?;
+                let evs = r.engine.reconcile(&s).await?;
+                dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
                 r.engine
                     .dispatch(StrategyEvent::ExecutionUpdate(s.clone()))
                     .await?;
@@ -723,6 +721,106 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 oldest_quote_age_seconds, "实例行情处理较慢");
         }
     }
+}
+
+pub fn dispatch_live_trade_emails(
+    ctx: &Arc<ServerContext>,
+    instance_name: &str,
+    events: n_core::trader::ReconcileEvents,
+) {
+    if events.fills.is_empty() && events.closes.is_empty() {
+        return;
+    }
+    let ctx = ctx.clone();
+    let inst_name = instance_name.to_string();
+    tokio::spawn(async move {
+        let cfg = ctx.services.config().await;
+        if !cfg.email.enabled || !cfg.email.sendable() {
+            return;
+        }
+
+        // 1. 处理开仓成交提醒
+        if cfg.email.trade_open_enabled {
+            for mut fill in events.fills {
+                if !cfg
+                    .email
+                    .trade_instances
+                    .iter()
+                    .any(|id| id == &fill.instance_id)
+                {
+                    continue;
+                }
+                // 检查成交时间是否在 10 分钟以内，避免冷启动回放历史成交轰炸
+                if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&fill.trade_time, "%Y-%m-%d %H:%M:%S")
+                {
+                    let age = (chrono::Local::now().naive_local() - dt).num_seconds();
+                    if age > 600 {
+                        tracing::debug!(
+                            trade_time = %fill.trade_time,
+                            "跳过过期的开仓成交邮件提醒 (age: {}s)",
+                            age
+                        );
+                        continue;
+                    }
+                }
+                fill.instance_name = inst_name.clone();
+                let (subject, body) = n_core::notify::email::trade_open_email_payload(&fill);
+                tracing::info!(
+                    instance_id = %fill.instance_id,
+                    symbol = %fill.symbol,
+                    direction = %fill.direction,
+                    fill_price = fill.fill_price,
+                    "准备发送实盘开仓提醒邮件"
+                );
+                let email_cfg = cfg.email.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+                });
+            }
+        }
+
+        // 2. 处理平仓成交提醒
+        if cfg.email.trade_close_enabled {
+            for mut close in events.closes {
+                if !cfg
+                    .email
+                    .trade_instances
+                    .iter()
+                    .any(|id| id == &close.instance_id)
+                {
+                    continue;
+                }
+                if let Ok(dt) =
+                    chrono::NaiveDateTime::parse_from_str(&close.exit_ts, "%Y-%m-%d %H:%M:%S")
+                {
+                    let age = (chrono::Local::now().naive_local() - dt).num_seconds();
+                    if age > 600 {
+                        tracing::debug!(
+                            exit_ts = %close.exit_ts,
+                            "跳过过期的平仓成交邮件提醒 (age: {}s)",
+                            age
+                        );
+                        continue;
+                    }
+                }
+                close.instance_name = inst_name.clone();
+                let (subject, body) = n_core::notify::email::trade_close_email_payload(&close);
+                tracing::info!(
+                    instance_id = %close.instance_id,
+                    symbol = %close.symbol,
+                    exit_reason = %close.exit_reason,
+                    realized_pnl_pts = close.realized_pnl_pts,
+                    realized_pnl_amount = close.realized_pnl_amount,
+                    "准备发送实盘平仓提醒邮件"
+                );
+                let email_cfg = cfg.email.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = n_core::notify::email::send_summary(&subject, &body, &email_cfg);
+                });
+            }
+        }
+    });
 }
 
 #[cfg(test)]

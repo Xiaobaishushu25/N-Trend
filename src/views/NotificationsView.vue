@@ -26,6 +26,7 @@ function fmtPrice(v: number): string {
 function kindLabel(item: NotificationHistoryItem): string {
   if (item.entry_trigger) return '入场提醒'
   if (item.manual_level) return '关键区域'
+  if (item.preclose) return item.preclose.kind === 'provisional_candidate' ? '临时推演' : '收盘预检'
   // 信号卡片本身已有完整信息，历史列表里不再重复显示“信号”
   if (item.signal) return ''
   switch (item.kind) {
@@ -167,6 +168,25 @@ onBeforeUnmount(() => {
             <span v-if="item.manual_level.bar_ts" class="signal-time">{{ item.manual_level.bar_ts }}</span>
             <span v-if="item.manual_level.price != null" class="signal-time">价 {{ fmtPrice(item.manual_level.price) }}</span>
             <div class="manual-history-reason">{{ item.manual_level.reason }}</div>
+          </div>
+
+          <div v-else-if="item.preclose" class="signal-line">
+            <span class="signal-code">{{ item.preclose.symbol }}</span>
+            <span class="signal-name">{{ item.preclose.name || item.preclose.symbol }}</span>
+            <span
+              class="signal-dir"
+              :class="item.preclose.direction === 'up' ? 'is-up' : 'is-down'"
+            >
+              {{ directionLabel(item.preclose.direction) }}
+            </span>
+            <span class="signal-level">
+              {{ item.preclose.kind === 'provisional_candidate' ? '临时推演' : '收盘预检' }}
+            </span>
+            <span v-if="item.preclose.entry_score != null" class="signal-score">
+              评分 {{ item.preclose.entry_score.toFixed(2) }}
+            </span>
+            <span class="signal-time">现价 {{ fmtPrice(item.preclose.reference_price) }}</span>
+            <span class="signal-time">收盘 {{ item.preclose.session_close_ts }}</span>
           </div>
 
           <template v-else>

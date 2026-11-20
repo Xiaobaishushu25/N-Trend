@@ -64,6 +64,7 @@ import { useSettingsStore } from '../stores/settings'
 import { useSymbolsStore } from '../stores/symbols'
 import { useGroupsStore } from '../stores/groups'
 import { usePlatform } from '../utils/platform'
+import { useLiveTraderStore } from '../stores/liveTrader'
 import type {
   AuthRecord,
   BackupStatus,
@@ -448,6 +449,7 @@ async function toggleAutoLaunch(enabled: boolean) {
 }
 
 // ── 3. 服务端全局设置 ──
+const liveTraderStore = useLiveTraderStore()
 const serverSettings = ref<ServerSettingsDto | null>(null)
 const serverSettingsUpdate = ref<ServerSettingsUpdate>({ configRevision: 0 })
 const newTqPassword = ref('')
@@ -455,6 +457,18 @@ const newSmtpPassword = ref('')
 const showTqPassword = ref(false)
 const showSmtpPassword = ref(false)
 const savingServerSettings = ref(false)
+
+const traderInstanceOptions = computed(() => {
+  const instances = liveTraderStore.instanceCatalog?.instances || []
+  const opts = instances.map((r) => ({
+    label: `${r.instance.name || '实盘'} (${r.instance.id})`,
+    value: r.instance.id,
+  }))
+  if (!opts.some((o) => o.value === 'default')) {
+    opts.unshift({ label: '默认实盘 (default)', value: 'default' })
+  }
+  return opts
+})
 
 const logLevels = [
   { label: 'trace', value: 'trace' },
@@ -478,10 +492,19 @@ async function loadServerSettings() {
       preclose: { ...s.preclose },
       log: { ...s.log },
       dataSource: { ...s.dataSource },
-      email: { ...s.email },
+      email: {
+        signal_warning_enabled: true,
+        signal_trigger_enabled: true,
+        signal_preclose_enabled: true,
+        trade_open_enabled: true,
+        trade_close_enabled: true,
+        ...s.email,
+        trade_instances: Array.isArray(s.email?.trade_instances) ? [...s.email.trade_instances] : ['default'],
+      },
     }
     newTqPassword.value = ''
     newSmtpPassword.value = ''
+    liveTraderStore.loadInstances().catch(() => {})
   } catch (e: any) {
     console.warn('获取服务端配置失败:', e)
   }
@@ -1152,23 +1175,26 @@ onMounted(async () => {
                 </div>
               </div>
 
-              <label class="section-title">邮件报警 (SMTP)</label>
-              <div class="setting-card">
+              <label class="section-title">邮件服务基础配置 (SMTP)</label>
+              <div class="setting-card" v-if="serverSettingsUpdate.email">
                 <div class="setting-card-row is-switch-row">
-                  <div class="row-label">启用邮件通知</div>
-                  <n-switch v-model:value="serverSettingsUpdate.email!.enabled" />
+                  <div class="row-label">
+                    启用邮件通知服务
+                    <Tip text="总开关：关闭后将暂停发送所有类型的邮件通知（包括信号类与实盘类）。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.enabled" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">SMTP 服务器地址</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_host" placeholder="smtp.qq.com" class="setting-input-wide" />
+                  <n-input v-model:value="serverSettingsUpdate.email.smtp_host" placeholder="smtp.qq.com" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">SMTP 端口</div>
-                  <n-input-number v-model:value="serverSettingsUpdate.email!.smtp_port" class="setting-input-number" />
+                  <n-input-number v-model:value="serverSettingsUpdate.email.smtp_port" class="setting-input-number" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">发件人账号</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.smtp_user" placeholder="user@example.com" class="setting-input-wide" />
+                  <n-input v-model:value="serverSettingsUpdate.email.smtp_user" placeholder="user@example.com" class="setting-input-wide" />
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">授权码 / 密码</div>
@@ -1191,11 +1217,36 @@ onMounted(async () => {
                 </div>
                 <div class="setting-card-row">
                   <div class="row-label">接收邮箱</div>
-                  <n-input v-model:value="serverSettingsUpdate.email!.to" placeholder="recipient@example.com" class="setting-input-wide" />
+                  <n-input v-model:value="serverSettingsUpdate.email.to" placeholder="recipient@example.com" class="setting-input-wide" />
+                </div>
+              </div>
+
+              <label class="section-title">信号类邮件通知</label>
+              <div class="setting-card" v-if="serverSettingsUpdate.email">
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    预警邮件提醒
+                    <Tip text="当检测到候选形态或预计即将触发入场时发送邮件预警。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.signal_warning_enabled" />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    入场触发邮件提醒
+                    <Tip text="当行情满足条件并正式触发信号入场点时发送邮件通知。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.signal_trigger_enabled" />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    收盘前预检测邮件提醒
+                    <Tip text="在日盘/夜盘各节收盘前推演候选形态时发送邮件提示。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.signal_preclose_enabled" />
                 </div>
                 <div class="setting-card-row" v-if="serverSettingsUpdate.notify">
                   <div class="row-label">
-                    邮件报警形态评分阈值
+                    信号报警评分阈值
                     <Tip text="仅当发现的新形态或触发信号评分达到该阈值时才发送邮件；设为 0 表示不设门槛全部发送。" />
                   </div>
                   <n-input-number
@@ -1207,6 +1258,39 @@ onMounted(async () => {
                     class="setting-input-number"
                     style="width: 180px"
                   />
+                </div>
+              </div>
+
+              <label class="section-title">实盘类邮件通知</label>
+              <div class="setting-card" v-if="serverSettingsUpdate.email">
+                <div class="setting-card-row">
+                  <div class="row-label">
+                    关注实盘实例
+                    <Tip text="选择需要推送开平仓提醒的实盘交易实例；支持选择多个实例；未选择任何实例时不发送实盘提醒。" />
+                  </div>
+                  <n-select
+                    v-model:value="serverSettingsUpdate.email.trade_instances"
+                    multiple
+                    filterable
+                    tag
+                    placeholder="请选择实盘交易实例（如 default）"
+                    :options="traderInstanceOptions"
+                    class="setting-input-wide"
+                  />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    实盘开仓提醒
+                    <Tip text="当实盘委托成交开仓时发送邮件通知（包含实例、品种、信号编号、成交价、原定入场价、滑点、目标与止损点数及金额、风控比、当前账户资产概况）。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.trade_open_enabled" />
+                </div>
+                <div class="setting-card-row is-switch-row">
+                  <div class="row-label">
+                    实盘平仓提醒
+                    <Tip text="当实盘委托成交平仓时发送邮件通知（包含实例、品种、平仓原因、滑点、实际盈亏点数及金额、原定盈亏金额对比、当前账户资产概况）。" />
+                  </div>
+                  <n-switch v-model:value="serverSettingsUpdate.email.trade_close_enabled" />
                 </div>
               </div>
 

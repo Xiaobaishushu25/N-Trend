@@ -26,6 +26,36 @@ import type {
 
 export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison' | 'orders'
 
+interface DiagnosticChange {
+  path: string[]
+  value?: unknown
+}
+
+function applyDiagnosticChanges(
+  diagnostics: StrategyDiagnostics,
+  changes: DiagnosticChange[],
+): StrategyDiagnostics | null {
+  let updated = diagnostics as unknown as Record<string, unknown>
+  for (const change of changes) {
+    if (!Array.isArray(change.path) || !change.path.length ||
+      change.path.some((key) => typeof key !== 'string' || key === '__proto__' || key === 'constructor' || key === 'prototype')) return null
+    const root = { ...updated }
+    let parent = root
+    for (const key of change.path.slice(0, -1)) {
+      const child = Object.prototype.hasOwnProperty.call(parent, key) ? parent[key] : undefined
+      if (!child || typeof child !== 'object' || Array.isArray(child)) return null
+      const copy = { ...child } as Record<string, unknown>
+      parent[key] = copy
+      parent = copy
+    }
+    const key = change.path[change.path.length - 1]
+    if (Object.prototype.hasOwnProperty.call(change, 'value')) parent[key] = change.value
+    else delete parent[key]
+    updated = root
+  }
+  return updated as unknown as StrategyDiagnostics
+}
+
 export const useLiveTraderStore = defineStore('liveTrader', {
   state: () => ({
     selectedInstanceId: 'default',
@@ -425,19 +455,27 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       return result
     },
-    applyInstanceDelta(payload: { instance_id: string; delta: { stream_id: string; base_revision: number; revision: number; changes: Partial<LiveTraderSnapshot> } }) {
+    applyInstanceDelta(payload: { instance_id: string; delta: { stream_id: string; base_revision: number; revision: number; changes: Partial<LiveTraderSnapshot> }; diagnostic_changes?: DiagnosticChange[] }) {
       if (payload.instance_id !== this.selectedInstanceId) return
       const delta = payload.delta
       if (this.instanceStreamId !== delta.stream_id || delta.base_revision !== this.instanceRevision || delta.revision !== delta.base_revision + 1) {
         void this.refresh()
         return
       }
+      let diagnostics = this.strategyDiagnostics
+      if (payload.diagnostic_changes) {
+        diagnostics = diagnostics && applyDiagnosticChanges(diagnostics, payload.diagnostic_changes)
+        if (!diagnostics) {
+          void this.refresh()
+          return
+        }
+      }
       const baseline: LiveTraderSnapshot = {
         instance_id: this.selectedInstanceId, source: 'server', health: this.health, account: this.account,
         broker_positions: this.brokerPositions, config: this.config || undefined,
         managed_positions: this.managedPositions, conditions: this.conditions, history: this.history,
         statistics: this.statistics, strategy_comparison: this.strategyComparison,
-        strategy: this.currentStrategy || undefined, strategy_diagnostics: this.strategyDiagnostics,
+        strategy: this.currentStrategy || undefined, strategy_diagnostics: diagnostics,
         bridge_online: this.bridgeOnline, execution_error: this.errorMsg,
         _stream_id: delta.stream_id, _revision: delta.revision,
       }
@@ -538,7 +576,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           this.lastPushAt = Date.now()
           this.applySnapshot(payload)
         }))
-        await add(listen<{ instance_id: string; delta: any }>('trader.instance.delta', ({ payload }) => this.applyInstanceDelta(payload)))
+        await add(listen<Parameters<typeof this.applyInstanceDelta>[0]>('trader.instance.delta', ({ payload }) => this.applyInstanceDelta(payload)))
         await add(listen<{ instance_id: string; heartbeat: { stream_id: string; revision: number } }>('trader.instance.heartbeat', ({ payload }) => {
           if (payload.instance_id !== this.selectedInstanceId) return
           if (payload.heartbeat.stream_id !== this.instanceStreamId || payload.heartbeat.revision !== this.instanceRevision) { void this.refresh(); return }

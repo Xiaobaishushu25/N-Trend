@@ -5,6 +5,7 @@ pub const FINE_MAX_A_BARS: usize = 16;
 pub const FINE_MAX_B_BARS: usize = 12;
 pub const LARGE_MAX_A_BARS: usize = 48;
 pub const LARGE_MAX_B_BARS: usize = 32;
+const B5_MAX_RETRACEMENT: f64 = 0.80;
 
 // a段内同向趋势K线的最低数量（放宽版趋势K判定）
 pub const MIN_STRONG_A_LEG: usize = 1;
@@ -163,7 +164,7 @@ pub fn make_pattern(
         Grade::A
     } else if retracement <= 0.66 {
         Grade::B
-    } else if retracement <= 0.80 {
+    } else if retracement <= 0.99 {
         Grade::C
     } else {
         Grade::TooDeep
@@ -338,7 +339,7 @@ pub(crate) fn best_pattern_for_b_end(
     )
 }
 
-/// Instance-local selection; never changes the legacy scanner's ranking.
+/// The nearest eligible A mode uses the frozen B5 admission rules.
 pub(crate) fn best_pattern_for_b_end_selected(
     level: &'static str,
     dir: Dir,
@@ -383,6 +384,7 @@ pub(crate) fn best_pattern_for_b_end_selected(
         if let Some(p) = make_pattern(level, dir, *s0, s1, b_end, bars, trend_k) {
             if nearest
                 && (!matches!(p.grade, Grade::A | Grade::B | Grade::C)
+                    || p.retracement > B5_MAX_RETRACEMENT
                     || is_small_n(&p, &atr20)
                     || a_leg_strong_count(&p, relaxed.as_ref().unwrap()) < MIN_STRONG_A_LEG
                     || crate::analyze::pattern_window_has_rollover_until(bars, &p, b_end.index))
@@ -593,6 +595,42 @@ mod tests {
         let (weakening, ratio) = b_leg_weakening(&down_bars, 1, 4, Dir::Down);
         assert!(weakening);
         assert!(ratio.unwrap() < 0.5);
+    }
+
+    #[test]
+    fn retracement_grade_at_admission_boundaries() {
+        let s0 = Swing {
+            index: 0,
+            price: 200.0,
+            is_high: true,
+        };
+        let s1 = Swing {
+            index: 2,
+            price: 100.0,
+            is_high: false,
+        };
+        for (s2_price, expected) in [
+            (119.5, Grade::TooShallow),
+            (199.0, Grade::C),
+            (199.5, Grade::TooDeep),
+            (200.0, Grade::Invalid),
+        ] {
+            let s2 = Swing {
+                index: 4,
+                price: s2_price,
+                is_high: true,
+            };
+            let bars = [
+                bar(195.0, 200.0, 190.0, 192.0),
+                bar(192.0, 194.0, 120.0, 125.0),
+                bar(125.0, 126.0, 100.0, 110.0),
+                bar(110.0, 115.0, 105.0, 112.0),
+                bar(112.0, s2_price, 110.0, 111.0),
+            ];
+            let pattern = make_pattern("fine", Dir::Down, s0, s1, s2, &bars, &[(false, false); 5])
+                .expect("pattern construction should succeed");
+            assert_eq!(pattern.grade, expected, "S2 price {s2_price}");
+        }
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub async fn get_chart_klines(
                     .map(|dt| dt.timestamp_millis())
             });
 
+            let revision_started = std::time::Instant::now();
             let rev = n_core::storage::repo::get_revision(
                 &ctx.db,
                 &format!("kline:{symbol}:{timeframe}"),
@@ -90,6 +91,7 @@ pub async fn get_chart_klines(
                 trace_id,
                 rows = rows.len(),
                 elapsed_ms = started.elapsed().as_millis(),
+                revision_ms = revision_started.elapsed().as_millis(),
                 "K线服务端修订号查询完成"
             );
 

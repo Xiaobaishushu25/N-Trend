@@ -50,6 +50,12 @@ const defaultConfig = (): Config => ({
     smtp_port: 465,
     smtp_user: '',
     smtp_password: '',
+    signal_warning_enabled: true,
+    signal_trigger_enabled: true,
+    signal_preclose_enabled: true,
+    trade_open_enabled: true,
+    trade_close_enabled: true,
+    trade_instances: ['default'],
   },
   notify: {
     in_app_new_pattern: true,

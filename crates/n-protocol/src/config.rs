@@ -101,6 +101,20 @@ pub struct EmailSettingsDto {
     pub smtp_user: String,
     #[serde(default, alias = "smtpPasswordConfigured")]
     pub smtp_password_configured: bool,
+
+    #[serde(default = "default_true", alias = "signalWarningEnabled")]
+    pub signal_warning_enabled: bool,
+    #[serde(default = "default_true", alias = "signalTriggerEnabled")]
+    pub signal_trigger_enabled: bool,
+    #[serde(default = "default_true", alias = "signalPrecloseEnabled")]
+    pub signal_preclose_enabled: bool,
+
+    #[serde(default = "default_true", alias = "tradeOpenEnabled")]
+    pub trade_open_enabled: bool,
+    #[serde(default = "default_true", alias = "tradeCloseEnabled")]
+    pub trade_close_enabled: bool,
+    #[serde(default = "default_trade_instances", alias = "tradeInstances")]
+    pub trade_instances: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -177,6 +191,20 @@ pub struct EmailSettingsUpdateDto {
     pub smtp_user: String,
     #[serde(default, alias = "smtpPassword")]
     pub smtp_password: Option<String>,
+
+    #[serde(default, alias = "signalWarningEnabled")]
+    pub signal_warning_enabled: Option<bool>,
+    #[serde(default, alias = "signalTriggerEnabled")]
+    pub signal_trigger_enabled: Option<bool>,
+    #[serde(default, alias = "signalPrecloseEnabled")]
+    pub signal_preclose_enabled: Option<bool>,
+
+    #[serde(default, alias = "tradeOpenEnabled")]
+    pub trade_open_enabled: Option<bool>,
+    #[serde(default, alias = "tradeCloseEnabled")]
+    pub trade_close_enabled: Option<bool>,
+    #[serde(default, alias = "tradeInstances")]
+    pub trade_instances: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -249,6 +277,10 @@ pub struct ClientLocalSettings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_trade_instances() -> Vec<String> {
+    vec!["default".to_string()]
 }
 
 fn default_zero_f64() -> f64 {

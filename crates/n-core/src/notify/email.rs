@@ -17,6 +17,16 @@ pub struct EmailSettings {
     pub smtp_port: u16,
     pub smtp_user: String,
     pub smtp_password: String,
+
+    // 信号类通知
+    pub signal_warning_enabled: bool,
+    pub signal_trigger_enabled: bool,
+    pub signal_preclose_enabled: bool,
+
+    // 实盘类通知
+    pub trade_open_enabled: bool,
+    pub trade_close_enabled: bool,
+    pub trade_instances: Vec<String>,
 }
 
 impl Default for EmailSettings {
@@ -29,6 +39,12 @@ impl Default for EmailSettings {
             smtp_port: 465,
             smtp_user: String::new(),
             smtp_password: String::new(),
+            signal_warning_enabled: true,
+            signal_trigger_enabled: true,
+            signal_preclose_enabled: true,
+            trade_open_enabled: true,
+            trade_close_enabled: true,
+            trade_instances: vec!["default".to_string()],
         }
     }
 }
@@ -374,6 +390,285 @@ pub fn single_bar_email_payload(alert: &crate::analyze::model::SingleBarAlert) -
     (subject, body)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTradeOpenNotice {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub symbol: String,
+    pub instrument_id: String,
+    pub signal_id: Option<i64>,
+    pub direction: String, // "up" or "down"
+    pub volume: i32,
+    pub fill_price: f64,
+    pub planned_entry_price: f64,
+    pub slippage_pts: f64, // >0: 不利滑点, <0: 有利滑点
+    pub slippage_amount: f64, // 金额（正数）
+    pub target_price: f64,
+    pub target_pts: f64,
+    pub target_amount: f64,
+    pub stop_price: f64,
+    pub stop_pts: f64,
+    pub stop_amount: f64,
+    pub rr: f64,
+    pub trade_time: String,
+    pub account: Option<crate::trader::TraderAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveTradeCloseNotice {
+    pub instance_id: String,
+    pub instance_name: String,
+    pub symbol: String,
+    pub instrument_id: String,
+    pub signal_id: Option<i64>,
+    pub direction: String, // "up" or "down"
+    pub volume: i32,
+    pub fill_price: f64, // entry fill price
+    pub exit_price: f64, // exit fill price
+    pub planned_exit_price: Option<f64>,
+    pub exit_reason: String,
+    pub slippage_pts: Option<f64>,
+    pub slippage_amount: Option<f64>,
+    pub realized_pnl_pts: f64,
+    pub realized_pnl_amount: f64,
+    pub planned_pnl_amount: Option<f64>,
+    pub pnl_diff_amount: Option<f64>, // realized - planned
+    pub r_multiple: f64,
+    pub bars_held: i64,
+    pub exit_ts: String,
+    pub account: Option<crate::trader::TraderAccount>,
+}
+
+pub fn format_exit_reason(reason: &str) -> &'static str {
+    match reason {
+        "target" => "目标止盈 (Target 1.0R)",
+        "stop" => "触发止损 (Stop Loss)",
+        "trailing" => "移动止盈/保本 (Trailing Stop)",
+        "breakeven" => "保本平仓 (Breakeven)",
+        "late_entry_fill" => "迟到成交退出 (Late Fill Exit)",
+        "external_manual" => "手动/外部平仓 (Manual Close)",
+        s if s.starts_with("manual") => "手动平仓 (Manual Close)",
+        s if s.starts_with("session") || s.starts_with("overnight") => "时段风控平仓 (Session Risk)",
+        _ => "策略平仓",
+    }
+}
+
+pub fn format_exit_reason_short(reason: &str) -> &'static str {
+    match reason {
+        "target" => "目标止盈",
+        "stop" => "触发止损",
+        "trailing" => "移动止盈",
+        "breakeven" => "保本平仓",
+        "late_entry_fill" => "迟到成交退出",
+        "external_manual" => "外部平仓",
+        s if s.starts_with("manual") => "手动平仓",
+        s if s.starts_with("session") || s.starts_with("overnight") => "风控平仓",
+        _ => "策略平仓",
+    }
+}
+
+fn fmt_account_section(account: Option<&crate::trader::TraderAccount>) -> String {
+    if let Some(acc) = account {
+        let margin_ratio = if acc.balance > 0.0 {
+            (acc.curr_margin / acc.balance * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        format!(
+            "■ 账户资产概况\n\
+             • 动态权益：{:.2} 元\n\
+             • 可用资金：{:.2} 元\n\
+             • 占用保证金：{:.2} 元（保证金占用率 {:.1}%）\n\
+             • 当日平仓盈亏：{:+.2} 元",
+            acc.balance, acc.available, acc.curr_margin, margin_ratio, acc.close_profit
+        )
+    } else {
+        "■ 账户资产概况\n• 暂未获取到账户资金快照".to_string()
+    }
+}
+
+pub fn trade_open_email_payload(n: &LiveTradeOpenNotice) -> (String, String) {
+    let dir = if n.direction == "up" { "多" } else { "空" };
+    let dir_label = if n.direction == "up" { "买入做多" } else { "卖出做空" };
+    let sig_str = n
+        .signal_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "无信号关联".to_string());
+    let stop_str = if n.stop_amount > 0.0 {
+        format!(" 止损亏损 -{:.2}元", n.stop_amount)
+    } else {
+        String::new()
+    };
+    let subject = format!(
+        "【实盘开仓】{} · {} {} {}手 @{:.1}{}",
+        n.instance_name, n.symbol, dir, n.volume, n.fill_price, stop_str
+    );
+
+    let slippage_desc = if n.slippage_pts.abs() < 1e-4 {
+        "0.00 点（无滑点）".to_string()
+    } else if n.slippage_pts < 0.0 {
+        format!(
+            "有利滑点 {:.2} 点（合 {:.2} 元，入场价格更优）",
+            n.slippage_pts.abs(),
+            n.slippage_amount
+        )
+    } else {
+        format!(
+            "不利滑点 {:.2} 点（合 {:.2} 元，存在跳空或追价滑点）",
+            n.slippage_pts,
+            n.slippage_amount
+        )
+    };
+
+    let now_str = crate::analyze::time::now_minute();
+    let account_sec = fmt_account_section(n.account.as_ref());
+
+    let body = format!(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         【实盘开仓提醒】N-Trend Automated Execution\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         ■ 基本信息\n\
+         • 交易实例：{}（{}）\n\
+         • 交易标的：{}（{}）\n\
+         • 信号编号：{}\n\
+         • 开仓方向：{}\n\
+         • 成交数量：{} 手\n\
+         • 成交时间：{}\n\n\
+         ■ 价格与滑点\n\
+         • 成交入场价：{:.2}\n\
+         • 原定入场价：{:.2}\n\
+         • 入场滑点：{}\n\n\
+         ■ 目标与风控\n\
+         • 目标价位：{:.2}（{:.2} 点，合 {:.2} 元）\n\
+         • 止损价位：{:.2}（{:.2} 点，合 {:.2} 元）\n\
+         • 风险收益比：{:.2}R\n\n\
+         {}\n\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         系统记录时间：{}",
+        n.instance_name,
+        n.instance_id,
+        n.symbol,
+        n.instrument_id,
+        sig_str,
+        dir_label,
+        n.volume,
+        n.trade_time,
+        n.fill_price,
+        n.planned_entry_price,
+        slippage_desc,
+        n.target_price,
+        n.target_pts,
+        n.target_amount,
+        n.stop_price,
+        n.stop_pts,
+        n.stop_amount,
+        n.rr,
+        account_sec,
+        now_str,
+    );
+
+    (subject, body)
+}
+
+pub fn trade_close_email_payload(n: &LiveTradeCloseNotice) -> (String, String) {
+    let reason_short = format_exit_reason_short(&n.exit_reason);
+    let reason_full = format_exit_reason(&n.exit_reason);
+    let subject = format!(
+        "【实盘平仓】{} · {} {} {:+.2}元 ({:+.1}点)",
+        n.instance_name, n.symbol, reason_short, n.realized_pnl_amount, n.realized_pnl_pts
+    );
+
+    let sig_str = n
+        .signal_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "无信号关联".to_string());
+
+    let planned_exit_desc = n
+        .planned_exit_price
+        .map(|p| format!("{p:.2}"))
+        .unwrap_or_else(|| "随市/动态价格".to_string());
+
+    let slippage_desc = match (n.slippage_pts, n.slippage_amount) {
+        (Some(pts), Some(amt)) => {
+            if pts.abs() < 1e-4 {
+                "0.00 点（无滑点）".to_string()
+            } else if pts < 0.0 {
+                format!("有利滑点 {:.2} 点（合 {:.2} 元，平仓价格更优）", pts.abs(), amt)
+            } else {
+                format!("不利滑点 {:.2} 点（合 {:.2} 元，平仓滑点磨损）", pts, amt)
+            }
+        }
+        _ => "无基准参考".to_string(),
+    };
+
+    let planned_pnl_desc = n
+        .planned_pnl_amount
+        .map(|amt| format!("{amt:+.2} 元"))
+        .unwrap_or_else(|| "跟随市场动态退出".to_string());
+
+    let diff_desc = match n.pnl_diff_amount {
+        Some(diff) if diff > 0.01 => {
+            format!("比原定计划多赚 {:.2} 元（实际成交价格更优！）", diff)
+        }
+        Some(diff) if diff < -0.01 => {
+            format!("比原定计划少赚/多亏 {:.2} 元（滑点磨损）", diff.abs())
+        }
+        Some(_) => "与原定计划盈亏完全一致（无滑点）".to_string(),
+        None => "非固定目标平仓，按实际执行结算".to_string(),
+    };
+
+    let now_str = crate::analyze::time::now_minute();
+    let account_sec = fmt_account_section(n.account.as_ref());
+
+    let body = format!(
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         【实盘平仓提醒】N-Trend Automated Execution\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         ■ 基本信息\n\
+         • 交易实例：{}（{}）\n\
+         • 交易标的：{}（{}）\n\
+         • 关联信号：{}\n\
+         • 平仓原因：{}\n\
+         • 平仓数量：{} 手\n\
+         • 持仓时长：{} 根K线\n\
+         • 平仓时间：{}\n\n\
+         ■ 成交价格与滑点\n\
+         • 入场均价：{:.2}\n\
+         • 平仓成交价：{:.2}\n\
+         • 预期平仓价：{}\n\
+         • 平仓滑点：{}\n\n\
+         ■ 盈亏统计与收益对比\n\
+         • 实际盈亏：{:+.2} 点，合 {:+.2} 元（{:+.2}R）\n\
+         • 原定计划盈亏：{}\n\
+         • 收益对比：{}\n\n\
+         {}\n\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+         系统记录时间：{}",
+        n.instance_name,
+        n.instance_id,
+        n.symbol,
+        n.instrument_id,
+        sig_str,
+        reason_full,
+        n.volume,
+        n.bars_held,
+        n.exit_ts,
+        n.fill_price,
+        n.exit_price,
+        planned_exit_desc,
+        slippage_desc,
+        n.realized_pnl_pts,
+        n.realized_pnl_amount,
+        n.r_multiple,
+        planned_pnl_desc,
+        diff_desc,
+        account_sec,
+        now_str,
+    );
+
+    (subject, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +819,96 @@ mod tests {
         assert!(body.contains("来源正式候选：#1"));
         assert!(body.contains("观察窗口：60分钟"));
         assert!(body.contains("入场评分：3.60"));
+    }
+
+    #[test]
+    fn test_trade_open_email_payload() {
+        let notice = LiveTradeOpenNotice {
+            instance_id: "default".into(),
+            instance_name: "默认实盘".into(),
+            symbol: "rb2505".into(),
+            instrument_id: "rb2505".into(),
+            signal_id: Some(1042),
+            direction: "up".into(),
+            volume: 1,
+            fill_price: 3520.0,
+            planned_entry_price: 3518.0,
+            slippage_pts: 2.0,
+            slippage_amount: 20.0,
+            target_price: 3580.0,
+            target_pts: 60.0,
+            target_amount: 600.0,
+            stop_price: 3490.0,
+            stop_pts: 30.0,
+            stop_amount: 300.0,
+            rr: 2.0,
+            trade_time: "2026-11-20 09:30:00".into(),
+            account: Some(crate::trader::TraderAccount {
+                balance: 100_000.0,
+                available: 85_000.0,
+                curr_margin: 15_000.0,
+                close_profit: 0.0,
+                position_profit: 0.0,
+                updated_at: 0.0,
+            }),
+        };
+
+        let (subject, body) = trade_open_email_payload(&notice);
+        assert_eq!(
+            subject,
+            "【实盘开仓】默认实盘 · rb2505 多 1手 @3520.0 止损亏损 -300.00元"
+        );
+        assert!(body.contains("交易标的：rb2505"));
+        assert!(body.contains("成交入场价：3520.00"));
+        assert!(body.contains("原定入场价：3518.00"));
+        assert!(body.contains("不利滑点 2.00 点（合 20.00 元"));
+        assert!(body.contains("目标价位：3580.00（60.00 点，合 600.00 元）"));
+        assert!(body.contains("止损价位：3490.00（30.00 点，合 300.00 元）"));
+        assert!(body.contains("动态权益：100000.00 元"));
+        assert!(body.contains("可用资金：85000.00 元"));
+        assert!(body.contains("占用保证金：15000.00 元（保证金占用率 15.0%）"));
+    }
+
+    #[test]
+    fn test_trade_close_email_payload_target_better() {
+        let notice = LiveTradeCloseNotice {
+            instance_id: "default".into(),
+            instance_name: "默认实盘".into(),
+            symbol: "rb2505".into(),
+            instrument_id: "rb2505".into(),
+            signal_id: Some(1042),
+            direction: "up".into(),
+            volume: 1,
+            fill_price: 3500.0,
+            exit_price: 3555.0,
+            planned_exit_price: Some(3550.0),
+            exit_reason: "target".into(),
+            slippage_pts: Some(-5.0),
+            slippage_amount: Some(50.0),
+            realized_pnl_pts: 55.0,
+            realized_pnl_amount: 550.0,
+            planned_pnl_amount: Some(500.0),
+            pnl_diff_amount: Some(50.0),
+            r_multiple: 1.1,
+            bars_held: 8,
+            exit_ts: "2026-11-20 11:15:00".into(),
+            account: Some(crate::trader::TraderAccount {
+                balance: 100_550.0,
+                available: 100_550.0,
+                curr_margin: 0.0,
+                close_profit: 550.0,
+                position_profit: 0.0,
+                updated_at: 0.0,
+            }),
+        };
+
+        let (subject, body) = trade_close_email_payload(&notice);
+        assert_eq!(subject, "【实盘平仓】默认实盘 · rb2505 目标止盈 +550.00元 (+55.0点)");
+        assert!(body.contains("平仓原因：目标止盈 (Target 1.0R)"));
+        assert!(body.contains("实际盈亏：+55.00 点，合 +550.00 元"));
+        assert!(body.contains("原定计划盈亏：+500.00 元"));
+        assert!(body.contains("比原定计划多赚 50.00 元（实际成交价格更优！）"));
+        assert!(body.contains("有利滑点 5.00 点（合 50.00 元，平仓价格更优）"));
+        assert!(body.contains("动态权益：100550.00 元"));
     }
 }

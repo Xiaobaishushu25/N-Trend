@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use super::remote_api::RemoteApiClient;
@@ -106,6 +107,10 @@ impl BackupScheduler {
     }
 
     pub async fn trigger_backup_now(&self) -> Result<String, String> {
+        self.run_backup(false).await
+    }
+
+    async fn run_backup(&self, automatic: bool) -> Result<String, String> {
         let _guard = match self.is_running.try_lock() {
             Ok(g) => g,
             Err(_) => {
@@ -115,7 +120,7 @@ impl BackupScheduler {
         };
 
         tracing::info!("📦 开始执行一致性数据库备份...");
-        match self.do_backup_now().await {
+        match self.do_backup_now(automatic).await {
             Ok(filename) => {
                 tracing::info!("✅ 备份成功已保存: {}", filename);
                 let _ = self.app.emit("backup-completed", &filename);
@@ -128,23 +133,12 @@ impl BackupScheduler {
         }
     }
 
-    async fn do_backup_now(&self) -> Result<String, String> {
-        let (bytes, expected_sha) = self
+    async fn do_backup_now(&self, automatic: bool) -> Result<String, String> {
+        let (response, expected_sha) = self
             .api
-            .download_database_backup()
+            .download_database_backup(automatic)
             .await
             .map_err(|e| e.message)?;
-
-        // Verify SHA-256
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let actual_sha = format!("{:x}", hasher.finalize());
-
-        if !expected_sha.is_empty() && actual_sha != expected_sha {
-            return Err(format!(
-                "备份 SHA-256 校验失败! 预期: {expected_sha}, 实际: {actual_sha}"
-            ));
-        }
 
         let now_str = Utc::now()
             .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap())
@@ -156,10 +150,21 @@ impl BackupScheduler {
         let target_path = self.backup_dir.join(&filename);
         let sha_path = self.backup_dir.join(format!("{filename}.sha256"));
 
-        std::fs::write(&part_path, &bytes).map_err(|e| format!("写入临时备份文件失败: {e}"))?;
-        std::fs::rename(&part_path, &target_path).map_err(|e| format!("保存备份文件失败: {e}"))?;
-        std::fs::write(&sha_path, format!("{actual_sha}  {filename}\n"))
-            .map_err(|e| format!("写入校验文件失败: {e}"))?;
+        if let Err(error) = write_backup(response, &expected_sha, &part_path).await {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(error);
+        }
+        if let Err(error) =
+            tokio::fs::write(&sha_path, format!("{expected_sha}  {filename}\n")).await
+        {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(format!("写入校验文件失败: {error}"));
+        }
+        if let Err(error) = tokio::fs::rename(&part_path, &target_path).await {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            let _ = tokio::fs::remove_file(&sha_path).await;
+            return Err(format!("保存备份文件失败: {error}"));
+        }
 
         let today = Self::shanghai_today();
         *self.last_backup_date.write().await = Some(today);
@@ -170,7 +175,7 @@ impl BackupScheduler {
         tracing::info!(
             "📁 备份文件已持久化: {} (SHA256: {})",
             target_path.display(),
-            actual_sha
+            expected_sha
         );
         Ok(filename)
     }
@@ -197,7 +202,7 @@ impl BackupScheduler {
         // Initial wait 15 seconds after startup before checking
         tokio::time::sleep(Duration::from_secs(15)).await;
 
-        let retry_delays = [60, 300, 1800, 21600]; // 1m, 5m, 30m, 6h
+        let retry_delays = [60, 300, 900];
         let mut retry_idx = 0;
 
         loop {
@@ -207,11 +212,11 @@ impl BackupScheduler {
                 last.as_deref() != Some(&today)
             };
 
-            if need_backup {
-                match self.trigger_backup_now().await {
+            if need_backup && n_protocol::automatic_backup_window(Utc::now()) {
+                match self.run_backup(true).await {
                     Ok(_) => {
                         retry_idx = 0;
-                        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+                        tokio::time::sleep(Duration::from_secs(60)).await;
                     }
                     Err(e) => {
                         let delay = retry_delays[retry_idx];
@@ -223,8 +228,39 @@ impl BackupScheduler {
                     }
                 }
             } else {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                retry_idx = 0;
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
     }
+}
+
+async fn write_backup(
+    mut response: reqwest::Response,
+    expected_sha: &str,
+    path: &Path,
+) -> Result<(), String> {
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| format!("创建临时备份失败: {e}"))?;
+    let mut hasher = Sha256::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("读取备份流失败: {e}"))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入临时备份失败: {e}"))?;
+    }
+    let actual_sha = format!("{:x}", hasher.finalize());
+    if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+        return Err(format!(
+            "备份 SHA-256 校验失败，预期 {expected_sha}，实际 {actual_sha}"
+        ));
+    }
+    file.sync_all()
+        .await
+        .map_err(|e| format!("同步备份文件失败: {e}"))
 }

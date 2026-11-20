@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, SqlxSqliteConnector, Statement};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -65,7 +65,8 @@ pub async fn generate_database_snapshot(
     let gz_temp_path = temp_dir.join(format!("ntrend-snapshot-{unique_id}.sqlite.gz"));
 
     let raw_path_str = raw_temp_path.to_string_lossy().replace('\\', "/");
-    let vacuum_sql = format!("VACUUM INTO '{raw_path_str}'");
+    let quoted = raw_path_str.replace('\'', "''");
+    let vacuum_sql = format!("VACUUM INTO '{quoted}'");
 
     tracing::info!(
         "📦 开始执行 SQLite VACUUM INTO 生成数据库快照: {}",
@@ -79,13 +80,16 @@ pub async fn generate_database_snapshot(
     // 校验生成的快照一致性 (VACUUM INTO 重构了全新 B-tree，quick_check 快速且充分)
     {
         tracing::info!("🔍 对生成的 SQLite 快照执行完整性校验 (PRAGMA quick_check)...");
-        let snapshot_db = match sea_orm::Database::connect(format!(
-            "sqlite://{}?mode=ro",
-            raw_temp_path.to_string_lossy().replace('\\', "/")
-        ))
-        .await
+        use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let options = SqliteConnectOptions::new()
+            .filename(&raw_temp_path)
+            .read_only(true);
+        let snapshot_db = match SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
         {
-            Ok(db) => db,
+            Ok(pool) => SqlxSqliteConnector::from_sqlx_sqlite_pool(pool),
             Err(e) => {
                 cleanup_raw_sqlite_artifacts(&raw_temp_path);
                 return Err(anyhow!("打开快照校验连接失败: {e}"));
@@ -107,7 +111,7 @@ pub async fn generate_database_snapshot(
             .unwrap_or(false);
 
         // 关闭连接后清理可能的 shm/wal
-        drop(snapshot_db);
+        let _ = snapshot_db.close().await;
 
         if !is_ok {
             cleanup_raw_sqlite_artifacts(&raw_temp_path);

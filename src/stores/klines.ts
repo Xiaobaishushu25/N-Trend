@@ -77,7 +77,9 @@ export const useKlinesStore = defineStore('klines', {
       this.error = ''
       const isSwitch = this.symbol !== symbol || this.timeframe !== timeframe
       if (isSwitch) this.latestClosedTs = ''
-      if (isSwitch || !silent) {
+      const keepHistory = !isSwitch && this.rows.length > 0 &&
+        ['tqsdk', 'tqsdk_recovery_pending', 'offline_snapshot', 'tq_unavailable'].includes(this.chartStatus)
+      if (!keepHistory) {
         // 切换品种或周期时，立即清空旧数据，防止旧品种数据残留被误用为新数据基准
         this.rows = []
         this.partialBar = null
@@ -87,8 +89,10 @@ export const useKlinesStore = defineStore('klines', {
       }
       this.symbol = symbol
       this.timeframe = timeframe
-      this.chartStatus = 'tqsdk'
-      this.chartMessage = ''
+      if (!keepHistory) {
+        this.chartStatus = 'tqsdk'
+        this.chartMessage = ''
+      }
       const seq = ++this.loadSeq
       const partialSeq = this.partialSeq
       try {

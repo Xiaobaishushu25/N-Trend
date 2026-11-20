@@ -482,6 +482,21 @@ pub struct NotificationEntryTrigger {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationPreclose {
+    pub symbol: String,
+    pub name: Option<String>,
+    pub direction: String,
+    pub session_close_ts: String,
+    pub reference_price: f64,
+    pub kind: String, // "formal_precheck" | "provisional_candidate"
+    #[serde(default)]
+    pub entry_score: Option<f64>,
+    pub state: String,
+    #[serde(default)]
+    pub parent_event_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NotificationHistoryItem {
     pub id: u64,
     pub created_at: String,
@@ -492,6 +507,8 @@ pub struct NotificationHistoryItem {
     pub entry_trigger: Option<NotificationEntryTrigger>,
     pub single_bar: Option<NotificationSingleBar>,
     pub manual_level: Option<ManualLevelAlert>,
+    #[serde(default)]
+    pub preclose: Option<NotificationPreclose>,
     #[serde(default)]
     pub read_at: Option<String>,
 }
@@ -507,6 +524,8 @@ pub struct NewNotificationHistoryItem {
     pub single_bar: Option<NotificationSingleBar>,
     #[serde(default)]
     pub manual_level: Option<ManualLevelAlert>,
+    #[serde(default)]
+    pub preclose: Option<NotificationPreclose>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

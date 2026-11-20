@@ -301,6 +301,29 @@ test('instance deltas require the selected stream and a contiguous revision', as
   assert.equal(store.instanceRevision, 5)
 })
 
+test('compact diagnostics update individual fields and preserve untouched history', () => {
+  const { store } = setup()
+  store.instancesSupported = true
+  store.selectedInstanceId = 'paper-b'
+  const preserved = { decisions: { existing: { reason: 'audit' } } }
+  store.applySnapshot({ ...snapshot(), instance_id: 'paper-b', _stream_id: 'b', _revision: 2,
+    strategy_diagnostics: { states: { older: preserved }, entry_decisions: { changed: 1, removed: 2 } } })
+  store.applyInstanceDelta({
+    instance_id: 'paper-b',
+    delta: { stream_id: 'b', base_revision: 2, revision: 3, changes: {} },
+    diagnostic_changes: [
+      { path: ['entry_decisions', 'changed'], value: 3 },
+      { path: ['entry_decisions', 'inserted'], value: null },
+      { path: ['entry_decisions', 'removed'] },
+    ],
+  })
+  assert.equal(store.instanceRevision, 3)
+  assert.equal(store.strategyDiagnostics.states.older, preserved)
+  assert.equal(store.strategyDiagnostics.entry_decisions.changed, 3)
+  assert.equal(store.strategyDiagnostics.entry_decisions.inserted, null)
+  assert.equal(Object.hasOwn(store.strategyDiagnostics.entry_decisions, 'removed'), false)
+})
+
 test('an old server reports missing multi-account support and can be retried after deployment', async () => {
   const { store, api } = setup()
   api.traderInstanceRequest = async () => { throw '服务端返回错误状态码: 404 Not Found' }

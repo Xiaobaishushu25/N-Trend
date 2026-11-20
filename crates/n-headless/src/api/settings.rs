@@ -77,6 +77,12 @@ pub async fn get_server_settings(
             smtp_port: cfg.email.smtp_port,
             smtp_user: cfg.email.smtp_user,
             smtp_password_configured: !secrets.smtp_password.is_empty(),
+            signal_warning_enabled: cfg.email.signal_warning_enabled,
+            signal_trigger_enabled: cfg.email.signal_trigger_enabled,
+            signal_preclose_enabled: cfg.email.signal_preclose_enabled,
+            trade_open_enabled: cfg.email.trade_open_enabled,
+            trade_close_enabled: cfg.email.trade_close_enabled,
+            trade_instances: cfg.email.trade_instances,
         },
     };
 
@@ -204,6 +210,24 @@ pub async fn update_server_settings(
         current_cfg.email.smtp_host = em.smtp_host;
         current_cfg.email.smtp_port = em.smtp_port;
         current_cfg.email.smtp_user = em.smtp_user;
+        if let Some(w) = em.signal_warning_enabled {
+            current_cfg.email.signal_warning_enabled = w;
+        }
+        if let Some(t) = em.signal_trigger_enabled {
+            current_cfg.email.signal_trigger_enabled = t;
+        }
+        if let Some(p) = em.signal_preclose_enabled {
+            current_cfg.email.signal_preclose_enabled = p;
+        }
+        if let Some(o) = em.trade_open_enabled {
+            current_cfg.email.trade_open_enabled = o;
+        }
+        if let Some(c) = em.trade_close_enabled {
+            current_cfg.email.trade_close_enabled = c;
+        }
+        if let Some(inst) = em.trade_instances {
+            current_cfg.email.trade_instances = inst;
+        }
         if let Some(pwd) = &em.smtp_password {
             if !pwd.trim().is_empty() {
                 current_cfg.email.smtp_password = pwd.trim().to_string();

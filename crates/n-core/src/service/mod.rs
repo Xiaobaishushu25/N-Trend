@@ -6,7 +6,7 @@ mod review;
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Local, NaiveDateTime, Timelike};
 use n_protocol::dto::{IntradayChartResponse, IntradayPointDto};
-use sea_orm::{DatabaseConnection, NotSet, Set};
+use sea_orm::{ConnectionTrait, DatabaseConnection, NotSet, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1491,6 +1491,9 @@ pub struct Services {
     config_path: std::path::PathBuf,
     /// R5a: quotes and entry detection share two revision-aware memory snapshots.
     market_cache: market_cache::MarketCache,
+    analysis_history: market_cache::AnalysisHistory<Bar>,
+    raw_history: market_cache::AnalysisHistory<Kline>,
+    history_reads: tokio::sync::Semaphore,
     /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
     /// 收盘前检测节流：复用3秒行情快照，但最多每10秒扫描一次候选事件。
@@ -1516,6 +1519,17 @@ pub struct Services {
     /// 仅供图表读取的后台实时快照，不进入正式库和策略。
     pub live_chart: Arc<live_chart::LiveChartCache>,
     review_score_cache: RwLock<HashMap<String, n_protocol::quality::ReviewScoreDto>>,
+}
+
+fn log_chart_sql(trace_id: Option<&str>, started: Instant, rows: usize) {
+    if let Some(trace_id) = trace_id {
+        tracing::info!(
+            trace_id,
+            sql_ms = started.elapsed().as_millis(),
+            rows,
+            "K线历史查询执行完成"
+        );
+    }
 }
 
 impl Services {
@@ -1621,6 +1635,9 @@ impl Services {
             config: config_arc,
             config_path,
             market_cache: market_cache::MarketCache::default(),
+            analysis_history: market_cache::AnalysisHistory::default(),
+            raw_history: market_cache::AnalysisHistory::default(),
+            history_reads: tokio::sync::Semaphore::new(2),
             entry_notified: RwLock::new(HashSet::new()),
             preclose_last_tick: Mutex::new(None),
             preclose_candidate_last_tick: Mutex::new(None),
@@ -2350,11 +2367,12 @@ impl Services {
         latest: f64,
     ) -> Result<Vec<Bar>> {
         let current_ts = provisional_5m_bucket_ts(now);
-        let mut raw: Vec<Kline> = repo::raw_klines(&self.db, symbol)
+        let mut raw: Vec<Kline> = self
+            .shared_raw_for(symbol)
             .await?
             .iter()
-            .map(model_to_fetch)
             .filter(|bar| parse_local_ts(&bar.datetime).is_some_and(|ts| ts <= current_ts))
+            .cloned()
             .collect();
         raw.sort_by(|a, b| a.datetime.cmp(&b.datetime));
 
@@ -2588,12 +2606,6 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_signals::Model>> {
-        let cutoff = (now - ChronoDuration::days(1))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        if let Err(err) = repo::prune_preclose_signals(&self.db, &cutoff).await {
-            tracing::warn!("自动清理过期收盘前预检测记录失败: {err:#}");
-        }
         let mut changed = Vec::new();
         for mut row in repo::active_preclose_signals(&self.db).await? {
             let Some(close) = parse_local_ts(&row.session_close_ts) else {
@@ -2650,12 +2662,6 @@ impl Services {
         &self,
         now: NaiveDateTime,
     ) -> Result<Vec<preclose_candidates::Model>> {
-        let cutoff = (now - ChronoDuration::days(1))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        if let Err(err) = repo::prune_preclose_candidates(&self.db, &cutoff).await {
-            tracing::warn!("自动清理过期临时未收盘候选记录失败: {err:#}");
-        }
         let mut changed = Vec::new();
         for mut row in repo::active_preclose_candidates(&self.db).await? {
             if row.state != "provisional" {
@@ -3665,7 +3671,31 @@ impl Services {
 
     /// 取某级别的分析用 bar；派生数据不足时从原始 5m 现场聚合兜底。
     pub async fn bars_for(&self, symbol: &str, timeframe: &str) -> Result<Vec<Bar>> {
-        self.bars_for_tail(symbol, timeframe, None).await
+        Ok(self
+            .shared_bars_for(symbol, timeframe)
+            .await?
+            .as_ref()
+            .clone())
+    }
+
+    pub async fn shared_bars_for(&self, symbol: &str, timeframe: &str) -> Result<Arc<Vec<Bar>>> {
+        self.analysis_history
+            .get(&self.db, &self.history_reads, (symbol, timeframe), || {
+                self.bars_for_tail(symbol, timeframe, None)
+            })
+            .await
+    }
+
+    pub async fn shared_raw_for(&self, symbol: &str) -> Result<Arc<Vec<Kline>>> {
+        self.raw_history
+            .get(&self.db, &self.history_reads, (symbol, "raw5m"), || async {
+                Ok(repo::raw_klines(&self.db, symbol)
+                    .await?
+                    .iter()
+                    .map(model_to_fetch)
+                    .collect())
+            })
+            .await
     }
 
     async fn bars_for_tail(
@@ -3722,7 +3752,13 @@ impl Services {
         if rows.len() >= ATR_PERIOD + 2 {
             return Ok(rows.iter().filter_map(model_to_bar).collect());
         }
-        let mut bars = self.bars_for(symbol, timeframe).await?;
+        let mut bars = self
+            .bars_for_tail(
+                symbol,
+                timeframe,
+                Some(crate::analyze::manual_level::ROLE_WINDOW),
+            )
+            .await?;
         let excess = bars
             .len()
             .saturating_sub(crate::analyze::manual_level::ROLE_WINDOW);
@@ -3737,27 +3773,58 @@ impl Services {
         timeframe: &str,
         limit: Option<usize>,
     ) -> Result<Vec<KlineDto>> {
+        Self::read_chart_rows(&self.db, symbol, timeframe, limit, None).await
+    }
+
+    async fn timed_chart_rows(
+        &self,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+        trace_id: &str,
+    ) -> Result<Vec<KlineDto>> {
+        let started = Instant::now();
+        let conn = self.db.begin().await?;
+        tracing::info!(
+            trace_id,
+            acquire_ms = started.elapsed().as_millis(),
+            "K线数据库连接就绪"
+        );
+        let rows = Self::read_chart_rows(&conn, symbol, timeframe, limit, Some(trace_id)).await?;
+        conn.commit().await?;
+        Ok(rows)
+    }
+
+    async fn read_chart_rows(
+        db: &impl ConnectionTrait,
+        symbol: &str,
+        timeframe: &str,
+        limit: Option<usize>,
+        trace_id: Option<&str>,
+    ) -> Result<Vec<KlineDto>> {
         let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
-        let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
+        let sql_started = Instant::now();
+        let rollovers = repo::symbol_rollovers(db, symbol).await?;
         if tf == Timeframe::M5 {
-            let rows = repo::klines(&self.db, symbol, "5m", limit, None).await?;
+            let rows = repo::klines(db, symbol, "5m", limit, None).await?;
+            log_chart_sql(trace_id, sql_started, rows.len());
             return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
-        let raw_cutoff = repo::latest_raw_ts(&self.db, symbol)
-            .await?
-            .unwrap_or_default();
+        let raw_cutoff = repo::latest_raw_ts(db, symbol).await?.unwrap_or_default();
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
             // 截止时间和数量都下推到 SQL；派生库尾部的未闭合桶不能挤占显示数量。
-            let rows =
-                repo::klines(&self.db, symbol, tf.as_str(), limit, Some(&raw_cutoff)).await?;
+            let rows = repo::klines(db, symbol, tf.as_str(), limit, Some(&raw_cutoff)).await?;
             if !rows.is_empty() {
+                log_chart_sql(trace_id, sql_started, rows.len());
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
             }
         }
         // Two spare buckets cover a truncated leading bucket and the unfinished
         // trailing bucket. Even a full trading day contains at most 288 5m bars.
         let raw_limit = aggregation_raw_limit(tf, limit);
-        let raw = repo::raw_klines_tail(&self.db, symbol, raw_limit).await?;
+        let raw = repo::raw_klines_tail(db, symbol, raw_limit).await?;
+        log_chart_sql(trace_id, sql_started, raw.len());
+        let aggregate_started = Instant::now();
         let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let derived = aggregate(&bars, tf);
         let mut bars: Vec<Bar> = derived
@@ -3770,6 +3837,13 @@ impl Services {
             .iter()
             .map(|b| bar_to_kline_dto(symbol, tf.as_str(), "derived", b))
             .collect();
+        if let Some(trace_id) = trace_id {
+            tracing::info!(
+                trace_id,
+                aggregate_ms = aggregate_started.elapsed().as_millis(),
+                "K线聚合完成"
+            );
+        }
         Ok(apply_limit_dto(rows, limit))
     }
 
@@ -3787,7 +3861,9 @@ impl Services {
         tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), primary = %config.data_source.primary_source, "K线服务配置读取完成");
         let primary_is_tq = config.data_source.primary_source == "tqsdk";
         if !primary_is_tq {
-            let rows = self.get_klines(symbol, timeframe, limit).await?;
+            let rows = self
+                .timed_chart_rows(symbol, timeframe, limit, trace_id)
+                .await?;
             tracing::info!(
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),
@@ -3845,7 +3921,9 @@ impl Services {
                 }
             }
 
-            let rows = self.get_klines(symbol, timeframe, limit).await?;
+            let rows = self
+                .timed_chart_rows(symbol, timeframe, limit, trace_id)
+                .await?;
             tracing::info!(
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),
@@ -3889,7 +3967,9 @@ impl Services {
         }
 
         if !config.data_source.fallback_enabled {
-            let rows = self.get_klines(symbol, timeframe, limit).await?;
+            let rows = self
+                .timed_chart_rows(symbol, timeframe, limit, trace_id)
+                .await?;
             tracing::info!(
                 trace_id,
                 elapsed_ms = started.elapsed().as_millis(),

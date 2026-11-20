@@ -1165,10 +1165,13 @@ const liveBars = ref<KlineRow[]>([])
 const chartClock = ref(Date.now())
 let chartClockTimer: ReturnType<typeof setInterval> | undefined
 const chartDataStatus = computed(() => {
-  if (klinesStore.loading) return '正在获取服务端数据…'
-  if (!klinesStore.dataReceivedAt) return ''
+  if (!klinesStore.dataReceivedAt) return klinesStore.loading ? '正在获取服务端数据…' : ''
   const received = new Date(klinesStore.dataReceivedAt).toLocaleTimeString('zh-CN', { hour12: false })
   const prefix = `服务端数据收到于 ${received}`
+  if (klinesStore.loading) return `${prefix} · 正在刷新…`
+  if (klinesStore.error && klinesStore.rows.length) {
+    return `刷新失败（${klinesStore.error}） · 已收盘数据截至 ${klinesStore.latestClosedTs || received}`
+  }
   if (klinesStore.partialReceivedAt) {
     const time = new Date(klinesStore.partialReceivedAt).toLocaleTimeString('zh-CN', { hour12: false })
     return chartClock.value - klinesStore.partialReceivedAt > 10_000
@@ -3236,7 +3239,7 @@ onBeforeUnmount(() => {
             @preview-manual-level="handleManualLevelPreview"
             @manual-level-draw-mode="onManualLevelDrawMode"
             @crosshair-candle="handleCrosshairCandle"
-            :loading="klinesStore.loading"
+            :loading="klinesStore.loading && !displayRows.length"
           />
           <div
             v-else-if="klinesStore.error"

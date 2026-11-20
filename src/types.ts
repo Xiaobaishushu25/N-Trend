@@ -389,7 +389,13 @@ export interface EmailSettings {
   smtp_host: string
   smtp_port: number
   smtp_user: string
-  smtp_password: string
+  smtp_password?: string
+  signal_warning_enabled?: boolean
+  signal_trigger_enabled?: boolean
+  signal_preclose_enabled?: boolean
+  trade_open_enabled?: boolean
+  trade_close_enabled?: boolean
+  trade_instances?: string[]
 }
 
 export interface AppConfig {
@@ -765,6 +771,18 @@ export interface NotificationSingleBar {
   price: number
 }
 
+export interface NotificationPreclose {
+  symbol: string
+  name?: string | null
+  direction: string
+  session_close_ts: string
+  reference_price: number
+  kind: string // 'formal_precheck' | 'provisional_candidate'
+  entry_score?: number | null
+  state: string
+  parent_event_id?: number | null
+}
+
 export interface NewNotificationHistoryItem {
   kind: NotifyKind
   title?: string | null
@@ -773,6 +791,7 @@ export interface NewNotificationHistoryItem {
   entry_trigger?: NotificationEntryTrigger | null
   single_bar?: NotificationSingleBar | null
   manual_level?: ManualLevelAlert | null
+  preclose?: NotificationPreclose | null
 }
 
 export interface NotificationHistoryItem {
@@ -785,6 +804,7 @@ export interface NotificationHistoryItem {
   entry_trigger?: NotificationEntryTrigger | null
   single_bar?: NotificationSingleBar | null
   manual_level?: ManualLevelAlert | null
+  preclose?: NotificationPreclose | null
 }
 
 export const TIMEFRAMES = ['5m', '15m', '30m', '60m', '120m', '240m', '1d'] as const

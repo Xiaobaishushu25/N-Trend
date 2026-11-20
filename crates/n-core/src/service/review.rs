@@ -366,7 +366,7 @@ impl Services {
             if !bars_by_symbol.contains_key(&event.symbol) {
                 bars_by_symbol.insert(
                     event.symbol.clone(),
-                    self.bars_for(&event.symbol, "15m").await?,
+                    self.shared_bars_for(&event.symbol, "15m").await?,
                 );
             }
             let bars = &bars_by_symbol[&event.symbol];

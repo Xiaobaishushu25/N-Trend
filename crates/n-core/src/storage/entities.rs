@@ -709,6 +709,7 @@ pub mod notification_history {
         pub entry_trigger_json: Option<String>,
         pub single_bar_json: Option<String>,
         pub manual_level_json: Option<String>,
+        pub preclose_json: Option<String>,
         pub read_at: Option<String>,
     }
 

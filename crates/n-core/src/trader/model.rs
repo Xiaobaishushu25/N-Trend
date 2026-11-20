@@ -127,6 +127,7 @@ pub struct TraderHealth {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct TraderAccount {
     pub balance: f64,
     pub available: f64,

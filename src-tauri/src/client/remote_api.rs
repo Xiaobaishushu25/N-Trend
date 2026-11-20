@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use n_protocol::auth::*;
 use n_protocol::config::*;
 use n_protocol::dto::*;
@@ -200,7 +199,11 @@ impl RemoteApiClient {
                 tracing::error!("❌ [RemoteAPI] 网络请求失败: {e}");
                 return Err(ApiErrorResponse::new(
                     "NETWORK_ERROR",
-                    format!("网络请求失败: {e}"),
+                    if trace_id.is_some() && e.is_timeout() {
+                        "等待K线响应头超时".to_owned()
+                    } else {
+                        format!("网络请求失败: {e}")
+                    },
                     "",
                 ));
             }
@@ -232,7 +235,11 @@ impl RemoteApiClient {
                     tracing::error!("❌ [RemoteAPI] 读取响应流失败 ({}): {e}", url);
                     return Err(ApiErrorResponse::new(
                         "READ_ERROR",
-                        format!("读取服务端响应流失败: {e}"),
+                        if trace_id.is_some() && e.is_timeout() {
+                            "读取K线响应正文超时".to_owned()
+                        } else {
+                            format!("读取服务端响应流失败: {e}")
+                        },
                         "",
                     ));
                 }
@@ -1181,9 +1188,13 @@ impl RemoteApiClient {
             .await
     }
 
-    pub async fn download_database_backup(&self) -> Result<(Bytes, String), ApiErrorResponse> {
+    pub async fn download_database_backup(
+        &self,
+        automatic: bool,
+    ) -> Result<(reqwest::Response, String), ApiErrorResponse> {
         let resp = self
             .download_request(Method::GET, "admin/database-backup")
+            .query(&[("automatic", automatic)])
             .send()
             .await
             .map_err(|e| {
@@ -1203,15 +1214,18 @@ impl RemoteApiClient {
         let sha256 = resp
             .headers()
             .get("X-Backup-Sha256")
+            .or_else(|| resp.headers().get("X-Database-SHA256"))
             .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
+            .filter(|sha| sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                ApiErrorResponse::new(
+                    "BACKUP_CHECKSUM_MISSING",
+                    "备份缺少有效的 SHA-256 校验值",
+                    "",
+                )
+            })?
             .to_string();
-
-        let bytes = resp.bytes().await.map_err(|e| {
-            ApiErrorResponse::new("BACKUP_READ_FAILED", format!("读取备份流失败: {e}"), "")
-        })?;
-
-        Ok((bytes, sha256))
+        Ok((resp, sha256))
     }
 
     // ── Integrity ──

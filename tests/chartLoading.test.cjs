@@ -46,17 +46,19 @@ test('live push before the history response keeps its newer candle without dismi
   assert.equal(store.loading, false)
 })
 
-test('every explicit reload clears prior data and a failed request never falls back to it', async () => {
+test('same-series refresh retains closed history and reports a failed refresh', async () => {
   const { store, requests } = klinesHarness()
   const first = store.load('CF0', '15m')
   requests[0].resolve(response(100))
   await first
+  const received = store.dataReceivedAt
   const second = store.load('CF0', '15m')
-  assert.equal(store.rows.length, 0)
-  assert.equal(store.dataReceivedAt, 0)
+  assert.equal(store.rows[0].close, 100)
+  assert.equal(store.dataReceivedAt, received)
   requests[1].reject(Error('network unavailable'))
   await second
-  assert.equal(store.rows.length, 0)
+  assert.equal(store.rows[0].close, 100)
+  assert.equal(store.dataReceivedAt, received)
   assert.equal(store.error, 'network unavailable')
   assert.equal(store.loading, false)
 })

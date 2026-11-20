@@ -60,6 +60,7 @@ fn notice(event: &pattern_events::Model, kind: &str) -> NewNotificationHistoryIt
         entry_trigger: None,
         single_bar: None,
         manual_level: None,
+        preclose: None,
     }
 }
 
@@ -194,6 +195,12 @@ async fn deliver(ctx: &Arc<ServerContext>, task: &outbox::Delivery) -> Result<De
                 || !cfg.email.sendable()
                 || e.entry_score < cfg.notify.new_pattern_min_score
             {
+                return Ok(DeliveryResult::Skipped);
+            }
+            if task.action == outbox::EMAIL_WARNING && !cfg.email.signal_warning_enabled {
+                return Ok(DeliveryResult::Skipped);
+            }
+            if task.action == outbox::EMAIL_TRIGGER && !cfg.email.signal_trigger_enabled {
                 return Ok(DeliveryResult::Skipped);
             }
             if age_seconds(&e).is_none_or(|age| age < -60 || age > EMAIL_MAX_AGE_SECS) {

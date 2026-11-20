@@ -11,6 +11,6 @@ pub const FEATURE_SCHEMA_VERSION: &str = "3";
 /// Execution/label-resolution contract.
 pub const EXECUTION_LOGIC_VERSION: &str = "7";
 
-/// Existing pattern and label contracts remain separately versioned.
-pub const PATTERN_LOGIC_VERSION: &str = "v2-strict-1";
+/// Pattern geometry and rating contract.
+pub const PATTERN_LOGIC_VERSION: &str = "v2-strict-2";
 pub const LABEL_CONTRACT_VERSION: &str = "warning-breakout-net-v3";

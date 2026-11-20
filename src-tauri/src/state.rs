@@ -66,6 +66,7 @@ impl AppState {
             entry_trigger: input.entry_trigger,
             single_bar: input.single_bar,
             manual_level: input.manual_level,
+            preclose: input.preclose,
             read_at: None,
         };
 

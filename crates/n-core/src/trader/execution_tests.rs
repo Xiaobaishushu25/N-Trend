@@ -2723,3 +2723,177 @@ fn test_night_session_and_external_trade_chronology() {
     };
     assert!(trade_is_after_position_open(&monday_later_trade, &pos));
 }
+
+#[tokio::test]
+async fn reconcile_produces_fill_and_close_events() {
+    let client = CtpTraderClient::new("http://127.0.0.1:0".into());
+    let engine = ExecutionEngine::new(client, ExecutionConfig::default());
+    let cond_id = "test_cond_1".to_string();
+    {
+        let mut s = engine.state.lock().await;
+        s.broker_connected = true;
+        s.broker_ready = true;
+        s.trading_day = "20261120".into();
+        s.conditions.insert(
+            cond_id.clone(),
+            ConditionOrder {
+                frozen: None,
+                origin: TradeOrigin {
+                    account_id: "acc1".into(),
+                    instance_id: "inst1".into(),
+                    strategy_id: "n_strategy".into(),
+                    strategy_version: "1".into(),
+                    signal_id: "1".into(),
+                },
+                id: cond_id.clone(),
+                event_id: Some(101),
+                symbol: "RB0".into(),
+                instrument_id: "rb2505".into(),
+                direction: "up".into(),
+                tier: PositionTier::Small,
+                entry_price: 3500.0,
+                stop_price: 3480.0,
+                target_price: 3550.0,
+                risk: 20.0,
+                score: 3.5,
+                volume: 1,
+                state: ConditionState::Triggered,
+                warning_bar_ts: "2026-11-20 09:15:00".into(),
+                trigger_ts: Some("2026-11-20 09:30:00".into()),
+                note: "".into(),
+                bars_waited: 0,
+                created_at: 100,
+                max_wait_bars: 4,
+            },
+        );
+        s.orders.insert(
+            "1001".into(),
+            ExecutionOrder {
+                origin: TradeOrigin {
+                    account_id: "acc1".into(),
+                    instance_id: "inst1".into(),
+                    strategy_id: "n_strategy".into(),
+                    strategy_version: "1".into(),
+                    signal_id: "1".into(),
+                },
+                request: OrderInsertRequest {
+                    instrument_id: "rb2505".into(),
+                    direction: "buy".into(),
+                    offset: "open".into(),
+                    price: 3502.0,
+                    volume: 1,
+                    exchange_id: Some("SHFE".into()),
+                    order_ref: Some("1001".into()),
+                },
+                condition_id: cond_id.clone(),
+                reason: None,
+                phase: OrderPhase::Working,
+                reported_filled: 0,
+                filled: 0,
+                note: "".into(),
+                submitted_at: 100,
+                action_at: 100,
+                trading_day: "20261120".into(),
+                entry_fill_notional: 0.0,
+                cancel_attempts: 0,
+                funds_at_submit: None,
+                entry_rules: None,
+            },
+        );
+    }
+
+    // 1. Reconcile entry fill
+    let snap_entry = json!({
+        "health": { "ready": true, "logged_in": true, "broker_id": "9999", "user_id": "test_user" },
+        "orders": [{
+            "order_ref": "1001", "instrument_id": "rb2505", "volume_total_original": 1,
+            "volume_traded": 1, "status": "all_traded", "status_msg": ""
+        }],
+        "trades": [{
+            "trade_id": "T1", "order_ref": "1001", "instrument_id": "rb2505",
+            "exchange_id": "SHFE", "direction": "buy", "offset": "open",
+            "price": 3502.0, "volume": 1, "trade_date": "20261120",
+            "trade_time": "09:30:01", "trading_day": "20261120"
+        }],
+        "account": { "balance": 100000.0, "available": 85000.0, "curr_margin": 15000.0, "close_profit": 0.0, "updated_at": 100.0 }
+    });
+
+    let ev1 = engine.reconcile(&snap_entry).await.unwrap();
+    assert_eq!(ev1.fills.len(), 1);
+    assert_eq!(ev1.closes.len(), 0);
+    let fill = &ev1.fills[0];
+    assert_eq!(fill.symbol, "RB0");
+    assert_eq!(fill.instance_id, "inst1");
+    assert_eq!(fill.signal_id, Some(101));
+    assert_eq!(fill.fill_price, 3502.0);
+    assert_eq!(fill.planned_entry_price, 3500.0);
+    assert_eq!(fill.slippage_pts, 2.0);
+    assert!(fill.account.is_some());
+    assert_eq!(fill.account.as_ref().unwrap().balance, 100000.0);
+
+    // 2. Insert exit order and reconcile exit fill
+    {
+        let mut s = engine.state.lock().await;
+        s.orders.insert(
+            "1002".into(),
+            ExecutionOrder {
+                origin: TradeOrigin {
+                    account_id: "acc1".into(),
+                    instance_id: "inst1".into(),
+                    strategy_id: "n_strategy".into(),
+                    strategy_version: "1".into(),
+                    signal_id: "1".into(),
+                },
+                request: OrderInsertRequest {
+                    instrument_id: "rb2505".into(),
+                    direction: "sell".into(),
+                    offset: "close".into(),
+                    price: 3555.0,
+                    volume: 1,
+                    exchange_id: Some("SHFE".into()),
+                    order_ref: Some("1002".into()),
+                },
+                condition_id: cond_id.clone(),
+                reason: Some("target".into()),
+                phase: OrderPhase::Working,
+                reported_filled: 0,
+                filled: 0,
+                note: "".into(),
+                submitted_at: 200,
+                action_at: 200,
+                trading_day: "20261120".into(),
+                entry_fill_notional: 0.0,
+                cancel_attempts: 0,
+                funds_at_submit: None,
+                entry_rules: None,
+            },
+        );
+    }
+
+    let snap_exit = json!({
+        "health": { "ready": true, "logged_in": true, "broker_id": "9999", "user_id": "test_user" },
+        "orders": [{
+            "order_ref": "1002", "instrument_id": "rb2505", "volume_total_original": 1,
+            "volume_traded": 1, "status": "all_traded", "status_msg": ""
+        }],
+        "trades": [{
+            "trade_id": "T2", "order_ref": "1002", "instrument_id": "rb2505",
+            "exchange_id": "SHFE", "direction": "sell", "offset": "close",
+            "price": 3555.0, "volume": 1, "trade_date": "20261120",
+            "trade_time": "10:15:00", "trading_day": "20261120"
+        }],
+        "account": { "balance": 100530.0, "available": 100530.0, "curr_margin": 0.0, "close_profit": 530.0, "updated_at": 200.0 }
+    });
+
+    let ev2 = engine.reconcile(&snap_exit).await.unwrap();
+    assert_eq!(ev2.fills.len(), 0);
+    assert_eq!(ev2.closes.len(), 1);
+    let close = &ev2.closes[0];
+    assert_eq!(close.symbol, "RB0");
+    assert_eq!(close.exit_price, 3555.0);
+    assert_eq!(close.exit_reason, "target");
+    assert_eq!(close.planned_exit_price, Some(3550.0));
+    assert_eq!(close.realized_pnl_pts, 53.0);
+    assert!(close.pnl_diff_amount.is_some());
+    assert!(close.pnl_diff_amount.unwrap() > 0.0);
+}

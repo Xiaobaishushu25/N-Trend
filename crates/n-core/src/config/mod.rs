@@ -192,6 +192,7 @@ impl Config {
                 smtp_port: get_u16(map, "email.smtp_port", d.email.smtp_port),
                 smtp_user: get_str(map, "email.smtp_user", &d.email.smtp_user),
                 smtp_password: get_str(map, "email.smtp_password", &d.email.smtp_password),
+                ..d.email
             },
             notify: NotifyConfig::default(),
             preclose: PrecloseConfig::default(),

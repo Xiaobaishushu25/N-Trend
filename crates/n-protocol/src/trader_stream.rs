@@ -10,6 +10,60 @@ pub struct TraderDelta {
     pub changes: Map<String, Value>,
 }
 
+/// A missing value removes the key; an explicit JSON null is a replacement.
+#[derive(Debug, Serialize)]
+pub struct DiagnosticChange {
+    pub path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+}
+
+const MAX_DIAGNOSTIC_CHANGES: usize = 128;
+
+fn collect_diagnostic_changes(
+    old: &Value,
+    new: &Value,
+    path: &mut Vec<String>,
+    out: &mut Vec<DiagnosticChange>,
+) {
+    if out.len() > MAX_DIAGNOSTIC_CHANGES || old == new {
+        return;
+    }
+    if let (Some(old), Some(new)) = (old.as_object(), new.as_object()) {
+        for (key, value) in new {
+            if out.len() > MAX_DIAGNOSTIC_CHANGES {
+                return;
+            }
+            path.push(key.clone());
+            if let Some(previous) = old.get(key) {
+                collect_diagnostic_changes(previous, value, path, out);
+            } else {
+                out.push(DiagnosticChange {
+                    path: path.clone(),
+                    value: Some(value.clone()),
+                });
+            }
+            path.pop();
+        }
+        for key in old.keys().filter(|key| !new.contains_key(*key)) {
+            if out.len() > MAX_DIAGNOSTIC_CHANGES {
+                return;
+            }
+            path.push(key.clone());
+            out.push(DiagnosticChange {
+                path: path.clone(),
+                value: None,
+            });
+            path.pop();
+        }
+    } else {
+        out.push(DiagnosticChange {
+            path: path.clone(),
+            value: Some(new.clone()),
+        });
+    }
+}
+
 pub struct TraderPublisher {
     stream_id: String,
     revision: u64,
@@ -92,8 +146,24 @@ impl TraderPublisher {
             "health": self.latest["health"], "account_updated_at": self.latest["account"]["updated_at"]})
     }
 
+    pub fn update_instance(
+        &mut self,
+        snapshot: Value,
+    ) -> (Value, Option<TraderDelta>, Option<Vec<DiagnosticChange>>) {
+        self.update_inner(snapshot, true)
+    }
+
     /// Refresh the REST baseline even when only query timestamps changed.
-    pub fn update(&mut self, mut snapshot: Value) -> (Value, Option<TraderDelta>) {
+    pub fn update(&mut self, snapshot: Value) -> (Value, Option<TraderDelta>) {
+        let (snapshot, delta, _) = self.update_inner(snapshot, false);
+        (snapshot, delta)
+    }
+
+    fn update_inner(
+        &mut self,
+        mut snapshot: Value,
+        compact_diagnostics: bool,
+    ) -> (Value, Option<TraderDelta>, Option<Vec<DiagnosticChange>>) {
         let object = snapshot
             .as_object_mut()
             .expect("trader snapshot must be an object");
@@ -102,13 +172,32 @@ impl TraderPublisher {
         }
         let previous = self.latest.as_object();
         let mut changes = Map::new();
+        let mut diagnostics = None;
         for (key, value) in object.iter() {
-            if !previous
-                .and_then(|p| p.get(key))
-                .is_some_and(|old| semantic_field_eq(key, old, value))
-            {
-                changes.insert(key.clone(), value.clone());
+            let old = previous.and_then(|p| p.get(key));
+            if old.is_some_and(|old| semantic_field_eq(key, old, value)) {
+                continue;
             }
+            if compact_diagnostics && key == "strategy_diagnostics" && value.is_object() {
+                if let Some(old) = old.filter(|old| old.is_object()) {
+                    let mut changes = Vec::new();
+                    collect_diagnostic_changes(old, value, &mut Vec::new(), &mut changes);
+                    // A client may still have an earlier countdown because countdown-only
+                    // changes are suppressed. Refresh it when a real change is sent.
+                    if old.get("calendar_health") == value.get("calendar_health") {
+                        if let Some(calendar) = value.get("calendar_health") {
+                            changes.push(DiagnosticChange {
+                                path: vec!["calendar_health".into()],
+                                value: Some(calendar.clone()),
+                            });
+                        }
+                    }
+                    if !changes.is_empty() && changes.len() <= MAX_DIAGNOSTIC_CHANGES {
+                        diagnostics = Some(changes);
+                    }
+                }
+            }
+            changes.insert(key.clone(), value.clone());
         }
         if let Some(previous) = previous {
             for key in previous.keys().filter(|k| !k.starts_with('_')) {
@@ -132,7 +221,7 @@ impl TraderPublisher {
         object.insert("_stream_id".into(), self.stream_id.clone().into());
         object.insert("_revision".into(), self.revision.into());
         self.latest = snapshot.clone();
-        (snapshot, delta)
+        (snapshot, delta, diagnostics)
     }
 }
 

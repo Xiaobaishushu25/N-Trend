@@ -767,8 +767,13 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                     if let Some(manager) = bridge_ctx.instances.get() {
                         manager.validate_snapshot("default", &snapshot).await?;
                     }
-                    if let Err(e) = bridge_ctx.execution_engine.reconcile(&snapshot).await {
-                        tracing::error!("柜台状态恢复失败，执行任务未完成: {e}");
+                    match bridge_ctx.execution_engine.reconcile(&snapshot).await {
+                        Ok(evs) => {
+                            crate::instance_runtime::dispatch_live_trade_emails(&bridge_ctx, "默认实盘", evs);
+                        }
+                        Err(e) => {
+                            tracing::error!("柜台状态恢复失败，执行任务未完成: {e}");
+                        }
                     }
                     if let Err(e) = bridge_ctx
                         .execution_engine
@@ -1118,6 +1123,7 @@ async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconc
                 entry_trigger: None,
                 single_bar: None,
                 manual_level: None,
+                preclose: None,
             };
             if let Ok(saved) =
                 n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
@@ -1153,6 +1159,7 @@ async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconc
                 entry_trigger: None,
                 single_bar: None,
                 manual_level: None,
+                preclose: None,
             };
             if let Ok(saved) =
                 n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
@@ -1266,6 +1273,100 @@ async fn publish_scan_signals(ctx: &Arc<ServerContext>, res: &ScanResult, reconc
     }
 }
 
+async fn record_preclose_notifications(
+    ctx: &Arc<ServerContext>,
+    updates: &[n_core::storage::entities::preclose_signals::Model],
+) {
+    for s in updates {
+        if s.state != "precheck" {
+            continue;
+        }
+        let dir_cn = if s.direction == "up" { "做多" } else { "做空" };
+        let item = NewNotificationHistoryItem {
+            kind: "warning".to_string(),
+            title: Some(format!("{} 收盘前预检测【{}】", s.symbol, dir_cn)),
+            content: format!(
+                "预计收盘：{}，参考现价：{:.1}，入场：{:.1}，止损：{:.1}",
+                s.session_close_ts, s.reference_price, s.entry, s.stop
+            ),
+            signal: None,
+            entry_trigger: None,
+            single_bar: None,
+            manual_level: None,
+            preclose: Some(n_protocol::dto::NotificationPreclose {
+                symbol: s.symbol.clone(),
+                name: Some(s.symbol.clone()),
+                direction: s.direction.clone(),
+                session_close_ts: s.session_close_ts.clone(),
+                reference_price: s.reference_price,
+                kind: "formal_precheck".to_string(),
+                entry_score: None,
+                state: s.state.clone(),
+                parent_event_id: Some(s.parent_event_id),
+            }),
+        };
+        if let Ok(saved) =
+            n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
+        {
+            let seq = ctx.next_event_seq();
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "notification.created",
+                    serde_json::to_value(&saved).unwrap_or_default(),
+                )
+                .await;
+        }
+    }
+}
+
+async fn record_preclose_candidate_notifications(
+    ctx: &Arc<ServerContext>,
+    updates: &[n_core::storage::entities::preclose_candidates::Model],
+) {
+    for c in updates {
+        if c.state != "provisional" || c.emitted_at != c.last_seen_at {
+            continue;
+        }
+        let dir_cn = if c.direction == "up" { "预做多" } else { "预做空" };
+        let item = NewNotificationHistoryItem {
+            kind: "warning".to_string(),
+            title: Some(format!("{} 未收盘临时推演【{}】", c.symbol, dir_cn)),
+            content: format!(
+                "推演评分：{:.2}，预计收盘：{}，参考现价：{:.1}",
+                c.entry_score, c.session_close_ts, c.reference_price
+            ),
+            signal: None,
+            entry_trigger: None,
+            single_bar: None,
+            manual_level: None,
+            preclose: Some(n_protocol::dto::NotificationPreclose {
+                symbol: c.symbol.clone(),
+                name: Some(c.symbol.clone()),
+                direction: c.direction.clone(),
+                session_close_ts: c.session_close_ts.clone(),
+                reference_price: c.reference_price,
+                kind: "provisional_candidate".to_string(),
+                entry_score: Some(c.entry_score),
+                state: c.state.clone(),
+                parent_event_id: c.parent_event_id,
+            }),
+        };
+        if let Ok(saved) =
+            n_core::storage::repo::insert_notification_history(&ctx.db, &item).await
+        {
+            let seq = ctx.next_event_seq();
+            ctx.realtime_hub
+                .broadcast(
+                    seq,
+                    "notification.created",
+                    serde_json::to_value(&saved).unwrap_or_default(),
+                )
+                .await;
+        }
+    }
+}
+
 fn spawn_preclose_emails(
     ctx: Arc<ServerContext>,
     updates: Vec<n_core::storage::entities::preclose_signals::Model>,
@@ -1279,7 +1380,7 @@ fn spawn_preclose_emails(
     }
     tokio::spawn(async move {
         let cfg = ctx.services.config().await;
-        if !cfg.email.enabled || !cfg.email.sendable() {
+        if !cfg.email.enabled || !cfg.email.signal_preclose_enabled || !cfg.email.sendable() {
             return;
         }
         for signal in signals {
@@ -1333,7 +1434,7 @@ fn spawn_preclose_candidate_emails(
     }
     tokio::spawn(async move {
         let cfg = ctx.services.config().await;
-        if !cfg.email.enabled || !cfg.email.sendable() {
+        if !cfg.email.enabled || !cfg.email.signal_preclose_enabled || !cfg.email.sendable() {
             return;
         }
         for candidate in candidates {
@@ -1535,6 +1636,7 @@ fn spawn_quote_detectors(
                             serde_json::to_value(&updates).unwrap_or_default(),
                         )
                         .await;
+                    record_preclose_notifications(&ctx, &updates).await;
                     spawn_preclose_emails(ctx.clone(), updates);
                 }
                 Err(error) => tracing::warn!("收盘前预检测轮询失败: {error:#}"),
@@ -1554,6 +1656,7 @@ fn spawn_quote_detectors(
                             serde_json::to_value(&updates).unwrap_or_default(),
                         )
                         .await;
+                    record_preclose_candidate_notifications(&ctx, &updates).await;
                     spawn_preclose_candidate_emails(ctx.clone(), updates);
                 }
                 Err(error) => tracing::warn!("临时未收盘推演轮询失败: {error:#}"),

@@ -259,7 +259,7 @@ pub async fn delete_symbol_rollover(db: &DatabaseConnection, symbol: &str, ts: &
 }
 
 pub async fn symbol_rollovers(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     symbol: &str,
 ) -> Result<Vec<rollovers::Model>> {
     Ok(rollovers::Entity::find()
@@ -318,7 +318,7 @@ pub async fn latest_ts(
 }
 
 pub async fn klines(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     symbol: &str,
     timeframe: &str,
     limit: Option<usize>,
@@ -356,7 +356,7 @@ pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<kli
 
 /// Read only the requested raw history, preserving the raw-source filter.
 pub async fn raw_klines_tail(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     symbol: &str,
     limit: Option<usize>,
 ) -> Result<Vec<klines::Model>> {
@@ -413,7 +413,7 @@ pub async fn raw_klines_window(
 }
 
 /// 只查询正式 5m 历史的截止时间，避免图表为了一个时间戳加载整个品种历史。
-pub async fn latest_raw_ts(db: &DatabaseConnection, symbol: &str) -> Result<Option<String>> {
+pub async fn latest_raw_ts(db: &impl ConnectionTrait, symbol: &str) -> Result<Option<String>> {
     klines::Entity::find()
         .select_only()
         .column(klines::Column::Ts)
@@ -2245,6 +2245,10 @@ pub async fn insert_notification_history(
         .manual_level
         .as_ref()
         .map(|s| serde_json::to_string(s).unwrap_or_default());
+    let preclose_json = item
+        .preclose
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
 
     let am = notification_history::ActiveModel {
         id: sea_orm::NotSet,
@@ -2256,6 +2260,7 @@ pub async fn insert_notification_history(
         entry_trigger_json: Set(entry_trigger_json),
         single_bar_json: Set(single_bar_json),
         manual_level_json: Set(manual_level_json),
+        preclose_json: Set(preclose_json),
         read_at: Set(None),
     };
 
@@ -2274,6 +2279,7 @@ pub async fn insert_notification_history(
         entry_trigger: item.entry_trigger.clone(),
         single_bar: item.single_bar.clone(),
         manual_level: item.manual_level.clone(),
+        preclose: item.preclose.clone(),
         read_at: model.read_at,
     })
 }
@@ -2307,6 +2313,10 @@ pub async fn list_notification_history(
             .manual_level_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
+        let preclose = m
+            .preclose_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
 
         out.push(n_protocol::NotificationHistoryItem {
             id: m.id as u64,
@@ -2318,6 +2328,7 @@ pub async fn list_notification_history(
             entry_trigger,
             single_bar,
             manual_level,
+            preclose,
             read_at: m.read_at,
         });
     }
@@ -3229,5 +3240,45 @@ mod tests {
         assert_eq!(derived_rows2.len(), 2);
         assert_eq!(derived_rows2[0].close, 104.0);
         assert_eq!(derived_rows2[1].close, 106.0);
+    }
+
+    #[tokio::test]
+    async fn test_notification_history_preclose_persistence() {
+        let db = test_db().await;
+        let item = n_protocol::NewNotificationHistoryItem {
+            kind: "warning".to_string(),
+            title: Some("RB0 收盘前预检测【做空】".to_string()),
+            content: "预计收盘：2026-09-05 15:00:00，参考现价：3200.0".to_string(),
+            signal: None,
+            entry_trigger: None,
+            single_bar: None,
+            manual_level: None,
+            preclose: Some(n_protocol::dto::NotificationPreclose {
+                symbol: "RB0".to_string(),
+                name: Some("螺纹主力".to_string()),
+                direction: "down".to_string(),
+                session_close_ts: "2026-09-05 15:00:00".to_string(),
+                reference_price: 3200.0,
+                kind: "formal_precheck".to_string(),
+                entry_score: Some(3.8),
+                state: "precheck".to_string(),
+                parent_event_id: Some(999),
+            }),
+        };
+
+        let saved = insert_notification_history(&db, &item).await.unwrap();
+        assert_eq!(saved.kind, "warning");
+        assert!(saved.preclose.is_some());
+        let pre = saved.preclose.unwrap();
+        assert_eq!(pre.symbol, "RB0");
+        assert_eq!(pre.direction, "down");
+        assert_eq!(pre.reference_price, 3200.0);
+        assert_eq!(pre.parent_event_id, Some(999));
+
+        let history = list_notification_history(&db, 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].title.as_deref(), Some("RB0 收盘前预检测【做空】"));
+        assert!(history[0].preclose.is_some());
+        assert_eq!(history[0].preclose.as_ref().unwrap().symbol, "RB0");
     }
 }

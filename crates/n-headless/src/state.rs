@@ -31,6 +31,8 @@ pub struct ServerContext {
     pub ctp_sidecars: Mutex<std::collections::HashMap<String, crate::ctp_sidecar::CtpSidecar>>,
     pub ctp_login_control: Mutex<()>,
     pub trader_snapshot: RwLock<serde_json::Value>,
+    pub automatic_backup: Mutex<Option<(chrono::NaiveDate, n_core::backup::SnapshotResult)>>,
+    pub backup_download: Arc<tokio::sync::Semaphore>,
     pub(crate) history_cache: crate::instance_runtime::HistoryCache,
 }
 
@@ -105,6 +107,8 @@ impl ServerContext {
             ctp_sidecars: Mutex::new(std::collections::HashMap::new()),
             ctp_login_control: Mutex::new(()),
             trader_snapshot: RwLock::new(serde_json::Value::Null),
+            automatic_backup: Mutex::new(None),
+            backup_download: Arc::new(tokio::sync::Semaphore::new(1)),
             history_cache: Default::default(),
         })
     }
