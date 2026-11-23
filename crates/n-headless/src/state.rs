@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, RwLock};
 
 pub struct ServerContext {
     pub db: DatabaseConnection,
+    pub(crate) device_activity: crate::auth::DeviceActivity,
     pub services: Arc<Services>,
     pub review: Arc<n_core::review::ReviewEngine>,
     pub data_dir: PathBuf,
@@ -32,7 +33,7 @@ pub struct ServerContext {
     pub instances: tokio::sync::OnceCell<Arc<n_core::trader::instances::InstanceManager>>,
     pub ctp_sidecars: Mutex<std::collections::HashMap<String, crate::ctp_sidecar::CtpSidecar>>,
     pub ctp_login_control: Mutex<()>,
-    pub trader_snapshot: RwLock<serde_json::Value>,
+    pub trader_snapshot: RwLock<n_protocol::trader_stream::SharedTraderSnapshot>,
     pub automatic_backup: Mutex<Option<(chrono::NaiveDate, n_core::backup::SnapshotResult)>>,
     pub backup_download: Arc<tokio::sync::Semaphore>,
     pub(crate) history_cache: crate::instance_runtime::HistoryCache,
@@ -92,6 +93,7 @@ impl ServerContext {
         Arc::new(Self {
             review: Arc::new(n_core::review::ReviewEngine::new(db.clone())),
             db,
+            device_activity: Default::default(),
             services,
             data_dir,
             secrets: Arc::new(RwLock::new(secrets)),
@@ -109,7 +111,7 @@ impl ServerContext {
             instances: tokio::sync::OnceCell::new(),
             ctp_sidecars: Mutex::new(std::collections::HashMap::new()),
             ctp_login_control: Mutex::new(()),
-            trader_snapshot: RwLock::new(serde_json::Value::Null),
+            trader_snapshot: RwLock::default(),
             automatic_backup: Mutex::new(None),
             backup_download: Arc::new(tokio::sync::Semaphore::new(1)),
             history_cache: Default::default(),

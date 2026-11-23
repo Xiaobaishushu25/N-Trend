@@ -260,7 +260,7 @@ struct HistoryMessage {
     applied: oneshot::Sender<bool>,
 }
 
-type QuoteBatch = Vec<(String, n_core::trader::model::ExecutionQuote)>;
+type QuoteBatch = Vec<n_core::trader::model::ReceivedExecutionQuote>;
 
 enum AccountEvent {
     Quotes(QuoteBatch),
@@ -488,12 +488,12 @@ async fn apply_history(
 
 pub(crate) fn warn_calendar_coverage(
     instance: &str,
-    diagnostics: &serde_json::Value,
+    calendar: Option<&serde_json::Value>,
     previous: &mut HashSet<String>,
 ) {
     let mut current = HashSet::new();
-    for health in diagnostics["calendar_health"]
-        .as_array()
+    for health in calendar
+        .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
     {
@@ -536,6 +536,7 @@ impl InstancePublisher {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut publisher =
                 n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
+            let mut fields = n_core::trader::execution::ExecutionSnapshotCache::default();
             let mut calendar_warnings = HashSet::new();
             let mut last_heartbeat = Instant::now();
             loop {
@@ -549,10 +550,12 @@ impl InstancePublisher {
                 }
                 let started = Instant::now();
                 let result: anyhow::Result<()> = async {
-                    let mut snapshot = manager.build_snapshot(&r.definition.id).await?;
-                    warn_calendar_coverage(&r.definition.id, &snapshot["strategy_diagnostics"], &mut calendar_warnings);
-                    snapshot["runtime_diagnostics"] = diagnostics.read().await.clone();
-                    let (baseline, delta, diagnostics) = publisher.update_instance(snapshot);
+                    let mut snapshot = manager.build_shared_snapshot(&r.definition.id, &mut fields).await?;
+                    let calendar = snapshot.object("strategy_diagnostics")
+                        .and_then(|fields| fields.get("calendar_health"));
+                    warn_calendar_coverage(&r.definition.id, calendar, &mut calendar_warnings);
+                    snapshot.insert("runtime_diagnostics", diagnostics.read().await.clone());
+                    let (baseline, delta, diagnostics) = publisher.update_shared(snapshot, true);
                     // Publish before potentially slow equity SQL, which must
                     // not hold up REST recovery or the quote/exit task either.
                     *r.published.write().await = baseline;
@@ -613,10 +616,10 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             .and_then(|events| {
                 events
                     .iter()
-                    .map(|(_, q)| {
+                    .map(|event| {
                         chrono::Utc::now()
                             .timestamp()
-                            .saturating_sub(q.timestamp)
+                            .saturating_sub(event.quote.timestamp)
                             .max(0)
                     })
                     .max()
@@ -639,11 +642,11 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             }
             if let Some(events) = quotes {
                 if let BrokerClient::Paper(p) = &r.broker {
-                    p.on_quotes(&events)?;
+                    p.on_received_quotes(&events)?;
                     let evs = r.engine.reconcile(&p.snapshot()).await?;
                     dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
                 }
-                r.engine.on_quote_batch(events).await?;
+                r.engine.on_received_quote_batch(events).await?;
             }
             if timer_due {
                 last_timer = Some(Instant::now());
@@ -764,7 +767,27 @@ pub fn dispatch_live_trade_emails(
                         continue;
                     }
                 }
-                fill.instance_name = inst_name.clone();
+                let resolved_name = if let Some(manager) = ctx.instances.get() {
+                    if let Ok(r) = manager.get(&fill.instance_id).await {
+                        let n = r.definition.name.trim();
+                        if !n.is_empty() {
+                            n.to_string()
+                        } else if !inst_name.is_empty() && inst_name != "default" {
+                            inst_name.clone()
+                        } else {
+                            "默认实盘".to_string()
+                        }
+                    } else if !inst_name.is_empty() && inst_name != "default" {
+                        inst_name.clone()
+                    } else {
+                        "默认实盘".to_string()
+                    }
+                } else if !inst_name.is_empty() && inst_name != "default" {
+                    inst_name.clone()
+                } else {
+                    "默认实盘".to_string()
+                };
+                fill.instance_name = resolved_name;
                 let (subject, body) = n_core::notify::email::trade_open_email_payload(&fill);
                 tracing::info!(
                     instance_id = %fill.instance_id,
@@ -804,7 +827,27 @@ pub fn dispatch_live_trade_emails(
                         continue;
                     }
                 }
-                close.instance_name = inst_name.clone();
+                let resolved_name = if let Some(manager) = ctx.instances.get() {
+                    if let Ok(r) = manager.get(&close.instance_id).await {
+                        let n = r.definition.name.trim();
+                        if !n.is_empty() {
+                            n.to_string()
+                        } else if !inst_name.is_empty() && inst_name != "default" {
+                            inst_name.clone()
+                        } else {
+                            "默认实盘".to_string()
+                        }
+                    } else if !inst_name.is_empty() && inst_name != "default" {
+                        inst_name.clone()
+                    } else {
+                        "默认实盘".to_string()
+                    }
+                } else if !inst_name.is_empty() && inst_name != "default" {
+                    inst_name.clone()
+                } else {
+                    "默认实盘".to_string()
+                };
+                close.instance_name = resolved_name;
                 let (subject, body) = n_core::notify::email::trade_close_email_payload(&close);
                 tracing::info!(
                     instance_id = %close.instance_id,

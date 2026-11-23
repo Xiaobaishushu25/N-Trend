@@ -24,6 +24,8 @@ flate2 = "1.0"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 n-protocol = { path = "../n-protocol" }
+rusqlite = { version = "0.32.1", default-features = false }
+futures-util = "0.3"
 
 [[bin]]
 name = "migrate"

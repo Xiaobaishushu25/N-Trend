@@ -83,22 +83,37 @@ fn holding_mfe_rebases_when_partial_entry_changes_cost_and_risk() {
 fn friday_night_flattening_preempts_an_inflight_partial_exit() {
     let strategy = P3Strategy::new(parameters()).unwrap();
     let p = position(false);
+    let cutoff = parse_time("2026-11-14 00:55:00").unwrap();
     let cond=serde_json::from_value(json!({"id":"position","symbol":"PB0","instrument_id":"pb2701","direction":"up",
         "tier":"small","entry_price":1000.,"stop_price":980.,"target_price":1100.,"risk":20.,"score":2.5,"volume":2,
         "warning_bar_ts":"2026-11-12 09:15:00","bars_waited":0,"max_wait_bars":12,"state":"closing",
         "created_at":parse_time("2026-11-12 09:15:00").unwrap(),"note":"first S1 working"})).unwrap();
-    let actions = run(
-        &strategy,
-        StrategyEvent::Timer {
-            timestamp: parse_time("2026-11-14 00:50:00").unwrap(),
-        },
-        &mut Value::Null,
-        &[p],
-        &[cond],
+    for (timestamp, should_flatten) in [(cutoff - 1, false), (cutoff, true)] {
+        let actions = run(
+            &strategy,
+            StrategyEvent::Timer { timestamp },
+            &mut Value::Null,
+            std::slice::from_ref(&p),
+            std::slice::from_ref(&cond),
+        );
+        assert_eq!(
+            actions.iter().any(
+                |a| matches!(a, TradeIntent::Close { reason, volume: None, .. } if reason == "pre_weekend")
+            ),
+            should_flatten
+        );
+    }
+    assert_eq!(
+        strategy.comparison_flat_boundary(&p.instrument_id, parse_time(&p.open_ts).unwrap()),
+        Some((cutoff, "pre_weekend"))
     );
-    assert!(actions
-        .iter()
-        .any(|a| matches!(a,TradeIntent::Close{reason,volume:None,..} if reason=="pre_weekend")));
+    assert_eq!(
+        strategy
+            .base
+            .parameters
+            .block(&p.instrument_id, cutoff - 5 * 60),
+        Some("filtered_weekend_window")
+    );
 }
 
 fn parameters() -> P3Parameters {

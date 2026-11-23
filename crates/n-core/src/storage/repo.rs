@@ -355,7 +355,38 @@ pub async fn klines(
     Ok(rows)
 }
 
-pub async fn raw_klines(db: &DatabaseConnection, symbol: &str) -> Result<Vec<klines::Model>> {
+pub async fn profiled_chart_klines(
+    db: &impl ConnectionTrait, symbol: &str, timeframe: &str, limit: Option<usize>,
+    end_ts: Option<&str>, raw_only: bool, trace_id: &str,
+) -> Result<Vec<klines::Model>> {
+    use sea_orm::{FromQueryResult, QueryTrait};
+    let mut select = klines::Entity::find()
+        .filter(klines::Column::Symbol.eq(symbol))
+        .filter(klines::Column::Timeframe.eq(timeframe));
+    if raw_only {
+        select = select.filter(klines::Column::Source.eq("raw"));
+    }
+    if let Some(end) = end_ts {
+        select = select.filter(klines::Column::Ts.lte(end));
+    }
+    let select = match limit {
+        Some(limit) => select.order_by_desc(klines::Column::Ts).limit(limit as u64),
+        None => select.order_by_asc(klines::Column::Ts),
+    };
+    let started = std::time::Instant::now();
+    let queried = db.query_all(select.build(DbBackend::Sqlite)).await?;
+    let decode = std::time::Instant::now();
+    let mut rows = queried.iter().map(|row| klines::Model::from_query_result(row, ""))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if limit.is_some() {
+        rows.reverse();
+    }
+    tracing::info!(trace_id, rows=rows.len(), sqlite_fetch_ms=decode.duration_since(started).as_millis(),
+        model_decode_ms=decode.elapsed().as_millis(), "K线 SQL 取行及模型解码完成");
+    Ok(rows)
+}
+
+pub async fn raw_klines(db: &impl ConnectionTrait, symbol: &str) -> Result<Vec<klines::Model>> {
     raw_klines_tail(db, symbol, None).await
 }
 
@@ -411,7 +442,7 @@ pub async fn raw_kline_count(db: &DatabaseConnection, symbol: &str) -> Result<us
 }
 
 pub async fn raw_klines_window(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     symbol: &str,
     start: &str,
     end: &str,
@@ -427,6 +458,18 @@ pub async fn raw_klines_window(
         .await
         .context("查询原始K线窗口失败")
 }
+
+pub async fn series_window(
+    db: &impl ConnectionTrait, symbol: &str, timeframe: &str, start: &str, end: &str,
+) -> Result<Vec<klines::Model>> {
+    klines::Entity::find()
+        .filter(klines::Column::Symbol.eq(symbol))
+        .filter(klines::Column::Timeframe.eq(timeframe))
+        .filter(klines::Column::Ts.between(start, end))
+        .order_by_asc(klines::Column::Ts)
+        .all(db).await.context("读取周期变更区间失败")
+}
+
 
 /// 只查询正式 5m 历史的截止时间，避免图表为了一个时间戳加载整个品种历史。
 pub async fn latest_raw_ts(db: &impl ConnectionTrait, symbol: &str) -> Result<Option<String>> {
@@ -2189,7 +2232,7 @@ pub async fn touch_device_last_seen(db: &DatabaseConnection, id: &str) -> Result
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE devices SET last_seen_at = ?1 WHERE id = ?2",
+        "UPDATE devices SET last_seen_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
         vec![now.into(), id.into()],
     ))
     .await

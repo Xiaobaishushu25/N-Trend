@@ -372,7 +372,7 @@ pub async fn login(ctx: &ServerContext, id: &str, input: SimnowLogin) -> Result<
     let pending = json!({"bridge_online":false,"health":{"connected":false,"authenticated":false,"logged_in":false,"ready":false},"account":null,"broker_positions":[]});
     runtime.engine.reconcile(&pending).await?;
     *runtime.snapshot.write().await = pending;
-    *runtime.published.write().await = Value::Null;
+    *runtime.published.write().await = Default::default();
     *runtime.error.write().await = None;
     Ok(json!({"instance_id":id,"accepted":true,"status":"connecting"}))
 }

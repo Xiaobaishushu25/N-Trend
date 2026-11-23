@@ -20,19 +20,18 @@ async fn unchanged_counter_replay_updates_funds_without_rewriting_state() {
     let working = vec![order(&open, "queueing", 0)];
     ready(&e, working.clone(), vec![]).await;
     let path = counter.directory.join("trader_execution.json");
-    let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-    let mark_state_file = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(stamp)
-            .unwrap();
-    };
-    let modified = || std::fs::metadata(&path).unwrap().modified().unwrap();
-    mark_state_file();
+    let connection = rusqlite::Connection::open(path.with_extension("sqlite3")).unwrap();
+    let data_version = || connection.pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0)).unwrap();
+    let before_replay = data_version();
+    let before = e.state.lock().await.clone();
     ready_with_funds(&e, working, vec![], 49000., 20.).await;
-    assert_eq!(modified(), stamp);
+    assert_eq!(data_version(), before_replay);
+    {
+        let current = e.state.lock().await;
+        assert!(Arc::ptr_eq(before.broker_trade_replay.as_ref().unwrap(), current.broker_trade_replay.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(before.broker_order_replay.as_ref().unwrap(), current.broker_order_replay.as_ref().unwrap()));
+        assert!(std::ptr::eq(&*before.orders, &*current.orders));
+    }
     assert_eq!(
         e.state.lock().await.entry_funds.as_ref().unwrap().available,
         49000.
@@ -41,14 +40,15 @@ async fn unchanged_counter_replay_updates_funds_without_rewriting_state() {
     // A terminal order that precedes the fill is itself a durable change.
     let filled = vec![order(&open, "all_traded", 2)];
     ready(&e, filled.clone(), vec![]).await;
-    assert_ne!(modified(), stamp);
+    let after_terminal = data_version();
+    assert_ne!(after_terminal, before_replay);
     let fill = trade(&open, "counter-fill", 2, 1000.);
-    mark_state_file();
     ready(&e, filled.clone(), vec![fill.clone()]).await;
-    assert_ne!(modified(), stamp);
-    mark_state_file();
+    let after_fill = data_version();
+    assert_ne!(after_fill, after_terminal);
     ready(&e, filled, vec![fill]).await;
-    assert_eq!(modified(), stamp);
+    assert_eq!(data_version(), after_fill);
+    drop(connection);
     drop(e);
     let restored = counter.engine(ExecutionMode::FullAuto, 2);
     assert_eq!(restored.state.lock().await.positions[&id].volume, 2);
@@ -202,10 +202,9 @@ async fn sizing_failure_after_real_fill_keeps_the_fill_and_protects_it() {
     }
     quote(&e, 999.).await;
     assert_eq!(counter.inserts()[1]["volume"], 2);
-    let persisted: ExecutionState = serde_json::from_slice(
-        &std::fs::read(counter.directory.join("trader_execution.json")).unwrap(),
-    )
-    .unwrap();
+    let persisted: ExecutionState = serde_json::from_value(
+        export_execution_state(&counter.directory.join("trader_execution.json")).unwrap(),
+    ).unwrap();
     assert_eq!(persisted.positions[&id].volume, 2);
     assert_eq!(persisted.seen_trades.len(), 1);
 }

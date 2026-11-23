@@ -17,6 +17,7 @@ use std::{
 
 pub const P2: &str = "n_p2";
 pub const CODE_VERSION: &str = "1";
+pub const CODE_VERSION_2: &str = "2";
 pub const EXECUTION_VERSION: &str = "candidate-book-v1";
 pub const ONE_LOT: &str = "candidate_one_lot_v1";
 
@@ -66,7 +67,7 @@ fn observation_bucket(ts: i64, instrument: &str) -> String {
     bucket(ts)
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct FeeRule {
     pub fixed_yuan_per_lot: f64,
     pub notional_rate: f64,
@@ -81,7 +82,7 @@ impl FeeRule {
             .all(|x| x.is_finite() && *x >= 0.)
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Fees {
     pub open: Option<FeeRule>,
     pub close_today: Option<FeeRule>,
@@ -200,18 +201,24 @@ impl Parameters {
         }) {
             return Some("filtered_holiday_window");
         }
-        self.weekend_windows(symbol, now)
+        self.weekend_windows(symbol, now, DEFAULT_WEEKEND_LEAD_SECONDS)
             .iter()
             .any(|(cut, reopen)| now >= *cut && now < *reopen)
             .then_some("filtered_weekend_window")
     }
-    pub(crate) fn flat_reason(&self, symbol: &str, opened: i64, now: i64) -> Option<&'static str> {
+    fn flat_reason(
+        &self,
+        symbol: &str,
+        opened: i64,
+        now: i64,
+        weekend_exit_lead_seconds: i64,
+    ) -> Option<&'static str> {
         if self.calendar.windows.iter().any(|h| {
             opened < parse_time(&h.reopen).unwrap() && now >= parse_time(&h.flat_at).unwrap()
         }) {
             return Some("pre_holiday");
         }
-        self.weekend_windows(symbol, now)
+        self.weekend_windows(symbol, now, weekend_exit_lead_seconds)
             .iter()
             .any(|(cut, reopen)| opened < *reopen && now >= *cut)
             .then_some("pre_weekend")
@@ -220,22 +227,23 @@ impl Parameters {
     /// Exchange wall-clock windows, selected from the bound contract rather than
     /// the broker's trading-day label (Friday night is often labelled Monday).
     /// Frozen holiday closures can remove the nominal Friday night session.
-    fn weekend_windows(&self, instrument: &str, now: i64) -> Vec<(i64, i64)> {
-        weekend_windows(instrument, now)
+    fn weekend_windows(&self, instrument: &str, now: i64, lead_seconds: i64) -> Vec<(i64, i64)> {
+        weekend_sessions(instrument, now)
             .into_iter()
-            .map(|(cut, reopen)| {
-                let nominal_close = cut + 600;
+            .map(|(nominal_close, reopen)| {
                 self.calendar
                     .windows
                     .iter()
                     .filter_map(|h| {
                         let close = parse_time(&h.last_close).ok()?;
                         let holiday_reopen = parse_time(&h.reopen).ok()?;
-                        (close <= nominal_close && nominal_close < holiday_reopen)
-                            .then_some((close - 600, holiday_reopen.max(reopen)))
+                        (close <= nominal_close && nominal_close < holiday_reopen).then_some((
+                            close - DEFAULT_WEEKEND_LEAD_SECONDS,
+                            holiday_reopen.max(reopen),
+                        ))
                     })
                     .min_by_key(|(cut, _)| *cut)
-                    .unwrap_or((cut, reopen))
+                    .unwrap_or((nominal_close - lead_seconds, reopen))
             })
             .collect()
     }
@@ -270,8 +278,10 @@ pub fn calendar_health(definition: &StrategyDefinition, now: i64) -> Option<Valu
         "warning_lead_seconds":3*24*60*60}),
     )
 }
-/// Last weekly cutoff plus this week's cutoff; overdue positions stay exposed until a confirmed fill.
-fn weekend_windows(instrument: &str, now: i64) -> Vec<(i64, i64)> {
+const DEFAULT_WEEKEND_LEAD_SECONDS: i64 = 10 * 60;
+
+/// Last and current weekly session close and reopening times.
+fn weekend_sessions(instrument: &str, now: i64) -> Vec<(i64, i64)> {
     let today = local(now).date_naive();
     let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
     let night = SessionCalendar::get(instrument).night_type;
@@ -296,7 +306,7 @@ fn weekend_windows(instrument: &str, now: i64) -> Vec<(i64, i64)> {
                 .single()
                 .unwrap()
                 .timestamp();
-            (close - 600, reopen)
+            (close, reopen)
         })
         .collect()
 }
@@ -469,12 +479,23 @@ pub struct CandidateStrategy {
     min_score: f64,
     min_risk_atr: f64,
     min_net_rr: f64,
+    weekend_exit_lead_seconds: i64,
     #[cfg(test)]
     calendar_time_override: Option<i64>,
 }
 impl CandidateStrategy {
     pub fn new(parameters: Parameters) -> Result<Self> {
         Self::with_min_score(parameters, 3.)
+    }
+    pub fn v2(parameters: Parameters) -> Result<Self> {
+        Self::with_min_score(parameters, 2.5)
+    }
+    pub fn for_version(parameters: Parameters, version: &str) -> Result<Self> {
+        match version {
+            CODE_VERSION => Self::new(parameters),
+            CODE_VERSION_2 => Self::v2(parameters),
+            _ => anyhow::bail!("未知的 P2 代码版本: {version}"),
+        }
     }
     fn with_min_score(parameters: Parameters, min_score: f64) -> Result<Self> {
         parameters.validate()?;
@@ -483,6 +504,7 @@ impl CandidateStrategy {
             min_score,
             min_risk_atr: 0.75,
             min_net_rr: 1.,
+            weekend_exit_lead_seconds: DEFAULT_WEEKEND_LEAD_SECONDS,
             #[cfg(test)]
             calendar_time_override: None,
         })
@@ -951,6 +973,7 @@ impl Strategy for CandidateStrategy {
                         &p.instrument_id,
                         parse_time(&p.open_ts)?,
                         *timestamp,
+                        self.weekend_exit_lead_seconds,
                     ) {
                         actions.push(TradeIntent::Close {
                             position_id: p.id.clone(),
@@ -1021,9 +1044,19 @@ impl ExitPolicy for FixedExit {
     }
 }
 pub fn definition(id: &str, parameters: Parameters) -> StrategyDefinition {
+    definition_for_version(id, CODE_VERSION, parameters)
+}
+pub fn definition_v2(id: &str, parameters: Parameters) -> StrategyDefinition {
+    definition_for_version(id, CODE_VERSION_2, parameters)
+}
+pub fn definition_for_version(
+    id: &str,
+    version: &str,
+    parameters: Parameters,
+) -> StrategyDefinition {
     StrategyDefinition {
         strategy_id: id.into(),
-        code_version: CODE_VERSION.into(),
+        code_version: version.into(),
         revision: "1".into(),
         exit_policy: "p2_fixed_exit_v1".into(),
         sizing_policy: ONE_LOT.into(),
@@ -1033,7 +1066,7 @@ pub fn definition(id: &str, parameters: Parameters) -> StrategyDefinition {
 pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     if d.strategy_id == P2 {
         ensure!(
-            d.code_version == CODE_VERSION
+            (d.code_version == CODE_VERSION || d.code_version == CODE_VERSION_2)
                 && d.sizing_policy == ONE_LOT
                 && d.exit_policy == "p2_fixed_exit_v1",
             "P2必须使用对应固定目标退出和固定一手模块"
@@ -1042,16 +1075,30 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     Ok(())
 }
 pub fn register(r: &mut StrategyRegistry) {
-    r.register_strategy(P2, CODE_VERSION, |p| {
-        Ok(Box::new(CandidateStrategy::new(serde_json::from_value(
-            p.clone(),
-        )?)?))
-    });
+    for version in [CODE_VERSION, CODE_VERSION_2] {
+        r.register_strategy(P2, version, move |p| {
+            Ok(Box::new(CandidateStrategy::for_version(
+                serde_json::from_value(p.clone())?,
+                version,
+            )?))
+        });
+    }
     r.register_exit("p2_fixed_exit_v1", Arc::new(FixedExit));
     r.register_sizing(ONE_LOT, Arc::new(OneLot));
 }
 pub fn presets() -> Value {
-    json!([{"label":"P2 · ATR过滤 / 原S1目标","definition":definition(P2,Parameters::reference_snapshot())}])
+    json!([
+        {
+            "id": "n_p2",
+            "label": "P2 · ATR过滤 / 原S1目标 (3.0分)",
+            "definition": definition(P2, Parameters::reference_snapshot())
+        },
+        {
+            "id": "n_p2_v2",
+            "label": "P2 V2 · 评分2.5准入 / 原S1目标",
+            "definition": definition_v2(P2, Parameters::reference_snapshot())
+        }
+    ])
 }
 
 #[cfg(test)]

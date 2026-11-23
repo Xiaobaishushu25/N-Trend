@@ -1,10 +1,11 @@
 //! SQLite-backed instance registry; all order state remains isolated on disk.
-use super::{broker::*, strategy::*, *};
+use super::{broker::*, model::ReceivedExecutionQuote, strategy::*, *};
 use crate::{
     sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement},
     storage::repo,
 };
 use anyhow::{ensure, Context, Result};
+use n_protocol::trader_stream::SharedTraderSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -13,6 +14,9 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, RwLock};
+
+#[path = "instance_comparison.rs"]
+mod comparison;
 
 pub const DEFAULT_INSTANCE: &str = "default";
 const REGISTRY_KEY: &str = "trader_instance_registry_v1";
@@ -55,13 +59,12 @@ pub struct InstanceRuntime {
     pub engine: Arc<ExecutionEngine>,
     pub broker: BrokerClient,
     pub control: Mutex<()>,
-    pub published: RwLock<Value>,
+    pub published: RwLock<SharedTraderSnapshot>,
     pub snapshot: RwLock<Value>,
     pub error: RwLock<Option<String>>,
     pub runtime_error: RwLock<Option<String>>,
-    pub quote_tx: tokio::sync::mpsc::Sender<Vec<(String, super::model::ExecutionQuote)>>,
-    pub quote_rx:
-        Mutex<Option<tokio::sync::mpsc::Receiver<Vec<(String, super::model::ExecutionQuote)>>>>,
+    pub quote_tx: tokio::sync::mpsc::Sender<Vec<ReceivedExecutionQuote>>,
+    pub quote_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Vec<ReceivedExecutionQuote>>>>,
     pub quote_gap: std::sync::atomic::AtomicBool,
 }
 pub struct InstanceManager {
@@ -72,6 +75,7 @@ pub struct InstanceManager {
     // Cache only successful samples; SQLite remains the source of truth.
     equity_sampled_minutes: RwLock<HashMap<String, i64>>,
     pub registry: Arc<StrategyRegistry>,
+    comparisons: Arc<comparison::Comparisons>,
 }
 
 /// A completion marker is written only after validating and backing up all old files.
@@ -143,14 +147,8 @@ impl InstanceManager {
             None => Catalog::default(),
         };
         if !catalog.instances.contains_key(DEFAULT_INSTANCE) {
-            let path = root.join("trader_instances/default/trader_execution.json");
-            let old = std::fs::read(path)
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
-            let identity = old
-                .as_ref()
-                .and_then(|v| v["account"].as_str())
-                .and_then(|s| s.split_once(':'));
+            let account_identity = default.account_identity().await;
+            let identity = account_identity.as_deref().and_then(|account| account.split_once(':'));
             let (broker, user) = identity.unwrap_or(("", ""));
             catalog.accounts.insert(
                 "default".into(),
@@ -181,6 +179,7 @@ impl InstanceManager {
             catalog: Mutex::new(catalog),
             runtimes: RwLock::new(BTreeMap::new()),
             equity_sampled_minutes: RwLock::new(HashMap::new()),
+            comparisons: Arc::new(comparison::Comparisons::default()),
             registry,
         });
         let c = m.catalog.lock().await.clone();
@@ -203,7 +202,7 @@ impl InstanceManager {
                     account,
                     engine: default.clone(),
                     broker: default.broker_client(),
-                    published: RwLock::new(Value::Null),
+                    published: RwLock::default(),
                     snapshot: RwLock::new(Value::Null),
                     error: RwLock::new(None),
                     runtime_error: RwLock::new(None),
@@ -268,7 +267,7 @@ impl InstanceManager {
             engine,
             broker,
             control: Mutex::new(()),
-            published: RwLock::new(Value::Null),
+            published: RwLock::default(),
             snapshot: RwLock::new(Value::Null),
             error: RwLock::new(Some(reason)),
             runtime_error: RwLock::new(None),
@@ -392,7 +391,7 @@ impl InstanceManager {
             account,
             engine,
             broker,
-            published: RwLock::new(Value::Null),
+            published: RwLock::default(),
             snapshot: RwLock::new(Value::Null),
             error: RwLock::new(None),
             runtime_error: RwLock::new(None),
@@ -623,13 +622,24 @@ impl InstanceManager {
     pub async fn snapshot(&self, id: &str) -> Result<Value> {
         let r = self.get(id).await?;
         let cached = r.published.read().await.clone();
-        if cached.is_object() {
-            Ok(cached)
+        if !cached.is_empty() {
+            Ok(cached.to_value())
         } else {
             self.build_snapshot(id).await
         }
     }
     pub async fn build_snapshot(&self, id: &str) -> Result<Value> {
+        Ok(self
+            .build_shared_snapshot(id, &mut execution::ExecutionSnapshotCache::default())
+            .await?
+            .to_value())
+    }
+
+    pub async fn build_shared_snapshot(
+        &self,
+        id: &str,
+        cache: &mut execution::ExecutionSnapshotCache,
+    ) -> Result<SharedTraderSnapshot> {
         let r = self.get(id).await?;
         let mut s = r.snapshot.read().await.clone();
         if !s.is_object() {
@@ -641,23 +651,18 @@ impl InstanceManager {
             AccountKind::Ctp { .. } => "ctp",
             AccountKind::Paper { .. } => "paper",
         });
-        s["config"] = serde_json::to_value(r.engine.get_config().await)?;
-        s["strategy"] = serde_json::to_value(r.engine.definition().await)?;
-        s["strategy_diagnostics"] = r.engine.strategy_diagnostics().await;
-        s["paused"] = json!(r.engine.paused().await);
-        s["managed_positions"] = serde_json::to_value(r.engine.list_positions().await)?;
-        s["conditions"] = serde_json::to_value(r.engine.list_conditions().await)?;
-        s["history"] = serde_json::to_value(r.engine.get_trade_history().await)?;
-        s["statistics"] = serde_json::to_value(r.engine.get_trade_statistics().await)?;
-        s["execution_error"] = json!(r
+        let mut snapshot = SharedTraderSnapshot::from_value(s);
+        snapshot.extend(r.engine.snapshot_fields(cache, true).await?);
+        if let Some(error) = r
             .error
             .read()
             .await
             .clone()
             .or(r.runtime_error.read().await.clone())
-            .or(r.engine.execution_error().await));
-        s["strategy_comparison"] = r.engine.comparison_summary().await;
-        Ok(s)
+        {
+            snapshot.insert("execution_error", json!(error));
+        }
+        Ok(snapshot)
     }
     pub async fn sample_equity(&self, id: &str, s: &Value) -> Result<()> {
         let Some(equity) = s["account"]["balance"].as_f64().filter(|v| v.is_finite()) else {
@@ -685,114 +690,5 @@ impl InstanceManager {
             .await
             .insert(id.to_owned(), now);
         Ok(())
-    }
-    pub async fn comparison(&self, from: i64, to: i64) -> Result<Value> {
-        ensure!(from <= to, "对比区间无效");
-        let mut rows = vec![];
-        let mut paired: BTreeMap<String, BTreeMap<(String, String), f64>> = BTreeMap::new();
-        let instances = self.catalog.lock().await.instances.clone();
-        for r in self.all().await {
-            let def = instances
-                .get(&r.definition.id)
-                .cloned()
-                .unwrap_or_else(|| r.definition.clone());
-            let samples=self.db.query_all(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT timestamp,equity,margin,fees,quality,trading_day FROM trader_equity WHERE instance_id=? AND timestamp>=? AND timestamp<=? ORDER BY timestamp",[r.definition.id.clone().into(),from.into(),to.into()])).await?;
-            let mut curve = vec![];
-            let mut peak: f64 = 0.0;
-            let mut drawdown: f64 = 0.0;
-            let mut first = None;
-            let mut last = None;
-            let mut margin_peak: f64 = 0.0;
-            let mut fees_by_day: BTreeMap<String, (f64, f64)> = BTreeMap::new();
-            let mut quality = vec![];
-            let mut previous: Option<i64> = None;
-            for s in &samples {
-                let timestamp = s.try_get::<i64>("", "timestamp")?;
-                let e = s.try_get::<f64>("", "equity")?;
-                if previous.is_some_and(|p| timestamp - p > 120) {
-                    quality.push("equity_sample_gap");
-                }
-                previous = Some(timestamp);
-                first.get_or_insert(e);
-                last = Some(e);
-                peak = peak.max(e);
-                if peak > 0.0 {
-                    drawdown = drawdown.max((peak - e) / peak)
-                }
-                margin_peak = margin_peak.max(s.try_get("", "margin")?);
-                curve.push(json!({"timestamp":timestamp,"equity":e}));
-                if let Some(f) = s.try_get::<Option<f64>>("", "fees")? {
-                    let day = s
-                        .try_get::<Option<String>>("", "trading_day")?
-                        .unwrap_or_default();
-                    let entry = fees_by_day.entry(day).or_insert((f, f));
-                    entry.1 = f;
-                } else {
-                    quality.push("fees_unconfirmed");
-                }
-            }
-            if samples.len() < 2 {
-                quality.push("insufficient_samples");
-            }
-            let history = r.engine.get_trade_history().await;
-            let positions = r.engine.list_positions().await;
-            let mut grouped: HashMap<String, (f64, i64, String, String)> = HashMap::new();
-            for t in history {
-                let ts = chrono::NaiveDateTime::parse_from_str(&t.exit_ts, "%Y%m%d %H:%M:%S")
-                    .or_else(|_| {
-                        chrono::NaiveDateTime::parse_from_str(&t.exit_ts, "%Y-%m-%d %H:%M:%S")
-                    })
-                    .ok()
-                    .and_then(|d| d.and_local_timezone(chrono::Local).single())
-                    .map(|d| d.timestamp());
-                if let Some(ts) = ts {
-                    let entry = grouped.entry(t.condition_order_id.clone()).or_insert((
-                        0.0,
-                        ts,
-                        t.origin.strategy_id.clone(),
-                        t.origin.signal_id.clone(),
-                    ));
-                    entry.0 += t.realized_pnl_amount;
-                    entry.1 = entry.1.max(ts);
-                }
-            }
-            grouped.retain(|id, (_, ts, _, _)| {
-                *ts >= from && *ts <= to && positions.iter().any(|p| p.id == *id && p.is_closed)
-            });
-            let wins = grouped.values().filter(|v| v.0 > 0.0).count();
-            let profits: f64 = grouped.values().filter(|v| v.0 > 0.0).map(|v| v.0).sum();
-            let losses: f64 = grouped.values().filter(|v| v.0 < 0.0).map(|v| v.0).sum();
-            let quote_gaps = r.engine.quote_gaps_between(from, to).await;
-            if quote_gaps > 0 {
-                quality.push("quote_gap");
-            }
-            paired.insert(
-                r.definition.id.clone(),
-                grouped
-                    .values()
-                    .filter(|v| !v.3.is_empty() && quote_gaps == 0)
-                    .map(|v| ((v.2.clone(), v.3.clone()), v.0))
-                    .collect(),
-            );
-            let fees_confirmed = !samples.is_empty() && !quality.contains(&"fees_unconfirmed");
-            quality.sort();
-            quality.dedup();
-            rows.push(json!({"instance":def,"account":r.account,"from":from,"to":to,"effective_from":curve.first().map(|p|p["timestamp"].clone()),"effective_to":curve.last().map(|p|p["timestamp"].clone()),"sample_count":samples.len(),"equity_curve":curve,
-                "return_pct":first.zip(last).filter(|(a,_)|*a>0.0).map(|(a,b)|(b/a-1.0)*100.0),"net_profit":first.zip(last).map(|(a,b)|b-a),"max_drawdown_pct":if samples.is_empty(){None}else{Some(drawdown*100.0)},"trades":grouped.len(),"win_rate_pct":if grouped.is_empty(){None}else{Some(wins as f64/grouped.len() as f64*100.0)},"profit_factor":if losses<0.0 {Some(profits/(-losses))}else{None},"max_margin":margin_peak,"fees_confirmed":fees_confirmed,"observed_fees":if fees_confirmed {Some(fees_by_day.values().map(|(a,b)|(b-a).max(0.0)).sum::<f64>())}else{None},"quality_flags":quality,"cash_flow_adjusted":false}));
-        }
-        let ids = paired.keys().cloned().collect::<Vec<_>>();
-        let mut pairs = vec![];
-        for (index, baseline) in ids.iter().enumerate() {
-            for candidate in ids.iter().skip(index + 1) {
-                let differences = paired[baseline]
-                    .iter()
-                    .filter_map(|(key, pnl)| paired[candidate].get(key).map(|p| p - pnl))
-                    .collect::<Vec<_>>();
-                pairs.push(json!({"baseline_instance_id":baseline,"candidate_instance_id":candidate,"paired_signals":differences.len(),"gross_profit_difference":differences.iter().sum::<f64>(),"basis":"completed_same_source_signals_gross"}));
-            }
-        }
-        Ok(
-            json!({"from":from,"to":to,"instances":rows,"signal_pairs":pairs,"note":"按共同区间展示可用样本；净值变化未调整外部出入金。模拟与实盘分别标识，影子实验不计入账户净值。费用为区间内可观察累计费用的差额，不补估缺失时段。"}),
-        )
     }
 }

@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{Duration, NaiveDateTime};
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
 
 use super::schedule::{is_valid_5m_slot, next_expected_5m_slot};
@@ -82,7 +82,32 @@ impl RawDataIntegrityChecker {
         let rows = repo::raw_klines(db, symbol)
             .await
             .context("查询 Raw 5m 数据失败")?;
+        Self::inspect_rows(&rows, symbol, max_api_window_bars)
+    }
 
+    pub async fn inspect_symbol_with_revision(
+        db: &DatabaseConnection,
+        symbol: &str,
+        max_api_window_bars: usize,
+    ) -> Result<(SymbolIntegrityReport, i64)> {
+        let txn = db.begin().await?;
+        let rows = repo::raw_klines(&txn, symbol).await?;
+        let revision =
+            crate::storage::cache_revisions::market_history_revision(&txn, symbol).await?;
+        txn.commit().await?;
+        let symbol = symbol.to_owned();
+        let report = tokio::task::spawn_blocking(move || {
+            Self::inspect_rows(&rows, &symbol, max_api_window_bars)
+        })
+        .await??;
+        Ok((report, revision))
+    }
+
+    fn inspect_rows(
+        rows: &[crate::storage::entities::klines::Model],
+        symbol: &str,
+        max_api_window_bars: usize,
+    ) -> Result<SymbolIntegrityReport> {
         if rows.is_empty() {
             return Ok(SymbolIntegrityReport {
                 symbol: symbol.to_string(),
@@ -104,7 +129,7 @@ impl RawDataIntegrityChecker {
         let mut corrupted_bars = Vec::new();
         let mut parsed_bars = Vec::with_capacity(rows.len());
 
-        for row in &rows {
+        for row in rows {
             // 1. 检查数据畸变
             if row.open <= 0.0
                 || row.high <= 0.0

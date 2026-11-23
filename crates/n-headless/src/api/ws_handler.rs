@@ -42,7 +42,7 @@ async fn handle_socket(
     // Keep the baseline before all deltas published to this client.
     let (client_id, mut rx, disconnect) = {
         let snapshot = ctx.trader_snapshot.read().await;
-        let baseline = (!snapshot.is_null()).then(|| {
+        let baseline = (!snapshot.is_empty()).then(|| {
             WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot)
         });
         ctx.realtime_hub

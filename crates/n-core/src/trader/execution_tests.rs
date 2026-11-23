@@ -20,10 +20,8 @@ mod market_tests;
 
 #[tokio::test]
 async fn historical_orders_are_paged_newest_first_without_changing_archive() {
-    let engine = ExecutionEngine::new(
-        CtpTraderClient::new("http://127.0.0.1:1".into()),
-        ExecutionConfig::default(),
-    );
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::MonitorOnly, 2);
     {
         let mut state = engine.state.lock().await;
         for reference in 1..=4031 {
@@ -36,7 +34,10 @@ async fn historical_orders_are_paged_newest_first_without_changing_archive() {
             })).unwrap();
             state.orders.insert(reference.to_string(), order);
         }
+        engine.save(&mut state).unwrap();
     }
+    drop(engine);
+    let engine = counter.engine(ExecutionMode::MonitorOnly, 2);
     let first = engine.execution_orders_page(1, 20).await;
     let second = engine.execution_orders_page(2, 20).await;
     assert_eq!(first.total, 4031);
@@ -60,6 +61,37 @@ async fn historical_orders_are_paged_newest_first_without_changing_archive() {
     );
     assert_eq!(engine.execution_orders_page(0, 0).await.page_size, 1);
     assert_eq!(engine.state.lock().await.orders.len(), 4031);
+}
+
+#[tokio::test]
+async fn cancelled_order_in_archive_accepts_a_late_fill_after_restart() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    let canceled = order(&open, "canceled", 0);
+    ready(&engine, vec![canceled.clone()], vec![]).await;
+    let reference = open["order_ref"].as_str().unwrap();
+    let marker = counter.directory.join("trader_execution.json");
+    let connection = rusqlite::Connection::open(marker.with_extension("sqlite3")).unwrap();
+    let archived = || {
+        connection.query_row("SELECT settled FROM execution_orders WHERE reference=?1",
+            [reference], |row| row.get::<_, bool>(0)).unwrap()
+    };
+    assert!(archived());
+    drop(engine);
+
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    let fill = trade(&open, "late-fill", 1, 1000.0);
+    ready(&engine, vec![canceled.clone()], vec![fill.clone()]).await;
+    ready(&engine, vec![canceled], vec![fill]).await;
+    let state = engine.state.lock().await;
+    assert_eq!(state.orders[reference].filled, 1);
+    assert_eq!(state.positions[&id].volume, 1);
+    assert_eq!(state.seen_trades.len(), 1);
+    assert!(archived());
 }
 
 struct Counter {
@@ -233,7 +265,7 @@ async fn quote(engine: &ExecutionEngine, price: f64) {
         tick: 1.0,
         lower: 500.0,
         upper: 2000.0,
-        timestamp: chrono::Utc::now().timestamp(),
+        timestamp: engine.now_utc().timestamp(),
     };
     engine
         .on_quotes([("PB2611".into(), q)].into_iter().collect())
@@ -902,11 +934,12 @@ async fn legacy_funds_rejection_is_migrated_to_wait_and_expiry_prevents_late_ree
     quote(&engine, 1000.0).await;
     drop(engine);
     let path = counter.directory.join("trader_execution.json");
-    let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut old = export_execution_state(&path).unwrap();
     old.as_object_mut().unwrap().remove("entry_funding_waits");
     for order in old["orders"].as_object_mut().unwrap().values_mut() {
         order.as_object_mut().unwrap().remove("funds_at_submit");
     }
+    std::fs::remove_file(path.with_extension("sqlite3")).unwrap();
     std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
     let engine = counter.engine(ExecutionMode::FullAuto, 2);
     ready_with_funds(&engine, vec![], vec![], 1000.0, 40000.0).await;
@@ -1138,6 +1171,115 @@ async fn quote_batch_keeps_an_intermediate_stop_and_persists_before_using_latest
 }
 
 #[tokio::test]
+async fn queued_expired_stop_is_persisted_and_waits_for_the_rebounded_book() {
+    let counter = Counter::new();
+    let now = chrono::Utc::now().timestamp();
+    let clock = Arc::new(ReplayClock::new(now));
+    let engine = counter.engine(ExecutionMode::FullAuto, 2).with_clock(clock.clone());
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(&engine, vec![order(&open, "all_traded", 2)], vec![trade(&open, "open", 2, 1000.0)]).await;
+    let mut book = {
+        let mut state = engine.state.lock().await;
+        state.positions.get_mut(&id).unwrap().open_ts = super::super::candidates::label(now - 3);
+        state.quotes["PB2611"].clone()
+    };
+    book.timestamp = now + 1;
+    book.last = 989.0;
+    book.bid = 988.0;
+    book.ask = 990.0;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    tx.try_send(ReceivedExecutionQuote {
+        symbol: "PB2611".into(), quote: book.clone(), received_at: now + 1,
+    }).unwrap();
+    assert_eq!(tx.capacity(), 63);
+
+    clock.advance(now + 20).unwrap();
+    engine.on_received_quote_batch(vec![rx.recv().await.unwrap()]).await.unwrap();
+    let persisted = export_execution_state(&counter.directory.join("trader_execution.json")).unwrap();
+    assert_eq!(persisted["closes"][&id]["reason"], "stop");
+    assert_eq!(counter.inserts().len(), 1);
+    assert_eq!(engine.state.lock().await.quotes["PB2611"].last, 1000.0);
+
+    book.timestamp = now + 20;
+    book.last = 1001.0;
+    book.bid = 1000.0;
+    book.ask = 1002.0;
+    engine.on_received_quote_batch(vec![ReceivedExecutionQuote {
+        symbol: "PB2611".into(), quote: book, received_at: now + 20,
+    }]).await.unwrap();
+    let orders = counter.inserts();
+    assert_eq!(orders.len(), 2);
+    assert_eq!(orders[1]["offset"], "auto");
+    assert!(orders[1]["price"].as_f64().unwrap() >= 990.0);
+}
+
+#[tokio::test]
+async fn late_protection_requires_a_valid_receipt_and_prior_position_exposure() {
+    let counter = Counter::new();
+    let now = chrono::Utc::now().timestamp();
+    let clock = Arc::new(ReplayClock::new(now));
+    let engine = counter.engine(ExecutionMode::FullAuto, 2).with_clock(clock.clone());
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(&engine, vec![order(&open, "all_traded", 2)], vec![trade(&open, "open", 2, 1000.0)]).await;
+    let mut book = {
+        let mut state = engine.state.lock().await;
+        state.positions.get_mut(&id).unwrap().open_ts = super::super::candidates::label(now + 2);
+        state.quotes.remove("PB2611").unwrap()
+    };
+    book.last = 989.0;
+    book.timestamp = now + 1;
+    clock.advance(now + 25).unwrap();
+    let before_fill = ReceivedExecutionQuote {
+        symbol: "PB2611".into(), quote: book.clone(), received_at: now + 1,
+    };
+    book.timestamp = now + 3;
+    let stale_on_arrival = ReceivedExecutionQuote {
+        symbol: "PB2611".into(), quote: book, received_at: now + 24,
+    };
+    engine.on_received_quote_batch(vec![before_fill, stale_on_arrival]).await.unwrap();
+    assert!(!engine.state.lock().await.closes.contains_key(&id));
+    assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn signal_interleaved_with_configuration_freezes_the_committed_mode() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let definition = engine.definition().await;
+    let mut cfg = engine.get_config().await;
+    cfg.mode = ExecutionMode::SemiAuto;
+    let identity = engine.identity.write().await;
+    let mut pending = Box::pin(engine.dispatch(StrategyEvent::Signal {
+        source: N_STRATEGY.into(),
+        payload: json!({
+            "signal_id":"config-interleaving", "symbol":"PB0", "instrument_id":"pb2611",
+            "direction":"up", "entry":1000.0, "stop":990.0, "target":1020.0,
+            "entry_score":4.0, "warning_ts":"2026-10-16 10:00:00"
+        }),
+    }));
+    assert!(futures_util::poll!(&mut pending).is_pending());
+    engine.configure_strategy(definition, cfg).await.unwrap();
+    let committed_revision = engine.definition().await.revision;
+    drop(identity);
+    pending.await.unwrap();
+
+    let conditions = engine.list_conditions().await;
+    assert_eq!(conditions.len(), 1);
+    let frozen = conditions[0].frozen.as_ref().unwrap();
+    assert_eq!(frozen.definition.revision, committed_revision);
+    assert_eq!(frozen.execution.mode, ExecutionMode::SemiAuto);
+    quote(&engine, 1000.0).await;
+    assert!(counter.inserts().is_empty());
+}
+
+#[tokio::test]
 async fn batched_observation_persists_a_stop_immediately_before_the_batch_finishes() {
     let counter = Counter::new();
     let engine = counter.engine(ExecutionMode::FullAuto, 2);
@@ -1159,13 +1301,260 @@ async fn batched_observation_persists_a_stop_immediately_before_the_batch_finish
         .observe_quotes([("PB2611".into(), q)].into_iter().collect(), false)
         .await
         .unwrap();
-    let persisted: ExecutionState = serde_json::from_slice(
-        &std::fs::read(counter.directory.join("trader_execution.json")).unwrap(),
-    )
-    .unwrap();
+    let persisted: ExecutionState = serde_json::from_value(
+        export_execution_state(&counter.directory.join("trader_execution.json")).unwrap(),
+    ).unwrap();
     assert_eq!(persisted.closes[&id].reason, "stop");
     assert!(persisted.aborted_entries.contains(&id));
     assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn repeated_stop_and_unchanged_quotes_do_not_rewrite_large_state() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    ready(
+        &engine,
+        vec![order(&open, "all_traded", 2)],
+        vec![trade(&open, "open", 2, 1000.0)],
+    )
+    .await;
+    let mut q = engine.state.lock().await.quotes["PB2611"].clone();
+    q.last = 989.0;
+    q.bid = 988.0;
+    q.ask = 990.0;
+    engine
+        .observe_quotes([("PB2611".into(), q.clone())].into(), false)
+        .await
+        .unwrap();
+    {
+        let mut s = engine.state.lock().await;
+        s.broker_ready = false;
+        let mut rejected = s.orders.values().next().unwrap().clone();
+        rejected.phase = OrderPhase::Rejected;
+        rejected.condition_id = "historical-condition".into();
+        rejected.filled = 0;
+        rejected.reported_filled = 0;
+        rejected.note = "historical rejection ".repeat(35);
+        for index in 0..8800 {
+            s.orders
+                .insert(format!("historical-{index}"), rejected.clone());
+        }
+        engine.save(&mut s).unwrap();
+    }
+    let path = counter.directory.join("trader_execution.json");
+    let disk = export_execution_state(&path).unwrap();
+    assert!(serde_json::to_vec(&disk).unwrap().len() > 8_000_000);
+    let db = rusqlite::Connection::open(path.with_extension("sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER keep_archived_orders BEFORE UPDATE ON execution_orders
+         WHEN old.reference LIKE 'historical-%'
+         BEGIN SELECT RAISE(ABORT, 'archive touched'); END;
+         CREATE TRIGGER keep_archived_inserts BEFORE INSERT ON execution_orders
+         WHEN new.reference LIKE 'historical-%'
+         BEGIN SELECT RAISE(ABORT, 'archive written'); END;",
+    ).unwrap();
+    {
+        let mut state = engine.state.lock().await;
+        state.orders.get_mut(open["order_ref"].as_str().unwrap()).unwrap().note = "updated".into();
+        state.last_bars.insert("PB0".into(), "2026-10-20 10:00:00".into());
+        engine.save(&mut state).unwrap();
+    }
+    engine.store.lock().unwrap().as_ref().unwrap().set_read_only();
+    engine
+        .on_quote_batch(vec![("PB2611".into(), q); 40])
+        .await
+        .unwrap();
+    let s = engine.state.lock().await;
+    assert_eq!(s.closes[&id].reason, "stop");
+    assert_eq!(s.orders.len(), 8801);
+    assert_eq!(counter.inserts().len(), 1);
+}
+
+#[tokio::test]
+async fn seat_rejected_exit_survives_restart_and_waits_for_new_order_sync() {
+    let counter = Counter::new();
+    let now = chrono::Utc::now().timestamp();
+    let clock = Arc::new(crate::trader::execution::ReplayClock::new(now));
+    let engine = counter
+        .engine(ExecutionMode::FullAuto, 2)
+        .with_clock(clock.clone());
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let open = counter.inserts()[0].clone();
+    let opened = order(&open, "all_traded", 2);
+    let fill = trade(&open, "open", 2, 1000.0);
+    ready(&engine, vec![opened.clone()], vec![fill.clone()]).await;
+    let mut stopped = engine.state.lock().await.quotes["PB2611"].clone();
+    stopped.timestamp = now;
+    stopped.last = 989.0;
+    stopped.bid = 988.0;
+    stopped.ask = 990.0;
+    engine
+        .on_quote_batch(vec![("PB2611".into(), stopped.clone())])
+        .await
+        .unwrap();
+    let mut rejected = order(&counter.inserts()[1], "rejected", 0);
+    rejected["status_msg"] = json!("交易所拒绝报单 [21]: CTP:该交易席位未连接到交易所");
+    ready(
+        &engine,
+        vec![opened.clone(), rejected.clone()],
+        vec![fill.clone()],
+    )
+    .await;
+    drop(engine);
+
+    let engine = counter
+        .engine(ExecutionMode::FullAuto, 2)
+        .with_clock(clock.clone());
+    ready(
+        &engine,
+        vec![opened.clone(), rejected.clone()],
+        vec![fill.clone()],
+    )
+    .await;
+    let synced_snapshot = |at: i64| {
+        json!({
+            "bridge_online":true, "health":{
+                "ready":true, "logged_in":true, "sync_pending":false, "trading_day":"20261016",
+                "broker_id":"fake", "user_id":"offline-test",
+                "orders_updated_at":at
+            },
+            "orders":[opened.clone(), rejected.clone()], "trades":[fill.clone()]
+        })
+    };
+    clock.advance(now + 5).unwrap();
+    stopped.timestamp = now + 5;
+    engine.reconcile(&synced_snapshot(now + 5)).await.unwrap();
+    engine
+        .on_quote_batch(vec![("PB2611".into(), stopped.clone()); 5])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 2);
+    clock.advance(now + 16).unwrap();
+    stopped.timestamp = now + 16;
+    engine.reconcile(&synced_snapshot(now)).await.unwrap();
+    engine
+        .on_quote_batch(vec![("PB2611".into(), stopped.clone()); 5])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 2);
+    assert_eq!(engine.state.lock().await.closes[&id].reason, "stop");
+    engine.reconcile(&synced_snapshot(now + 16)).await.unwrap();
+    engine
+        .on_quote_batch(vec![("PB2611".into(), stopped); 5])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 3);
+    assert_eq!(counter.inserts()[2]["offset"], "auto");
+}
+
+#[tokio::test]
+async fn price_rejected_entry_waits_for_a_fresh_different_limit_price() {
+    let counter = Counter::new();
+    let now = chrono::Utc::now().timestamp();
+    let clock = Arc::new(crate::trader::execution::ReplayClock::new(now));
+    let engine = counter
+        .engine(ExecutionMode::FullAuto, 2)
+        .with_clock(clock.clone());
+    ready(&engine, vec![], vec![]).await;
+    register(&engine, 1000.0, 990.0).await;
+    quote(&engine, 1000.0).await;
+    let mut rejected = order(&counter.inserts()[0], "rejected", 0);
+    rejected["status_msg"] = json!("交易所拒绝报单 [163]: CTP:报单价格不在涨跌停板价范围内");
+    ready(&engine, vec![rejected.clone()], vec![]).await;
+    let mut q = engine.state.lock().await.quotes["PB2611"].clone();
+    clock.advance(now + 3).unwrap();
+    q.timestamp = now + 3;
+    engine
+        .on_quote_batch(vec![("PB2611".into(), q.clone()); 10])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 1);
+    q.last = 998.0;
+    q.bid = 997.0;
+    q.ask = 999.0;
+    engine
+        .on_quote_batch(vec![("PB2611".into(), q.clone())])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 2);
+    assert_ne!(counter.inserts()[0]["price"], counter.inserts()[1]["price"]);
+    ready(&engine, vec![rejected], vec![]).await;
+    engine
+        .on_quote_batch(vec![("PB2611".into(), q)])
+        .await
+        .unwrap();
+    assert_eq!(counter.inserts().len(), 2);
+}
+
+#[tokio::test]
+async fn snapshot_reuses_history_and_refreshes_only_changed_fields() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    let id = register(&engine, 1000.0, 990.0).await;
+    let mut cache = ExecutionSnapshotCache::default();
+    let first = engine.snapshot_fields(&mut cache, true).await.unwrap();
+    let second = engine.snapshot_fields(&mut cache, true).await.unwrap();
+    for key in ["history", "conditions", "statistics", "managed_positions"] {
+        assert!(
+            std::ptr::eq(first.get(key).unwrap(), second.get(key).unwrap()),
+            "{key}"
+        );
+    }
+    engine
+        .state
+        .lock()
+        .await
+        .conditions
+        .get_mut(&id)
+        .unwrap()
+        .note = "updated".into();
+    let next = engine.snapshot_fields(&mut cache, true).await.unwrap();
+    assert!(!std::ptr::eq(
+        first.get("conditions").unwrap(),
+        next.get("conditions").unwrap()
+    ));
+    assert_eq!(next.to_value()["conditions"][0]["note"], "updated");
+    assert!(std::ptr::eq(
+        first.get("history").unwrap(),
+        next.get("history").unwrap()
+    ));
+    assert!(std::ptr::eq(
+        first.get("statistics").unwrap(),
+        next.get("statistics").unwrap()
+    ));
+}
+
+#[test]
+fn price_rejected_protective_exit_can_recheck_a_pinned_book_after_sync() {
+    let wait = execution_safety::RejectionWait::Price {
+        submitted_at: 100,
+        rejected_price: 500.0,
+        rejected_trading_day: "20261123".into(),
+        is_exit: true,
+    };
+    let mut q = ExecutionQuote {
+        instrument_id: "pb2611".into(),
+        exchange_id: "SHFE".into(),
+        underlying_symbol: "PB0".into(),
+        last: 500.0,
+        bid: 500.0,
+        ask: 501.0,
+        tick: 1.0,
+        lower: 500.0,
+        upper: 2000.0,
+        timestamp: 105,
+    };
+    assert!(wait.waiting(&q, 500.0, 105, 103.0, "20261123"));
+    q.timestamp = 117;
+    assert!(wait.waiting(&q, 500.0, 117, 100.0, "20261123"));
+    assert!(!wait.waiting(&q, 500.0, 117, 112.0, "20261123"));
 }
 
 #[tokio::test]
@@ -2513,13 +2902,8 @@ async fn persistence_failure_protects_memory_and_blocks_new_orders_while_preserv
 
     assert!(state_file.exists());
 
-    let initial_disk_content = std::fs::read(&state_file).unwrap();
-
-    // Now induce persistence failure by creating a directory where .tmp file would be written
-
-    let tmp_file = state_file.with_extension("tmp");
-
-    std::fs::create_dir(&tmp_file).unwrap();
+    let initial_disk_content = export_execution_state(&state_file).unwrap();
+    engine.store.lock().unwrap().as_ref().unwrap().set_read_only();
 
     // Attempt to register a new plan that attempts to persist state
 
@@ -2561,7 +2945,7 @@ async fn persistence_failure_protects_memory_and_blocks_new_orders_while_preserv
 
     // 1. Verify old file on disk remains completely intact and uncorrupted
 
-    let disk_content_after_fail = std::fs::read(&state_file).unwrap();
+    let disk_content_after_fail = export_execution_state(&state_file).unwrap();
 
     assert_eq!(initial_disk_content, disk_content_after_fail);
 

@@ -57,7 +57,153 @@ pub async fn ensure(db: &DatabaseConnection) -> Result<()> {
     .await
     .context("创建 R5a 同事务信号及品种修订触发器失败")?;
     ensure_history_revisions(db).await?;
+    ensure_series_revisions(db).await?;
     Ok(())
+}
+
+async fn ensure_series_revisions(db: &DatabaseConnection) -> Result<()> {
+    db.execute_unprepared(
+        "CREATE TABLE IF NOT EXISTS market_series_revisions (
+            symbol TEXT NOT NULL, timeframe TEXT NOT NULL, revision INTEGER NOT NULL,
+            changed_at TEXT NOT NULL, PRIMARY KEY(symbol, timeframe)
+        ) WITHOUT ROWID;",
+    )
+    .await?;
+    for (table, scope) in [("klines", None), ("rollovers", Some("'rollovers'"))] {
+        let update = |row: &str, timestamp: &str| {
+            let timeframe = scope
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{row}.timeframe"));
+            format!("INSERT INTO market_series_revisions VALUES ({row}.symbol, {timeframe}, 1, {timestamp})
+                     ON CONFLICT(symbol,timeframe) DO UPDATE SET revision = revision + 1,
+                         changed_at = excluded.changed_at;")
+        };
+        let moved = if scope.is_some() {
+            "OLD.symbol IS NOT NEW.symbol"
+        } else {
+            "OLD.symbol IS NOT NEW.symbol OR OLD.timeframe IS NOT NEW.timeframe"
+        };
+        let changed = if scope.is_some() {
+            "OLD.ts IS NOT NEW.ts OR OLD.from_contract IS NOT NEW.from_contract OR
+             OLD.to_contract IS NOT NEW.to_contract OR OLD.confirmed IS NOT NEW.confirmed"
+        } else {
+            "OLD.ts IS NOT NEW.ts OR OLD.open IS NOT NEW.open OR OLD.high IS NOT NEW.high OR
+             OLD.low IS NOT NEW.low OR OLD.close IS NOT NEW.close OR OLD.volume IS NOT NEW.volume OR
+             OLD.hold IS NOT NEW.hold OR OLD.source IS NOT NEW.source"
+        };
+        let old_scope = scope.unwrap_or("OLD.timeframe");
+        db.execute_unprepared(&format!(
+            "CREATE TRIGGER IF NOT EXISTS series_{table}_insert AFTER INSERT ON {table}
+             BEGIN {insert} END;
+             CREATE TRIGGER IF NOT EXISTS series_{table}_delete AFTER DELETE ON {table}
+             BEGIN {delete} END;
+             CREATE TRIGGER IF NOT EXISTS series_{table}_update AFTER UPDATE ON {table}
+             WHEN {moved} OR ({changed})
+             BEGIN
+                 INSERT INTO market_series_revisions
+                     SELECT OLD.symbol, {old_scope}, 1, OLD.ts WHERE {moved}
+                     ON CONFLICT(symbol,timeframe) DO UPDATE SET revision=revision+1, changed_at=excluded.changed_at;
+                 {modify}
+             END;",
+            insert = update("NEW", "NEW.ts"),
+            delete = update("OLD", "OLD.ts"),
+            modify = update("NEW", "MIN(OLD.ts, NEW.ts)"),
+        )).await.with_context(|| format!("初始化 {table} 周期修订失败"))?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeriesRevision {
+    pub revision: i64,
+    pub changed_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeriesRevisions {
+    pub series: SeriesRevision,
+    pub raw: SeriesRevision,
+    pub rollovers: i64,
+}
+
+pub struct SeriesBoundary {
+    pub versions: SeriesRevisions,
+    pub cutoff: String,
+    pub visible: Option<String>,
+}
+
+pub async fn market_series_boundary(
+    db: &impl ConnectionTrait,
+    symbol: &str,
+    timeframe: &str,
+) -> Result<SeriesBoundary> {
+    use sea_orm::{DbBackend, Statement};
+    let row = db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "WITH tail AS (
+            SELECT MAX(ts) AS cutoff FROM klines WHERE symbol=?1 AND timeframe='5m' AND source='raw'
+         )
+         SELECT tail.cutoff,
+            (SELECT MAX(ts) FROM klines WHERE symbol=?1 AND timeframe=?2 AND ts<=tail.cutoff) visible,
+            COALESCE(series.revision,0) series_rev, COALESCE(series.changed_at,'') series_ts,
+            COALESCE(raw.revision,0) raw_rev, COALESCE(raw.changed_at,'') raw_ts,
+            COALESCE(rollovers.revision,0) rollovers_rev
+         FROM tail
+         LEFT JOIN market_series_revisions series ON series.symbol=?1 AND series.timeframe=?2
+         LEFT JOIN market_series_revisions raw ON raw.symbol=?1 AND raw.timeframe='5m'
+         LEFT JOIN market_series_revisions rollovers ON rollovers.symbol=?1 AND rollovers.timeframe='rollovers'",
+        [symbol.into(), timeframe.into()],
+    )).await?.context("读取周期边界失败")?;
+    Ok(SeriesBoundary {
+        versions: SeriesRevisions {
+            series: SeriesRevision {
+                revision: row.try_get("", "series_rev")?,
+                changed_at: row.try_get("", "series_ts")?,
+            },
+            raw: SeriesRevision {
+                revision: row.try_get("", "raw_rev")?,
+                changed_at: row.try_get("", "raw_ts")?,
+            },
+            rollovers: row.try_get("", "rollovers_rev")?,
+        },
+        cutoff: row
+            .try_get::<Option<String>>("", "cutoff")?
+            .unwrap_or_default(),
+        visible: row.try_get("", "visible")?,
+    })
+}
+
+pub async fn market_series_revisions(
+    db: &impl ConnectionTrait,
+    symbol: &str,
+    timeframe: &str,
+) -> Result<SeriesRevisions> {
+    use sea_orm::{DbBackend, Statement};
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT timeframe,revision,changed_at FROM market_series_revisions
+         WHERE symbol=?1 AND timeframe IN (?2,'5m','rollovers')",
+            [symbol.into(), timeframe.into()],
+        ))
+        .await?;
+    let mut versions = SeriesRevisions::default();
+    for row in rows {
+        let key: String = row.try_get("", "timeframe")?;
+        let version = SeriesRevision {
+            revision: row.try_get("", "revision")?,
+            changed_at: row.try_get("", "changed_at")?,
+        };
+        if key == timeframe {
+            versions.series = version.clone();
+        }
+        match key.as_str() {
+            "5m" => versions.raw = version,
+            "rollovers" => versions.rollovers = version.revision,
+            _ => {}
+        }
+    }
+    Ok(versions)
 }
 
 async fn ensure_history_revisions(db: &DatabaseConnection) -> Result<()> {
@@ -112,7 +258,7 @@ async fn ensure_history_revisions(db: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
-pub async fn market_history_revision(db: &DatabaseConnection, symbol: &str) -> Result<i64> {
+pub async fn market_history_revision(db: &impl ConnectionTrait, symbol: &str) -> Result<i64> {
     use sea_orm::{DbBackend, Statement};
     let row = db
         .query_one(Statement::from_sql_and_values(
@@ -125,6 +271,21 @@ pub async fn market_history_revision(db: &DatabaseConnection, symbol: &str) -> R
         .transpose()
         .context("读取行情历史版本失败")
         .map(|revision| revision.unwrap_or(0))
+}
+
+pub async fn market_history_revisions(
+    db: &impl ConnectionTrait,
+) -> Result<std::collections::BTreeMap<String, i64>> {
+    use sea_orm::{DbBackend, Statement};
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT symbol, revision FROM market_history_revisions".to_owned(),
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| Ok((row.try_get("", "symbol")?, row.try_get("", "revision")?)))
+        .collect()
 }
 
 #[cfg(test)]

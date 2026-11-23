@@ -16,7 +16,7 @@ import { Adjustments, ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Chevron
 import KLineChart from '../components/KLineChart.vue'
 import IntradayChart from '../components/IntradayChart.vue'
 import ReorderToggle from '../components/ReorderToggle.vue'
-import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
+import { api, onDataSourceFailover, onDataUpdated, onEntryTrigger, onKlineClosed, onKlineHistory, onKlinePartial, onQuotesUpdated, onScanCompleted } from '../services/api'
 import { useIntradayStore } from '../stores/intraday'
 import OverflowText from '../components/OverflowText.vue'
 import SignalNotes from '../components/SignalNotes.vue'
@@ -169,6 +169,8 @@ function integrityGapsOf(report: any): any[] {
 }
 
 const integrityCheckSeq = ref(0)
+const integrityCache = new Map<string, { revision: number; report: any }>()
+let autoIntegritySymbol = ''
 const integrityGaps = computed(() => integrityGapsOf(integrityReport.value))
 const integrityHasGaps = computed(() => integrityGaps.value.length > 0)
 const integrityUnexpectedCount = computed(() => integrityReport.value?.unexpected_bars?.length ?? 0)
@@ -196,7 +198,13 @@ async function handleCheckIntegrity(showNotice = true) {
   integrityChecking.value = true
   integrityReport.value = null
   try {
-    const r = await api.checkSymbolIntegrity(checkedSymbol)
+    const cached = integrityCache.get(checkedSymbol)
+    const knownRevision = klinesStore.symbol === checkedSymbol ? klinesStore.seriesRevision : null
+    const r = !showNotice && cached && knownRevision === cached.revision
+      ? cached.report : await api.checkSymbolIntegrity(checkedSymbol)
+    if (typeof r?.history_revision === 'number') {
+      integrityCache.set(checkedSymbol, { revision: r.history_revision, report: r })
+    }
     if (checkSeq !== integrityCheckSeq.value || checkedSymbol !== symbol.value) return
     integrityReport.value = r
     const gaps = integrityGapsOf(r)
@@ -270,8 +278,7 @@ async function handleRepairIntegrity() {
       console.log(`  补前缺口:`, integrityGapsOf(integrityReport.value).map((g:any)=> `${g.start_ts} ~ ${g.end_ts} 缺${g.missing_count}根`))
     }
     integrityReport.value = null
-    await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
-    await loadTrendLine()
+    await refreshChartHistory(res?.history_revision)
     await handleCheckIntegrity(false)
   } catch (e) {
     notify.error("补全失败: " + String(e))
@@ -2195,12 +2202,50 @@ watch([symbol, timeframe], async () => {
   }
 }, { immediate: true })
 
-// 完整性检测与最近形态只针对当前品种；切换品种进入图表后异步进行，
-// 不阻塞K线加载，也不在每次切换派生周期时重复发起同一检测。
+// 完整性检测与最近形态只针对当前品种。
 watch(symbol, () => {
+  ++integrityCheckSeq.value
+  integrityChecking.value = false
+  integrityReport.value = null
+  autoIntegritySymbol = ''
   loadRecentPatterns()
-  void handleCheckIntegrity(false)
 }, { immediate: true })
+
+watch(() => klinesStore.dataReceivedAt, (receivedAt) => {
+  const sym = symbol.value
+  if (!receivedAt || !sym || klinesStore.symbol !== sym || autoIntegritySymbol === sym) return
+  autoIntegritySymbol = sym
+  const seq = integrityCheckSeq.value
+  // The animation frame draws the chart before the expensive check starts.
+  requestAnimationFrame(() => setTimeout(() => {
+    if (seq === integrityCheckSeq.value && sym === symbol.value) void handleCheckIntegrity(false)
+  }, 0))
+}, { flush: 'post' })
+
+async function refreshChartHistory(revision?: number, resetVersion = false) {
+  const sym = symbol.value
+  const tf = timeframe.value
+  if (!sym) return
+  const seq = chartLoadSeq
+  if (resetVersion && klinesStore.symbol === sym && klinesStore.timeframe === tf) {
+    klinesStore.seriesRevision = null
+  }
+  const previous = klinesStore.rows
+  await klinesStore.load(sym, tf, chartLoadLimit.value, true, revision)
+  if (seq !== chartLoadSeq || sym !== symbol.value || tf !== timeframe.value || previous === klinesStore.rows) return
+  liveBars.value = klinesStore.partialBar ? [klinesStore.partialBar] : []
+  void loadTrendLine()
+  if (integrityReport.value && integrityReport.value.history_revision !== klinesStore.seriesRevision) {
+    integrityReport.value = null
+    const check = ++integrityCheckSeq.value
+    requestAnimationFrame(() => setTimeout(() => {
+      if (check === integrityCheckSeq.value && sym === symbol.value) void handleCheckIntegrity(false)
+    }, 0))
+  }
+}
+
+let historyRefreshTimer: ReturnType<typeof setTimeout> | undefined
+let scheduledHistoryRefresh: { seq: number; symbol: string; revision: number | undefined } | undefined
 
 // 分组/组内顺序在别处被改动（如列表页表格拖拽）时，重拉本页列表
 watch(() => groupsStore.revision, () => loadGroupSymbols())
@@ -2208,6 +2253,7 @@ watch(
   () => appStore.isOnline,
   async (online) => {
     if (online) {
+      if (klinesStore.dataReceivedAt || klinesStore.error) void refreshChartHistory(undefined, true)
       await symbolsStore.load().catch(() => {})
       await groupsStore.load().catch(() => {})
       await loadGroupSymbols().catch(() => {})
@@ -2241,29 +2287,28 @@ onMounted(async () => {
   )
   unlisteners.push(
     await onDataSourceFailover((_event) => {
-      if (!symbol.value) return
-      // 数据源切换后重新走图表专用入口：天勤异常时临时取新浪，恢复时补缺口并清缓存。
-      void (async () => {
-        await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
-        await loadTrendLine()
-      })()
+      void refreshChartHistory(undefined, true)
     }),
   )
   unlisteners.push(
-    await onDataUpdated(async () => {
-      // 数据库刷新后实时临时桶已经转正，清掉残留，避免旧收盘继续覆盖历史K线
-      liveBars.value = []
+    await onDataUpdated((stats) => {
       loadSnapshots()
       scansStore.refreshLatestSignals()
       loadRecentPatterns()
-      // 定时入库后静默重载完整K线，让刚收盘的实时桶转正为历史K线
-      if (symbol.value) {
-        await klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
-        if (klinesStore.partialBar && klinesStore.partialBar.symbol === symbol.value && klinesStore.partialBar.timeframe === timeframe.value) {
-          liveBars.value = [klinesStore.partialBar]
-        }
-        loadTrendLine()
-      }
+      const sym = symbol.value
+      if (!sym) return
+      const revision = stats.history_revisions ? stats.history_revisions[sym] ?? 0 : undefined
+      const seq = chartLoadSeq
+      const old = scheduledHistoryRefresh
+      const target = old?.seq === seq && old.symbol === sym
+        ? (old.revision != null && revision != null ? Math.max(old.revision, revision) : undefined)
+        : revision
+      scheduledHistoryRefresh = { seq, symbol: sym, revision: target }
+      clearTimeout(historyRefreshTimer)
+      historyRefreshTimer = setTimeout(() => {
+        scheduledHistoryRefresh = undefined
+        if (seq === chartLoadSeq && sym === symbol.value) void refreshChartHistory(target)
+      }, 150)
     }),
   )
   // 实时现价：合并进快照表，缺失品种保留旧值，避免盘口跳动时整表闪空
@@ -2303,11 +2348,22 @@ onMounted(async () => {
   )
 
   unlisteners.push(
-    await onKlineClosed((payload) => {
-      if (payload.symbol === symbol.value && payload.timeframe === timeframe.value) {
-        if (symbol.value) {
-          void klinesStore.load(symbol.value, timeframe.value, chartLoadLimit.value, true)
-        }
+    await onKlineHistory((update) => {
+      if (update.symbol !== symbol.value || klinesStore.timeframe !== timeframe.value) return
+      const result = klinesStore.acceptHistoryUpdate(update)
+      if (result === 'reload') {
+        const recovering = klinesStore.chartStatus === 'tqsdk_recovery_pending'
+        void refreshChartHistory(recovering ? undefined : update.series_revision)
+      } else if (result === 'appended') {
+        liveBars.value = liveBars.value.filter(bar => bar.ts > klinesStore.latestClosedTs)
+        void loadTrendLine()
+      }
+    }),
+  )
+  unlisteners.push(
+    await onKlineClosed((event) => {
+      if (event.series_revision == null && event.symbol === symbol.value && event.timeframe === timeframe.value) {
+        void refreshChartHistory()
       }
     }),
   )
@@ -2323,6 +2379,8 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   clearInterval(chartClockTimer)
+  clearTimeout(historyRefreshTimer)
+  ++integrityCheckSeq.value
   ++chartLoadSeq
   ++trendSeq
   window.removeEventListener('keydown', onReviewKeydown)

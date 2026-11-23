@@ -64,10 +64,134 @@ fn collect_diagnostic_changes(
     }
 }
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+#[derive(Clone)]
+enum SnapshotField {
+    Json(Arc<Value>),
+    Object(Arc<SharedTraderSnapshot>),
+}
+
+impl SnapshotField {
+    fn same_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Json(left), Self::Json(right)) => Arc::ptr_eq(left, right) || left == right,
+            (Self::Object(left), Self::Object(right)) => {
+                Arc::ptr_eq(left, right) || left.fields_eq(right, &[])
+            }
+            _ => false,
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Json(value) => (**value).clone(),
+            Self::Object(value) => value.to_value(),
+        }
+    }
+
+    fn json(&self) -> Option<&Value> {
+        match self {
+            Self::Json(value) => Some(value),
+            Self::Object(_) => None,
+        }
+    }
+}
+
+impl Serialize for SnapshotField {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Json(value) => value.as_ref().serialize(serializer),
+            Self::Object(value) => value.as_ref().serialize(serializer),
+        }
+    }
+}
+
+/// Immutable field values can be shared by the publisher and its REST baseline.
+#[derive(Clone, Default, Serialize)]
+#[serde(transparent)]
+pub struct SharedTraderSnapshot(BTreeMap<String, SnapshotField>);
+
+impl SharedTraderSnapshot {
+    pub fn from_value(value: Value) -> Self {
+        let Value::Object(object) = value else {
+            return Self::default();
+        };
+        let mut result = Self::default();
+        for (key, value) in object {
+            if key == "strategy_diagnostics" && value.is_object() {
+                result.insert_object(key, Self::from_value(value));
+            } else {
+                result.insert(key, value);
+            }
+        }
+        result
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, value: Value) {
+        self.insert_shared(key, Arc::new(value));
+    }
+
+    pub fn insert_shared(&mut self, key: impl Into<String>, value: Arc<Value>) {
+        self.0.insert(key.into(), SnapshotField::Json(value));
+    }
+
+    pub fn insert_object(&mut self, key: impl Into<String>, value: Self) {
+        self.0
+            .insert(key.into(), SnapshotField::Object(Arc::new(value)));
+    }
+
+    pub fn extend(&mut self, fields: Self) {
+        self.0.extend(fields.0);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key).and_then(SnapshotField::json)
+    }
+
+    pub fn object(&self, key: &str) -> Option<&Self> {
+        match self.0.get(key) {
+            Some(SnapshotField::Object(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn to_value(&self) -> Value {
+        Value::Object(
+            self.0
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_value()))
+                .collect(),
+        )
+    }
+
+    fn fields_eq(&self, other: &Self, ignored: &[&str]) -> bool {
+        self.0
+            .iter()
+            .filter(|(key, _)| !ignored.contains(&key.as_str()))
+            .all(|(key, value)| other.0.get(key).is_some_and(|old| value.same_value(old)))
+            && self
+                .0
+                .keys()
+                .filter(|key| !ignored.contains(&key.as_str()))
+                .count()
+                == other
+                    .0
+                    .keys()
+                    .filter(|key| !ignored.contains(&key.as_str()))
+                    .count()
+    }
+}
+
 pub struct TraderPublisher {
     stream_id: String,
     revision: u64,
-    latest: Value,
+    latest: SharedTraderSnapshot,
 }
 
 fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
@@ -79,15 +203,7 @@ fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
             if !object_fields_eq(left, right, &["calendar_health"]) {
                 return false;
             }
-            return match (left.get("calendar_health"), right.get("calendar_health")) {
-                (Some(Value::Array(left)), Some(Value::Array(right))) => {
-                    left.len() == right.len()
-                        && left.iter().zip(right).all(|(left, right)| {
-                            value_fields_eq(left, right, &["remaining_seconds"])
-                        })
-                }
-                (left, right) => left == right,
-            };
+            return calendar_health_eq(left.get("calendar_health"), right.get("calendar_health"));
         }
     }
     let ignored: &[&str] = match key {
@@ -105,6 +221,19 @@ fn semantic_field_eq(key: &str, left: &Value, right: &Value) -> bool {
         return left == right;
     }
     value_fields_eq(left, right, ignored)
+}
+
+fn calendar_health_eq(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (left, right) {
+        (Some(Value::Array(left)), Some(Value::Array(right))) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| value_fields_eq(left, right, &["remaining_seconds"]))
+        }
+        (left, right) => left == right,
+    }
 }
 
 fn object_fields_eq(
@@ -137,51 +266,57 @@ impl TraderPublisher {
         Self {
             stream_id,
             revision: 0,
-            latest: Value::Null,
+            latest: SharedTraderSnapshot::default(),
         }
     }
 
     pub fn heartbeat(&self) -> Value {
         serde_json::json!({"stream_id": self.stream_id, "revision": self.revision,
-            "health": self.latest["health"], "account_updated_at": self.latest["account"]["updated_at"]})
+            "health": self.latest.get("health"), "account_updated_at": self.latest.get("account").and_then(|account| account.get("updated_at"))})
     }
 
     pub fn update_instance(
         &mut self,
         snapshot: Value,
     ) -> (Value, Option<TraderDelta>, Option<Vec<DiagnosticChange>>) {
-        self.update_inner(snapshot, true)
+        let (snapshot, delta, diagnostics) =
+            self.update_shared(SharedTraderSnapshot::from_value(snapshot), true);
+        (snapshot.to_value(), delta, diagnostics)
     }
 
     /// Refresh the REST baseline even when only query timestamps changed.
     pub fn update(&mut self, snapshot: Value) -> (Value, Option<TraderDelta>) {
-        let (snapshot, delta, _) = self.update_inner(snapshot, false);
-        (snapshot, delta)
+        let (snapshot, delta, _) =
+            self.update_shared(SharedTraderSnapshot::from_value(snapshot), false);
+        (snapshot.to_value(), delta)
     }
 
-    fn update_inner(
+    pub fn update_shared(
         &mut self,
-        mut snapshot: Value,
+        mut snapshot: SharedTraderSnapshot,
         compact_diagnostics: bool,
-    ) -> (Value, Option<TraderDelta>, Option<Vec<DiagnosticChange>>) {
-        let object = snapshot
-            .as_object_mut()
-            .expect("trader snapshot must be an object");
+    ) -> (
+        SharedTraderSnapshot,
+        Option<TraderDelta>,
+        Option<Vec<DiagnosticChange>>,
+    ) {
+        let object = &mut snapshot.0;
         for key in ["execution_orders", "revision", "_stream_id", "_revision"] {
             object.remove(key);
         }
-        let previous = self.latest.as_object();
+        let previous = &self.latest.0;
         let mut changes = Map::new();
         let mut diagnostics = None;
         for (key, value) in object.iter() {
-            let old = previous.and_then(|p| p.get(key));
-            if old.is_some_and(|old| semantic_field_eq(key, old, value)) {
+            let old = previous.get(key);
+            if old.is_some_and(|old| snapshot_field_eq(key, old, value)) {
                 continue;
             }
+            let value = value.to_value();
             if compact_diagnostics && key == "strategy_diagnostics" && value.is_object() {
-                if let Some(old) = old.filter(|old| old.is_object()) {
+                if let Some(old) = old.map(SnapshotField::to_value).filter(Value::is_object) {
                     let mut changes = Vec::new();
-                    collect_diagnostic_changes(old, value, &mut Vec::new(), &mut changes);
+                    collect_diagnostic_changes(&old, &value, &mut Vec::new(), &mut changes);
                     // A client may still have an earlier countdown because countdown-only
                     // changes are suppressed. Refresh it when a real change is sent.
                     if old.get("calendar_health") == value.get("calendar_health") {
@@ -197,13 +332,11 @@ impl TraderPublisher {
                     }
                 }
             }
-            changes.insert(key.clone(), value.clone());
+            changes.insert(key.clone(), value);
         }
-        if let Some(previous) = previous {
-            for key in previous.keys().filter(|k| !k.starts_with('_')) {
-                if !object.contains_key(key) {
-                    changes.insert(key.clone(), Value::Null);
-                }
+        for key in previous.keys().filter(|k| !k.starts_with('_')) {
+            if !object.contains_key(key) {
+                changes.insert(key.clone(), Value::Null);
             }
         }
         let delta = if changes.is_empty() {
@@ -218,10 +351,25 @@ impl TraderPublisher {
                 changes,
             })
         };
-        object.insert("_stream_id".into(), self.stream_id.clone().into());
-        object.insert("_revision".into(), self.revision.into());
+        snapshot.insert("_stream_id", self.stream_id.clone().into());
+        snapshot.insert("_revision", self.revision.into());
         self.latest = snapshot.clone();
         (snapshot, delta, diagnostics)
+    }
+}
+
+fn snapshot_field_eq(key: &str, old: &SnapshotField, value: &SnapshotField) -> bool {
+    match (old, value) {
+        (SnapshotField::Json(left), SnapshotField::Json(right)) => {
+            Arc::ptr_eq(left, right) || semantic_field_eq(key, left, right)
+        }
+        (SnapshotField::Object(left), SnapshotField::Object(right))
+            if key == "strategy_diagnostics" =>
+        {
+            left.fields_eq(right, &["calendar_health"])
+                && calendar_health_eq(left.get("calendar_health"), right.get("calendar_health"))
+        }
+        _ => old.same_value(value),
     }
 }
 

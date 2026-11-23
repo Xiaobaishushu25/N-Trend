@@ -157,7 +157,11 @@ impl ExecutionEngine {
         }
         Ok(())
     }
-    fn calendar_health_for_state(&self, s: &ExecutionState, now: i64) -> Vec<serde_json::Value> {
+    pub(super) fn calendar_health_for_state(
+        &self,
+        s: &ExecutionState,
+        now: i64,
+    ) -> Vec<serde_json::Value> {
         let mut definitions =
             std::collections::BTreeMap::from([(s.definition.revision.clone(), &s.definition)]);
         for c in s
@@ -418,10 +422,12 @@ impl ExecutionEngine {
                 p.origin = o.clone();
             }
         }
-        for p in s.orders.values_mut() {
-            if let Some(o) = origins.get(&p.condition_id) {
-                p.origin = o.clone();
-            }
+        let order_origin_updates: Vec<_> = s.orders.iter().filter_map(|(reference, order)| {
+            let origin = origins.get(&order.condition_id)?;
+            (origin != &order.origin).then(|| (reference.clone(), origin))
+        }).collect();
+        for (reference, origin) in order_origin_updates {
+            s.orders.get_mut(&reference).unwrap().origin = origin.clone();
         }
         self.save(&mut s)
     }
@@ -880,7 +886,11 @@ impl ExecutionEngine {
         self.commit_state(&mut guard, next)?;
         Ok(id)
     }
-    fn commit_state(&self, current: &mut ExecutionState, mut next: ExecutionState) -> Result<()> {
+    pub(super) fn commit_state(
+        &self,
+        current: &mut ExecutionState,
+        mut next: ExecutionState,
+    ) -> Result<()> {
         if let Err(e) = self.save(&mut next) {
             current.persistence_error = next.persistence_error;
             return Err(e);
@@ -888,7 +898,7 @@ impl ExecutionEngine {
         *current = next;
         Ok(())
     }
-    fn insert_plan(
+    pub(super) fn insert_plan(
         &self,
         s: &mut ExecutionState,
         plan: EntryPlan,
@@ -1044,13 +1054,17 @@ impl ExecutionEngine {
         event: StrategyEvent,
         persist: bool,
     ) -> Result<()> {
-        let cfg = self.get_config().await;
+        let fallback = self.get_config().await;
         let identity = self.identity.read().await.clone();
         let instance_id = identity.1.clone();
         let mut guard = self.state.lock().await;
+        if matches!(&event, StrategyEvent::Quote(quote) if !quote.valid_at(self.now_utc().timestamp())) {
+            return Ok(());
+        }
         let active = guard.definition.clone();
-        let mut versions =
-            HashMap::from([(active.revision.clone(), (active.clone(), cfg.clone()))]);
+        // Once configured, the state commit owns both the revision and its mode.
+        let config = guard.active_config.as_ref().unwrap_or(&fallback).clone();
+        let mut versions = HashMap::from([(active.revision.clone(), (active.clone(), config))]);
         let unsettled_conditions = guard.unsettled_condition_ids();
         for c in guard.conditions.values().filter(|c| {
             matches!(
@@ -1069,10 +1083,8 @@ impl ExecutionEngine {
                 || unsettled_conditions.contains(&c.id)
         }) {
             if let Some(f) = &c.frozen {
-                versions.insert(
-                    f.definition.revision.clone(),
-                    (f.definition.clone(), f.execution.clone()),
-                );
+                versions.entry(f.definition.revision.clone())
+                    .or_insert_with(|| (f.definition.clone(), f.execution.clone()));
             }
         }
         let handlers = versions
@@ -1225,6 +1237,7 @@ impl ExecutionEngine {
             return if persist {
                 self.save(&mut guard)
             } else {
+                guard.quote_observations_dirty = true;
                 Ok(())
             };
         }

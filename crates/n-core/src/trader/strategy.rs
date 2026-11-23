@@ -18,7 +18,7 @@ pub struct TradeOrigin {
     pub signal_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrategyDefinition {
     pub strategy_id: String,
     pub code_version: String,
@@ -55,7 +55,7 @@ pub enum EntryTrigger {
 }
 
 /// No N-pattern fields are required here. Evidence belongs to the strategy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryPlan {
     pub signal_id: String,
     pub symbol: String,
@@ -562,4 +562,13 @@ pub struct FrozenPlan {
     pub definition: StrategyDefinition,
     pub execution: ExecutionConfig,
     pub plan: EntryPlan,
+}
+
+impl PartialEq for FrozenPlan {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+            || (self.definition == other.definition
+                && self.execution == other.execution
+                && self.plan == other.plan)
+    }
 }

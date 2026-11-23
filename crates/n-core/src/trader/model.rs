@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub(super) const EXECUTION_QUOTE_MAX_AGE_SECONDS: i64 = 15;
+
 pub fn is_actual_futures_contract(code: &str) -> bool {
     let prefix = code.bytes().take_while(u8::is_ascii_alphabetic).count();
     prefix > 0
@@ -25,14 +27,22 @@ pub struct ExecutionQuote {
     pub timestamp: i64,
 }
 
+/// Receipt time at the execution feed, before an instance queues this tick.
+#[derive(Debug, Clone)]
+pub struct ReceivedExecutionQuote {
+    pub symbol: String,
+    pub quote: ExecutionQuote,
+    pub received_at: i64,
+}
+
 impl ExecutionQuote {
     pub fn valid(&self) -> bool {
         self.valid_at(chrono::Utc::now().timestamp())
     }
 
     pub fn valid_at(&self, now: i64) -> bool {
-        let age = now - self.timestamp;
-        (0..=15).contains(&age)
+        now.checked_sub(self.timestamp)
+            .is_some_and(|age| (0..=EXECUTION_QUOTE_MAX_AGE_SECONDS).contains(&age))
             && self.last.is_finite()
             && self.last > 0.0
             && self.tick.is_finite()

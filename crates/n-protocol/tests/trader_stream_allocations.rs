@@ -1,7 +1,8 @@
-use n_protocol::trader_stream::TraderPublisher;
+use n_protocol::trader_stream::{SharedTraderSnapshot, TraderPublisher};
 use serde_json::{json, Map, Value};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::sync::Arc;
 use std::time::Instant;
 
 struct CountingAllocator;
@@ -112,4 +113,48 @@ fn unchanged_large_snapshot_avoids_comparison_deep_copies() {
     );
     assert!(allocations * 10 < old_allocations * 6,
         "comparison must stop copying both complete snapshots: old={old_allocations}, new={allocations}");
+}
+
+#[test]
+fn shared_baseline_reuses_large_fields_across_heartbeat_and_account_change() {
+    let archive = Arc::new(json!(vec![
+        json!({
+            "signal": "historical trade",
+            "proof": vec![json!({"price": 1200, "context": "frozen evidence"}); 20],
+        });
+        8800
+    ]));
+    let build = |uptime: i32, balance: i32| {
+        let mut snapshot = SharedTraderSnapshot::default();
+        snapshot.insert_shared("history", archive.clone());
+        snapshot.insert("health", json!({"ready":true,"uptime":uptime}));
+        snapshot.insert("account", json!({"balance":balance}));
+        snapshot
+    };
+    let mut publisher = TraderPublisher::new("boot".into());
+    publisher.update_shared(build(1, 1000), true);
+    let ((baseline, delta, _), allocations, _) =
+        measure(|| publisher.update_shared(build(2, 1000), true));
+    assert!(delta.is_none());
+    assert!(std::ptr::eq(
+        baseline.get("history").unwrap(),
+        archive.as_ref()
+    ));
+    assert_eq!(baseline.get("health").unwrap()["uptime"], 2);
+    assert!(
+        allocations < 100,
+        "unexpected archive copy: {allocations} allocations"
+    );
+    let (baseline, delta, _) = publisher.update_shared(build(3, 999), true);
+    assert_eq!(
+        delta.unwrap().changes,
+        json!({"account":{"balance":999}})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert_eq!(
+        baseline.get("history").unwrap().as_array().unwrap().len(),
+        8800
+    );
 }

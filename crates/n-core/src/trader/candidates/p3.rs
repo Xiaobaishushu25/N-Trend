@@ -15,6 +15,7 @@ pub const VERSION: &str = "3";
 const PREVIOUS_VERSION: &str = "2";
 const ATR_FLOOR_VERSION: &str = "1";
 const MAX_TARGET_ATR: f64 = 3.5;
+const WEEKEND_EXIT_LEAD_SECONDS: i64 = 5 * 60;
 pub const EXIT: &str = "p3_exit_v1";
 pub const SIZING: &str = "risk_budget_v1";
 pub(in crate::trader) const FIRST_S1: &str = "p3_first_s1";
@@ -116,6 +117,7 @@ impl P3Strategy {
         }
         let mut base =
             CandidateStrategy::with_min_score(p.common(), 2.5)?.with_min_net_rr(p.min_net_rr)?;
+        base.weekend_exit_lead_seconds = WEEKEND_EXIT_LEAD_SECONDS;
         if version != ATR_FLOOR_VERSION {
             base = base.without_atr_floor();
         }
@@ -203,7 +205,7 @@ impl P3Strategy {
                 .flatten()
         });
         let weekend = params
-            .weekend_windows(instrument, opened + 7 * 86400)
+            .weekend_windows(instrument, opened + 7 * 86400, WEEKEND_EXIT_LEAD_SECONDS)
             .into_iter()
             .filter(move |&(_, reopen)| opened < reopen)
             .map(|(cutoff, _)| (cutoff, "pre_weekend"));

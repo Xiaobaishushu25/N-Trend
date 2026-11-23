@@ -2,15 +2,32 @@ import { defineStore } from 'pinia'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { reportPerformance } from '../utils/performanceLog'
-import type { KlineRow, Timeframe } from '../types'
+import type { ChartHistoryUpdate, ChartKlineResponse, KlineRow, Timeframe } from '../types'
 
 interface PendingLoad {
   key: string
   seq: number
   dirty: boolean
+  requiredRevision: number | null
+  updates: ChartHistoryUpdate[]
   promise: Promise<void>
 }
 const pendingLoads = new WeakMap<object, PendingLoad>()
+const historyRequests = new WeakMap<object, Map<string, Promise<ChartKlineResponse>>>()
+
+function requestHistory(store: object, key: string, symbol: string, timeframe: Timeframe, limit: number) {
+  let requests = historyRequests.get(store)
+  if (!requests) {
+    requests = new Map()
+    historyRequests.set(store, requests)
+  }
+  const pending = requests.get(key)
+  if (pending) return pending
+  const current = requests
+  const request = api.getChartKlines(symbol, timeframe, limit).finally(() => current.delete(key))
+  current.set(key, request)
+  return request
+}
 
 export const useKlinesStore = defineStore('klines', {
   state: () => ({
@@ -29,6 +46,8 @@ export const useKlinesStore = defineStore('klines', {
     partialSeq: 0,
     partialExpected: false,
     latestClosedTs: '',
+    seriesRevision: null as number | null,
+    historyLimit: 500,
   }),
   actions: {
     acceptPartial(symbol: string, timeframe: Timeframe, bar: KlineRow | null) {
@@ -43,30 +62,81 @@ export const useKlinesStore = defineStore('klines', {
       if (this.chartMessage === '历史数据已获取，实时柱正在准备；就绪后自动推送更新。') this.chartMessage = ''
       return true
     },
-    async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false) {
+    applyHistoryUpdate(update: ChartHistoryUpdate): 'ignored' | 'current' | 'appended' | 'reload' {
+      if (update.symbol !== this.symbol) return 'ignored'
+      const revision = update.series_revision
+      if (this.chartStatus !== 'tqsdk' || this.seriesRevision == null || revision == null) return 'reload'
+      if (revision <= this.seriesRevision) return 'current'
+      if (update.full_reload_required || update.previous_revision !== this.seriesRevision) return 'reload'
+      const bars = (update.bars ?? []).filter(bar => bar.timeframe === this.timeframe)
+      let latest = this.latestClosedTs
+      for (const bar of bars) {
+        if (bar.symbol !== this.symbol || bar.ts <= latest) return 'reload'
+        latest = bar.ts
+      }
+      this.seriesRevision = revision
+      if (!bars.length) return 'current'
+      const rows = this.rows.concat(bars)
+      this.rows = rows.slice(Math.max(0, rows.length - this.historyLimit))
+      this.latestClosedTs = latest
+      this.dataReceivedAt = Date.now()
+      if (this.partialBar && this.partialBar.ts <= latest) {
+        this.partialBar = null
+        this.partialReceivedAt = 0
+        this.partialExpected = false
+      }
+      return 'appended'
+    },
+    acceptHistoryUpdate(update: ChartHistoryUpdate): 'ignored' | 'current' | 'appended' | 'reload' {
+      if (update.symbol !== this.symbol) return 'ignored'
+      const pending = pendingLoads.get(this)
+      if (pending?.seq === this.loadSeq) {
+        if (pending.updates.length < 32) {
+          pending.updates.push(update)
+        } else if (update.series_revision == null) {
+          pending.dirty = true
+        } else {
+          pending.requiredRevision = Math.max(pending.requiredRevision ?? 0, update.series_revision)
+        }
+        // Replay after the baseline arrives. This includes events for a
+        // timeframe whose initial request has not completed yet.
+        if (this.seriesRevision == null) return 'current'
+      }
+      return this.applyHistoryUpdate(update)
+    },
+    async load(symbol: string, timeframe: Timeframe, limit = 500, silent = false, revision?: number) {
       const key = JSON.stringify([symbol, timeframe, limit])
       const pending = pendingLoads.get(this)
-      if (silent && pending?.key === key && pending.seq === this.loadSeq) {
-        // A close/data-update event may postdate the HTTP snapshot. Share the
-        // active request, then run one trailing refresh for all accumulated events.
-        pending.dirty = true
+      if (revision != null && this.symbol === symbol && this.timeframe === timeframe
+        && this.chartStatus === 'tqsdk' && this.seriesRevision != null && this.seriesRevision >= revision) return
+      if (pending?.key === key && pending.seq === this.loadSeq) {
+        if (silent && revision == null) pending.dirty = true
+        if (revision != null) pending.requiredRevision = Math.max(pending.requiredRevision ?? 0, revision)
+        if (!silent && !this.rows.length) this.loading = true
         return pending.promise
       }
-      const entry: PendingLoad = { key, seq: this.loadSeq + 1, dirty: false, promise: Promise.resolve() }
+      const entry: PendingLoad = {
+        key, seq: this.loadSeq + 1, dirty: false, requiredRevision: revision ?? null,
+        updates: [], promise: Promise.resolve(),
+      }
       pendingLoads.set(this, entry)
       entry.promise = (async () => {
-        await this.loadOnce(symbol, timeframe, limit, silent)
-        while (entry.dirty && pendingLoads.get(this) === entry && entry.seq === this.loadSeq) {
+        await this.loadOnce(symbol, timeframe, limit, silent, entry)
+        while (pendingLoads.get(this) === entry && entry.seq === this.loadSeq
+          && (entry.dirty || (this.chartStatus === 'tqsdk' && entry.requiredRevision != null
+            && (this.seriesRevision ?? -1) < entry.requiredRevision))) {
+          const required = entry.requiredRevision
           entry.dirty = false
           entry.seq = this.loadSeq + 1
-          await this.loadOnce(symbol, timeframe, limit, true)
+          await this.loadOnce(symbol, timeframe, limit, true, entry)
+          if (entry.requiredRevision === required && !entry.dirty) break
         }
       })().finally(() => {
         if (pendingLoads.get(this) === entry) pendingLoads.delete(this)
       })
       return entry.promise
     },
-    async loadOnce(symbol: string, timeframe: Timeframe, limit: number, silent: boolean) {
+    async loadOnce(symbol: string, timeframe: Timeframe, limit: number, silent: boolean, entry: PendingLoad) {
       const started = performance.now()
       if (!silent) reportPerformance('chart_load_started', 0, { symbol, timeframe })
       // silent：后台静默刷新（如定时入库后），不弹加载遮罩
@@ -76,7 +146,10 @@ export const useKlinesStore = defineStore('klines', {
       }
       this.error = ''
       const isSwitch = this.symbol !== symbol || this.timeframe !== timeframe
-      if (isSwitch) this.latestClosedTs = ''
+      if (isSwitch) {
+        this.latestClosedTs = ''
+        this.seriesRevision = null
+      }
       const keepHistory = !isSwitch && this.rows.length > 0 &&
         ['tqsdk', 'tqsdk_recovery_pending', 'offline_snapshot', 'tq_unavailable'].includes(this.chartStatus)
       if (!keepHistory) {
@@ -89,6 +162,7 @@ export const useKlinesStore = defineStore('klines', {
       }
       this.symbol = symbol
       this.timeframe = timeframe
+      this.historyLimit = Math.max(0, Math.min(limit, 5000))
       if (!keepHistory) {
         this.chartStatus = 'tqsdk'
         this.chartMessage = ''
@@ -96,14 +170,17 @@ export const useKlinesStore = defineStore('klines', {
       const seq = ++this.loadSeq
       const partialSeq = this.partialSeq
       try {
-        const response = await api.getChartKlines(symbol, timeframe, limit)
+        const response = await requestHistory(this, entry.key, symbol, timeframe, limit)
         if (seq !== this.loadSeq) {
           if (!silent) reportPerformance('chart_load_superseded', performance.now() - started, { symbol, timeframe })
           return
         }
+        const revision = response.series_revision ?? null
+        if (response.status === 'tqsdk' && this.chartStatus === 'tqsdk'
+          && this.seriesRevision != null && revision != null && revision < this.seriesRevision) return
         this.rows = response.rows
-        const closedTs = response.rows[response.rows.length - 1]?.ts ?? ''
-        if (closedTs > this.latestClosedTs) this.latestClosedTs = closedTs
+        this.seriesRevision = revision
+        this.latestClosedTs = response.rows[response.rows.length - 1]?.ts ?? ''
         this.dataReceivedAt = Date.now()
         // 实时推送可能在历史响应之前到达，不能被稍旧的HTTP快照覆盖。
         if (partialSeq === this.partialSeq) {
@@ -119,6 +196,14 @@ export const useKlinesStore = defineStore('klines', {
         }
         this.chartStatus = response.status
         this.chartMessage = this.partialBar && response.message.includes('实时柱正在准备') ? '' : response.message
+        for (const update of entry.updates.splice(0)) {
+          if (this.applyHistoryUpdate(update) !== 'reload') continue
+          if (update.series_revision == null
+            || (update.full_reload_required && this.chartStatus === 'tqsdk_recovery_pending')) entry.dirty = true
+          else if (this.chartStatus === 'tqsdk') {
+            entry.requiredRevision = Math.max(entry.requiredRevision ?? 0, update.series_revision)
+          }
+        }
         if (!silent) reportPerformance('chart_load_finished', performance.now() - started, { symbol, timeframe, rows: response.rows.length })
       } catch (e: any) {
         if (seq !== this.loadSeq) return
@@ -149,6 +234,7 @@ export const useKlinesStore = defineStore('klines', {
       this.partialReceivedAt = 0
       this.partialExpected = false
       this.latestClosedTs = ''
+      this.seriesRevision = null
     },
   },
 })

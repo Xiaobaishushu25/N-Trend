@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use sea_orm::DatabaseConnection;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 use super::{fetch_to_model, model_to_fetch};
 use crate::derive::{aggregate, Timeframe};
@@ -46,6 +46,7 @@ pub struct RawPipeline {
     db: DatabaseConnection,
     symbol_locks: SymbolLocks,
     judger: crate::finality::FinalityJudger,
+    writer: Arc<Semaphore>,
 }
 
 impl RawPipeline {
@@ -54,6 +55,7 @@ impl RawPipeline {
             db,
             symbol_locks,
             judger: crate::finality::FinalityJudger::default(),
+            writer: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -66,6 +68,7 @@ impl RawPipeline {
             db,
             symbol_locks,
             judger,
+            writer: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -109,9 +112,22 @@ impl RawPipeline {
     ) -> Result<usize> {
         let lock = self.symbol_locks.get(symbol);
         let _guard = lock.lock().await;
+        Ok(self
+            .write_raw_batch_locked(symbol, incoming_bars, only_missing)
+            .await?
+            .0)
+    }
 
+    /// The caller holds the symbol lock. Also report whether derived history
+    /// had to be initialized, since that cannot be delivered as a tail patch.
+    pub(super) async fn write_raw_batch_locked(
+        &self,
+        symbol: &str,
+        incoming_bars: &[Kline],
+        only_missing: bool,
+    ) -> Result<(usize, bool)> {
         if incoming_bars.is_empty() {
-            return Ok(0);
+            return Ok((0, false));
         }
         let mut incoming = BTreeMap::new();
         for row in incoming_bars {
@@ -145,7 +161,7 @@ impl RawPipeline {
                 .await?
                 .is_empty();
         if changed.is_empty() && !initialize {
-            return Ok(0);
+            return Ok((0, false));
         }
         let existing = if initialize {
             repo::raw_klines(&self.db, symbol).await?
@@ -204,11 +220,12 @@ impl RawPipeline {
             .iter()
             .map(|k| fetch_to_model(symbol, "5m", "raw", k))
             .collect();
+        let _write = self.writer.acquire().await?;
         repo::atomically_upsert_raw_and_derived(&self.db, symbol, raw_models, derived_models)
             .await
             .context("RawPipeline::process_raw_batch 原子事务写入失败")?;
 
-        Ok(derived_count)
+        Ok((derived_count, initialize))
     }
 
     /// 单根 Final 5m 行情更新入口（未来 Finality 确认后的统一持久化入口）。
@@ -224,6 +241,7 @@ impl RawPipeline {
 
         let raw = repo::raw_klines(&self.db, symbol).await?;
         if raw.len() < 3 {
+            let _write = self.writer.acquire().await?;
             repo::delete_derived_klines(&self.db, symbol).await?;
             return Ok(0);
         }
@@ -237,6 +255,7 @@ impl RawPipeline {
         }
 
         let derived_count = derived_models.len();
+        let _write = self.writer.acquire().await?;
         repo::atomically_save_raw_and_derived(&self.db, symbol, Vec::new(), derived_models)
             .await
             .context("RawPipeline::rebuild_derived 事务写入失败")?;

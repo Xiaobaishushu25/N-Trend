@@ -34,11 +34,14 @@ use crate::storage::repo;
 pub mod live_chart;
 pub mod pipeline;
 pub use pipeline::{RawPipeline, SymbolLocks};
+mod chart_recovery;
+mod history_reads;
 
 const MONTH_KLINE_CACHE_TTL: Duration = Duration::from_secs(900);
 const CHART_FALLBACK_COUNT: usize = 100;
 const CHART_FALLBACK_CACHE_TTL: Duration = Duration::from_secs(300);
 const CHART_COMPARE_BARS: usize = 30;
+static CHART_AGGREGATION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 const ROLLOVER_SCAN_SETTING_PREFIX: &str = "rollover_scanned::";
 const ROLLOVER_PENDING_RETENTION_DAYS: i64 = 30;
 /// 临时未收盘扫描沿用正式预警的有效门槛，避免把低分噪声显示成预做多/预做空。
@@ -1472,15 +1475,42 @@ pub struct KlineDto {
     pub rollover: bool,
 }
 
+impl From<KlineDto> for n_protocol::dto::KlineDto {
+    fn from(kline: KlineDto) -> Self {
+        Self {
+            symbol: kline.symbol,
+            timeframe: kline.timeframe,
+            ts: kline.ts,
+            open: kline.open,
+            high: kline.high,
+            low: kline.low,
+            close: kline.close,
+            volume: kline.volume,
+            hold: kline.hold,
+            source: kline.source,
+            rollover: kline.rollover,
+        }
+    }
+}
+
 /// 图表专用数据响应。临时新浪数据只通过该响应返回，不进入正式行情管道。
 #[derive(Debug, Clone, Serialize)]
 pub struct ChartKlineResponse {
     pub rows: Vec<KlineDto>,
+    pub series_revision: Option<i64>,
     /// tqsdk / sina_consistent / sina_mismatch / sina_unverified / tqsdk_recovery_pending
     pub status: String,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_bar: Option<KlineDto>,
+}
+
+pub struct ChartClosure {
+    symbol: String,
+    previous_revision: i64,
+    series_revision: i64,
+    previous_end: Option<String>,
+    end: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1561,6 +1591,7 @@ pub fn coordinator_limits_from_config(config: &Config) -> (u64, usize) {
 
 pub struct Services {
     pub db: DatabaseConnection,
+    chart_db: DatabaseConnection,
     /// 全局共享新浪客户端句柄（接入统一 SinaRequestCoordinator 与全局 RateLimiter）。
     client: SinaClient,
     /// 统一双轨制数据源（天勤主力 + 新浪备选）。
@@ -1570,8 +1601,9 @@ pub struct Services {
     config_path: std::path::PathBuf,
     /// R5a: quotes and entry detection share two revision-aware memory snapshots.
     market_cache: market_cache::MarketCache,
-    analysis_history: market_cache::AnalysisHistory<Bar>,
-    raw_history: market_cache::AnalysisHistory<Kline>,
+    analysis_history: market_cache::AnalysisHistory<Bar, history_reads::BarHistoryStamp>,
+    raw_history: market_cache::AnalysisHistory<Kline, crate::storage::cache_revisions::SeriesRevision>,
+    chart_history: market_cache::AnalysisHistory<KlineDto, history_reads::BarHistoryStamp>,
     history_reads: tokio::sync::Semaphore,
     /// 已发过入场价提醒的形态（symbol+direction+level+entry），避免重复通知
     entry_notified: RwLock<HashSet<(String, String, String, u64)>>,
@@ -1584,7 +1616,8 @@ pub struct Services {
     /// 月合约 5m K 线缓存：同一品种换月确认短时间不重复抓取
     month_kline_cache: RwLock<HashMap<String, (Instant, usize, Vec<Kline>)>>,
     /// 图表临时新浪数据缓存；只存在内存，不进入 RawPipeline。
-    chart_fallback_cache: Mutex<HashMap<String, ChartFallbackCache>>,
+    chart_fallback_cache: Arc<Mutex<HashMap<String, ChartFallbackCache>>>,
+    chart_recovery: chart_recovery::ChartRecovery,
     /// 串行化扫描：手动扫描与定时扫描不会同时跑，避免同一预警K线重复入库。
     scan_lock: RwLock<()>,
     /// 串行化全量行情刷新与扫描，避免启动刷新尚未完成时扫描读取半批新、半批旧数据。
@@ -1612,6 +1645,15 @@ fn log_chart_sql(trace_id: Option<&str>, started: Instant, rows: usize) {
 }
 
 impl Services {
+    pub fn with_chart_reader(mut self, db: DatabaseConnection) -> Self {
+        self.chart_db = db;
+        self
+    }
+
+    pub fn chart_reader(&self) -> &DatabaseConnection {
+        &self.chart_db
+    }
+
     pub async fn new(
         db: DatabaseConnection,
         config: Config,
@@ -1708,6 +1750,7 @@ impl Services {
 
         let pipeline = RawPipeline::new(db.clone(), SymbolLocks::new());
         Ok(Self {
+            chart_db: db.clone(),
             db,
             client,
             data_source,
@@ -1716,13 +1759,15 @@ impl Services {
             market_cache: market_cache::MarketCache::default(),
             analysis_history: market_cache::AnalysisHistory::default(),
             raw_history: market_cache::AnalysisHistory::default(),
+            chart_history: market_cache::AnalysisHistory::default(),
             history_reads: tokio::sync::Semaphore::new(2),
             entry_notified: RwLock::new(HashSet::new()),
             preclose_last_tick: Mutex::new(None),
             preclose_candidate_last_tick: Mutex::new(None),
             deep_backfilled: RwLock::new(HashSet::new()),
             month_kline_cache: RwLock::new(HashMap::new()),
-            chart_fallback_cache: Mutex::new(HashMap::new()),
+            chart_fallback_cache: Arc::default(),
+            chart_recovery: chart_recovery::ChartRecovery::default(),
             scan_lock: RwLock::new(()),
             data_cycle_lock: Mutex::new(()),
             pipeline,
@@ -3613,6 +3658,125 @@ impl Services {
 
     /// Persist the final 5m bar before chart publication or scan dispatch.
     pub async fn store_tq_closed_bar_event(&self, event: &ClosedBarEvent) -> Result<()> {
+        self.validate_tq_closed_bar_event(event).await?;
+        self.pipeline
+            .process_final_bar(&event.symbol, &event.kline)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist the closure before enqueueing a scan. Chart materialization
+    /// can happen afterwards without delaying the scan queue.
+    pub async fn store_tq_chart_closure(
+        &self,
+        event: &ClosedBarEvent,
+    ) -> Result<Option<ChartClosure>> {
+        self.validate_tq_closed_bar_event(event).await?;
+        let symbol = &event.symbol;
+        let lock = self.pipeline.symbol_locks().get(symbol);
+        let _guard = lock.lock().await;
+
+        let before = self.db.begin().await?;
+        let previous_revision = market_history_revision(&before, symbol).await?;
+        let previous_end = repo::latest_raw_ts(&before, symbol).await?;
+        before.commit().await?;
+        let (_, initialized) = self
+            .pipeline
+            .write_raw_batch_locked(symbol, std::slice::from_ref(&event.kline), false)
+            .await?;
+        let series_revision = market_history_revision(&self.db, symbol).await?;
+        if series_revision == previous_revision {
+            return Ok(None);
+        }
+        Ok(Some(ChartClosure {
+            symbol: symbol.clone(),
+            previous_revision,
+            series_revision,
+            previous_end: previous_end.filter(|previous_end| {
+                !initialized && chart_tail_is_contiguous(symbol, previous_end, &event.bar_end)
+            }),
+            end: event.bar_end.clone(),
+        }))
+    }
+
+    pub async fn chart_history_update(
+        &self,
+        closure: ChartClosure,
+    ) -> n_protocol::dto::ChartHistoryUpdate {
+        let ChartClosure {
+            symbol,
+            previous_revision,
+            series_revision,
+            previous_end,
+            end,
+        } = closure;
+        let mut update = n_protocol::dto::ChartHistoryUpdate {
+            symbol,
+            previous_revision,
+            series_revision,
+            full_reload_required: true,
+            bars: Vec::new(),
+        };
+        let Some(previous_end) = previous_end else {
+            return update;
+        };
+        // A concurrent commit invalidates the incremental patch. Read the
+        // revision and its visible bars in a single snapshot.
+        let read = async {
+            let snapshot = self.db.begin().await?;
+            let revision = market_history_revision(&snapshot, &update.symbol).await?;
+            let bars = if revision == series_revision {
+                Self::closed_chart_tail(&snapshot, &update.symbol, &previous_end, &end).await?
+            } else {
+                Vec::new()
+            };
+            snapshot.commit().await?;
+            Ok::<_, anyhow::Error>((revision, bars))
+        }
+        .await;
+        match read {
+            Ok((revision, bars)) => {
+                update.series_revision = revision;
+                update.full_reload_required =
+                    bars.iter().filter(|bar| bar.timeframe == "5m").count() != 1;
+                update.bars = bars;
+            }
+            Err(error) => {
+                tracing::warn!(symbol = %update.symbol, %error, "闭合K线已入库，图表改用历史请求恢复");
+            }
+        }
+        update
+    }
+
+    async fn closed_chart_tail(
+        db: &impl ConnectionTrait,
+        symbol: &str,
+        previous_end: &str,
+        end: &str,
+    ) -> Result<Vec<n_protocol::dto::KlineDto>> {
+        let previous = NaiveDateTime::parse_from_str(previous_end, "%Y-%m-%d %H:%M:%S")?;
+        let now = NaiveDateTime::parse_from_str(end, "%Y-%m-%d %H:%M:%S")?;
+        let mut bars = Vec::new();
+        for timeframe in Timeframe::supported() {
+            let becomes_visible = |at| {
+                let bucket = crate::derive::current_bucket_end_ts(at, timeframe);
+                bucket.as_str() > previous_end && bucket.as_str() <= end
+            };
+            if timeframe != Timeframe::M5 && !becomes_visible(previous) && !becomes_visible(now) {
+                continue;
+            }
+            bars.extend(
+                Self::read_chart_rows(db, symbol, timeframe.as_str(), Some(4), None)
+                    .await?
+                    .into_iter()
+                    .filter(|bar| bar.ts.as_str() > previous_end && bar.ts.as_str() <= end)
+                    .map(n_protocol::dto::KlineDto::from),
+            );
+        }
+        Ok(bars)
+    }
+
+    async fn validate_tq_closed_bar_event(&self, event: &ClosedBarEvent) -> Result<()> {
         if event.source != "tqsdk" || event.event_type != "bar_closed" || event.period != "5m" {
             return Err(anyhow!("非法闭合事件来源或类型"));
         }
@@ -3683,9 +3847,6 @@ impl Services {
             return Err(anyhow!("闭合事件品种未启用: {}", event.symbol));
         }
 
-        self.pipeline
-            .process_final_bar(&event.symbol, &event.kline)
-            .await?;
         Ok(())
     }
 
@@ -3947,50 +4108,31 @@ impl Services {
             .clone())
     }
 
-    pub async fn shared_bars_for(&self, symbol: &str, timeframe: &str) -> Result<Arc<Vec<Bar>>> {
-        self.analysis_history
-            .get(&self.db, &self.history_reads, (symbol, timeframe), || {
-                self.bars_for_tail(symbol, timeframe, None)
-            })
-            .await
-    }
-
-    pub async fn shared_raw_for(&self, symbol: &str) -> Result<Arc<Vec<Kline>>> {
-        self.raw_history
-            .get(&self.db, &self.history_reads, (symbol, "raw5m"), || async {
-                Ok(repo::raw_klines(&self.db, symbol)
-                    .await?
-                    .iter()
-                    .map(model_to_fetch)
-                    .collect())
-            })
-            .await
-    }
-
     async fn bars_for_tail(
         &self,
+        db: &impl ConnectionTrait,
         symbol: &str,
         timeframe: &str,
         limit: Option<usize>,
     ) -> Result<Vec<Bar>> {
         // Preserve the existing insufficient-derived-history fallback decision.
         let limit = limit.map(|n| n.max(ATR_PERIOD + 2));
-        let cutoff = repo::latest_raw_ts(&self.db, symbol)
+        let cutoff = repo::latest_raw_ts(db, symbol)
             .await?
             .unwrap_or_default();
-        let rows = repo::klines(&self.db, symbol, timeframe, limit, Some(&cutoff)).await?;
+        let rows = repo::klines(db, symbol, timeframe, limit, Some(&cutoff)).await?;
         let mut bars: Vec<Bar> = rows
             .iter()
             .filter(|r| r.ts.as_str() <= cutoff.as_str())
             .filter_map(model_to_bar)
             .collect();
-        let rollovers = repo::symbol_rollovers(&self.db, symbol).await?;
+        let rollovers = repo::symbol_rollovers(db, symbol).await?;
         mark_rollover_bars(&mut bars, &rollovers, timeframe);
         if bars.len() >= ATR_PERIOD + 2 {
             return Ok(bars);
         }
         let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
-        let raw = repo::raw_klines_tail(&self.db, symbol, aggregation_raw_limit(tf, limit)).await?;
+        let raw = repo::raw_klines_tail(db, symbol, aggregation_raw_limit(tf, limit)).await?;
         let fetch_bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
         let fallback: Vec<Bar> = aggregate(&fetch_bars, tf)
             .iter()
@@ -4023,6 +4165,7 @@ impl Services {
         }
         let mut bars = self
             .bars_for_tail(
+                &self.db,
                 symbol,
                 timeframe,
                 Some(crate::analyze::manual_level::ROLE_WINDOW),
@@ -4051,17 +4194,45 @@ impl Services {
         timeframe: &str,
         limit: Option<usize>,
         trace_id: &str,
-    ) -> Result<Vec<KlineDto>> {
+    ) -> Result<(Vec<KlineDto>, i64)> {
+        use crate::storage::cache_revisions::{market_series_boundary, market_series_revisions};
+        use history_reads::BarHistoryStamp;
+        let tf = Timeframe::parse(timeframe).ok_or_else(|| anyhow!("不支持的级别 {timeframe}"))?;
+        let timeframe = tf.as_str();
+        let waiting = Instant::now();
+        let mut slot = match limit.filter(|limit| *limit <= 1200) {
+            Some(limit) => Some(self.chart_history.lock((symbol.to_owned(), format!("{timeframe}/{limit}"))).await),
+            None => None,
+        };
         let started = Instant::now();
-        let conn = self.db.begin().await?;
-        tracing::info!(
-            trace_id,
-            acquire_ms = started.elapsed().as_millis(),
-            "K线数据库连接就绪"
-        );
+        let conn = self.chart_db.begin().await?;
+        tracing::info!(trace_id, slot_wait_ms = started.duration_since(waiting).as_millis(),
+            acquire_ms = started.elapsed().as_millis(), "K线数据库连接就绪");
+        let revision = market_history_revision(&conn, symbol).await?;
+        let stamp = if slot.is_some() {
+            let (revisions, visible) = if matches!(tf, Timeframe::M15 | Timeframe::M60) {
+                let view = market_series_boundary(&conn, symbol, timeframe).await?;
+                (view.versions, view.visible)
+            } else {
+                (market_series_revisions(&conn, symbol, timeframe).await?, None)
+            };
+            let uses_raw = tf != Timeframe::M5 && visible.is_none();
+            Some(BarHistoryStamp::new(revisions, visible, uses_raw))
+        } else {
+            None
+        };
+        if let (Some(stamp), Some(Some((cached, rows)))) = (&stamp, slot.as_deref()) {
+            if cached == stamp {
+                conn.commit().await?;
+                return Ok((rows.as_ref().clone(), revision));
+            }
+        }
         let rows = Self::read_chart_rows(&conn, symbol, timeframe, limit, Some(trace_id)).await?;
         conn.commit().await?;
-        Ok(rows)
+        if let (Some(slot), Some(stamp)) = (slot.as_deref_mut(), stamp) {
+            *slot = Some((stamp, Arc::new(rows.clone())));
+        }
+        Ok((rows, revision))
     }
 
     async fn read_chart_rows(
@@ -4075,14 +4246,20 @@ impl Services {
         let sql_started = Instant::now();
         let rollovers = repo::symbol_rollovers(db, symbol).await?;
         if tf == Timeframe::M5 {
-            let rows = repo::klines(db, symbol, "5m", limit, None).await?;
+            let rows = match trace_id {
+                Some(trace) => repo::profiled_chart_klines(db, symbol, "5m", limit, None, false, trace).await?,
+                None => repo::klines(db, symbol, "5m", limit, None).await?,
+            };
             log_chart_sql(trace_id, sql_started, rows.len());
             return Ok(mark_rollover_models(rows, &rollovers, "5m"));
         }
         let raw_cutoff = repo::latest_raw_ts(db, symbol).await?.unwrap_or_default();
         if matches!(tf, Timeframe::M15 | Timeframe::M60) {
             // 截止时间和数量都下推到 SQL；派生库尾部的未闭合桶不能挤占显示数量。
-            let rows = repo::klines(db, symbol, tf.as_str(), limit, Some(&raw_cutoff)).await?;
+            let rows = match trace_id {
+                Some(trace) => repo::profiled_chart_klines(db, symbol, tf.as_str(), limit, Some(&raw_cutoff), false, trace).await?,
+                None => repo::klines(db, symbol, tf.as_str(), limit, Some(&raw_cutoff)).await?,
+            };
             if !rows.is_empty() {
                 log_chart_sql(trace_id, sql_started, rows.len());
                 return Ok(mark_rollover_models(rows, &rollovers, tf.as_str()));
@@ -4091,21 +4268,32 @@ impl Services {
         // Two spare buckets cover a truncated leading bucket and the unfinished
         // trailing bucket. Even a full trading day contains at most 288 5m bars.
         let raw_limit = aggregation_raw_limit(tf, limit);
-        let raw = repo::raw_klines_tail(db, symbol, raw_limit).await?;
+        let raw = match trace_id {
+            Some(trace) => repo::profiled_chart_klines(db, symbol, "5m", raw_limit, None, true, trace).await?,
+            None => repo::raw_klines_tail(db, symbol, raw_limit).await?,
+        };
         log_chart_sql(trace_id, sql_started, raw.len());
         let aggregate_started = Instant::now();
-        let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
-        let derived = aggregate(&bars, tf);
-        let mut bars: Vec<Bar> = derived
-            .iter()
-            .filter(|r| r.datetime <= raw_cutoff)
-            .filter_map(fetch_to_bar)
-            .collect();
-        mark_rollover_bars(&mut bars, &rollovers, tf.as_str());
-        let rows: Vec<KlineDto> = bars
-            .iter()
-            .map(|b| bar_to_kline_dto(symbol, tf.as_str(), "derived", b))
-            .collect();
+        let large_read = raw.len() >= 4096 && trace_id.is_some();
+        let symbol = symbol.to_owned();
+        let build = move || {
+            let bars: Vec<Kline> = raw.iter().map(model_to_fetch).collect();
+            let derived = aggregate(&bars, tf);
+            let mut bars: Vec<Bar> = derived.iter()
+                .filter(|r| r.datetime <= raw_cutoff)
+                .filter_map(fetch_to_bar).collect();
+            mark_rollover_bars(&mut bars, &rollovers, tf.as_str());
+            bars.iter().map(|b| bar_to_kline_dto(&symbol, tf.as_str(), "derived", b)).collect()
+        };
+        let rows: Vec<KlineDto> = if large_read {
+            let permit = CHART_AGGREGATION.acquire().await?;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                build()
+            }).await?
+        } else {
+            build()
+        };
         if let Some(trace_id) = trace_id {
             tracing::info!(
                 trace_id,
@@ -4130,7 +4318,7 @@ impl Services {
         tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), primary = %config.data_source.primary_source, "K线服务配置读取完成");
         let primary_is_tq = config.data_source.primary_source == "tqsdk";
         if !primary_is_tq {
-            let rows = self
+            let (rows, revision) = self
                 .timed_chart_rows(symbol, timeframe, limit, trace_id)
                 .await?;
             tracing::info!(
@@ -4141,6 +4329,7 @@ impl Services {
             );
             return Ok(ChartKlineResponse {
                 rows,
+                series_revision: Some(revision),
                 status: if config.data_source.primary_source == "offline" {
                     "offline_snapshot"
                 } else {
@@ -4158,39 +4347,20 @@ impl Services {
 
         self.live_chart.request(symbol);
 
-        // 健康检查有自己的冷却与连续成功策略，避免短暂抖动时反复切换。
-        let tq_ready = self.data_source.tq_available_or_probe().await;
-        tracing::info!(
-            trace_id,
-            elapsed_ms = started.elapsed().as_millis(),
-            tq_ready,
-            "K线天勤健康检查完成"
-        );
+        let tq_ready = self.data_source.tq_is_available();
+        if !tq_ready {
+            self.data_source.request_chart_health_probe().await;
+        }
+        tracing::info!(trace_id, elapsed_ms = started.elapsed().as_millis(), tq_ready,
+            "K线天勤健康检查完成");
 
         if tq_ready {
-            let had_fallback = self.chart_fallback_cache.lock().await.contains_key(symbol);
-            let mut recovery_pending = false;
-            let mut recovery_message = String::new();
-            if had_fallback {
-                tracing::info!(trace_id, "K线历史回退缺口恢复开始");
-                match self.recover_chart_gap(symbol).await {
-                    Ok(()) => {
-                        self.chart_fallback_cache.lock().await.remove(symbol);
-                        tracing::info!(
-                            trace_id,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "K线历史回退缺口恢复完成"
-                        );
-                    }
-                    Err(error) => {
-                        recovery_pending = true;
-                        recovery_message = format!("天勤已恢复，但缺口同步失败：{error:#}");
-                        tracing::warn!(symbol, "图表临时数据恢复同步失败: {error:#}");
-                    }
-                }
+            let recovery_pending = self.chart_fallback_cache.lock().await.contains_key(symbol);
+            if recovery_pending {
+                self.request_chart_recovery(symbol).await;
             }
 
-            let rows = self
+            let (rows, revision) = self
                 .timed_chart_rows(symbol, timeframe, limit, trace_id)
                 .await?;
             tracing::info!(
@@ -4218,6 +4388,7 @@ impl Services {
 
             return Ok(ChartKlineResponse {
                 rows,
+                series_revision: Some(revision),
                 status: if recovery_pending {
                     "tqsdk_recovery_pending".to_string()
                 } else {
@@ -4225,18 +4396,22 @@ impl Services {
                 },
                 message: if partial_bar.is_none()
                     && crate::scheduler::is_symbol_trading_time(symbol, &now)
-                    && recovery_message.is_empty()
+                    && !recovery_pending
                 {
                     "历史数据已获取，实时柱正在准备；就绪后自动推送更新。".into()
                 } else {
-                    recovery_message
+                    if recovery_pending {
+                        "天勤已恢复，正在后台补齐缺口；当前显示已入库历史。".into()
+                    } else {
+                        String::new()
+                    }
                 },
                 partial_bar,
             });
         }
 
         if !config.data_source.fallback_enabled {
-            let rows = self
+            let (rows, revision) = self
                 .timed_chart_rows(symbol, timeframe, limit, trace_id)
                 .await?;
             tracing::info!(
@@ -4257,6 +4432,7 @@ impl Services {
             }
             return Ok(ChartKlineResponse {
                 rows,
+                series_revision: Some(revision),
                 status: "tq_unavailable".to_string(),
                 message: "天勤暂不可用，已关闭新浪临时图表回退；当前仅显示本地最后一段数据。"
                     .to_string(),
@@ -4293,7 +4469,8 @@ impl Services {
                     elapsed_ms = started.elapsed().as_millis(),
                     "新浪临时图表获取失败，回退本地历史K线: {error:#}"
                 );
-                self.local_chart_fallback(symbol, timeframe, limit).await
+                self.local_chart_fallback(symbol, timeframe, limit, trace_id)
+                    .await
             }
             Err(_) => {
                 tracing::warn!(
@@ -4303,7 +4480,8 @@ impl Services {
                     elapsed_ms = started.elapsed().as_millis(),
                     "新浪临时图表超过2秒，回退本地历史K线"
                 );
-                self.local_chart_fallback(symbol, timeframe, limit).await
+                self.local_chart_fallback(symbol, timeframe, limit, trace_id)
+                    .await
             }
         }
     }
@@ -4313,8 +4491,11 @@ impl Services {
         symbol: &str,
         timeframe: &str,
         limit: Option<usize>,
+        trace_id: &str,
     ) -> Result<ChartKlineResponse> {
-        let rows = self.get_klines(symbol, timeframe, limit).await?;
+        let (rows, revision) = self
+            .timed_chart_rows(symbol, timeframe, limit, trace_id)
+            .await?;
         let latest = rows
             .last()
             .map(|row| row.ts.as_str())
@@ -4322,6 +4503,7 @@ impl Services {
         Ok(ChartKlineResponse {
             message: format!("实时数据源响应缓慢，当前显示本地已入库历史K线（截至 {latest}）；请勿作为实时行情使用。"),
             rows,
+            series_revision: Some(revision),
             status: "tq_unavailable".to_string(),
             partial_bar: None,
         })
@@ -4348,11 +4530,12 @@ impl Services {
                 .client
                 .fetch_minute(symbol, "5", CHART_FALLBACK_COUNT)
                 .await?;
-            let local = repo::raw_klines(&self.db, symbol)
-                .await?
-                .iter()
-                .map(model_to_fetch)
-                .collect::<Vec<_>>();
+            let local = match (bars_5m.iter().map(|bar| bar.datetime.as_str()).min(),
+                bars_5m.iter().map(|bar| bar.datetime.as_str()).max()) {
+                (Some(first), Some(last)) => repo::raw_klines_window(&self.chart_db, symbol, first, last)
+                    .await?.iter().map(model_to_fetch).collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
             let (status, message) = compare_chart_sources(&local, &bars_5m);
             let entry = ChartFallbackCache {
                 bars_5m,
@@ -4387,7 +4570,7 @@ impl Services {
             })
             .collect();
 
-        let mut local_rows = self.get_klines(symbol, timeframe, limit).await?;
+        let mut local_rows = Self::read_chart_rows(&self.chart_db, symbol, timeframe, limit, None).await?;
         if let Some(first_temp_ts) = temp_rows.first().map(|row| row.ts.as_str()) {
             // 异常模式允许视觉拼接，但用新浪最近100根替换同时间窗口，避免重复时间戳。
             local_rows.retain(|row| row.ts.as_str() < first_temp_ts);
@@ -4416,6 +4599,7 @@ impl Services {
 
         Ok(ChartKlineResponse {
             rows,
+            series_revision: None,
             status: entry.status,
             message,
             partial_bar: None,
@@ -4542,26 +4726,6 @@ impl Services {
         self.live_chart.get(symbol, tf, now.naive_local())
     }
 
-    /// 天勤恢复后只补本地实际缺口加20根重叠数据，不固定重拉500/1000根。
-    async fn recover_chart_gap(&self, symbol: &str) -> Result<()> {
-        let latest = repo::latest_ts(&self.db, symbol, "5m").await?;
-        let count = if let Some(latest_ts) = latest {
-            let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let gap_minutes = ts_gap_minutes(&now, &latest_ts).unwrap_or(0).max(0);
-            ((gap_minutes / 5) as usize + 20).clamp(20, 300)
-        } else {
-            100
-        };
-
-        let tq = self.data_source.tq_client().await;
-        let rows = tq.fetch_minute(symbol, "5", count).await?;
-        if rows.is_empty() {
-            return Err(anyhow!("天勤恢复同步未返回已定版K线"));
-        }
-        self.pipeline.process_raw_batch(symbol, &rows).await?;
-        Ok(())
-    }
-
     /// 当前周期长期趋势线：逐根 MA20 及方向，供图表叠加参考线使用。
     pub async fn trend_series(
         &self,
@@ -4573,6 +4737,7 @@ impl Services {
         // with the visible tail instead of reading and calculating all history.
         let bars = self
             .bars_for_tail(
+                &self.chart_db,
                 symbol,
                 timeframe,
                 limit.map(|n| n.saturating_add(ATR_PERIOD)),
@@ -5787,6 +5952,25 @@ impl Services {
     }
 }
 
+fn chart_tail_is_contiguous(symbol: &str, previous: &str, incoming: &str) -> bool {
+    let (Some(previous), Some(incoming)) = (parse_local_ts(previous), parse_local_ts(incoming))
+    else {
+        return false;
+    };
+    // A replay/correction at or behind the existing tail needs a baseline.
+    if incoming <= previous || incoming - previous > ChronoDuration::days(7) {
+        return false;
+    }
+    let mut at = previous + ChronoDuration::minutes(5);
+    while at < incoming {
+        if crate::scheduler::expected_5m_close(symbol, at) {
+            return false;
+        }
+        at += ChronoDuration::minutes(5);
+    }
+    at == incoming
+}
+
 fn aggregation_raw_limit(tf: Timeframe, limit: Option<usize>) -> Option<usize> {
     limit.map(|n| {
         n.saturating_add(2)
@@ -6389,6 +6573,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analysis_history_ignores_unrelated_period_changes_and_repairs_the_tail() {
+        let db = crate::storage::connect(std::path::Path::new(":memory:")).await.unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(db.clone(), config, "chart-series-test.json".into()).await.unwrap();
+        let first = chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        let bar = |minutes, price| {
+            let ts = first + chrono::Duration::minutes(minutes);
+            source_test_bar(&ts.format("%Y-%m-%d %H:%M:%S").to_string(), price)
+        };
+        let mut initial = Vec::new();
+        for index in 0..26 {
+            let sample = bar(index * 15, 100. + index as f64);
+            initial.push(fetch_to_model("RB0", "5m", "raw", &sample));
+            initial.push(fetch_to_model("RB0", "15m", "derived", &sample));
+        }
+        repo::upsert_klines(&db, initial).await.unwrap();
+        let derived_before = services.shared_bars_for("RB0", "15m").await.unwrap();
+        let raw_before = services.shared_raw_for("RB0").await.unwrap();
+        repo::upsert_klines(&db, vec![fetch_to_model("RB0", "5m", "raw", &bar(380, 126.))]).await.unwrap();
+        let derived_after = services.shared_bars_for("RB0", "15m").await.unwrap();
+        assert!(Arc::ptr_eq(&derived_before, &derived_after));
+        let raw_after = services.shared_raw_for("RB0").await.unwrap();
+        assert_eq!(raw_after.len(), raw_before.len() + 1);
+        assert_eq!(raw_after.last().unwrap().close, 126.);
+        repo::upsert_klines(&db, vec![fetch_to_model("RB0", "15m", "derived", &bar(45, 105.5))]).await.unwrap();
+        let corrected = services.shared_bars_for("RB0", "15m").await.unwrap();
+        let baseline = services.bars_for_tail(&db, "RB0", "15m", None).await.unwrap();
+        assert_eq!(corrected[3].close, 105.5);
+        assert_eq!(
+            corrected.iter().map(|bar| (bar.dt, bar.close)).collect::<Vec<_>>(),
+            baseline.iter().map(|bar| (bar.dt, bar.close)).collect::<Vec<_>>(),
+        );
+        assert_eq!(derived_before[3].close, 103.);
+    }
+
+    #[tokio::test]
     async fn chart_tail_and_ma_match_full_history_across_session_boundaries() {
         let db = crate::storage::connect(std::path::Path::new(":memory:"))
             .await
@@ -6535,6 +6756,120 @@ mod tests {
             services.get_klines("RB0", "15m", None).await.unwrap()[0].close,
             105.0
         );
+    }
+
+    #[tokio::test]
+    async fn chart_closures_publish_a_version_chain_and_invalidate_on_corrections_or_gaps() {
+        async fn push(
+            services: &Services,
+            event: &ClosedBarEvent,
+        ) -> Option<n_protocol::dto::ChartHistoryUpdate> {
+            let closure = services.store_tq_chart_closure(event).await.unwrap()?;
+            Some(services.chart_history_update(closure).await)
+        }
+
+        let db = crate::storage::connect(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let mut config = Config::default();
+        config.data_source.primary_source = "offline".into();
+        let services = Services::new(
+            db,
+            config,
+            std::env::temp_dir().join("chart-history-patch-test.json"),
+        )
+        .await
+        .unwrap();
+        services.seed_symbols("RB0").await.unwrap();
+        services
+            .process_raw_batch(
+                "RB0",
+                &[
+                    source_test_bar("2026-01-05 09:05:00", 100.0),
+                    source_test_bar("2026-01-05 09:10:00", 101.0),
+                    source_test_bar("2026-01-05 09:15:00", 102.0),
+                    source_test_bar("2026-01-05 09:20:00", 103.0),
+                ],
+            )
+            .await
+            .unwrap();
+        let initial = services
+            .get_chart_klines("RB0", "15m", Some(1200), "initial")
+            .await
+            .unwrap();
+        let event = |end: &str, price| ClosedBarEvent {
+            event_id: 1,
+            event_type: "bar_closed".into(),
+            source: "tqsdk".into(),
+            proof: crate::fetch::tq_client::BarCloseProof::NextBarStarted,
+            symbol: "RB0".into(),
+            tq_symbol: "KQ.m@SHFE.rb".into(),
+            period: "5m".into(),
+            bar_end: end.into(),
+            next_bar_start: Some(end.into()),
+            kline: source_test_bar(end, price),
+            market_event_time: String::new(),
+            emitted_at: String::new(),
+            event_lag_ms: 0,
+        };
+        let first = push(&services, &event("2026-01-05 09:25:00", 104.0)).await
+            .unwrap();
+        assert_eq!(initial.series_revision, Some(first.previous_revision));
+        assert!(!first.full_reload_required);
+        assert_eq!(first.bars.len(), 1);
+        assert_eq!(first.bars[0].timeframe, "5m");
+
+        let closed = event("2026-01-05 09:30:00", 105.0);
+        let second = push(&services, &closed).await.unwrap();
+        assert_eq!(first.series_revision, second.previous_revision);
+        assert!(!second.full_reload_required);
+        let after = services
+            .get_chart_klines("RB0", "15m", Some(1200), "after")
+            .await
+            .unwrap();
+        assert_eq!(after.series_revision, Some(second.series_revision));
+        let updated = second
+            .bars
+            .iter()
+            .find(|bar| bar.timeframe == "15m")
+            .unwrap();
+        assert_eq!(
+            *updated,
+            n_protocol::dto::KlineDto::from(after.rows.last().unwrap().clone())
+        );
+        assert!(push(&services, &closed).await.is_none());
+
+        let corrected = push(&services, &event("2026-01-05 09:10:00", 108.0)).await
+            .unwrap();
+        assert!(corrected.full_reload_required);
+        assert!(corrected.bars.is_empty());
+        let baseline = services
+            .get_chart_klines("RB0", "15m", Some(1200), "correction")
+            .await
+            .unwrap();
+        assert_eq!(baseline.series_revision, Some(corrected.series_revision));
+        assert!(baseline.rows[0].high > initial.rows[0].high);
+
+        let missed = push(&services, &event("2026-01-05 09:40:00", 106.0)).await
+            .unwrap();
+        assert!(missed.full_reload_required);
+        let pending = services
+            .store_tq_chart_closure(&event("2026-01-05 09:45:00", 109.0))
+            .await
+            .unwrap()
+            .unwrap();
+        services
+            .process_raw_batch("RB0", &[source_test_bar("2026-01-05 09:10:00", 110.0)])
+            .await
+            .unwrap();
+        let crossed = services.chart_history_update(pending).await;
+        assert!(crossed.full_reload_required);
+        assert!(crossed.bars.is_empty());
+        assert!(chart_tail_is_contiguous(
+            "RB0",
+            "2026-01-05 11:30:00",
+            "2026-01-05 13:35:00"
+        ));
     }
 
     #[tokio::test]

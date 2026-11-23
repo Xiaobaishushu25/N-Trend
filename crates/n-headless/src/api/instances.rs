@@ -207,7 +207,7 @@ pub async fn action(
                 Action::Strategy { strategy } => r.engine.set_definition(strategy).await?,
                 Action::P3RunnerComparison { enabled } => {
                     r.engine.set_p3_runner_comparison(enabled).await?;
-                    *r.published.write().await = Value::Null;
+                    *r.published.write().await = Default::default();
                 }
                 Action::Confirm { condition_id } => {
                     anyhow::ensure!(
@@ -241,7 +241,7 @@ pub async fn action(
                     r.engine
                         .close_managed_position(&position_id, volume, reason, note)
                         .await?;
-                    *r.published.write().await = Value::Null;
+                    *r.published.write().await = Default::default();
                 }
                 Action::UpdateTradeRecord {
                     trade_id,
@@ -251,11 +251,11 @@ pub async fn action(
                     r.engine
                         .update_trade_record(&trade_id, user_note, exit_reason)
                         .await?;
-                    *r.published.write().await = Value::Null;
+                    *r.published.write().await = Default::default();
                 }
                 Action::SyncBrokerPositions => {
                     r.engine.sync_broker_positions().await?;
-                    *r.published.write().await = Value::Null;
+                    *r.published.write().await = Default::default();
                 }
             }
             Ok(json!({"instance_id":id,"accepted":true}))
@@ -277,7 +277,7 @@ pub async fn comparison(
         async {
             let to = q.to.unwrap_or_else(|| chrono::Utc::now().timestamp());
             manager(&ctx)?
-                .comparison(q.from.unwrap_or(to - 30 * 86400), to)
+                .comparison(q.from.unwrap_or_else(|| to.saturating_sub(30 * 86400)), to)
                 .await
         }
         .await,
@@ -408,7 +408,8 @@ mod tests {
             "conditions":vec![json!({"id":"condition","frozen":{
                 "evidence":"immutable strategy evidence", "prices":[100,101,102]
             }});2000]});
-        *runtime.published.write().await = fixture.clone();
+        *runtime.published.write().await =
+            n_protocol::trader_stream::SharedTraderSnapshot::from_value(fixture.clone());
         for encoding in ["identity", "gzip"] {
             let request = Request::builder()
                 .uri(format!("/api/v2/trader/instances/{id}/snapshot"))
@@ -445,7 +446,7 @@ mod tests {
             let decoded: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(decoded["data"], fixture);
         }
-        *runtime.published.write().await = Value::Null;
+        *runtime.published.write().await = Default::default();
         let (_, snapshot) = call(
             &router,
             "GET",

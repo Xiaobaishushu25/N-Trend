@@ -47,6 +47,17 @@ pub struct KlineDto {
     pub rollover: bool,
 }
 
+/// A symbol-wide transition. Bars are finalized for their own timeframe.
+/// An empty patch can still advance the revision while a larger bucket forms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChartHistoryUpdate {
+    pub symbol: String,
+    pub previous_revision: i64,
+    pub series_revision: i64,
+    pub full_reload_required: bool,
+    pub bars: Vec<KlineDto>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChartKlineResponse {
     pub rows: Vec<KlineDto>,

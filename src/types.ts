@@ -50,7 +50,16 @@ export interface ChartKlineResponse {
   rows: KlineRow[]
   status: 'tqsdk' | 'tq_unavailable' | 'sina_consistent' | 'sina_mismatch' | 'sina_unverified' | 'tqsdk_recovery_pending' | string
   message: string
+  series_revision?: number | null
   partial_bar?: KlineRow | null
+}
+
+export interface ChartHistoryUpdate {
+  symbol: string
+  previous_revision?: number
+  series_revision?: number
+  full_reload_required: boolean
+  bars?: KlineRow[]
 }
 
 /** 当前周期 MA20 长期趋势线的一个数据点 */
@@ -380,6 +389,7 @@ export interface SymbolScanDelta {
 export interface RefreshStats {
   succeeded: number
   failures: number
+  history_revisions?: Record<string, number>
 }
 
 export interface EmailSettings {
@@ -1107,6 +1117,7 @@ export interface ExecutionOrdersPage {
 
 export interface StrategyComparisonSummary {
   p3_runner?: P3RunnerComparison
+  p3_stall?: P3StallComparison
   archive_error?: string | null
   active_run: string | null
   archived_runs: number
@@ -1130,6 +1141,36 @@ export interface StrategyComparisonSummary {
       observed_at: number; risk_ticks: number | null; quote_gap_count: number
       variants: Array<{ id: string; status: string; reason: string }>
     }>
+  }>
+}
+
+export interface P3StallComparison {
+  version: string
+  observed: number
+  active: number
+  triggered: number
+  paired: number
+  unavailable: number
+  target_later: number
+  delta_net_r: number
+  recent: Array<{
+    id: string
+    instrument: string
+    event_id: number | null
+    open: boolean
+    opened_at: number
+    target_seen: boolean
+    s1: number
+    target: number
+    signal: { bar_at: number; confirmed_at: number; close: number; peak_r: number } | null
+    reference: {
+      quote_at: number; opposite_price: number; one_tick_price: number; two_tick_price: number
+      one_tick_net_r: number; two_tick_net_r: number
+    } | null
+    actual: { price: number; at: string; reason: string; net_r: number | null } | null
+    unavailable: string | null
+    delta_net_r: number | null
+    target_later: boolean
   }>
 }
 

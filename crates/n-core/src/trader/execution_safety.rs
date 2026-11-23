@@ -2,6 +2,10 @@
 use super::*;
 
 impl ExecutionOrder {
+    fn clean_rejection(&self) -> bool {
+        self.phase == OrderPhase::Rejected && self.filled == 0 && self.reported_filled == 0
+    }
+
     pub(super) fn settled(&self) -> bool {
         matches!(self.phase, OrderPhase::Terminal | OrderPhase::Rejected)
             && self.filled >= self.reported_filled
@@ -18,7 +22,131 @@ impl ExecutionOrder {
     }
 }
 
+pub(super) enum RejectionWait {
+    Seat {
+        submitted_at: i64,
+    },
+    Price {
+        submitted_at: i64,
+        rejected_price: f64,
+        rejected_trading_day: String,
+        is_exit: bool,
+    },
+}
+
+impl RejectionWait {
+    pub(super) fn waiting(
+        &self,
+        q: &ExecutionQuote,
+        price: f64,
+        now: i64,
+        orders_synced_at: f64,
+        trading_day: &str,
+    ) -> bool {
+        let can_check_again = |submitted_at: i64| {
+            now >= submitted_at.saturating_add(15)
+                && orders_synced_at > submitted_at as f64
+                && q.timestamp > submitted_at
+        };
+        match self {
+            Self::Seat { submitted_at } => {
+                // A healthy local bridge does not prove its trading seat is
+                // connected. Recheck at most once per 15s after a fresh query.
+                !can_check_again(*submitted_at)
+            }
+            Self::Price {
+                submitted_at,
+                rejected_price,
+                rejected_trading_day,
+                is_exit,
+            } => {
+                let new_band = !trading_day.is_empty()
+                    && !rejected_trading_day.is_empty()
+                    && trading_day != rejected_trading_day;
+                let repriced = (price - rejected_price).abs() >= q.tick * 0.5;
+                // A protective exit must still be able to probe a pinned
+                // price after reconciliation, even if the book cannot reprice.
+                q.timestamp <= *submitted_at
+                    || !(repriced || new_band || *is_exit && can_check_again(*submitted_at))
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RejectionWaits {
+    pub(super) entry: Option<RejectionWait>,
+    pub(super) exit: Option<RejectionWait>,
+}
+
+pub(super) struct Rejections {
+    pub(super) entries: HashSet<String>,
+    pub(super) waits: HashMap<String, RejectionWaits>,
+}
+
 impl ExecutionState {
+    pub(super) fn rejected_submission_state(&self) -> Arc<Rejections> {
+        self.orders
+            .rejections
+            .get_or_init(|| Arc::new(self.inspect_order_rejections()))
+            .clone()
+    }
+
+    fn inspect_order_rejections(&self) -> Rejections {
+        let mut last = HashMap::new();
+        let mut rejected_entries = HashSet::new();
+        for (reference, order) in self.orders.iter() {
+            let is_exit = order.reason.is_some();
+            if !is_exit && order.clean_rejection() {
+                rejected_entries.insert(order.condition_id.as_str());
+            }
+            let submitted_at = if order.submitted_at > 0 {
+                order.submitted_at
+            } else {
+                order.action_at
+            };
+            let sequence = (
+                submitted_at,
+                reference.parse::<u64>().unwrap_or_default(),
+                reference.as_str(),
+            );
+            let latest = last
+                .entry((order.condition_id.as_str(), is_exit))
+                .or_insert((sequence, order));
+            if sequence > latest.0 {
+                *latest = (sequence, order);
+            }
+        }
+        let mut waits = HashMap::<_, RejectionWaits>::new();
+        for ((id, is_exit), ((submitted_at, _, _), order)) in last {
+            if !order.clean_rejection() {
+                continue;
+            }
+            let wait = if order.note.contains("该交易席位未连接到交易所") {
+                RejectionWait::Seat { submitted_at }
+            } else if order.note.contains("报单价格不在涨跌停板价范围内") {
+                RejectionWait::Price {
+                    submitted_at,
+                    rejected_price: order.request.price,
+                    rejected_trading_day: order.trading_day.clone(),
+                    is_exit,
+                }
+            } else {
+                continue;
+            };
+            let sides = waits.entry(id.to_owned()).or_default();
+            if is_exit {
+                sides.exit = Some(wait);
+            } else {
+                sides.entry = Some(wait);
+            }
+        }
+        Rejections {
+            entries: rejected_entries.into_iter().map(str::to_owned).collect(),
+            waits,
+        }
+    }
+
     pub(super) fn close_reservation(&self, id: &str) -> i32 {
         self.orders
             .values()
@@ -43,18 +171,21 @@ impl ExecutionEngine {
         reason: &str,
         reference: f64,
         volume: Option<i32>,
-    ) {
-        s.abort_entry(id);
+    ) -> bool {
+        let mut changed = s.abort_entry(id);
         let qty = s.positions.get(id).map(|p| p.volume).unwrap_or(0);
         let all = volume.is_none();
-        let task = s.closes.entry(id.into()).or_insert_with(|| CloseTask {
-            reason: reason.into(),
-            target: volume.unwrap_or(qty).min(qty),
-            filled: 0,
-            reference,
-            attempts: 0,
-            all,
-            note: None,
+        let task = s.closes.entry(id.into()).or_insert_with(|| {
+            changed = true;
+            CloseTask {
+                reason: reason.into(),
+                target: volume.unwrap_or(qty).min(qty),
+                filled: 0,
+                reference,
+                attempts: 0,
+                all,
+                note: None,
+            }
         });
         // A repeated partial-close request is the same task, not another lot.
         // A full exit may enlarge the task, but a profit request cannot demote it.
@@ -62,14 +193,23 @@ impl ExecutionEngine {
             if !task.all || priority(reason) > priority(&task.reason) {
                 task.reason = reason.into();
                 task.reference = reference;
+                changed = true;
             }
+            let target = task.target.max(task.filled.saturating_add(qty));
+            changed |= !task.all || task.target != target;
             task.all = true;
-            task.target = task.target.max(task.filled.saturating_add(qty));
+            task.target = target;
         }
         if let Some(c) = s.conditions.get_mut(id) {
-            c.state = ConditionState::Closing;
-            c.note = format!("退出任务已锁定: {}", task.reason);
+            if c.state != ConditionState::Closing
+                || c.note.strip_prefix("退出任务已锁定: ") != Some(task.reason.as_str())
+            {
+                c.state = ConditionState::Closing;
+                c.note = format!("退出任务已锁定: {}", task.reason);
+                changed = true;
+            }
         }
+        changed
     }
 
     pub(super) fn latch_exit_with_note(

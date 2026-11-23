@@ -10,27 +10,24 @@ use crate::trader::{
 use std::collections::BTreeMap;
 
 #[tokio::test]
-async fn p3_timeout_distinguishes_a_delayed_report_from_an_actual_late_fill() {
-    for (risk, terminal_status, trade_time, market_gap, expected_exit) in [
-        (60., "all_traded", "10:00:00", false, None),
-        (20., "canceled", "10:00:02", false, None),
-        (
-            60.,
-            "all_traded",
-            "10:00:03",
-            false,
-            Some("late_entry_fill"),
-        ),
-        (60., "all_traded", "", false, Some("late_entry_fill")),
-        (60., "all_traded", "10:00:00", true, Some("market_gap")),
+async fn p3_timeout_keeps_confirmed_fills_under_normal_position_management() {
+    for (filled, terminal_status, trade_time, market_gap, expected_exit) in [
+        (2, "all_traded", "10:00:00", false, None),
+        (1, "canceled", "10:00:02", false, None),
+        (2, "all_traded", "10:00:03", false, None),
+        (1, "canceled", "10:00:04", false, None),
+        (2, "all_traded", "", false, Some("late_entry_fill")),
+        (2, "all_traded", "10:00:03", true, Some("market_gap")),
     ] {
         let counter = Counter::new();
         let e = engine(&counter, ExitMode::HybridS1).await;
+        let risk = 20.;
         send(&e, signal("entry-timeout", true, risk, 2. * risk)).await;
         quote(&e, 1000.).await;
         age(&e).await;
         quote(&e, 999.).await;
         let open = counter.inserts()[0].clone();
+        assert_eq!(open["volume"], 2);
         let id = e.list_conditions().await[0].id.clone();
         let submitted = candidates::parse_time("2026-10-16 10:00:00").unwrap();
         {
@@ -43,24 +40,25 @@ async fn p3_timeout_distinguishes_a_delayed_report_from_an_actual_late_fill() {
             "/order/cancel"
         );
         assert!(e.state.lock().await.entry_timeouts.contains_key(&id));
-        let order_status = vec![order(&open, terminal_status, 1)];
+        let order_status = vec![order(&open, terminal_status, filled)];
         // The terminal order report may arrive before its trade, even across a restart.
         ready(&e, order_status.clone(), vec![]).await;
         assert!(e.state.lock().await.entry_timeouts.contains_key(&id));
         if market_gap {
             e.quote_gap().await.unwrap();
+            assert!(!e.state.lock().await.entry_timeouts.contains_key(&id));
         }
         drop(e);
 
         let mut e = counter.engine(ExecutionMode::FullAuto, 2);
         e.registry = registry();
-        let mut fill = trade(&open, "delayed-open-report", 1, 998.);
+        let mut fill = trade(&open, "delayed-open-report", filled, 998.);
         fill["trade_time"] = json!(trade_time);
         ready(&e, order_status.clone(), vec![fill.clone()]).await;
         ready(&e, order_status, vec![fill]).await;
         {
             let s = e.state.lock().await;
-            assert_eq!(s.positions[&id].volume, 1);
+            assert_eq!(s.positions[&id].volume, filled);
             assert_eq!(
                 s.closes.get(&id).map(|task| task.reason.as_str()),
                 expected_exit
@@ -73,11 +71,11 @@ async fn p3_timeout_distinguishes_a_delayed_report_from_an_actual_late_fill() {
             if expected_exit.is_some() { 2 } else { 1 }
         );
         if expected_exit.is_none() {
-            assert_eq!(e.list_conditions().await[0].volume, 1);
+            assert_eq!(e.list_conditions().await[0].volume, filled);
             age(&e).await;
             quote(&e, 1000. + risk).await;
             assert_eq!(e.state.lock().await.closes[&id].reason, "stop");
-            assert_eq!(counter.inserts()[1]["volume"], 1);
+            assert_eq!(counter.inserts()[1]["volume"], filled);
         }
     }
 }
@@ -651,7 +649,7 @@ async fn p3_runner_comparison_continues_both_lanes_after_external_close() {
             hold: 1.,
         })
         .collect();
-    e.on_p3_runner_history("SHFE.pb2611", &bars).await.unwrap();
+    e.on_p3_shadow_history("SHFE.pb2611", &bars).await.unwrap();
     clock.advance(at + 2).unwrap();
     let mut external = trade(
         &json!({"order_ref":"external", "direction":"buy", "offset":"close"}),
@@ -684,7 +682,7 @@ async fn p3_runner_comparison_continues_both_lanes_after_external_close() {
     assert_eq!(row["first_fill"]["price"], 971.);
     assert_eq!(row["base"]["price"], 951.);
     assert_eq!(row["dynamic"]["price"], 932.);
-    assert!(e.p3_runner_history_symbols().await.is_empty());
+    assert!(e.p3_shadow_history_symbols().await.is_empty());
     assert_eq!(counter.inserts().len(), 1);
     drop(e);
     let restarted = counter.engine(ExecutionMode::FullAuto, 2);
@@ -692,6 +690,117 @@ async fn p3_runner_comparison_continues_both_lanes_after_external_close() {
         restarted.comparison_summary().await["p3_runner"],
         *comparison
     );
+}
+
+#[tokio::test]
+async fn p3_single_stall_pairs_the_next_book_with_real_exit_without_submitting() {
+    use crate::fetch::kline::Kline;
+
+    for (short, exit_r, exit_reason) in [(false, 1., "target_1r"), (true, -1., "stop")] {
+        let counter = Counter::new();
+        // Simulate a database written before the shadow field existed.
+        drop(counter.engine(ExecutionMode::FullAuto, 2));
+        rusqlite::Connection::open(counter.directory.join("trader_execution.sqlite3"))
+            .unwrap()
+            .execute("DELETE FROM execution_fields WHERE field='p3_stall'", [])
+            .unwrap();
+        let mut e = engine(&counter, ExitMode::FixedS1).await;
+        let at = candidates::parse_time("2026-10-16 10:00:00").unwrap();
+        let clock = Arc::new(ReplayClock::new(at));
+        e.clock = clock.clone();
+        let mut params = parameters(ExitMode::FixedS1);
+        params.max_lots = 1;
+        params.min_net_rr = 0.1;
+        e.configure_strategy(p3::definition(params), e.get_config().await)
+            .await.unwrap();
+        e.state.lock().await.entry_funds = None;
+        let snapshot = |orders, fills| {
+            json!({"bridge_online":true,
+                "health":{"ready":true,"logged_in":true,"sync_pending":false,"trading_day":"20261016","broker_id":"fake","user_id":"offline-test"},
+                "account":{"available":50000.,"curr_margin":0.,"updated_at":at},
+                "orders":orders,"trades":fills,"broker_positions":[]})
+        };
+        e.reconcile(&snapshot(Vec::<Value>::new(), Vec::<Value>::new())).await.unwrap();
+        let sign = if short { -1. } else { 1. };
+        let mut payload = signal("stall", short, 20., 12.);
+        let warning = candidates::label(at - 900);
+        payload["created_at_epoch"] = json!(at);
+        payload["warning_ts"] = json!(warning);
+        payload["warning_context"]["as_of"] = json!(warning);
+        send(&e, payload).await;
+        quote(&e, 1000.).await;
+        clock.advance(at + 1).unwrap();
+        age(&e).await;
+        quote(&e, 1000. + sign).await;
+        let open = counter.inserts()[0].clone();
+        assert_eq!(open["volume"], 1);
+        let entry = trade(&open, "stall-entry", 1, 1000.);
+        let orders = vec![order(&open, "all_traded", 1)];
+        e.reconcile(&snapshot(orders.clone(), vec![entry.clone()])).await.unwrap();
+        assert_eq!(e.comparison_summary().await["p3_stall"]["observed"], 1);
+        assert_eq!(e.p3_shadow_history_symbols().await, ["SHFE.pb2611".into()].into());
+
+        // The first partial 15m bucket cannot count as one of the stalled bars.
+        // The scheduled 10:15–10:30 recess does not consume a bar.
+        let bars = [5, 10, 15, 35, 40, 45, 50, 55, 60].map(|minutes| {
+            let peak = 1000. + sign * if minutes == 10 { 18. } else { 8. };
+            let close = 1000. + sign * 4.;
+            Kline { datetime: candidates::label(at + minutes * 60), open: close,
+                high: peak.max(close), low: peak.min(close), close, volume: 1., hold: 1. }
+        });
+        clock.advance(at + 55 * 60).unwrap();
+        e.on_p3_shadow_history("SHFE.pb2611", &bars).await.unwrap();
+        assert_eq!(e.comparison_summary().await["p3_stall"]["triggered"], 0);
+        clock.advance(at + 3602).unwrap();
+        e.on_p3_shadow_history("SHFE.pb2611", &bars).await.unwrap();
+        let triggered = &e.comparison_summary().await["p3_stall"];
+        assert_eq!(triggered["triggered"], 1);
+        assert_eq!(triggered["recent"][0]["signal"]["bar_at"], at + 3600);
+        assert_eq!(triggered["recent"][0]["signal"]["peak_r"], 0.9);
+        assert!(triggered["recent"][0]["reference"].is_null());
+
+        let book = |timestamp| ExecutionQuote {
+            instrument_id: "pb2611".into(), exchange_id: "SHFE".into(), underlying_symbol: "PB0".into(),
+            last: 1000. + sign * 4., bid: 999. + sign * 4., ask: 1001. + sign * 4.,
+            tick: 1., lower: 500., upper: 2000., timestamp,
+        };
+        clock.advance(at + 3603).unwrap();
+        e.on_quote_batch(vec![("PB0".into(), book(at + 3601))]).await.unwrap();
+        assert!(e.comparison_summary().await["p3_stall"]["recent"][0]["reference"].is_null());
+        e.on_quote_batch(vec![("PB0".into(), book(at + 3603))]).await.unwrap();
+        assert_eq!(counter.inserts().len(), 1);
+        assert!(e.state.lock().await.closes.is_empty());
+        let captured = e.comparison_summary().await["p3_stall"].clone();
+        assert_eq!(captured["recent"][0]["reference"]["one_tick_price"], 1000. + sign * 2.);
+        assert_eq!(captured["recent"][0]["reference"]["two_tick_price"], 1000. + sign);
+        assert!(e.p3_shadow_history_symbols().await.is_empty());
+
+        drop(e);
+        let mut e = counter.engine(ExecutionMode::FullAuto, 2);
+        e.registry = registry();
+        e.clock = clock.clone();
+        e.reconcile(&snapshot(orders.clone(), vec![entry.clone()])).await.unwrap();
+        assert_eq!(e.comparison_summary().await["p3_stall"], captured);
+        assert!(e.list_positions().await.iter().any(|p| !p.is_closed));
+        clock.advance(at + 3604).unwrap();
+        age(&e).await;
+        let real_price = 1000. + sign * 20. * exit_r;
+        quote(&e, real_price).await;
+        let close = counter.inserts()[1].clone();
+        let mut result = trade(&close, "stall-original-exit", 1, real_price);
+        result["trade_time"] = json!("11:00:04");
+        e.reconcile(&snapshot(vec![orders[0].clone(), order(&close, "all_traded", 1)], vec![entry, result]))
+            .await.unwrap();
+        let report = e.comparison_summary().await["p3_stall"].clone();
+        assert_eq!(report["paired"], 1);
+        assert_eq!(report["recent"][0]["actual"]["reason"], exit_reason);
+        assert_eq!(report["target_later"], usize::from(exit_r > 0.));
+        assert!((report["delta_net_r"].as_f64().unwrap() - (0.1 - exit_r)).abs() < 1e-8);
+        assert_eq!(report["recent"][0]["reference"], captured["recent"][0]["reference"]);
+        drop(e);
+        let restarted = counter.engine(ExecutionMode::FullAuto, 2);
+        assert_eq!(restarted.comparison_summary().await["p3_stall"], report);
+    }
 }
 
 #[tokio::test]

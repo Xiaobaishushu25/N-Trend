@@ -9,11 +9,12 @@ use n_core::notify::email::{
 };
 use n_core::scheduler::CloseScanMode;
 use n_core::service::{RefreshStats, ScanResult};
+use n_core::trader::model::{ExecutionQuote, ReceivedExecutionQuote};
 use n_protocol::NewNotificationHistoryItem;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-type QuoteBatch = Vec<(String, n_core::trader::model::ExecutionQuote)>;
+type QuoteBatch = Vec<ReceivedExecutionQuote>;
 
 /// Drain only the batches already waiting; retain every tick and its order.
 pub(crate) fn drain_quote_batches(
@@ -37,9 +38,9 @@ fn filter_quote_events(
 ) -> QuoteBatch {
     events
         .iter()
-        .filter(|(code, quote)| {
-            subscriptions.contains(&code.to_uppercase())
-                || subscriptions.contains(&quote.instrument_id.to_uppercase())
+        .filter(|event| {
+            subscriptions.contains(&event.symbol.to_uppercase())
+                || subscriptions.contains(&event.quote.instrument_id.to_uppercase())
         })
         .cloned()
         .collect()
@@ -81,10 +82,17 @@ async fn handle_market_unavailable(quote_ctx: &ServerContext) {
     }
 }
 
-async fn dispatch_quote_events(quote_ctx: &ServerContext, events: QuoteBatch) {
+async fn dispatch_quote_events(
+    quote_ctx: &ServerContext,
+    events: Vec<(String, ExecutionQuote)>,
+    received_at: i64,
+) {
     if events.is_empty() {
         return;
     }
+    let events = events.into_iter().map(|(symbol, quote)| ReceivedExecutionQuote {
+        symbol, quote, received_at,
+    }).collect();
     if let Some(manager) = quote_ctx.instances.get() {
         for r in manager.all().await {
             let mut subscriptions = r.engine.requested_contracts().await;
@@ -121,7 +129,7 @@ async fn dispatch_quote_events(quote_ctx: &ServerContext, events: QuoteBatch) {
         }
     }
     if quote_ctx.instances.get().is_none() {
-        if let Err(e) = quote_ctx.execution_engine.on_quote_batch(events).await {
+        if let Err(e) = quote_ctx.execution_engine.on_received_quote_batch(events).await {
             tracing::warn!("执行行情推进失败: {e}");
         }
     }
@@ -167,15 +175,39 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>, close_scan_mode: CloseScanMo
     spawn_scan_maintenance(ctx.clone(), close_scan_mode);
     spawn_quote_poller(ctx.clone());
     spawn_live_chart_publisher(ctx.clone());
+    spawn_chart_recovery_publisher(ctx.clone());
     spawn_tq_bar_event_consumer(ctx.clone(), scan_wake);
     spawn_tq_warmup(ctx.clone());
     spawn_trader_stream(ctx.clone());
     spawn_execution(ctx.clone());
-    spawn_p3_runner_history(ctx.clone());
+    spawn_p3_shadow_history(ctx.clone());
     crate::instance_runtime::spawn(ctx);
 }
 
-fn spawn_p3_runner_history(ctx: Arc<ServerContext>) {
+fn spawn_chart_recovery_publisher(ctx: Arc<ServerContext>) {
+    let mut updates = ctx.services.subscribe_chart_recovery();
+    let owner = Arc::downgrade(&ctx);
+    tokio::spawn(async move {
+        loop {
+            let update = updates.recv().await;
+            let Some(ctx) = owner.upgrade() else { break };
+            match update {
+                Ok(update) => {
+                    let symbol = update.symbol.clone();
+                    ctx.realtime_hub.broadcast_chart_history(
+                        ctx.next_event_seq(), &symbol, serde_json::json!(update),
+                    ).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    broadcast_data_updated(&ctx, 0, 0).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn spawn_p3_shadow_history(ctx: Arc<ServerContext>) {
     use std::collections::{BTreeMap, HashMap};
 
     use n_core::fetch::kline::Kline;
@@ -200,7 +232,7 @@ fn spawn_p3_runner_history(ctx: Arc<ServerContext>) {
             };
             let mut subscriptions = BTreeMap::<String, Vec<Arc<ExecutionEngine>>>::new();
             for engine in engines {
-                for symbol in engine.p3_runner_history_symbols().await {
+                for symbol in engine.p3_shadow_history_symbols().await {
                     subscriptions.entry(symbol).or_default().push(engine.clone());
                 }
             }
@@ -226,11 +258,10 @@ fn spawn_p3_runner_history(ctx: Arc<ServerContext>) {
                         }
                     }
                 }
-                if let Some((_, bars)) = history.get(&symbol) {
-                    for engine in watchers {
-                        if let Err(error) = engine.on_p3_runner_history(&symbol, bars).await {
-                            tracing::warn!(%symbol, %error, "P3余仓影子收盘行情保存失败");
-                        }
+                let bars = history.get(&symbol).map_or(&[][..], |(_, bars)| bars.as_slice());
+                for engine in watchers {
+                    if let Err(error) = engine.on_p3_shadow_history(&symbol, bars).await {
+                        tracing::warn!(%symbol, %error, "P3影子收盘行情保存失败");
                     }
                 }
             }
@@ -353,19 +384,14 @@ pub async fn register_execution_signals(
     let mut bar_times = std::collections::HashMap::new();
     let mut raw_bars = std::collections::HashMap::new();
     for code in &codes {
-        if let Ok(bars) = ctx.services.bars_for(code, "15m").await {
+        if let Ok(bars) = ctx.services.shared_bars_for(code, "15m").await {
             bar_times.insert(
                 code.clone(),
                 bars.iter().map(|b| b.dt.to_bar_ts()).collect::<Vec<_>>(),
             );
         }
-        if let Ok(rows) = n_core::storage::repo::raw_klines(&ctx.db, code).await {
-            raw_bars.insert(
-                code.clone(),
-                rows.iter()
-                    .map(n_core::service::model_to_fetch)
-                    .collect::<Vec<_>>(),
-            );
+        if let Ok(rows) = ctx.services.shared_raw_for(code).await {
+            raw_bars.insert(code.clone(), rows);
         }
     }
     for signal in signals {
@@ -456,7 +482,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                     .quote_gap_with_reason("本实例行情消费队列已满")
                     .await;
             }
-            if let Err(e) = r.engine.on_quote_batch(events).await {
+            if let Err(e) = r.engine.on_received_quote_batch(events).await {
                 tracing::warn!("默认实例行情推进失败: {e}");
             }
             if processing_started.elapsed() >= Duration::from_millis(250) {
@@ -541,6 +567,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                     let tq = quote_ctx.services.data_source.tq_client().await;
                     match tq.execution_events(&codes, cursor, &stream_id).await {
                         Ok(batch) => {
+                            let received_at = chrono::Utc::now().timestamp();
                             let restarted = !stream_id.is_empty()
                                 && batch["stream_id"]
                                     .as_str()
@@ -577,7 +604,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                                     )
                                 })
                                 .collect();
-                            dispatch_quote_events(&quote_ctx, events).await;
+                            dispatch_quote_events(&quote_ctx, events, received_at).await;
                         }
                         Err(e) => {
                             handle_market_unavailable(&quote_ctx).await;
@@ -600,6 +627,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                     let _ = ctp.subscribe_market(&codes).await;
                     match ctp.fetch_market_ticks(&stream_id, cursor, 500).await {
                         Ok(batch) => {
+                            let received_at = chrono::Utc::now().timestamp();
                             let restarted = !stream_id.is_empty() && batch.stream_id != stream_id;
                             if batch.gap || restarted {
                                 let reason = if restarted {
@@ -617,8 +645,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                             cursor = batch.latest_seq_id;
                             handle_market_recovered(&quote_ctx).await;
 
-                            let mut events: QuoteBatch = Vec::new();
-                            let now_ts = chrono::Utc::now().timestamp();
+                            let mut events = Vec::new();
                             for ev in batch.events {
                                 match ev {
                                     n_core::trader::CtpMarketEvent::Status { ref status, .. } => {
@@ -663,7 +690,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                                         }
 
                                         if let Some(quote) = ev.to_execution_quote() {
-                                            if quote.valid_at(now_ts) {
+                                            if quote.valid_at(received_at) {
                                                 events.push((quote.instrument_id.to_uppercase(), quote));
                                             }
                                         }
@@ -671,7 +698,7 @@ fn spawn_execution(ctx: Arc<ServerContext>) {
                                     _ => {}
                                 }
                             }
-                            dispatch_quote_events(&quote_ctx, events).await;
+                            dispatch_quote_events(&quote_ctx, events, received_at).await;
                             if cursor == 0 {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                             }
@@ -768,9 +795,23 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                     if let Some(manager) = bridge_ctx.instances.get() {
                         manager.validate_snapshot("default", &snapshot).await?;
                     }
+                    let default_name = if let Some(manager) = bridge_ctx.instances.get() {
+                        if let Ok(r) = manager.get("default").await {
+                            let n = r.definition.name.trim();
+                            if !n.is_empty() {
+                                n.to_string()
+                            } else {
+                                "默认实盘".to_string()
+                            }
+                        } else {
+                            "默认实盘".to_string()
+                        }
+                    } else {
+                        "默认实盘".to_string()
+                    };
                     match bridge_ctx.execution_engine.reconcile(&snapshot).await {
                         Ok(evs) => {
-                            crate::instance_runtime::dispatch_live_trade_emails(&bridge_ctx, "默认实盘", evs);
+                            crate::instance_runtime::dispatch_live_trade_emails(&bridge_ctx, &default_name, evs);
                         }
                         Err(e) => {
                             tracing::error!("柜台状态恢复失败，执行任务未完成: {e}");
@@ -821,6 +862,7 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut publisher =
             n_protocol::trader_stream::TraderPublisher::new(uuid::Uuid::new_v4().to_string());
+        let mut fields = n_core::trader::execution::ExecutionSnapshotCache::default();
         let mut calendar_warnings = std::collections::HashSet::new();
         let mut last_sent = Instant::now();
         loop {
@@ -849,33 +891,29 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
                 }
                 let _ = manager.sample_equity("default", &snapshot).await;
             }
-            snapshot["config"] =
-                serde_json::to_value(ctx.execution_engine.get_config().await).unwrap_or_default();
-            snapshot["managed_positions"] =
-                serde_json::to_value(ctx.execution_engine.list_positions().await)
-                    .unwrap_or_default();
-            snapshot["conditions"] =
-                serde_json::to_value(ctx.execution_engine.list_conditions().await)
-                    .unwrap_or_default();
-            snapshot["history"] =
-                serde_json::to_value(ctx.execution_engine.get_trade_history().await)
-                    .unwrap_or_default();
-            snapshot["statistics"] =
-                serde_json::to_value(ctx.execution_engine.get_trade_statistics().await)
-                    .unwrap_or_default();
-            snapshot["execution_error"] =
-                serde_json::to_value(ctx.execution_engine.execution_error().await)
-                    .unwrap_or_default();
-            snapshot["strategy_comparison"] = ctx.execution_engine.comparison_summary().await;
-            // Coverage warnings do not need to clone the strategy's history/decision archive.
-            snapshot["strategy_diagnostics"] = serde_json::json!({
-                "calendar_health":ctx.execution_engine.calendar_health().await});
+            let execution_fields = match ctx
+                .execution_engine
+                .snapshot_fields(&mut fields, false)
+                .await
+            {
+                Ok(fields) => fields,
+                Err(error) => {
+                    tracing::warn!(%error, "默认实例快照生成失败");
+                    continue;
+                }
+            };
+            let calendar = execution_fields
+                .object("strategy_diagnostics")
+                .and_then(|fields| fields.get("calendar_health"));
             crate::instance_runtime::warn_calendar_coverage(
                 "default",
-                &snapshot["strategy_diagnostics"],
+                calendar,
                 &mut calendar_warnings,
             );
-            let (snapshot, delta) = publisher.update(snapshot);
+            let mut snapshot =
+                n_protocol::trader_stream::SharedTraderSnapshot::from_value(snapshot);
+            snapshot.extend(execution_fields);
+            let (snapshot, delta, _) = publisher.update_shared(snapshot, false);
             if let Some(manager) = ctx.instances.get() {
                 if let Ok(r) = manager.get("default").await {
                     *r.published.write().await = snapshot.clone();
@@ -961,13 +999,7 @@ fn spawn_scheduler(ctx: Arc<ServerContext>) {
             if startup_refresh || n_core::scheduler::regular_refresh_due(now, &cfg, last_refresh) {
                 if let Ok(stats) = run_refresh(&ctx).await {
                     last_refresh = Some(now);
-                    ctx.realtime_hub
-                        .broadcast(
-                            ctx.next_event_seq(),
-                            "data.updated",
-                            serde_json::to_value(&stats).unwrap_or_default(),
-                        )
-                        .await;
+                    broadcast_data_updated(&ctx, stats.succeeded, stats.failures).await;
                 }
             }
 
@@ -1007,6 +1039,17 @@ fn spawn_scan_maintenance(ctx: Arc<ServerContext>, mode: CloseScanMode) {
             }
         }
     });
+}
+
+pub(crate) async fn broadcast_data_updated(ctx: &ServerContext, succeeded: usize, failures: usize) {
+    let mut payload = serde_json::json!({ "succeeded": succeeded, "failures": failures });
+    match n_core::storage::cache_revisions::market_history_revisions(&ctx.db).await {
+        Ok(revisions) => payload["history_revisions"] = serde_json::json!(revisions),
+        Err(error) => tracing::warn!(%error, "无法读取行情刷新后的历史修订号"),
+    }
+    ctx.realtime_hub
+        .broadcast(ctx.next_event_seq(), "data.updated", payload)
+        .await;
 }
 
 async fn run_refresh(ctx: &Arc<ServerContext>) -> anyhow::Result<RefreshStats> {
@@ -1657,8 +1700,12 @@ fn spawn_quote_poller(ctx: Arc<ServerContext>) {
             }
 
             let cycle_started = Instant::now();
-            let contracts: Vec<String> = ctx.trader_snapshot.read().await["broker_positions"]
-                .as_array()
+            let contracts: Vec<String> = ctx
+                .trader_snapshot
+                .read()
+                .await
+                .get("broker_positions")
+                .and_then(serde_json::Value::as_array)
                 .into_iter()
                 .flatten()
                 .filter_map(|p| p["instrument_id"].as_str().map(str::to_uppercase))
@@ -1824,11 +1871,14 @@ fn spawn_tq_bar_event_consumer(
                     // A closure notification is a commitment that the final bar
                     // and its derived candles are already readable in the DB.
                     let store_started = Instant::now();
-                    if let Err(error) = ctx.services.store_tq_closed_bar_event(&ev).await {
-                        tracing::warn!(symbol = %ev.symbol, bar_end = %ev.bar_end, "闭合K线入库失败，将重试: {error:#}");
-                        persist_failed = true;
-                        break;
-                    }
+                    let closure = match ctx.services.store_tq_chart_closure(&ev).await {
+                        Ok(update) => update,
+                        Err(error) => {
+                            tracing::warn!(symbol = %ev.symbol, bar_end = %ev.bar_end, "闭合K线入库或图表更新准备失败，将重试: {error:#}");
+                            persist_failed = true;
+                            break;
+                        }
+                    };
                     if ends_fifteen_minute_bar(&ev.bar_end) {
                         match n_core::storage::scan_jobs::enqueue(
                             &ctx.db, &ev.symbol, &ev.bar_end, Local::now().timestamp(), true,
@@ -1841,9 +1891,28 @@ fn spawn_tq_bar_event_consumer(
                                     "闭合扫描任务写入失败，将重试: {error:#}"
                                 );
                                 persist_failed = true;
-                                break;
                             }
                         }
+                    }
+                    if let Some(closure) = closure {
+                        let update = ctx.services.chart_history_update(closure).await;
+                        ctx.realtime_hub
+                            .broadcast_chart_history(
+                                ctx.next_event_seq(),
+                                &ev.symbol,
+                                serde_json::json!(&update),
+                            )
+                            .await;
+                        for bar in update.bars {
+                            ctx.realtime_hub.broadcast_kline(
+                                ctx.next_event_seq(), "kline.closed", &ev.symbol, &bar.timeframe,
+                                serde_json::json!({"symbol":ev.symbol,"timeframe":bar.timeframe,"bar":bar,
+                                    "series_revision":update.series_revision}),
+                            ).await;
+                        }
+                    }
+                    if persist_failed {
+                        break;
                     }
                     after_id = after_id.max(ev.event_id);
                     tracing::info!(
@@ -1856,54 +1925,6 @@ fn spawn_tq_bar_event_consumer(
                         ev.period,
                         ev.bar_end
                     );
-                    let seq = ctx.next_event_seq();
-                    let closed_dto = n_protocol::dto::KlineDto {
-                        symbol: ev.symbol.clone(),
-                        timeframe: ev.period.clone(),
-                        ts: ev.bar_end.clone(),
-                        open: ev.kline.open,
-                        high: ev.kline.high,
-                        low: ev.kline.low,
-                        close: ev.kline.close,
-                        volume: ev.kline.volume,
-                        hold: ev.kline.hold,
-                        source: "tqsdk_closed".to_string(),
-                        rollover: false,
-                    };
-                    let payload = serde_json::json!({
-                        "symbol": ev.symbol,
-                        "timeframe": ev.period,
-                        "bar": closed_dto,
-                        "event": ev,
-                    });
-                    ctx.realtime_hub
-                        .broadcast_kline(seq, "kline.closed", &ev.symbol, &ev.period, payload)
-                        .await;
-                    // Notify every derived timeframe that actually closed here.
-                    // The chart uses the finalized DB row, never the display cache.
-                    for tf in ["15m", "30m", "60m", "120m", "240m", "1d"] {
-                        use chrono::Timelike;
-                        let end =
-                            chrono::NaiveDateTime::parse_from_str(&ev.bar_end, "%Y-%m-%d %H:%M:%S")
-                                .unwrap();
-                        let target = n_core::derive::Timeframe::parse(tf).unwrap();
-                        let closes_here = target
-                            .minutes()
-                            .map_or(end.hour() == 15 && end.minute() == 0, |minutes| {
-                                (end.hour() as i64 * 60 + end.minute() as i64) % minutes == 0
-                            });
-                        if !closes_here {
-                            continue;
-                        }
-                        if let Ok(rows) = ctx.services.get_klines(&ev.symbol, tf, Some(1)).await {
-                            if let Some(bar) = rows.last().filter(|bar| bar.ts == ev.bar_end) {
-                                ctx.realtime_hub.broadcast_kline(
-                                    ctx.next_event_seq(), "kline.closed", &ev.symbol, tf,
-                                    serde_json::json!({ "symbol": ev.symbol, "timeframe": tf, "bar": bar }),
-                                ).await;
-                            }
-                        }
-                    }
                 }
             }
             if persist_failed {
@@ -1953,13 +1974,7 @@ fn spawn_tq_warmup(ctx: Arc<ServerContext>) {
                         stats.succeeded,
                         stats.failures
                     );
-                    ctx.realtime_hub
-                        .broadcast(
-                            ctx.next_event_seq(),
-                            "data.updated",
-                            serde_json::to_value(&stats).unwrap_or_default(),
-                        )
-                        .await;
+                    broadcast_data_updated(&ctx, stats.succeeded, stats.failures).await;
                     if stats.failures == 0 {
                         break;
                     }
@@ -2040,10 +2055,11 @@ mod quote_delivery_tests {
         assert!(!target.needs(42, "invalid time"));
     }
 
-    fn quote(code: &str, price: f64) -> (String, n_core::trader::model::ExecutionQuote) {
-        (
-            code.into(),
-            n_core::trader::model::ExecutionQuote {
+    fn quote(code: &str, price: f64) -> ReceivedExecutionQuote {
+        let received_at = chrono::Utc::now().timestamp();
+        ReceivedExecutionQuote {
+            symbol: code.into(),
+            quote: ExecutionQuote {
                 instrument_id: code.into(),
                 exchange_id: "SHFE".into(),
                 underlying_symbol: String::new(),
@@ -2053,9 +2069,10 @@ mod quote_delivery_tests {
                 tick: 1.0,
                 lower: 1.0,
                 upper: 2000.0,
-                timestamp: chrono::Utc::now().timestamp(),
+                timestamp: received_at,
             },
-        )
+            received_at,
+        }
     }
 
     #[tokio::test]
@@ -2063,14 +2080,16 @@ mod quote_delivery_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let first = vec![quote("pb2611", 1000.0)];
         for price in 0..64 {
-            tx.try_send(vec![quote("pb2611", 990.0 + price as f64)])
-                .unwrap();
+            let mut event = quote("pb2611", 990.0 + price as f64);
+            event.received_at = price;
+            tx.try_send(vec![event]).unwrap();
         }
         let events = drain_quote_batches(&mut rx, first);
         assert_eq!(events.len(), 65);
-        assert_eq!(events[0].1.last, 1000.0);
-        assert_eq!(events[1].1.last, 990.0);
-        assert_eq!(events[64].1.last, 1053.0);
+        assert_eq!(events[0].quote.last, 1000.0);
+        assert_eq!(events[1].quote.last, 990.0);
+        assert_eq!(events[64].quote.last, 1053.0);
+        assert_eq!(events[64].received_at, 63);
         assert!(rx.is_empty());
         tx.try_send(vec![quote("pb2611", 1054.0)]).unwrap();
     }
@@ -2085,12 +2104,12 @@ mod quote_delivery_tests {
         let selected =
             filter_quote_events(&events, &std::collections::HashSet::from(["PB2611".into()]));
         assert_eq!(
-            selected.iter().map(|(_, q)| q.last).collect::<Vec<_>>(),
+            selected.iter().map(|event| event.quote.last).collect::<Vec<_>>(),
             vec![1000.0, 990.0]
         );
         assert!(filter_quote_events(&events, &Default::default()).is_empty());
         let mut alias = quote("pb2611", 1001.0);
-        alias.0 = "PB0".into();
+        alias.symbol = "PB0".into();
         assert_eq!(
             filter_quote_events(
                 &vec![alias],

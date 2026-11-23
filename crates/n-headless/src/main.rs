@@ -107,6 +107,7 @@ fn print_help() {
   cargo run -p n-headless -- --data-dir /opt/ntrend/data --host 0.0.0.0 --port 8081
   cargo run -p n-headless -- --data-dir ./data --check-integrity
   cargo run -p n-headless -- --data-dir ./data --repair-integrity
+  n-headless --export-execution-state ./data/trader_instances/default/trader_execution.json
 "#
     );
 }
@@ -116,6 +117,12 @@ async fn main() -> anyhow::Result<()> {
     cli::validate_args(std::env::args().skip(1))?;
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if let Some(path) = args.find(|arg| arg == "--export-execution-state").and_then(|_| args.next()) {
+        let state = n_core::trader::execution::export_execution_state(Path::new(&path))?;
+        serde_json::to_writer(std::io::stdout().lock(), &state)?;
         return Ok(());
     }
 
@@ -222,7 +229,12 @@ async fn main() -> anyhow::Result<()> {
         config.email.smtp_password = secrets.smtp_password.clone();
     }
 
-    let services = Arc::new(Services::new(db.clone(), config.clone(), config_path.clone()).await?);
+    let chart_db = storage::connect_chart_reader(&db_path).await?;
+    let services = Arc::new(
+        Services::new(db.clone(), config.clone(), config_path.clone())
+            .await?
+            .with_chart_reader(chart_db),
+    );
 
     if n_core::storage::repo::get_setting(&db, "signal_origin")
         .await?

@@ -499,6 +499,31 @@ pub fn format_symbol_display(symbol: &str, instrument_id: &str) -> String {
     }
 }
 
+pub fn format_symbol_title(symbol: &str, instrument_id: &str) -> String {
+    let inst = instrument_id.trim();
+    if !inst.is_empty() {
+        inst.to_uppercase()
+    } else {
+        let s = symbol.trim();
+        if !s.is_empty() {
+            s.to_uppercase()
+        } else {
+            "未知".to_string()
+        }
+    }
+}
+
+pub fn format_price_compact(p: f64) -> String {
+    let p_abs = p.abs();
+    if (p_abs.fract()).abs() < 1e-4 {
+        format!("{:.0}", p)
+    } else if (p_abs * 10.0).fract().abs() < 1e-4 {
+        format!("{:.1}", p)
+    } else {
+        format!("{:.2}", p)
+    }
+}
+
 fn fmt_account_section(account: Option<&crate::trader::TraderAccount>) -> String {
     if let Some(acc) = account {
         let margin_ratio = if acc.balance > 0.0 {
@@ -527,14 +552,48 @@ pub fn trade_open_email_payload(n: &LiveTradeOpenNotice) -> (String, String) {
         .map(|id| format!("#{id}"))
         .unwrap_or_else(|| "无信号关联".to_string());
     let stop_str = if n.stop_amount > 0.0 {
-        format!(" 止损亏损 -{:.2}元", n.stop_amount)
+        format!(" 止损-{}元", format_price_compact(n.stop_amount))
     } else {
         String::new()
     };
+    let symbol_title = format_symbol_title(&n.symbol, &n.instrument_id);
     let symbol_display = format_symbol_display(&n.symbol, &n.instrument_id);
+    let price_str = format_price_compact(n.fill_price);
+    let inst_suffix = if n.instance_name.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", n.instance_name)
+    };
     let subject = format!(
-        "【实盘开仓】{} · {} {} {}手 @{:.1}{}",
-        n.instance_name, symbol_display, dir, n.volume, n.fill_price, stop_str
+        "【实盘开仓】{} {}{}手 @{}{}{}",
+        symbol_title, dir, n.volume, price_str, stop_str, inst_suffix
+    );
+
+    let target_str = if n.target_amount > 0.0 {
+        format!("+{:.0}元", n.target_amount)
+    } else {
+        format!("+{:.1}点", n.target_pts)
+    };
+    let stop_detail = if n.stop_amount > 0.0 {
+        format!("-{:.0}元", n.stop_amount)
+    } else {
+        format!("-{:.1}点", n.stop_pts)
+    };
+    let equity_str = if let Some(acc) = n.account.as_ref() {
+        format!(" | 权益: {:.2}元", acc.balance)
+    } else {
+        String::new()
+    };
+    let preheader = format!(
+        "成交：{} {}手 @{:.2} | 止损 {:.2}（{}） | 目标 {:.2}（{}）{}",
+        dir_label,
+        n.volume,
+        n.fill_price,
+        n.stop_price,
+        stop_detail,
+        n.target_price,
+        target_str,
+        equity_str
     );
 
     let slippage_desc = if n.slippage_pts.abs() < 1e-4 {
@@ -557,12 +616,13 @@ pub fn trade_open_email_payload(n: &LiveTradeOpenNotice) -> (String, String) {
     let account_sec = fmt_account_section(n.account.as_ref());
 
     let body = format!(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+        "{preheader}\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
          【实盘开仓提醒】N-Trend Automated Execution\n\
          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
          ■ 基本信息\n\
          • 交易实例：{}（{}）\n\
-         • 交易标的：{}（{}）\n\
+         • 交易标的：{}\n\
          • 信号编号：{}\n\
          • 开仓方向：{}\n\
          • 成交数量：{} 手\n\
@@ -580,8 +640,7 @@ pub fn trade_open_email_payload(n: &LiveTradeOpenNotice) -> (String, String) {
          系统记录时间：{}",
         n.instance_name,
         n.instance_id,
-        n.symbol,
-        n.instrument_id,
+        symbol_display,
         sig_str,
         dir_label,
         n.volume,
@@ -606,10 +665,43 @@ pub fn trade_open_email_payload(n: &LiveTradeOpenNotice) -> (String, String) {
 pub fn trade_close_email_payload(n: &LiveTradeCloseNotice) -> (String, String) {
     let reason_short = format_exit_reason_short(&n.exit_reason);
     let reason_full = format_exit_reason(&n.exit_reason);
+    let symbol_title = format_symbol_title(&n.symbol, &n.instrument_id);
     let symbol_display = format_symbol_display(&n.symbol, &n.instrument_id);
+    let pnl_amt_str = if n.realized_pnl_amount >= 0.0 {
+        format!("+{}元", format_price_compact(n.realized_pnl_amount))
+    } else {
+        format!("-{}元", format_price_compact(n.realized_pnl_amount.abs()))
+    };
+    let pnl_pts_str = if n.realized_pnl_pts >= 0.0 {
+        format!("(+{}点)", format_price_compact(n.realized_pnl_pts))
+    } else {
+        format!("(-{}点)", format_price_compact(n.realized_pnl_pts.abs()))
+    };
+    let inst_suffix = if n.instance_name.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", n.instance_name)
+    };
     let subject = format!(
-        "【实盘平仓】{} · {} {} {:+.2}元 ({:+.1}点)",
-        n.instance_name, symbol_display, reason_short, n.realized_pnl_amount, n.realized_pnl_pts
+        "【实盘平仓】{} {} {}{}{}",
+        symbol_title, reason_short, pnl_amt_str, pnl_pts_str, inst_suffix
+    );
+
+    let equity_str = if let Some(acc) = n.account.as_ref() {
+        format!(" | 权益: {:.2}元", acc.balance)
+    } else {
+        String::new()
+    };
+    let preheader = format!(
+        "平仓：{} {}手 @{:.2}（入场 {:.2}） | 实际盈亏: {:+.2}元 ({:+.2}点, {:+.2}R){}",
+        reason_short,
+        n.volume,
+        n.exit_price,
+        n.fill_price,
+        n.realized_pnl_amount,
+        n.realized_pnl_pts,
+        n.r_multiple,
+        equity_str
     );
 
     let sig_str = n
@@ -693,12 +785,13 @@ pub fn trade_close_email_payload(n: &LiveTradeCloseNotice) -> (String, String) {
     let account_sec = fmt_account_section(n.account.as_ref());
 
     let body = format!(
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
+        "{preheader}\n\
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
          【实盘平仓提醒】N-Trend Automated Execution\n\
          ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\
          ■ 基本信息\n\
          • 交易实例：{}（{}）\n\
-         • 交易标的：{}（{}）\n\
+         • 交易标的：{}\n\
          • 关联信号：{}\n\
          • 平仓原因：{}\n\
          • 平仓数量：{} 手\n\
@@ -718,8 +811,7 @@ pub fn trade_close_email_payload(n: &LiveTradeCloseNotice) -> (String, String) {
          系统记录时间：{}",
         n.instance_name,
         n.instance_id,
-        n.symbol,
-        n.instrument_id,
+        symbol_display,
         sig_str,
         reason_full,
         n.volume,
@@ -928,8 +1020,9 @@ mod tests {
         let (subject, body) = trade_open_email_payload(&notice);
         assert_eq!(
             subject,
-            "【实盘开仓】默认实盘 · rb2505 多 1手 @3520.0 止损亏损 -300.00元"
+            "【实盘开仓】RB2505 多1手 @3520 止损-300元 · 默认实盘"
         );
+        assert!(body.starts_with("成交：买入做多 1手 @3520.00 | 止损 3490.00（-300元） | 目标 3580.00（+600元） | 权益: 100000.00元"));
         assert!(body.contains("交易标的：rb2505"));
         assert!(body.contains("成交入场价：3520.00"));
         assert!(body.contains("原定入场价：3518.00"));
@@ -975,7 +1068,8 @@ mod tests {
         };
 
         let (subject, body) = trade_close_email_payload(&notice);
-        assert_eq!(subject, "【实盘平仓】默认实盘 · rb2505 目标止盈 +550.00元 (+55.0点)");
+        assert_eq!(subject, "【实盘平仓】RB2505 目标止盈 +550元(+55点) · 默认实盘");
+        assert!(body.starts_with("平仓：目标止盈 1手 @3555.00（入场 3500.00） | 实际盈亏: +550.00元 (+55.00点, +1.10R) | 权益: 100550.00元"));
         assert!(body.contains("平仓原因：目标止盈 (Target 1.0R)"));
         assert!(body.contains("实际盈亏：+55.00 点，合 +550.00 元"));
         assert!(body.contains("原定计划盈亏：+500.00 元"));
@@ -1018,7 +1112,8 @@ mod tests {
         };
 
         let (subject, body) = trade_close_email_payload(&notice);
-        assert_eq!(subject, "【实盘平仓】默认实盘 · V0（v2701） 5K不及预期 -25.00元 (-5.0点)");
+        assert_eq!(subject, "【实盘平仓】V2701 5K不及预期 -25元(-5点) · 默认实盘");
+        assert!(body.starts_with("平仓：5K不及预期 1手 @4791.00（入场 4796.00） | 实际盈亏: -25.00元 (-5.00点, -0.35R) | 权益: 60817.72元"));
         assert!(body.contains("交易标的：V0（v2701）"));
         assert!(body.contains("平仓原因：5K走势不及预期保护平仓 (No Follow-through)"));
         assert!(body.contains("实际盈亏：-5.00 点，合 -25.00 元（-0.35R）"));

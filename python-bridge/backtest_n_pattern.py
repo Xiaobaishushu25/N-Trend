@@ -190,7 +190,7 @@ class BacktestConfig:
     max_exit_slippage_ticks: int = 0
     large_volume: int = 2
     small_volume: int = 1
-    strategy: str = "n_pattern"  # "n_pattern" | "p2" | "p3"
+    strategy: str = "n_pattern"  # "n_pattern" | "p2" | "p2v2" | "p3"
     p3_mode: str = "fixed_s1"  # "fixed_s1" | "hybrid_s1"
     p3_budget: float = 600.0
     p3_min_net_rr: float = 1.0
@@ -217,14 +217,20 @@ class BacktestConfig:
         if min(self.large_volume, self.small_volume) < 1 or min(self.slippage_ticks, self.min_risk_ticks,
                 self.max_exit_slippage_ticks, self.order_wait_seconds, self.action_interval_seconds) < 0:
             raise ValueError("Invalid sizing or execution limits")
-        if self.strategy not in ("n_pattern", "p2", "p3"):
-            raise ValueError("strategy must be 'n_pattern', 'p2', or 'p3'")
+        if self.strategy not in ("n_pattern", "p2", "p2v2", "p2_v2", "p3"):
+            raise ValueError("strategy must be 'n_pattern', 'p2', 'p2v2', or 'p3'")
         if self.strategy == "p2":
             self.large_volume = 1
             self.small_volume = 1
             self.one_per_symbol = True
             if self.min_score < 3.0:
                 self.min_score = 3.0
+        elif self.strategy in ("p2v2", "p2_v2"):
+            self.large_volume = 1
+            self.small_volume = 1
+            self.one_per_symbol = True
+            if self.min_score < 2.5:
+                self.min_score = 2.5
         elif self.strategy == "p3":
             self.one_per_symbol = True
             if self.min_score < 2.5:
@@ -1187,7 +1193,7 @@ class NPatternBacktestEngine:
             if (target - entry) * sign <= risk:
                 target = entry + sign * risk
 
-            if self.cfg.strategy in ("p2", "p3"):
+            if self.cfg.strategy in ("p2", "p2v2", "p2_v2", "p3"):
                 prefix = self.cfg.strategy
                 min_score = 3.0 if self.cfg.strategy == "p2" else 2.5
                 if score < min_score:
@@ -1206,8 +1212,8 @@ class NPatternBacktestEngine:
                 if atr14 is None or atr14 <= 0:
                     self.analytics.inc_counter(logical_symbol, f"{prefix}_atr_unavailable")
                     continue
-                if self.cfg.strategy == "p2" and not (0.75 <= (risk / atr14) <= 2.5):
-                    self.analytics.inc_counter(logical_symbol, "p2_atr_out_of_range")
+                if self.cfg.strategy in ("p2", "p2v2", "p2_v2") and not (0.75 <= (risk / atr14) <= 2.5):
+                    self.analytics.inc_counter(logical_symbol, f"{prefix}_atr_out_of_range")
                     continue
                 if self.cfg.strategy == "p3" and (risk / atr14) > 2.5:
                     self.analytics.inc_counter(logical_symbol, "p3_atr_out_of_range")
@@ -1251,7 +1257,7 @@ class NPatternBacktestEngine:
                     current_equity=current_equity,
                 )
                 cond_id = self._next_cond_id(logical_symbol)
-                planned_lots = 1 if self.cfg.strategy == "p2" else (
+                planned_lots = 1 if self.cfg.strategy in ("p2", "p2v2", "p2_v2") else (
                     self.cfg.large_volume if score >= self.cfg.large_score else self.cfg.small_volume
                 )
 
@@ -1385,7 +1391,7 @@ class NPatternBacktestEngine:
                 instructions.append(OrderInstruction("close", pos.pos_id, pos.logical_symbol, pos.actual_symbol,
                     "SELL" if sign > 0 else "BUY", pos.remaining_lots, pos.pending_exit_reason, price,
                     closing_all=True))
-            elif self.cfg.strategy == "p2" or (self.cfg.strategy == "p3" and self.cfg.p3_mode == "fixed_s1"):
+            elif self.cfg.strategy in ("p2", "p2v2", "p2_v2") or (self.cfg.strategy == "p3" and self.cfg.p3_mode == "fixed_s1"):
                 if (price - pos.initial_stop) * sign <= 0.0:
                     pos.closing_all_sent = True
                     instructions.append(OrderInstruction(
@@ -1604,7 +1610,7 @@ class NPatternBacktestEngine:
                 self.analytics.inc_counter(cond.logical_symbol, "slot_blocked_skipped")
                 continue
 
-            if self.cfg.strategy in ("p2", "p3"):
+            if self.cfg.strategy in ("p2", "p2v2", "p2_v2", "p3"):
                 actual_risk = abs(price - cond.stop)
                 if actual_risk / quote.price_tick + 1e-6 < 10.0:
                     cond.state = "cancelled"
@@ -2997,7 +3003,7 @@ def load_symbols_from_db(db_path: str | Path) -> list[str]:
 # ===== CLI =====
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Backtest n-core N-pattern strategy on TQSDK.")
-    p.add_argument("--strategy", choices=["n_pattern", "p2", "p3"], default="n_pattern", help="Strategy variant: n_pattern (default), p2 (candidate S1), or p3 (risk budget + fixed_s1/hybrid_s1)")
+    p.add_argument("--strategy", choices=["n_pattern", "p2", "p2v2", "p2_v2", "p3"], default="n_pattern", help="Strategy variant: n_pattern (default), p2 (candidate S1 score 3.0), p2v2 (candidate S1 score 2.5), or p3 (risk budget + fixed_s1/hybrid_s1)")
     p.add_argument("--p3-mode", choices=["fixed_s1", "hybrid_s1"], default="fixed_s1", help="P3 exit mode: fixed_s1 or hybrid_s1")
     p.add_argument("--p3-budget", type=float, default=600.0, help="P3 risk budget in CNY (default 600.0)")
     p.add_argument("--p3-min-net-rr", type=float, default=1.0, help="P3 minimum net risk-reward ratio (default 1.0)")

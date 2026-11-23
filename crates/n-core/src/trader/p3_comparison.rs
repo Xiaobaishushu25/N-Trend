@@ -17,7 +17,7 @@ const VERSION: &str = "p3-runner-paired-v1";
 const ATR_FACTOR: f64 = 2.;
 const ATR_PERIOD: usize = 14;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub(super) struct P3RunnerBook {
     pub enabled: bool,
@@ -26,7 +26,7 @@ pub(super) struct P3RunnerBook {
     pairs: BTreeMap<String, Pair>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Pair {
     position: ManagedPosition,
     market_symbol: String,
@@ -49,14 +49,14 @@ struct Pair {
     interventions: BTreeMap<String, Intervention>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Runner {
     stop: f64,
     fill: Option<Fill>,
     peak_r: f64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Fill {
     at: i64,
     price: f64,
@@ -68,7 +68,7 @@ struct Fill {
     atr: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 struct Intervention {
     at: String,
     price: f64,
@@ -236,10 +236,11 @@ impl P3RunnerBook {
         }
     }
 
-    pub fn on_quote(&mut self, quote: &ExecutionQuote, now: i64) {
+    pub fn on_quote(&mut self, quote: &ExecutionQuote, now: i64) -> bool {
         if !quote.valid_at(now) {
-            return;
+            return false;
         }
+        let mut observed = false;
         for pair in self.pairs.values_mut().filter(|pair| {
             pair.active()
                 && pair
@@ -247,8 +248,9 @@ impl P3RunnerBook {
                     .instrument_id
                     .eq_ignore_ascii_case(&quote.instrument_id)
         }) {
-            pair.on_quote(quote);
+            observed |= pair.on_quote(quote);
         }
+        observed
     }
 
     pub fn on_history(&mut self, symbol: &str, raw: &[Kline], cutoff: i64) -> bool {
@@ -365,11 +367,12 @@ impl Pair {
         changed
     }
 
-    fn on_quote(&mut self, q: &ExecutionQuote) {
+    fn on_quote(&mut self, q: &ExecutionQuote) -> bool {
         if q.timestamp < self.registered_at || self.last_quote_at.is_some_and(|at| q.timestamp < at)
         {
-            return;
+            return false;
         }
+        let mut changed = self.last_quote_at != Some(q.timestamp);
         self.last_quote_at = Some(q.timestamp);
         let sign = if self.position.direction == "up" {
             1.
@@ -379,9 +382,11 @@ impl Pair {
         let fill_price = self.position.fill_price;
         let risk = self.position.risk;
         let r = (q.last - fill_price) * sign / risk;
+        changed |= r > self.peak_r;
         self.peak_r = self.peak_r.max(r);
         if self.followed_at.is_none() && r >= NO_FOLLOW_MFE_R {
             self.followed_at = Some(q.timestamp);
+            changed = true;
         }
         let forced = [&self.flat_boundary, &self.pending_exit]
             .into_iter()
@@ -410,15 +415,17 @@ impl Pair {
         if self.first_fill.is_none() {
             let stop_hit = (q.last - self.position.initial_stop_price) * sign <= 0.;
             if let Some(reason) = forced.or(stop_hit.then_some("stop")) {
+                changed = true;
                 if can_fill {
                     self.common_exit = Some(make_fill(reason, self.peak_r, 2));
                 } else {
                     self.invalid = Some("unavailable_close_book".into());
                 }
             } else if (q.last - self.position.target_price) * sign >= 0. {
+                changed = true;
                 if !can_fill {
                     self.invalid = Some("unavailable_close_book".into());
-                    return;
+                    return true;
                 }
                 let reason =
                     if ((self.position.target_price - fill_price) * sign - risk).abs() <= 1e-6 {
@@ -432,7 +439,7 @@ impl Pair {
                     runner.peak_r = r;
                 }
             }
-            return;
+            return changed;
         }
         let latest_due_bar = q.timestamp - q.timestamp.rem_euclid(900) - 900;
         let usable_atr = atr.filter(|(at, _)| {
@@ -445,7 +452,7 @@ impl Pair {
             .or_else(|| (self.peak_r < TRAIL_ACTIVATE_R || forced.is_some()).then_some((0, 0.)))
         else {
             self.invalid = Some("atr_unavailable".into());
-            return;
+            return true;
         };
         let distances = [
             TRAIL_DISTANCE_R,
@@ -457,12 +464,15 @@ impl Pair {
             .zip(distances)
             .filter(|(lane, _)| lane.fill.is_none())
         {
+            let stop = p3::runner_stop(&self.position, q, self.peak_r, runner.stop, distance);
+            changed |= r > runner.peak_r || stop != runner.stop;
             runner.peak_r = runner.peak_r.max(r);
-            runner.stop = p3::runner_stop(&self.position, q, self.peak_r, runner.stop, distance);
+            runner.stop = stop;
             let stop_hit = (q.last - runner.stop) * sign <= 0.;
             if let Some(reason) = forced.or_else(|| {
                 stop_hit.then(|| protection_reason(true, fill_price, runner.stop, sign, q.tick))
             }) {
+                changed = true;
                 if can_fill {
                     runner.fill = Some(make_fill(reason, runner.peak_r, 1));
                 } else {
@@ -471,5 +481,6 @@ impl Pair {
                 }
             }
         }
+        changed
     }
 }

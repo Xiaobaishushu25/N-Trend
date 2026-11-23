@@ -106,11 +106,25 @@ pub async fn enqueue_scheduled(
         return Ok(false);
     }
     let values = vec!["(?)"; symbols.len()].join(",");
-    let params = symbols.iter().map(|symbol| Value::from(*symbol)).chain([
-        bar_end.into(),
-        EVENT_LOGIC_VERSION.into(),
-        now.into(),
-    ]);
+    let mut params = symbols.iter().map(|symbol| Value::from(*symbol)).collect::<Vec<_>>();
+    params.extend([bar_end.into(), EVENT_LOGIC_VERSION.into()]);
+    // The scheduler probes every five seconds. Already settled rounds should
+    // remain readers; the upsert below still rechecks the predicate after a race.
+    let due = db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "WITH due(symbol) AS (VALUES {values})
+             SELECT 1 FROM due LEFT JOIN market_history_revisions history ON history.symbol=due.symbol
+             LEFT JOIN scan_jobs job ON job.symbol=due.symbol AND job.bar_end=? AND job.logic_version=?
+             WHERE job.id IS NULL OR job.state='skipped'
+                OR job.revision<>COALESCE(history.revision,0) LIMIT 1"
+        ),
+        params.clone(),
+    )).await?;
+    if due.is_none() {
+        return Ok(false);
+    }
+    params.push(now.into());
     let result = db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         format!(

@@ -170,13 +170,14 @@ async fn clock_observations_batch_but_control_intents_commit_immediately_and_res
             .insert(rev, json!({"clock":0,"decisions":{"old":"immutable"}}));
         e.save(&mut s).unwrap();
     }
-    let before = std::fs::read(counter.directory.join("trader_execution.json")).unwrap();
+    let path = counter.directory.join("trader_execution.json");
+    let before = export_execution_state(&path).unwrap();
     // No callback intent: retain the observation in memory until batch commit.
     e.dispatch_observation(StrategyEvent::Quote(book(1001.)), false)
         .await
         .unwrap();
     assert_eq!(
-        std::fs::read(counter.directory.join("trader_execution.json")).unwrap(),
+        export_execution_state(&path).unwrap(),
         before
     );
     let rev = e.definition().await.revision;
@@ -185,8 +186,8 @@ async fn clock_observations_batch_but_control_intents_commit_immediately_and_res
     e.dispatch_observation(StrategyEvent::Quote(book(990.)), false)
         .await
         .unwrap();
-    let disk: ExecutionState = serde_json::from_slice(
-        &std::fs::read(counter.directory.join("trader_execution.json")).unwrap(),
+    let disk: ExecutionState = serde_json::from_value(
+        export_execution_state(&path).unwrap(),
     )
     .unwrap();
     assert_eq!(disk.conditions[&id].state, ConditionState::Canceled);

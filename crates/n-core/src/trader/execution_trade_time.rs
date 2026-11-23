@@ -51,6 +51,9 @@ impl ExecutionState {
         position.open_ts = timestamp.into();
         // Missing historical quotes cannot be recreated by a timestamp repair.
         // Do not manufacture a zero-MFE no-follow failure during recovery.
+        if date_changed {
+            self.p3_stall.invalidate(id, "entry_time_corrected");
+        }
         if date_changed && !position.is_closed {
             self.p3_runner.invalidate_entry(id, "entry_time_corrected");
             for state in self.strategy_states.values_mut().filter(|v| v.is_object()) {

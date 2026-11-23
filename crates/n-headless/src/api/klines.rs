@@ -1,4 +1,4 @@
-use crate::auth::AuthDevice;
+use crate::auth::ChartDevice;
 use crate::state::ServerContext;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -17,7 +17,7 @@ pub struct KlineQuery {
 
 pub async fn get_chart_klines(
     State(ctx): State<Arc<ServerContext>>,
-    _device: AuthDevice,
+    _device: ChartDevice,
     Path((symbol, timeframe)): Path<(String, String)>,
     Query(q): Query<KlineQuery>,
     headers: HeaderMap,
@@ -48,23 +48,7 @@ pub async fn get_chart_klines(
     }
     match result {
         Ok(res) => {
-            let rows: Vec<KlineDto> = res
-                .rows
-                .into_iter()
-                .map(|k| KlineDto {
-                    symbol: k.symbol,
-                    timeframe: k.timeframe,
-                    ts: k.ts,
-                    open: k.open,
-                    high: k.high,
-                    low: k.low,
-                    close: k.close,
-                    volume: k.volume,
-                    hold: k.hold,
-                    source: k.source,
-                    rollover: k.rollover,
-                })
-                .collect();
+            let rows: Vec<KlineDto> = res.rows.into_iter().map(Into::into).collect();
 
             let latest_closed = rows.last().and_then(|r| {
                 chrono::NaiveDateTime::parse_from_str(&r.ts, "%Y-%m-%d %H:%M:%S")
@@ -80,34 +64,7 @@ pub async fn get_chart_klines(
                     .map(|dt| dt.timestamp_millis())
             });
 
-            let revision_started = std::time::Instant::now();
-            let rev = n_core::storage::repo::get_revision(
-                &ctx.db,
-                &format!("kline:{symbol}:{timeframe}"),
-            )
-            .await
-            .unwrap_or(1);
-            tracing::info!(
-                trace_id,
-                rows = rows.len(),
-                elapsed_ms = started.elapsed().as_millis(),
-                revision_ms = revision_started.elapsed().as_millis(),
-                "K线服务端修订号查询完成"
-            );
-
-            let partial_bar = res.partial_bar.map(|p| KlineDto {
-                symbol: p.symbol,
-                timeframe: p.timeframe,
-                ts: p.ts,
-                open: p.open,
-                high: p.high,
-                low: p.low,
-                close: p.close,
-                volume: p.volume,
-                hold: p.hold,
-                source: p.source,
-                rollover: p.rollover,
-            });
+            let partial_bar = res.partial_bar.map(Into::into);
 
             let server_elapsed_ms = started.elapsed().as_millis();
             tracing::info!(
@@ -127,7 +84,7 @@ pub async fn get_chart_klines(
                     status: res.status,
                     message: res.message,
                     latest_closed_ts: latest_closed,
-                    series_revision: Some(rev),
+                    series_revision: res.series_revision,
                     server_time: Some(chrono::Local::now().timestamp_millis()),
                     has_more: Some(true),
                     next_before,
@@ -146,7 +103,7 @@ pub async fn get_chart_klines(
 
 pub async fn get_trend_series(
     State(ctx): State<Arc<ServerContext>>,
-    _device: AuthDevice,
+    _device: ChartDevice,
     Path((symbol, timeframe)): Path<(String, String)>,
     Query(q): Query<KlineQuery>,
 ) -> Result<Json<Vec<TrendPointDto>>, (StatusCode, Json<ApiErrorResponse>)> {
@@ -176,7 +133,7 @@ pub async fn get_trend_series(
 
 pub async fn get_klines(
     State(ctx): State<Arc<ServerContext>>,
-    device: AuthDevice,
+    device: ChartDevice,
     path: Path<(String, String)>,
     query: Query<KlineQuery>,
 ) -> Result<Json<Vec<KlineDto>>, (StatusCode, Json<ApiErrorResponse>)> {
@@ -186,7 +143,7 @@ pub async fn get_klines(
 
 pub async fn get_intraday_chart(
     State(ctx): State<Arc<ServerContext>>,
-    _device: AuthDevice,
+    _device: ChartDevice,
     Path(symbol): Path<String>,
 ) -> Result<Json<n_protocol::dto::IntradayChartResponse>, (StatusCode, Json<ApiErrorResponse>)> {
     match ctx.services.get_intraday_chart(&symbol).await {

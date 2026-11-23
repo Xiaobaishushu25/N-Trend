@@ -33,6 +33,104 @@ function klinesHarness() {
 const response = (close) => ({ rows: [{ close }], status: 'tqsdk', message: '' })
 
 const bar = (close, symbol = 'CF0', timeframe = '15m', ts = '2026-10-29 14:15:00') => ({ symbol, timeframe, ts, close })
+const versioned = (revision, ...bars) => ({ rows: bars, status: 'tqsdk', message: '', series_revision: revision })
+const historyUpdate = (previous, next, bars = [], reload = false) => ({
+  symbol: 'CF0', previous_revision: previous, series_revision: next,
+  full_reload_required: reload, bars,
+})
+
+test('finalized push advances the chart version and scheduled refresh skips the same version', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m', 2)
+  requests[0].resolve(versioned(20, bar(100)))
+  await first
+  const next = bar(121, 'CF0', '15m', '2026-10-29 14:30:00')
+  store.acceptPartial('CF0', '15m', next)
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(20, 22)), 'current')
+  assert.equal(store.seriesRevision, 22)
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(22, 25, [next])), 'appended')
+  assert.equal(store.partialBar, null)
+  assert.equal(store.acceptPartial('CF0', '15m', next), false)
+  await store.load('CF0', '15m', 2, true, 25)
+  assert.equal(requests.length, 1)
+  assert.equal(store.rows.length, 2)
+  assert.equal(store.rows[1].close, 121)
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(22, 25, [next])), 'current')
+  assert.equal(store.rows.length, 2)
+})
+
+test('closed push received during initial load merges with the older HTTP baseline', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  const duplicate = store.load('CF0', '15m')
+  store.acceptHistoryUpdate(historyUpdate(5, 8, [bar(121, 'CF0', '15m', '2026-10-29 14:30:00')]))
+  assert.equal(store.rows.length, 0)
+  assert.equal(requests.length, 1)
+  requests[0].resolve(versioned(5, bar(100)))
+  await Promise.all([first, duplicate])
+  assert.equal(store.seriesRevision, 8)
+  assert.equal(store.rows[1].close, 121)
+  assert.equal(requests.length, 1)
+})
+
+test('chart recovery completed during the initial response refreshes even at the same revision', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  store.acceptHistoryUpdate(historyUpdate(12, 12, [], true))
+  requests[0].resolve({ ...versioned(12, bar(100)), status: 'tqsdk_recovery_pending' })
+  await flush()
+  assert.equal(requests.length, 2)
+  requests[1].resolve(versioned(12, bar(100)))
+  await first
+  assert.equal(store.chartStatus, 'tqsdk')
+})
+
+test('gap and historical correction require a new baseline, with one trailing refresh if needed', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  requests[0].resolve(versioned(10, bar(100)))
+  await first
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(12, 13, [bar(170)])), 'reload')
+  const refresh = store.load('CF0', '15m', 500, true, 13)
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(13, 15, [], true)), 'reload')
+  const same = store.load('CF0', '15m', 500, true, 15)
+  requests[1].resolve(versioned(13, bar(120)))
+  await flush()
+  assert.equal(requests.length, 3)
+  requests[2].resolve(versioned(15, bar(130)))
+  await Promise.all([refresh, same])
+  assert.equal(store.rows.length, 1)
+  assert.equal(store.rows[0].close, 130)
+  assert.equal(store.seriesRevision, 15)
+})
+
+test('an older in-flight response cannot overwrite rows already finalized by a push', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  requests[0].resolve(versioned(10, bar(100)))
+  await first
+  const refresh = store.load('CF0', '15m')
+  const next = bar(121, 'CF0', '15m', '2026-10-29 14:30:00')
+  assert.equal(store.acceptHistoryUpdate(historyUpdate(10, 11, [next])), 'appended')
+  requests[1].resolve(versioned(10, bar(100)))
+  await refresh
+  assert.equal(store.seriesRevision, 11)
+  assert.equal(store.rows[1].close, 121)
+})
+
+test('switching back shares an outstanding HTTP request without accepting a superseded symbol', async () => {
+  const { store, requests } = klinesHarness()
+  const first = store.load('CF0', '15m')
+  const other = store.load('SR0', '15m')
+  const returned = store.load('CF0', '15m')
+  assert.equal(requests.length, 2)
+  requests[1].resolve(versioned(30, bar(300, 'SR0')))
+  await other
+  assert.equal(store.rows.length, 0)
+  requests[0].resolve(versioned(10, bar(100)))
+  await Promise.all([first, returned])
+  assert.equal(store.rows[0].symbol, 'CF0')
+})
 
 test('live push before the history response keeps its newer candle without dismissing the mask', async () => {
   const { store, requests } = klinesHarness()

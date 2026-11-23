@@ -21,6 +21,12 @@ def api(path):
 def add_bytes(tar,name,body):
     info=tarfile.TarInfo(name);info.size=len(body);tar.addfile(info,io.BytesIO(body))
     manifest['files'][name]={'bytes':len(body),'sha256':hashlib.sha256(body).hexdigest(),'captured_at':now()}
+def execution_state(path):
+    body=path.read_bytes()
+    if 'execution_storage_version' not in json.loads(body):
+        return body
+    executable=next(p for p in [root/'target/release/n-headless',pathlib.Path('/opt/ntrend/bin/n-headless')] if p.is_file())
+    return subprocess.check_output([executable,'--export-execution-state',path],timeout=30)
 with tempfile.TemporaryDirectory(prefix='ntrend-readonly-audit-') as tmp:
     backup=pathlib.Path(tmp)/'source.sqlite'
     source=sqlite3.connect((root/'data/ntrend.db').as_uri()+'?mode=ro',uri=True,timeout=20)
@@ -40,7 +46,24 @@ with tempfile.TemporaryDirectory(prefix='ntrend-readonly-audit-') as tmp:
             name={'/trader/history':'trade-history.json','/trader/snapshot':'execution-snapshot.json','/trader/conditions':'conditions-api.json','/trader/positions':'positions-api.json'}.get(path,'orders-api.json')
             try:add_bytes(tar,name,json.dumps(api(path),ensure_ascii=False).encode())
             except Exception as e:manifest['errors'][name]=str(e)
-        for name in ['trader_execution.json','trader_config.json','strategy_comparison.jsonl','overnight_attribution.jsonl','overnight_tracking.jsonl','trading_calendar.json']:
+        state_paths=sorted((root/'data/trader_instances').glob('*/trader_execution.json'))
+        default_state=root/'data/trader_instances/default/trader_execution.json'
+        if not default_state.exists():default_state=root/'data/trader_execution.json'
+        default_export=None
+        for p in state_paths:
+            name=p.relative_to(root/'data').as_posix()
+            try:
+                body=execution_state(p)
+                add_bytes(tar,name,body)
+                if p==default_state:default_export=body
+            except Exception as e:manifest['errors'][name]=str(e)
+        if default_state.exists():
+            name='trader_execution.json'
+            try:
+                body=default_export if default_export is not None else execution_state(default_state)
+                add_bytes(tar,name,body)
+            except Exception as e:manifest['errors'][name]=str(e)
+        for name in ['trader_config.json','strategy_comparison.jsonl','overnight_attribution.jsonl','overnight_tracking.jsonl','trading_calendar.json']:
             p=root/'data'/name
             if p.exists():add_bytes(tar,name,p.read_bytes())
         for p in sorted((root/'data').glob('ntrend.log.*')):
@@ -71,10 +94,11 @@ def run(host,output):
     manifest=json.loads((output/'collection-manifest.json').read_text(encoding='utf-8'))
     for name,info in manifest['files'].items():
         if hashlib.sha256((output/name).read_bytes()).hexdigest()!=info['sha256']:raise ValueError('Checksum mismatch: '+name)
-    state=json.loads((output/'trader_execution.json').read_text(encoding='utf-8'))
+    state_path=output/'trader_execution.json'
+    state=json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else None
     print(json.dumps(dict(archive=str(output),raw_5m=manifest['raw_5m'],started_at=manifest['started_at'],
                          finished_at=manifest['finished_at'],errors=manifest['errors'],
-                         counts={k:len(state.get(k,[])) for k in ['history','orders','conditions','positions','seen_trades']},
+                         counts={k:len(state.get(k,[])) for k in ['history','orders','conditions','positions','seen_trades']} if state is not None else None,
                          archive_bytes=archive.stat().st_size,checksums_verified=len(manifest['files'])),ensure_ascii=True,indent=2))
 
 

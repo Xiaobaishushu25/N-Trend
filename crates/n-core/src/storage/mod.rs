@@ -45,10 +45,51 @@ pub async fn connect(path: &Path) -> Result<DatabaseConnection> {
     Ok(db)
 }
 
+/// A small read-only pool for interactive charts. Background writers cannot
+/// take these connections while they wait on SQLite's writer lock.
+pub async fn connect_chart_reader(path: &Path) -> Result<DatabaseConnection> {
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    let pool = SqlitePoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(5))
+        .acquire_slow_threshold(Duration::from_millis(250))
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .busy_timeout(Duration::from_secs(2)),
+        )
+        .await
+        .with_context(|| format!("连接图表只读库失败 ({})", path.display()))?;
+    Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
+}
+
 #[cfg(test)]
 mod pool_tests {
     use super::*;
     use sea_orm::TransactionTrait;
+
+    #[tokio::test]
+    async fn chart_pool_can_read_when_shared_pool_is_fully_leased() {
+        let path = std::env::temp_dir().join(format!("ntrend-chart-{}.sqlite", uuid::Uuid::new_v4()));
+        let primary = connect(&path).await.unwrap();
+        primary.execute_unprepared("CREATE TABLE chart_pool_probe(n INTEGER); INSERT INTO chart_pool_probe VALUES(1)").await.unwrap();
+        let chart = connect_chart_reader(&path).await.unwrap();
+        let pool = primary.get_sqlite_connection_pool();
+        let mut leases = Vec::new();
+        for _ in 0..8 {
+            leases.push(pool.acquire().await.unwrap());
+        }
+        let row = tokio::time::timeout(Duration::from_secs(1), chart.query_one(
+            Statement::from_string(DbBackend::Sqlite, "SELECT n FROM chart_pool_probe"),
+        )).await.unwrap().unwrap().unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 1);
+        assert!(chart.execute_unprepared("UPDATE chart_pool_probe SET n=2").await.is_err());
+        drop(leases);
+        chart.get_sqlite_connection_pool().close().await;
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[tokio::test]
     async fn file_read_does_not_wait_for_an_uncommitted_writer() {

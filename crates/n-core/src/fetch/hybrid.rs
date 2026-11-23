@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::config::Config;
 use crate::fetch::datasource::MarketDataSource;
@@ -33,6 +33,7 @@ pub struct HybridDataSource {
     consecutive_failures: AtomicU32,
     consecutive_successes: AtomicU32,
     last_health_check: RwLock<Instant>,
+    chart_health_probe: Arc<Semaphore>,
     failover_time: RwLock<Instant>,
     event_tx: broadcast::Sender<DataSourceEvent>,
 }
@@ -53,6 +54,7 @@ impl HybridDataSource {
             consecutive_failures: AtomicU32::new(0),
             consecutive_successes: AtomicU32::new(0),
             last_health_check: RwLock::new(Instant::now() - Duration::from_secs(60)),
+            chart_health_probe: Arc::new(Semaphore::new(1)),
             failover_time: RwLock::new(Instant::now() - Duration::from_secs(60)),
             event_tx,
         }
@@ -88,6 +90,21 @@ impl HybridDataSource {
             return false;
         }
         self.check_and_update_health().await
+    }
+
+    pub async fn request_chart_health_probe(self: &Arc<Self>) {
+        if self.tq_is_available()
+            || self.last_health_check.read().await.elapsed() <= Duration::from_secs(10)
+        {
+            return;
+        }
+        if let Ok(permit) = self.chart_health_probe.clone().try_acquire_owned() {
+            let source = self.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = source.tq_available_or_probe().await;
+            });
+        }
     }
 
     pub async fn fetch_trading_calendar(

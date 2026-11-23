@@ -22,6 +22,7 @@ import type {
   EntryTriggerHit,
   GroupRow,
   KlineRow,
+  ChartHistoryUpdate,
   ManualLevelAlert,
   ManualLevelDto,
   ManualLevelEvent,
@@ -278,8 +279,12 @@ export function onKlinePartial(cb: (payload: { symbol: string; timeframe: string
   return listen<{ symbol: string; timeframe: string; bar: any }>('kline-partial', (e) => cb(e.payload))
 }
 
-export function onKlineClosed(cb: (payload: { symbol: string; timeframe: string; bar: any }) => void) {
-  return listen<{ symbol: string; timeframe: string; bar: any }>('kline-closed', (e) => cb(e.payload))
+export function onKlineClosed(cb: (payload: { symbol: string; timeframe: string; bar: KlineRow; series_revision?: number }) => void) {
+  return listen<{ symbol: string; timeframe: string; bar: KlineRow; series_revision?: number }>('kline-closed', (e) => cb(e.payload))
+}
+
+export function onKlineHistory(cb: (payload: ChartHistoryUpdate) => void) {
+  return listen<ChartHistoryUpdate>('kline-history', (e) => cb(e.payload))
 }
 
 export function onChartKlinesRefreshed(cb: (payload: { symbol: string; timeframe: string; response: ChartKlineResponse }) => void) {

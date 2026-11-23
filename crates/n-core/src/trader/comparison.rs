@@ -14,7 +14,7 @@ pub const COMPARISON_VERSION: &str = "paired-quote-v3-shared-policy";
 pub const COST_TICKS: f64 = 2.5;
 pub const FILTER_TICKS: u32 = 10;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExperimentDefinition {
     pub version: String,
     pub id: String,
@@ -235,7 +235,7 @@ impl VariantTrade {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PairedSignal {
     pub condition: ConditionOrder,
     pub observed_at: i64,
@@ -250,7 +250,7 @@ pub struct PairedSignal {
     pub variants: Vec<VariantTrade>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ComparisonRun {
     pub definition: ExperimentDefinition,
     pub signals: BTreeMap<String, PairedSignal>,
@@ -258,7 +258,7 @@ pub struct ComparisonRun {
     archive: RunArchive,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct RunArchive {
     signals: usize,
     groups: Vec<VariantStats>,
@@ -266,7 +266,7 @@ struct RunArchive {
     recent: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ComparisonBook {
     pub active_run: Option<String>,
     pub runs: Vec<ComparisonRun>,
@@ -609,7 +609,7 @@ fn signal_brief(s: &PairedSignal) -> serde_json::Value {
         "variants":s.variants.iter().map(|v|serde_json::json!({"id":v.id,"status":v.status,"reason":v.reason})).collect::<Vec<_>>()})
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct PairedEffect {
     base: String,
     candidate: String,
@@ -664,7 +664,7 @@ impl PairedEffect {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 struct VariantStats {
     id: String,
     label: String,

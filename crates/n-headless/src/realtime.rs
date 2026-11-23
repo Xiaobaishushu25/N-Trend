@@ -206,6 +206,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_updates_reach_all_timeframes_for_the_subscribed_symbol() {
+        let hub = RealtimeHub::new();
+        let (first, mut first_rx, _) = hub.register_client("first".into(), "standard".into()).await;
+        let (second, mut second_rx, _) = hub
+            .register_client("second".into(), "standard".into())
+            .await;
+        let (other, other_rx, _) = hub.register_client("other".into(), "standard".into()).await;
+        hub.update_subscription(first, vec!["CF0".into()], vec!["5m".into()])
+            .await;
+        hub.update_subscription(second, vec!["CF0".into()], vec!["1d".into()])
+            .await;
+        hub.update_subscription(other, vec!["SR0".into()], vec!["1d".into()])
+            .await;
+        let update = serde_json::json!({
+            "symbol": "CF0", "previous_revision": 10, "series_revision": 13,
+            "full_reload_required": false, "bars": [],
+        });
+        hub.broadcast_chart_history(1, "CF0", update).await;
+        for rx in [&mut first_rx, &mut second_rx] {
+            let (message, _) = rx.try_recv().unwrap().into_parts();
+            assert!(
+                matches!(message.as_ref(), Message::Text(text) if text.contains("kline.history"))
+            );
+        }
+        assert!(other_rx.is_empty());
+    }
+
+    #[tokio::test]
     async fn trader_delta_peers_get_only_changes_and_legacy_peers_get_light_baseline() {
         let hub = RealtimeHub::new();
         let (id, mut modern, _) = hub.register_client("new".into(), "admin".into()).await;
@@ -309,7 +337,7 @@ impl RealtimeHub {
         &self,
         event_seq: u64,
         delta: &n_protocol::trader_stream::TraderDelta,
-        snapshot: &serde_json::Value,
+        snapshot: impl serde::Serialize,
     ) {
         let (has_modern, has_legacy, gzip) = {
             let clients = self.clients.read().await;
@@ -506,6 +534,28 @@ impl RealtimeHub {
         timeframe: &str,
         payload: serde_json::Value,
     ) {
+        self.broadcast_chart_event(event_seq, topic, symbol, Some(timeframe), payload)
+            .await;
+    }
+
+    pub async fn broadcast_chart_history(
+        &self,
+        event_seq: u64,
+        symbol: &str,
+        payload: serde_json::Value,
+    ) {
+        self.broadcast_chart_event(event_seq, "kline.history", symbol, None, payload)
+            .await;
+    }
+
+    async fn broadcast_chart_event(
+        &self,
+        event_seq: u64,
+        topic: &str,
+        symbol: &str,
+        timeframe: Option<&str>,
+        payload: serde_json::Value,
+    ) {
         let msg = WsServerMessage::Event {
             event_seq,
             topic: topic.to_string(),
@@ -523,8 +573,10 @@ impl RealtimeHub {
             // 若显式设置了订阅，则仅当匹配 symbol 和 timeframe 时发送
             let symbol_match = session.subscribed_symbols.is_empty()
                 || session.subscribed_symbols.contains(symbol);
-            let tf_match = session.subscribed_timeframes.is_empty()
-                || session.subscribed_timeframes.contains(timeframe);
+            let tf_match = timeframe.is_none_or(|timeframe| {
+                session.subscribed_timeframes.is_empty()
+                    || session.subscribed_timeframes.contains(timeframe)
+            });
 
             !symbol_match || !tf_match || Self::enqueue(*id, session, ws_msg.clone(), topic)
         });

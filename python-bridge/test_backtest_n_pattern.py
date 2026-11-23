@@ -701,6 +701,33 @@ class TestMockedTqBacktestDriver(unittest.TestCase):
         self.assertIn("RB0", buf.getvalue())
 
 
+class TestP2Strategy(unittest.TestCase):
+    def test_p2_and_p2v2_config_validation(self):
+        cfg_p2 = BacktestConfig(
+            strategy="p2",
+            symbols=["RB0"],
+            start=date(2025, 1, 2),
+            end=date(2025, 2, 1),
+            min_score=2.0,
+        )
+        self.assertEqual(cfg_p2.min_score, 3.0)
+        self.assertEqual(cfg_p2.large_volume, 1)
+        self.assertEqual(cfg_p2.small_volume, 1)
+        self.assertTrue(cfg_p2.one_per_symbol)
+
+        cfg_p2v2 = BacktestConfig(
+            strategy="p2v2",
+            symbols=["RB0"],
+            start=date(2025, 1, 2),
+            end=date(2025, 2, 1),
+            min_score=2.0,
+        )
+        self.assertEqual(cfg_p2v2.min_score, 2.5)
+        self.assertEqual(cfg_p2v2.large_volume, 1)
+        self.assertEqual(cfg_p2v2.small_volume, 1)
+        self.assertTrue(cfg_p2v2.one_per_symbol)
+
+
 class TestP3Strategy(unittest.TestCase):
     def test_p3_config_validation(self):
         cfg = BacktestConfig(

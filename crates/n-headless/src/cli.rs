@@ -5,7 +5,7 @@ pub fn validate_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<(
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" | "--check-integrity" | "--repair-integrity" => {}
-            "--data-dir" | "--host" | "--port" => {
+            "--data-dir" | "--host" | "--port" | "--export-execution-state" => {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("{arg} needs a value"))?;
@@ -53,6 +53,7 @@ mod tests {
             ],
             vec!["--data-dir=./data", "--check-integrity"],
             vec!["--data-dir", "./data", "--repair-integrity"],
+            vec!["--export-execution-state", "./data/trader_execution.json"],
             vec!["--help"],
         ] {
             validate(&args).unwrap();
@@ -69,6 +70,7 @@ mod tests {
             vec!["--data-dir="],
             vec!["--data-dir", "--repair-integrity"],
             vec!["--port", "invalid"],
+            vec!["--export-execution-state"],
         ] {
             assert!(validate(&args).is_err(), "{args:?}");
         }

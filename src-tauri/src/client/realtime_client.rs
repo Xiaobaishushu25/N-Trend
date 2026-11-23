@@ -577,6 +577,9 @@ impl RealtimeClient {
                             }
                             let _ = self.app.emit("kline-partial", &payload);
                         }
+                        "kline.history" => {
+                            let _ = self.app.emit("kline-history", &payload);
+                        }
                         "kline.closed" => {
                             if let (Some(sym), Some(tf)) = (
                                 payload.get("symbol").and_then(|v| v.as_str()),

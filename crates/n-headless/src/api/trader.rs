@@ -46,7 +46,7 @@ pub async fn get_trader_status(State(ctx): State<Arc<ServerContext>>) -> impl In
 
 pub async fn get_trader_snapshot(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     let snapshot = ctx.trader_snapshot.read().await.clone();
-    if snapshot.is_null() {
+    if snapshot.is_empty() {
         Json(ApiResponse::err("交易快照正在初始化".to_string()))
     } else {
         Json(ApiResponse::ok(snapshot))

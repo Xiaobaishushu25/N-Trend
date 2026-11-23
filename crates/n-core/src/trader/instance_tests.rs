@@ -398,7 +398,10 @@ async fn legacy_live_position_keeps_its_strategy_and_protection_after_instance_m
         pos
     };
     let old_history = e.get_trade_history().await.len();
+    let path = root.join("trader_execution.json");
+    let legacy = export_execution_state(&path).unwrap();
     drop(e);
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let dest = migrate_default(&root).unwrap();
     let restored = ExecutionEngine::with_config_path(
         BrokerClient::Paper(p.clone()),
@@ -610,6 +613,32 @@ async fn equity_comparison_uses_the_requested_interval_and_marks_missing_samples
     assert_eq!(row["quality_flags"][0], "equity_sample_gap");
     let empty = m.comparison(700, 800).await.unwrap();
     assert!(empty["instances"][0]["net_profit"].is_null());
+
+    db.execute_unprepared(
+        "WITH RECURSIVE minutes(x) AS (SELECT 1 UNION ALL
+             SELECT x+1 FROM minutes WHERE x<43200)
+         INSERT INTO trader_equity(instance_id,timestamp,equity,margin,fees,trading_day)
+         SELECT 'default',1000 + x*60,
+             CASE x WHEN 1000 THEN 1500.0 WHEN 1001 THEN 750.0 ELSE 1000.0 END,
+             CASE x WHEN 1100 THEN 800.0 ELSE 500.0 END, x, '20261024' FROM minutes",
+    ).await.unwrap();
+    let builds_before = m.comparison_builds();
+    let (a, b) = tokio::join!(m.comparison(1000, 2_593_000), m.comparison(1000, 2_593_000));
+    assert_eq!(m.comparison_builds(), builds_before + 1);
+    let a = a.unwrap();
+    assert_eq!(a, b.unwrap());
+    let row = &a["instances"][0];
+    assert_eq!(row["sample_count"], 43_200);
+    assert_eq!(row["net_profit"], 0.0);
+    assert_eq!(row["max_drawdown_pct"], 50.0);
+    assert_eq!(row["max_margin"], 800.0);
+    assert_eq!(row["observed_fees"], 43199.0);
+    let curve = row["equity_curve"].as_array().unwrap();
+    assert!(curve.len() <= 240);
+    assert_eq!(curve.first().unwrap()["timestamp"], 1060);
+    assert_eq!(curve.last().unwrap()["timestamp"], 2_593_000);
+    assert!(curve.iter().any(|point| point["equity"] == 1500.0));
+    assert!(curve.iter().any(|point| point["equity"] == 750.0));
 }
 
 #[tokio::test]

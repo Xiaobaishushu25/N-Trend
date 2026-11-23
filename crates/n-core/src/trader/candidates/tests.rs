@@ -530,10 +530,18 @@ fn weekend_cutoffs_follow_actual_contract_sessions_in_shanghai_time() {
     // Missed exits remain due on Monday; a newly opened Monday position is not overdue.
     let monday = parse_time("2026-10-26 09:01:00").unwrap();
     assert_eq!(
-        params.flat_reason("pb2611", parse_time("2026-10-23 14:00:00").unwrap(), monday),
+        params.flat_reason(
+            "pb2611",
+            parse_time("2026-10-23 14:00:00").unwrap(),
+            monday,
+            DEFAULT_WEEKEND_LEAD_SECONDS,
+        ),
         Some("pre_weekend")
     );
-    assert_eq!(params.flat_reason("pb2611", monday, monday), None);
+    assert_eq!(
+        params.flat_reason("pb2611", monday, monday, DEFAULT_WEEKEND_LEAD_SECONDS),
+        None
+    );
 }
 
 #[test]
@@ -549,14 +557,14 @@ fn frozen_holiday_suppresses_a_nonexistent_friday_night_close() {
     params.validate().unwrap();
     let now = parse_time("2026-10-23 14:50:00").unwrap();
     assert!(params
-        .weekend_windows("pb2611", now)
+        .weekend_windows("pb2611", now, DEFAULT_WEEKEND_LEAD_SECONDS)
         .contains(&(now, parse_time("2026-10-26 09:00:00").unwrap())));
     assert_eq!(
-        params.flat_reason("pb2611", now - 3600, now),
+        params.flat_reason("pb2611", now - 3600, now, DEFAULT_WEEKEND_LEAD_SECONDS),
         Some("pre_holiday")
     );
     assert!(!params
-        .weekend_windows("pb2611", now)
+        .weekend_windows("pb2611", now, DEFAULT_WEEKEND_LEAD_SECONDS)
         .iter()
         .any(|(cut, _)| *cut == parse_time("2026-10-24 00:50:00").unwrap()));
 }
@@ -710,4 +718,62 @@ fn pending_expiry_counts_observed_buckets_without_filling_session_gaps() {
             assert!(actions.is_empty());
         }
     }
+}
+
+#[test]
+fn p2_v2_accepts_score_2_5_and_preserves_p2_v1() {
+    let p_v1 = parameters();
+    let s_v1 = CandidateStrategy::new(p_v1).unwrap();
+    let p_v2 = parameters();
+    let s_v2 = CandidateStrategy::v2(p_v2).unwrap();
+
+    let mut signal_2_8 = signal();
+    signal_2_8["entry_score"] = json!(2.8);
+
+    // v1 (min_score: 3.0) must reject score 2.8
+    assert_eq!(rejection(&s_v1, signal_2_8.clone()), "score_below_min");
+
+    // v2 (min_score: 2.5) must accept score 2.8 and generate entry plan
+    let plan_v2 = plan(&s_v2, signal_2_8);
+    assert_eq!(plan_v2.requested_volume, 1);
+
+    // v2 must reject score 2.49 with score_below_min
+    let mut signal_2_49 = signal();
+    signal_2_49["entry_score"] = json!(2.49);
+    assert_eq!(rejection(&s_v2, signal_2_49), "score_below_min");
+
+    // Other P2 filters remain active in v2 (e.g. ATR out of range, 10 tick minimum risk)
+    let mut signal_low_atr = signal();
+    signal_low_atr["entry_score"] = json!(2.8);
+    signal_low_atr["warning_context"]["atr14"] = json!(7.99); // risk 20 / atr 7.99 = 2.503 > 2.50
+    assert_eq!(rejection(&s_v2, signal_low_atr), "atr_out_of_range");
+}
+
+#[test]
+fn p2_v2_definitions_and_registry() {
+    let p = parameters();
+    let def_v1 = definition(P2, p.clone());
+    assert_eq!(def_v1.code_version, "1");
+    assert!(validate_definition(&def_v1).is_ok());
+
+    let def_v2 = definition_v2(P2, p.clone());
+    assert_eq!(def_v2.code_version, "2");
+    assert!(validate_definition(&def_v2).is_ok());
+
+    let mut registry = StrategyRegistry::default();
+    register(&mut registry);
+
+    assert!(registry.strategy(&def_v1).is_ok());
+    assert!(registry.strategy(&def_v2).is_ok());
+
+    let s_v1 = CandidateStrategy::for_version(p.clone(), CODE_VERSION).unwrap();
+    let s_v2 = CandidateStrategy::for_version(p.clone(), CODE_VERSION_2).unwrap();
+    let s_alias = CandidateStrategy::v2(p).unwrap();
+
+    let mut signal_2_8 = signal();
+    signal_2_8["entry_score"] = json!(2.8);
+
+    assert_eq!(rejection(&s_v1, signal_2_8.clone()), "score_below_min");
+    assert_eq!(plan(&s_v2, signal_2_8.clone()).requested_volume, 1);
+    assert_eq!(plan(&s_alias, signal_2_8).requested_volume, 1);
 }

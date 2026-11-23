@@ -151,8 +151,14 @@ const connectionTooltip = computed(() => {
   return 'CTP 柜台通信正常，资金与持仓已同步完成。'
 })
 
+function presetKey(p: { id?: string; definition: { strategy_id: string; code_version?: string } }): string {
+  if (p.id) return p.id
+  if (p.definition.strategy_id === 'n_p2' && p.definition.code_version === '2') return 'n_p2_v2'
+  return p.definition.strategy_id
+}
+
 function applyPreset(id: string) {
-  const preset = presets.value.find(p => p.definition.strategy_id === id)
+  const preset = presets.value.find(p => presetKey(p) === id || p.definition.strategy_id === id)
   if (!preset) {
     if (id === 'n_pattern' && strategy.value) {
       strategy.value = { ...strategy.value, strategy_id: id, code_version: '1', exit_policy: 'n_exit_v1', sizing_policy: 'n_score_v1', parameters: null }
@@ -162,7 +168,7 @@ function applyPreset(id: string) {
   }
   strategy.value = JSON.parse(JSON.stringify(preset.definition)) as StrategyDefinition
   parameters.value = JSON.stringify(strategy.value.parameters, null, 2)
-  if (config.value) Object.assign(config.value, { min_entry_risk_ticks: 10, default_large_volume: 1, default_small_volume: 1, slippage_ticks: 0, ...(id === 'n_p3_v1' ? { order_wait_seconds: 3 } : {}) })
+  if (config.value) Object.assign(config.value, { min_entry_risk_ticks: 10, default_large_volume: 1, default_small_volume: 1, slippage_ticks: 0, ...(preset.definition.strategy_id === 'n_p3_v1' ? { order_wait_seconds: 3 } : {}) })
 }
 
 function openCreate(copy: boolean) {
@@ -234,7 +240,7 @@ async function create() {
       }
       account.config = { initial_balance: balance.value, contracts: mapping }
     }
-    const preset = presets.value.find(p => p.definition.strategy_id === createPreset.value)
+    const preset = presets.value.find(p => presetKey(p) === createPreset.value || p.definition.strategy_id === createPreset.value)
     const candidateConfig: ExecutionConfig = { mode: 'SemiAuto', max_risk_percent: 1, daily_loss_limit_r: 3, default_large_volume: 1, default_small_volume: 1, order_wait_seconds: 3, slippage_ticks: 0, max_slippage_ticks: 20, max_exit_slippage_ticks: 0, min_entry_risk_ticks: 10, quote_source: 'tianqin' }
     const result = await api.traderInstanceRequest<{ instance_id: string }>('create', undefined, { name: name.value, ...(kind.value === 'simnow' ? { simnow: { ...simnow.value } } : { account }), copy_from: copyFrom.value,
       ...(preset ? { strategy: preset.definition, config: candidateConfig } : {}) })
@@ -277,10 +283,14 @@ async function loadComparison() {
   } catch (e) { setInstanceError(e) } finally { compareBusy.value = false }
 }
 async function showComparison() { compareOpen.value = !compareOpen.value; if (compareOpen.value) await loadComparison() }
-function curve(samples: { equity: number }[]) {
+function curve(samples: { equity: number; timestamp: number }[]) {
   if (samples.length < 2) return ''
   const low = Math.min(...samples.map(p => p.equity)), high = Math.max(...samples.map(p => p.equity))
-  return samples.map((p, i) => `${i * 160 / (samples.length - 1)},${32 - (p.equity - low) / (high - low || 1) * 28}`).join(' ')
+  const start = samples[0].timestamp, duration = samples[samples.length - 1].timestamp - start
+  return samples.map((p, i) => {
+    const x = duration > 0 ? (p.timestamp - start) / duration : i / (samples.length - 1)
+    return `${x * 160},${32 - (p.equity - low) / (high - low || 1) * 28}`
+  }).join(' ')
 }
 
 const emit = defineEmits<{
@@ -857,10 +867,11 @@ watch(
                 <label class="form-label">策略方案预设</label>
                 <select v-model="createPreset" class="form-select">
                   <option value="">{{ copyFrom ? '沿用所选策略配置' : '现有 N 字形策略' }}</option>
-                  <option v-for="p in presets" :key="p.definition.strategy_id" :value="p.definition.strategy_id">{{ p.label }}</option>
+                  <option v-for="p in presets" :key="presetKey(p)" :value="presetKey(p)">{{ p.label }}</option>
                 </select>
               </div>
               <p v-if="createPreset === 'n_p3_v1'" class="field-hint">P3 按 600 元含成本预算开 0～2 手，默认 S1 净盈亏比门槛 1.0，保留摩擦限制并取消 ATR 下限。创建后可调整门槛与退出模式。</p>
+              <p v-else-if="createPreset === 'n_p2_v2'" class="field-hint">P2 V2 准入门槛评分为 2.5（原版 P2 为 3.0），其余固定一手、10 tick 最小风险与 ATR 过滤规则保持一致。</p>
               <p v-else-if="createPreset" class="field-hint">候选策略使用固定一手、10 tick 最小风险和半自动模式。创建后请核对费用与日历；六品种 B5 固定交易 EG、PP、PVC、JD、SR、CJ。</p>
 
               <div class="form-row">
@@ -955,7 +966,7 @@ watch(
               <div class="preset-load-row">
                 <span class="ctrl-label">快速套用策略模板:</span>
                 <div class="preset-buttons">
-                  <button v-for="p in presets" :key="p.definition.strategy_id" type="button" class="btn btn-xs btn-outline" @click="applyPreset(p.definition.strategy_id)">
+                  <button v-for="p in presets" :key="presetKey(p)" type="button" class="btn btn-xs btn-outline" @click="applyPreset(presetKey(p))">
                     {{ p.label }}
                   </button>
                 </div>
@@ -975,6 +986,8 @@ watch(
                     <option v-for="s in trader.instanceCatalog?.modules.strategies.filter(s => s.id === strategy?.strategy_id)" :key="s.version" :value="s.version">{{ s.version }}</option>
                   </select>
                   <span v-if="isP3 && strategy.code_version === '3'" class="field-hint">计划目标距离大于 3.5 ATR 时过滤新开仓信号。</span>
+                  <span v-else-if="strategy.strategy_id === 'n_p2' && strategy.code_version === '2'" class="field-hint">P2 V2：准入门槛评分为 2.5（v1 为 3.0）。</span>
+                  <span v-else-if="strategy.strategy_id === 'n_p2' && strategy.code_version === '1'" class="field-hint">P2 原版：准入门槛评分为 3.0。</span>
                 </div>
 
                 <div class="form-row">

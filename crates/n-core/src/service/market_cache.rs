@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::storage::{
     entities::{pattern_events, symbols},
@@ -21,14 +21,15 @@ use crate::storage::{
 
 const EXTERNAL_REVISION_POLL: Duration = Duration::from_secs(10);
 
-type HistorySlot<T> = Arc<Mutex<Option<(i64, Arc<Vec<T>>)>>>;
+type HistoryState<T, V> = Option<(V, Arc<Vec<T>>)>;
+type HistorySlot<T, V> = Arc<Mutex<HistoryState<T, V>>>;
 
 /// Reuses closed analysis history across scans, review and trading instances.
-pub(super) struct AnalysisHistory<T> {
-    slots: Mutex<HashMap<(String, String), HistorySlot<T>>>,
+pub(super) struct AnalysisHistory<T, V = i64> {
+    slots: Mutex<HashMap<(String, String), HistorySlot<T, V>>>,
 }
 
-impl<T> Default for AnalysisHistory<T> {
+impl<T, V> Default for AnalysisHistory<T, V> {
     fn default() -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
@@ -36,82 +37,30 @@ impl<T> Default for AnalysisHistory<T> {
     }
 }
 
-impl<T> AnalysisHistory<T> {
-    pub(super) async fn get<F, Fut>(
-        &self,
-        db: &DatabaseConnection,
-        reads: &Semaphore,
-        (symbol, timeframe): (&str, &str),
-        load: F,
-    ) -> Result<Arc<Vec<T>>>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = Result<Vec<T>>>,
-    {
-        use crate::storage::cache_revisions::market_history_revision;
-        let key = (symbol.to_owned(), timeframe.to_owned());
-        let slot = {
-            let mut slots = self.slots.lock().await;
-            // Limit retained data on small servers and avoid evicting in-flight reads.
-            if slots.len() >= 64 && !slots.contains_key(&key) {
-                let idle = slots
-                    .iter()
-                    .find(|(_, slot)| Arc::strong_count(slot) == 1)
-                    .map(|(key, _)| key.clone());
-                if let Some(idle) = idle {
-                    slots.remove(&idle);
-                }
-            }
-            if slots.len() >= 64 && !slots.contains_key(&key) {
-                // All retained entries are in use. This read still uses the shared
-                // concurrency limit, but does not grow the retained cache.
-                HistorySlot::default()
+impl<T, V> AnalysisHistory<T, V> {
+    async fn slot(&self, key: (String, String)) -> HistorySlot<T, V> {
+        let mut slots = self.slots.lock().await;
+        if slots.len() >= 64 && !slots.contains_key(&key) {
+            let idle = slots
+                .iter()
+                .find(|(_, slot)| Arc::strong_count(slot) == 1)
+                .map(|(key, _)| key.clone());
+            if let Some(idle) = idle {
+                slots.remove(&idle);
             } else {
-                slots.entry(key).or_default().clone()
-            }
-        };
-        let slot_started = Instant::now();
-        let mut slot = slot.lock().await;
-        let slot_wait_ms = slot_started.elapsed().as_millis();
-        let revision = market_history_revision(db, symbol).await?;
-        if let Some((_, bars)) = slot.as_ref().filter(|(cached, _)| *cached == revision) {
-            tracing::debug!(
-                target: "scan_perf",
-                symbol, timeframe, revision, slot_wait_ms,
-                "[HISTORY] cache hit"
-            );
-            return Ok(bars.clone());
-        }
-
-        let queued = Instant::now();
-        let _read = reads.acquire().await?;
-        let started = Instant::now();
-        for _ in 0..3 {
-            let revision = market_history_revision(db, symbol).await?;
-            let load_started = Instant::now();
-            let bars = Arc::new(load().await?);
-            let load_ms = load_started.elapsed().as_millis();
-            if market_history_revision(db, symbol).await? == revision {
-                if slot_started.elapsed() >= Duration::from_millis(500) {
-                    tracing::info!(
-                        target: "scan_perf",
-                        symbol,
-                        timeframe,
-                        revision,
-                        rows = bars.len(),
-                        slot_wait_ms,
-                        queue_ms = started.duration_since(queued).as_millis(),
-                        load_ms,
-                        total_ms = slot_started.elapsed().as_millis(),
-                        "后台分析历史读取较慢"
-                    );
-                }
-                *slot = Some((revision, bars.clone()));
-                return Ok(bars);
+                // Preserve in-flight reads and bound retained data.
+                return HistorySlot::default();
             }
         }
-        Err(anyhow!("读取分析历史时行情持续更新: {symbol}/{timeframe}"))
+        slots.entry(key).or_default().clone()
     }
+
+    pub(super) async fn lock(
+        &self, key: (String, String),
+    ) -> OwnedMutexGuard<HistoryState<T, V>> {
+        self.slot(key).await.lock_owned().await
+    }
+
 }
 
 struct Snapshot<T> {
@@ -191,12 +140,13 @@ impl<T> RevisionCache<T> {
         }
         // Observe revisions before and after materializing rows. If a write
         // raced with refresh, retry rather than install an inconsistent cache.
-        for _ in 0..3 {
+        for _ in 0..10 {
             let before_epoch = epoch();
             let before_revision = repo::get_revision(db, scope).await?;
             let rows = load().await?;
             let after_revision = repo::get_revision(db, scope).await?;
             if before_epoch != epoch() || before_revision != after_revision {
+                tokio::task::yield_now().await;
                 continue;
             }
             let rows = Arc::new(rows);

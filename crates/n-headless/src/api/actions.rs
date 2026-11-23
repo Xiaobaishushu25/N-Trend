@@ -18,14 +18,7 @@ pub async fn refresh_data_now(
                 succeeded: s.succeeded,
                 failures: s.failures,
             };
-            let seq = ctx.next_event_seq();
-            ctx.realtime_hub
-                .broadcast(
-                    seq,
-                    "data.updated",
-                    serde_json::to_value(&stats).unwrap_or_default(),
-                )
-                .await;
+            crate::runtime::broadcast_data_updated(&ctx, stats.succeeded, stats.failures).await;
             Ok(Json(stats))
         }
         Err(e) => {

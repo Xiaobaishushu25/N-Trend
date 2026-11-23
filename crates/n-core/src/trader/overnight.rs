@@ -22,7 +22,7 @@ pub enum CheckpointType {
 }
 
 /// 跨时段/隔夜影子跟踪快照
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OvernightSnapshot {
     #[serde(default)]
     pub open_observation_version: u32,

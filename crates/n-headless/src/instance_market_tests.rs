@@ -97,7 +97,9 @@ async fn stalled_instance_publication_does_not_block_its_quotes_or_another_accou
     for round in 0..8 {
         for r in &instances {
             r.quote_tx
-                .send(vec![("PB0".into(), q.clone()); 16])
+                .send(vec![n_core::trader::model::ReceivedExecutionQuote {
+                    symbol: "PB0".into(), quote: q.clone(), received_at: q.timestamp,
+                }; 16])
                 .await
                 .unwrap();
         }
@@ -129,7 +131,7 @@ async fn stalled_instance_publication_does_not_block_its_quotes_or_another_accou
         assert!(!r.quote_gap.load(Ordering::Relaxed));
         assert!(r.engine.get_trade_history().await.is_empty());
     }
-    assert!(cache_gate.is_null());
+    assert!(cache_gate.is_empty());
     drop(cache_gate);
     ctx.is_shutting_down.store(true, Ordering::Relaxed);
     for task in tasks {

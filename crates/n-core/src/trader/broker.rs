@@ -187,9 +187,17 @@ impl PaperBroker {
         })
     }
     pub fn on_quotes(&self, quotes: &[(String, ExecutionQuote)]) -> Result<()> {
+        self.update_from_books(quotes.iter().map(|(_, quote)| quote))
+    }
+
+    pub fn on_received_quotes(&self, quotes: &[ReceivedExecutionQuote]) -> Result<()> {
+        self.update_from_books(quotes.iter().map(|event| &event.quote))
+    }
+
+    fn update_from_books<'a>(&self, quotes: impl Iterator<Item = &'a ExecutionQuote>) -> Result<()> {
         {
             let mut cached = self.quotes.lock().unwrap();
-            for (_, q) in quotes {
+            for q in quotes {
                 if q.valid() {
                     cached.insert(q.instrument_id.to_uppercase(), q.clone());
                 }
