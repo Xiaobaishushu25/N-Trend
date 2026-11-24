@@ -165,6 +165,7 @@ fn registered_event_ids(
 }
 
 pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>, close_scan_mode: CloseScanMode) {
+    spawn_scheduler_lag_monitor(ctx.clone());
     if !n_core::storage::outbox::LEGACY_DIRECT_PUBLISH {
         outbox_dispatch::spawn(ctx.clone());
     }
@@ -182,6 +183,23 @@ pub fn spawn_runtime_tasks(ctx: Arc<ServerContext>, close_scan_mode: CloseScanMo
     spawn_execution(ctx.clone());
     spawn_p3_shadow_history(ctx.clone());
     crate::instance_runtime::spawn(ctx);
+}
+
+fn spawn_scheduler_lag_monitor(ctx: Arc<ServerContext>) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let scheduled = timer.tick().await;
+            if ctx.is_shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            let lag = scheduled.elapsed();
+            if lag >= Duration::from_millis(500) {
+                tracing::warn!(scheduler_lag_ms = lag.as_millis(), "服务端 Tokio 定时任务唤醒延迟");
+            }
+        }
+    });
 }
 
 fn spawn_chart_recovery_publisher(ctx: Arc<ServerContext>) {

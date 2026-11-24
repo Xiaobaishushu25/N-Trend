@@ -1501,12 +1501,16 @@ async fn snapshot_reuses_history_and_refreshes_only_changed_fields() {
     let mut cache = ExecutionSnapshotCache::default();
     let first = engine.snapshot_fields(&mut cache, true).await.unwrap();
     let second = engine.snapshot_fields(&mut cache, true).await.unwrap();
-    for key in ["history", "conditions", "statistics", "managed_positions"] {
+    for key in ["history", "statistics", "managed_positions"] {
         assert!(
             std::ptr::eq(first.get(key).unwrap(), second.get(key).unwrap()),
             "{key}"
         );
     }
+    assert!(std::ptr::eq(
+        first.condition_rows().unwrap(),
+        second.condition_rows().unwrap()
+    ));
     engine
         .state
         .lock()
@@ -1517,8 +1521,8 @@ async fn snapshot_reuses_history_and_refreshes_only_changed_fields() {
         .note = "updated".into();
     let next = engine.snapshot_fields(&mut cache, true).await.unwrap();
     assert!(!std::ptr::eq(
-        first.get("conditions").unwrap(),
-        next.get("conditions").unwrap()
+        first.condition_rows().unwrap(),
+        next.condition_rows().unwrap()
     ));
     assert_eq!(next.to_value()["conditions"][0]["note"], "updated");
     assert!(std::ptr::eq(

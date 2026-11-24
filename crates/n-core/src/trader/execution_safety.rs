@@ -390,15 +390,17 @@ impl ExecutionEngine {
         s.last_action_at = now;
         self.save(&mut s)?;
         drop(s);
-        if let Err(error) = self
+        let broker_started = Instant::now();
+        let result = self
             .client
             .cancel_order(
                 &reference,
                 &request.instrument_id,
                 request.exchange_id.as_deref(),
             )
-            .await
-        {
+            .await;
+        execution_timing::record(|timings| timings.broker_requests += broker_started.elapsed());
+        if let Err(error) = result {
             tracing::warn!("撤单结果待柜台确认: {error}");
         }
         Ok(())

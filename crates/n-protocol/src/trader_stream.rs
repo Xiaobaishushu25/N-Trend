@@ -1,5 +1,6 @@
-//! Versioned, top-level replacements: absent fields are unchanged, null clears a field.
+//! Versioned snapshot replacements and condition records keyed by ID.
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +9,14 @@ pub struct TraderDelta {
     pub base_revision: u64,
     pub revision: u64,
     pub changes: Map<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions_patch: Option<ConditionsPatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionsPatch {
+    pub upsert: Vec<Value>,
+    pub remove: Vec<String>,
 }
 
 /// A missing value removes the key; an explicit JSON null is a replacement.
@@ -67,10 +76,13 @@ fn collect_diagnostic_changes(
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub type ConditionRows = BTreeMap<String, Arc<RawValue>>;
+
 #[derive(Clone)]
 enum SnapshotField {
     Json(Arc<Value>),
     Object(Arc<SharedTraderSnapshot>),
+    Conditions(Arc<ConditionRows>),
 }
 
 impl SnapshotField {
@@ -80,6 +92,7 @@ impl SnapshotField {
             (Self::Object(left), Self::Object(right)) => {
                 Arc::ptr_eq(left, right) || left.fields_eq(right, &[])
             }
+            (Self::Conditions(left), Self::Conditions(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
     }
@@ -88,13 +101,14 @@ impl SnapshotField {
         match self {
             Self::Json(value) => (**value).clone(),
             Self::Object(value) => value.to_value(),
+            Self::Conditions(_) => serde_json::to_value(self).expect("condition rows contain valid JSON"),
         }
     }
 
     fn json(&self) -> Option<&Value> {
         match self {
             Self::Json(value) => Some(value),
-            Self::Object(_) => None,
+            Self::Object(_) | Self::Conditions(_) => None,
         }
     }
 }
@@ -104,6 +118,7 @@ impl Serialize for SnapshotField {
         match self {
             Self::Json(value) => value.as_ref().serialize(serializer),
             Self::Object(value) => value.as_ref().serialize(serializer),
+            Self::Conditions(rows) => serializer.collect_seq(rows.values().map(Arc::as_ref)),
         }
     }
 }
@@ -142,6 +157,26 @@ impl SharedTraderSnapshot {
             .insert(key.into(), SnapshotField::Object(Arc::new(value)));
     }
 
+    pub fn insert_conditions(&mut self, rows: Arc<ConditionRows>) {
+        self.0
+            .insert("conditions".into(), SnapshotField::Conditions(rows));
+    }
+
+    pub fn condition_rows(&self) -> Option<&ConditionRows> {
+        match self.0.get("conditions")? {
+            SnapshotField::Conditions(rows) => Some(rows),
+            _ => None,
+        }
+    }
+
+    pub fn expand_conditions_patch(&self, delta: &mut TraderDelta) {
+        if delta.conditions_patch.take().is_some() {
+            if let Some(rows) = self.0.get("conditions") {
+                delta.changes.insert("conditions".into(), rows.to_value());
+            }
+        }
+    }
+
     pub fn extend(&mut self, fields: Self) {
         self.0.extend(fields.0);
     }
@@ -159,6 +194,10 @@ impl SharedTraderSnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub fn field_names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
     }
 
     pub fn to_value(&self) -> Value {
@@ -307,9 +346,24 @@ impl TraderPublisher {
         let previous = &self.latest.0;
         let mut changes = Map::new();
         let mut diagnostics = None;
+        let mut conditions_patch = None;
         for (key, value) in object.iter() {
             let old = previous.get(key);
             if old.is_some_and(|old| snapshot_field_eq(key, old, value)) {
+                continue;
+            }
+            if let (Some(SnapshotField::Conditions(old)), SnapshotField::Conditions(rows)) = (old, value) {
+                let upsert: Vec<_> = rows.iter().filter_map(|(id, row)| {
+                    if old.get(id).is_some_and(|previous| Arc::ptr_eq(previous, row) || previous.get() == row.get()) {
+                        None
+                    } else {
+                        Some(serde_json::from_str(row.get()).expect("condition row contains valid JSON"))
+                    }
+                }).collect();
+                let remove: Vec<_> = old.keys().filter(|id| !rows.contains_key(*id)).cloned().collect();
+                if !upsert.is_empty() || !remove.is_empty() {
+                    conditions_patch = Some(ConditionsPatch { upsert, remove });
+                }
                 continue;
             }
             let value = value.to_value();
@@ -339,7 +393,7 @@ impl TraderPublisher {
                 changes.insert(key.clone(), Value::Null);
             }
         }
-        let delta = if changes.is_empty() {
+        let delta = if changes.is_empty() && conditions_patch.is_none() {
             None
         } else {
             let base_revision = self.revision;
@@ -349,6 +403,7 @@ impl TraderPublisher {
                 base_revision,
                 revision: self.revision,
                 changes,
+                conditions_patch,
             })
         };
         snapshot.insert("_stream_id", self.stream_id.clone().into());
@@ -445,6 +500,36 @@ impl TraderSnapshotCache {
             .snapshot
             .as_object_mut()
             .ok_or("invalid trader baseline")?;
+        if let Some(patch) = delta.conditions_patch {
+            if delta.changes.contains_key("conditions") {
+                return Err("conflicting conditions changes");
+            }
+            let rows = object
+                .get_mut("conditions")
+                .and_then(Value::as_array_mut)
+                .ok_or("missing conditions baseline")?;
+            if rows
+                .iter()
+                .chain(&patch.upsert)
+                .any(|row| row.get("id").and_then(Value::as_str).is_none())
+            {
+                return Err("invalid condition id");
+            }
+            let mut indexed: BTreeMap<_, _> = std::mem::take(rows)
+                .into_iter()
+                .map(|row| (row["id"].as_str().unwrap().to_owned(), row))
+                .collect();
+            for id in patch.remove {
+                indexed.remove(&id);
+            }
+            indexed.extend(
+                patch
+                    .upsert
+                    .into_iter()
+                    .map(|row| (row["id"].as_str().unwrap().to_owned(), row)),
+            );
+            *rows = indexed.into_values().collect();
+        }
         for (key, value) in delta.changes {
             object.insert(key, value);
         }

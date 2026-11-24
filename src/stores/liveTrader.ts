@@ -31,6 +31,11 @@ interface DiagnosticChange {
   value?: unknown
 }
 
+interface ConditionsPatch {
+  upsert: LiveConditionOrder[]
+  remove: string[]
+}
+
 function applyDiagnosticChanges(
   diagnostics: StrategyDiagnostics,
   changes: DiagnosticChange[],
@@ -455,7 +460,17 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       return result
     },
-    applyInstanceDelta(payload: { instance_id: string; delta: { stream_id: string; base_revision: number; revision: number; changes: Partial<LiveTraderSnapshot> }; diagnostic_changes?: DiagnosticChange[] }) {
+    applyInstanceDelta(payload: {
+      instance_id: string
+      delta: {
+        stream_id: string
+        base_revision: number
+        revision: number
+        changes: Partial<LiveTraderSnapshot>
+        conditions_patch?: ConditionsPatch
+      }
+      diagnostic_changes?: DiagnosticChange[]
+    }) {
       if (payload.instance_id !== this.selectedInstanceId) return
       const delta = payload.delta
       if (this.instanceStreamId !== delta.stream_id || delta.base_revision !== this.instanceRevision || delta.revision !== delta.base_revision + 1) {
@@ -470,10 +485,23 @@ export const useLiveTraderStore = defineStore('liveTrader', {
           return
         }
       }
+      let conditions = this.conditions
+      if (delta.conditions_patch) {
+        const { upsert, remove } = delta.conditions_patch
+        if ('conditions' in delta.changes || !Array.isArray(upsert) || !Array.isArray(remove) ||
+          upsert.some(row => typeof row?.id !== 'string') || remove.some(id => typeof id !== 'string')) {
+          void this.refresh()
+          return
+        }
+        const indexed = new Map(conditions.map(row => [row.id, row]))
+        for (const id of remove) indexed.delete(id)
+        for (const row of upsert) indexed.set(row.id, row)
+        conditions = [...indexed.values()]
+      }
       const baseline: LiveTraderSnapshot = {
         instance_id: this.selectedInstanceId, source: 'server', health: this.health, account: this.account,
         broker_positions: this.brokerPositions, config: this.config || undefined,
-        managed_positions: this.managedPositions, conditions: this.conditions, history: this.history,
+        managed_positions: this.managedPositions, conditions, history: this.history,
         statistics: this.statistics, strategy_comparison: this.strategyComparison,
         strategy: this.currentStrategy || undefined, strategy_diagnostics: diagnostics,
         bridge_online: this.bridgeOnline, execution_error: this.errorMsg,

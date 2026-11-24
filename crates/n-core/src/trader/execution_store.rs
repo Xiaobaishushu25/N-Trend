@@ -1,4 +1,4 @@
-use super::{atomic_json, ExecutionOrder, ExecutionOrdersPage, ExecutionState};
+use super::{atomic_json, execution_timing, ExecutionOrder, ExecutionOrdersPage, ExecutionState};
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -7,6 +7,7 @@ use std::fs;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 const VERSION: u32 = 1;
 const DB_NAME: &str = "trader_execution.sqlite3";
@@ -17,6 +18,8 @@ pub(super) struct Orders {
     records: Arc<HashMap<String, ExecutionOrder>>,
     #[serde(skip)]
     dirty: HashSet<String>,
+    #[serde(skip)]
+    archived_rules: Arc<HashSet<String>>,
     #[serde(skip)]
     revision: u64,
     #[serde(skip)]
@@ -52,9 +55,30 @@ impl Orders {
         self.dirty.clear();
     }
 
+    pub(super) fn release_settled_rule_details(&mut self) {
+        let references = self.dirty_references();
+        self.release_rules_for(references);
+    }
+
+    fn release_rules_for(&mut self, references: impl IntoIterator<Item = String>) {
+        for reference in references {
+            if self.records[&reference].settled() && self.records[&reference].entry_rules.is_some()
+            {
+                Arc::make_mut(&mut self.records)
+                    .get_mut(&reference)
+                    .unwrap()
+                    .entry_rules = None;
+                Arc::make_mut(&mut self.archived_rules).insert(reference);
+            }
+        }
+    }
+
     pub(super) fn insert(&mut self, reference: String, order: ExecutionOrder) {
         self.invalidate();
         self.dirty.insert(reference.clone());
+        if self.archived_rules.contains(&reference) {
+            Arc::make_mut(&mut self.archived_rules).remove(&reference);
+        }
         Arc::make_mut(&mut self.records).insert(reference, order);
     }
 
@@ -120,7 +144,7 @@ impl ExecutionStore {
                 Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
             configure(&connection)?;
             check_marker(&connection, &marker)?;
-            return Self::load(connection);
+            return Self::load(connection, true);
         }
 
         let backup = state_path.with_file_name("trader_execution.legacy.json");
@@ -184,8 +208,10 @@ impl ExecutionStore {
             tx.commit()?;
             id
         };
-        let (store, state) = Self::load(connection)?;
+        let (store, mut state) = Self::load(connection, false)?;
         verify_import(&expected, &state)?;
+        let references: Vec<_> = state.orders.keys().cloned().collect();
+        state.orders.release_rules_for(references);
         atomic_json(
             state_path,
             &StoreMarker {
@@ -198,11 +224,11 @@ impl ExecutionStore {
         Ok((store, state))
     }
 
-    fn load(connection: Connection) -> Result<(Self, ExecutionState)> {
+    fn load(connection: Connection, omit_settled_rules: bool) -> Result<(Self, ExecutionState)> {
         // The comparison baseline contains no orders or transient state.
         let previous = read_fields(&connection)?;
         let mut state = previous.clone();
-        read_orders(&connection, &mut state)?;
+        read_orders(&connection, &mut state, omit_settled_rules)?;
         Ok((
             Self {
                 connection,
@@ -213,6 +239,7 @@ impl ExecutionStore {
     }
 
     pub(super) fn save(&mut self, state: &ExecutionState) -> Result<()> {
+        let write_started = Instant::now();
         let tx = self.connection.transaction()?;
         let changed = write_fields(&tx, Some(&self.previous), state)?;
         let order_changed = write_orders(&tx, &state.orders, false)?;
@@ -222,7 +249,11 @@ impl ExecutionStore {
                 [],
             )?;
         }
-        tx.commit()?;
+        execution_timing::record(|timings| timings.sqlite_write += write_started.elapsed());
+        let commit_started = Instant::now();
+        let result = tx.commit();
+        execution_timing::record(|timings| timings.sqlite_commit += commit_started.elapsed());
+        result?;
         if changed {
             update_baseline(&mut self.previous, state);
         }
@@ -253,6 +284,18 @@ impl ExecutionStore {
             page,
             page_size,
         })
+    }
+
+    pub(super) fn list_orders(&self) -> Result<Vec<ExecutionOrder>> {
+        let mut query = self
+            .connection
+            .prepare_cached("SELECT value FROM execution_orders ORDER BY ref_number, reference")?;
+        let mut rows = query.query([])?;
+        let mut orders = Vec::new();
+        while let Some(row) = rows.next()? {
+            orders.push(serde_json::from_slice(row.get_ref(0)?.as_blob()?)?);
+        }
+        Ok(orders)
     }
 
     #[cfg(test)]
@@ -341,17 +384,35 @@ pub(super) fn export(state_path: &Path) -> Result<serde_json::Value> {
 
 fn read_state(connection: &Connection) -> Result<ExecutionState> {
     let mut state = read_fields(connection)?;
-    read_orders(connection, &mut state)?;
+    read_orders(connection, &mut state, false)?;
     Ok(state)
 }
 
-fn read_orders(connection: &Connection, state: &mut ExecutionState) -> Result<()> {
-    let mut select = connection.prepare("SELECT reference,value FROM execution_orders")?;
+fn read_orders(
+    connection: &Connection,
+    state: &mut ExecutionState,
+    omit_settled_rules: bool,
+) -> Result<()> {
+    // Settled orders still supply reconciliation metadata. The immutable
+    // submission rule details are only needed by the historical order API.
+    let query = if omit_settled_rules {
+        "SELECT reference,
+                CASE WHEN settled=1 THEN CAST(json_remove(CAST(value AS TEXT), '$.entry_rules') AS BLOB)
+                     ELSE value END,
+                settled=1 AND COALESCE(json_type(CAST(value AS TEXT), '$.entry_rules')='object', 0)
+         FROM execution_orders"
+    } else {
+        "SELECT reference,value,0 FROM execution_orders"
+    };
+    let mut select = connection.prepare(query)?;
     let mut rows = select.query([])?;
     while let Some(row) = rows.next()? {
         let reference: String = row.get(0)?;
         let order = serde_json::from_slice(row.get_ref(1)?.as_blob()?)
             .with_context(|| format!("读取委托 {reference} 失败"))?;
+        if row.get::<_, bool>(2)? {
+            Arc::make_mut(&mut state.orders.archived_rules).insert(reference.clone());
+        }
         Arc::make_mut(&mut state.orders.records).insert(reference, order);
     }
     Ok(())
@@ -430,7 +491,7 @@ fn write_fields(
     macro_rules! write {
         (scalar_default: $($field:ident),+) => { write!(scalar: $($field),+); };
         ($kind:ident: $($field:ident),+) => {$(
-            fields.$kind(stringify!($field), previous.map(|p| &p.$field), &state.$field)?;
+            fields.$kind(stringify!($field), previous.map(|p| &p.$field as _), &state.$field)?;
         )+};
     }
     state_fields!(write);
@@ -519,6 +580,9 @@ impl<'db> FieldChanges<'db> {
         old: Option<&HashMap<String, T>>,
         map: &HashMap<String, T>,
     ) -> Result<()> {
+        if old.is_some_and(|before| std::ptr::eq(before, map)) {
+            return Ok(());
+        }
         for (key, value) in map {
             if old.and_then(|old| old.get(key)) != Some(value) {
                 self.put(field, key, value)?;
@@ -540,6 +604,9 @@ impl<'db> FieldChanges<'db> {
         old: Option<&HashSet<String>>,
         set: &HashSet<String>,
     ) -> Result<()> {
+        if old.is_some_and(|before| std::ptr::eq(before, set)) {
+            return Ok(());
+        }
         for key in set
             .iter()
             .filter(|key| old.is_none_or(|old| !old.contains(*key)))
@@ -558,6 +625,9 @@ impl<'db> FieldChanges<'db> {
         old: Option<&Vec<T>>,
         list: &[T],
     ) -> Result<()> {
+        if old.is_some_and(|before| std::ptr::eq(before.as_slice(), list)) {
+            return Ok(());
+        }
         for (index, value) in list.iter().enumerate() {
             if old.and_then(|old| old.get(index)) != Some(value) {
                 self.put(field, &format!("{index:020}"), value)?;
@@ -581,10 +651,23 @@ fn write_orders(tx: &Transaction, orders: &Orders, import: bool) -> Result<bool>
              ref_number=excluded.ref_number,wire_ref=excluded.wire_ref,value=excluded.value
          WHERE execution_orders.value <> excluded.value",
     )?;
+    let mut archived_rules = tx.prepare_cached(
+        "SELECT CAST(json_extract(CAST(value AS TEXT), '$.entry_rules') AS BLOB)
+         FROM execution_orders WHERE reference=?1",
+    )?;
     let mut changed = false;
     let mut save = |key: &str, order: &ExecutionOrder| -> Result<()> {
         let reference = order.request.order_ref.as_deref().unwrap_or_default();
         let number = reference.parse::<u64>().unwrap_or(0);
+        let mut restored;
+        let order = if orders.archived_rules.contains(key) {
+            let rules = archived_rules.query_row([key], |row| row.get::<_, Vec<u8>>(0))?;
+            restored = order.clone();
+            restored.entry_rules = Some(serde_json::from_slice(&rules)?);
+            &restored
+        } else {
+            order
+        };
         changed |= put.execute(params![
             key,
             order.settled(),
@@ -610,6 +693,60 @@ fn write_orders(tx: &Transaction, orders: &Orders, import: bool) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settled_rule_details_stay_on_disk_across_updates_and_restarts() {
+        let dir = std::env::temp_dir().join(format!("ntrend_execution_{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("trader_execution.json");
+        let (mut store, mut state) = ExecutionStore::open(&path).unwrap();
+        let order = |reference: &str, phase: &str, filled: i32| -> ExecutionOrder {
+            serde_json::from_value(serde_json::json!({
+                "request":{"instrument_id":"MA2701","direction":"buy","offset":"open",
+                    "price":2150.0,"volume":1,"order_ref":reference},
+                "condition_id":"condition","phase":phase,"reported_filled":1,"filled":filled,
+                "action_at":1,"submitted_at":1,"trading_day":"20261124","note":"",
+                "entry_rules":{"version":"v1","config":super::super::ExecutionConfig::default(),
+                    "planned_risk_ticks":5.0,"comparison_run_id":null}
+            }))
+            .unwrap()
+        };
+        for index in 1..=128 {
+            let reference = index.to_string();
+            state
+                .orders
+                .insert(reference.clone(), order(&reference, "Terminal", 1));
+        }
+        state
+            .orders
+            .insert("129".into(), order("129", "Terminal", 0));
+        store.save(&state).unwrap();
+        state.orders.release_settled_rule_details();
+        state.orders.mark_saved();
+        assert!(state.orders["1"].entry_rules.is_none());
+        assert!(state.orders["129"].entry_rules.is_some());
+        drop(store);
+
+        let (mut store, mut state) = ExecutionStore::open(&path).unwrap();
+        assert_eq!(state.orders.len(), 129);
+        assert!(state.orders["1"].entry_rules.is_none());
+        assert!(state.orders["129"].entry_rules.is_some());
+        state.orders.get_mut("1").unwrap().note = "柜台补充回报".into();
+        store.save(&state).unwrap();
+        let list = store.list_orders().unwrap();
+        assert_eq!(list[0].note, "柜台补充回报");
+        assert_eq!(
+            list[0].entry_rules.as_ref().unwrap().planned_risk_ticks,
+            5.0
+        );
+        assert!(store.page(1, 2).unwrap().items[1].entry_rules.is_some());
+        assert_eq!(
+            export(&path).unwrap()["orders"]["1"]["entry_rules"]["version"],
+            "v1"
+        );
+        drop(store);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn resumes_interrupted_import_and_refuses_to_boot_without_database() {

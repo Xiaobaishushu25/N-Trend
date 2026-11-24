@@ -1,4 +1,5 @@
 use axum::extract::ws::Message;
+use n_protocol::trader_stream::{DiagnosticChange, SharedTraderSnapshot, TraderDelta};
 use n_protocol::ws::WsServerMessage;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,9 +29,15 @@ pub struct ClientSession {
     disconnect: Arc<Notify>,
     pub subscribed_symbols: HashSet<String>,
     pub subscribed_timeframes: HashSet<String>,
-    trader_delta: bool,
-    gzip: bool,
-    compact_diagnostics: bool,
+    capabilities: ClientCapabilities,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ClientCapabilities {
+    pub trader_delta: bool,
+    pub gzip: bool,
+    pub compact_diagnostics: bool,
+    pub conditions_patch: bool,
 }
 
 #[cfg(test)]
@@ -86,7 +93,9 @@ mod tests {
         use std::io::Read;
         let hub = RealtimeHub::new();
         let (id, mut modern, modern_disconnect) = hub
-            .register_with_baseline("new".into(), "admin".into(), true, true, false, None)
+            .register_with_baseline("new".into(), "admin".into(), ClientCapabilities {
+                trader_delta: true, gzip: true, ..Default::default()
+            }, None)
             .await;
         let (_, legacy, legacy_disconnect) =
             hub.register_client("old".into(), "admin".into()).await;
@@ -122,7 +131,9 @@ mod tests {
     async fn compact_diagnostics_preserve_legacy_deltas() {
         let hub = RealtimeHub::new();
         let (_, mut modern, _) = hub
-            .register_with_baseline("new".into(), "admin".into(), true, false, true, None)
+            .register_with_baseline("new".into(), "admin".into(), ClientCapabilities {
+                trader_delta: true, compact_diagnostics: true, ..Default::default()
+            }, None)
             .await;
         let (_, mut legacy, _) = hub.register_client("old".into(), "admin".into()).await;
         let mut publisher = n_protocol::trader_stream::TraderPublisher::new("test".into());
@@ -134,8 +145,14 @@ mod tests {
         snapshot["strategy_diagnostics"]["entry_decisions"] =
             serde_json::json!({"changed":3,"added":null});
         let (_, delta, diagnostics) = publisher.update_instance(snapshot.clone());
-        hub.broadcast_instance_delta(1, "test", delta.unwrap(), diagnostics)
-            .await;
+        hub.broadcast_instance_delta(
+            1,
+            "test",
+            delta.unwrap(),
+            diagnostics,
+            &SharedTraderSnapshot::default(),
+        )
+        .await;
         let (compact, _) = modern.recv().await.unwrap().into_parts();
         let (full, _) = legacy.recv().await.unwrap().into_parts();
         let Message::Text(compact) = compact.as_ref() else {
@@ -245,7 +262,12 @@ mod tests {
         publisher.update(raw.clone());
         raw["account"]["balance"] = serde_json::json!(2);
         let (snapshot, delta) = publisher.update(raw);
-        hub.broadcast_trader(2, &delta.unwrap(), &snapshot).await;
+        hub.broadcast_trader(
+            2,
+            &delta.unwrap(),
+            &SharedTraderSnapshot::from_value(snapshot),
+        )
+        .await;
         let (new, _) = modern.recv().await.unwrap().into_parts();
         let Message::Text(new) = new.as_ref() else {
             panic!()
@@ -262,11 +284,92 @@ mod tests {
         assert!(old["payload"].get("execution_orders").is_none());
         assert_eq!(old["payload"]["broker_positions"][0]["position"], 2);
     }
+
+    #[tokio::test]
+    async fn condition_updates_are_compact_only_for_clients_that_negotiated_them() {
+        use n_protocol::trader_stream::{ConditionRows, TraderPublisher};
+        use serde_json::value::to_raw_value;
+
+        let hub = RealtimeHub::new();
+        let (_, mut modern, _) = hub
+            .register_with_baseline(
+                "modern".into(),
+                "admin".into(),
+                ClientCapabilities {
+                    trader_delta: true,
+                    conditions_patch: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        let (_, mut legacy, _) = hub
+            .register_with_baseline(
+                "legacy".into(),
+                "admin".into(),
+                ClientCapabilities {
+                    trader_delta: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+        let snapshot = |state| {
+            let rows: ConditionRows = ["a", "b"]
+                .into_iter()
+                .map(|id| {
+                    let value = serde_json::json!({
+                        "id": id, "state": if id == "a" { state } else { "pending" }
+                    });
+                    (id.to_owned(), Arc::from(to_raw_value(&value).unwrap()))
+                })
+                .collect();
+            let mut snapshot = SharedTraderSnapshot::default();
+            snapshot.insert_conditions(Arc::new(rows));
+            snapshot
+        };
+        let mut publisher = TraderPublisher::new("boot".into());
+        publisher.update_shared(snapshot("pending"), false);
+        let (current, delta, _) = publisher.update_shared(snapshot("closed"), false);
+        let delta = delta.unwrap();
+        hub.broadcast_trader(1, &delta, &current).await;
+        hub.broadcast_instance_delta(2, "instance", delta, None, &current)
+            .await;
+
+        for ptr in ["/payload", "/payload/delta"] {
+            let read = |item: QueuedMessage| {
+                let (frame, _) = item.into_parts();
+                let Message::Text(text) = frame.as_ref() else {
+                    panic!("expected text frame")
+                };
+                serde_json::from_str::<serde_json::Value>(text).unwrap()
+            };
+            let compact = read(modern.try_recv().unwrap());
+            let compact = compact.pointer(ptr).unwrap();
+            assert_eq!(
+                compact["conditions_patch"]["upsert"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(compact["conditions_patch"]["upsert"][0]["state"], "closed");
+            assert!(compact["changes"].get("conditions").is_none());
+            let full = read(legacy.try_recv().unwrap());
+            let full = full.pointer(ptr).unwrap();
+            assert!(full.get("conditions_patch").is_none());
+            assert_eq!(
+                full["changes"]["conditions"],
+                current.to_value()["conditions"]
+            );
+        }
+    }
 }
 
 pub struct RealtimeHub {
     clients: RwLock<HashMap<usize, ClientSession>>,
     next_client_id: AtomicUsize,
+    baseline_encoding: Semaphore,
 }
 
 impl RealtimeHub {
@@ -274,7 +377,15 @@ impl RealtimeHub {
         Self {
             clients: RwLock::new(HashMap::new()),
             next_client_id: AtomicUsize::new(1),
+            baseline_encoding: Semaphore::new(1),
         }
+    }
+
+    pub async fn baseline_slot(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.baseline_encoding
+            .acquire()
+            .await
+            .expect("baseline semaphore stays open")
     }
 
     #[cfg(test)]
@@ -283,7 +394,7 @@ impl RealtimeHub {
         device_id: String,
         role: String,
     ) -> (usize, mpsc::Receiver<QueuedMessage>, Arc<Notify>) {
-        self.register_with_baseline(device_id, role, false, false, false, None)
+        self.register_with_baseline(device_id, role, ClientCapabilities::default(), None)
             .await
     }
 
@@ -291,10 +402,8 @@ impl RealtimeHub {
         &self,
         device_id: String,
         role: String,
-        trader_delta: bool,
-        gzip: bool,
-        compact_diagnostics: bool,
-        baseline: Option<WsServerMessage>,
+        capabilities: ClientCapabilities,
+        baseline: Option<(u64, &SharedTraderSnapshot)>,
     ) -> (usize, mpsc::Receiver<QueuedMessage>, Arc<Notify>) {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE_CAPACITY);
         let disconnect = Arc::new(Notify::new());
@@ -307,13 +416,18 @@ impl RealtimeHub {
             disconnect: disconnect.clone(),
             subscribed_symbols: HashSet::new(),
             subscribed_timeframes: HashSet::new(),
-            trader_delta,
-            gzip,
-            compact_diagnostics,
+            capabilities,
         };
-        if let Some(event) = baseline {
-            if let Some(frame) = PreparedEvent::new(event, gzip).await {
-                if !Self::enqueue(client_id, &session, frame.message(gzip), &frame.topic) {
+        if let Some((event_seq, snapshot)) = baseline {
+            if let Some(frame) =
+                PreparedEvent::from_trader_snapshot(event_seq, snapshot, capabilities.gzip).await
+            {
+                if !Self::enqueue(
+                    client_id,
+                    &session,
+                    frame.message(capabilities.gzip),
+                    &frame.topic,
+                ) {
                     return (client_id, rx, disconnect);
                 }
             }
@@ -329,50 +443,59 @@ impl RealtimeHub {
     #[cfg(test)]
     pub async fn set_trader_delta(&self, client_id: usize, enabled: bool) {
         if let Some(session) = self.clients.write().await.get_mut(&client_id) {
-            session.trader_delta = enabled;
+            session.capabilities.trader_delta = enabled;
         }
     }
 
     pub async fn broadcast_trader(
         &self,
         event_seq: u64,
-        delta: &n_protocol::trader_stream::TraderDelta,
-        snapshot: impl serde::Serialize,
+        delta: &TraderDelta,
+        snapshot: &SharedTraderSnapshot,
     ) {
-        let (has_modern, has_legacy, gzip) = {
+        let (mut delta_modes, mut legacy_gzip) = (HashMap::new(), None);
+        {
             let clients = self.clients.read().await;
-            (
-                clients.values().any(|s| s.trader_delta),
-                clients.values().any(|s| !s.trader_delta),
-                clients.values().any(|s| s.gzip),
-            )
-        };
-        let modern = if has_modern {
-            PreparedEvent::new(
-                WsServerMessage::new_event(event_seq, "trader.delta", delta),
+            for session in clients.values() {
+                let capabilities = session.capabilities;
+                if capabilities.trader_delta {
+                    let compact = delta.conditions_patch.is_some() && capabilities.conditions_patch;
+                    *delta_modes.entry(compact).or_insert(false) |= capabilities.gzip;
+                } else {
+                    *legacy_gzip.get_or_insert(false) |= capabilities.gzip;
+                }
+            }
+        }
+        let mut frames = HashMap::new();
+        for (compact, gzip) in delta_modes {
+            let mut outgoing = std::borrow::Cow::Borrowed(delta);
+            if !compact && delta.conditions_patch.is_some() {
+                snapshot.expand_conditions_patch(outgoing.to_mut());
+            }
+            if let Some(frame) = PreparedEvent::new(
+                WsServerMessage::new_event(event_seq, "trader.delta", outgoing.as_ref()),
                 gzip,
             )
             .await
-        } else {
-            None
-        };
-        let legacy = if has_legacy {
-            PreparedEvent::new(
-                WsServerMessage::new_event(event_seq, "trader.updated", snapshot),
-                gzip,
-            )
-            .await
+            {
+                frames.insert(compact, frame);
+            }
+        }
+        let legacy = if let Some(gzip) = legacy_gzip {
+            let _slot = self.baseline_slot().await;
+            PreparedEvent::from_trader_snapshot(event_seq, snapshot, gzip).await
         } else {
             None
         };
         self.clients.write().await.retain(|id, session| {
-            let event = if session.trader_delta {
-                &modern
+            let capabilities = session.capabilities;
+            let event = if capabilities.trader_delta {
+                frames.get(&(delta.conditions_patch.is_some() && capabilities.conditions_patch))
             } else {
-                &legacy
+                legacy.as_ref()
             };
-            event.as_ref().map_or(true, |frame| {
-                Self::enqueue(*id, session, frame.message(session.gzip), &frame.topic)
+            event.map_or(true, |frame| {
+                Self::enqueue(*id, session, frame.message(capabilities.gzip), &frame.topic)
             })
         });
     }
@@ -381,58 +504,54 @@ impl RealtimeHub {
         &self,
         event_seq: u64,
         instance_id: &str,
-        mut delta: n_protocol::trader_stream::TraderDelta,
-        diagnostics: Option<Vec<n_protocol::trader_stream::DiagnosticChange>>,
+        delta: TraderDelta,
+        diagnostics: Option<Vec<DiagnosticChange>>,
+        snapshot: &SharedTraderSnapshot,
     ) {
         const TOPIC: &str = "trader.instance.delta";
-        let Some(diagnostics) = diagnostics else {
-            self.broadcast(
-                event_seq,
-                TOPIC,
-                serde_json::json!({ "instance_id": instance_id, "delta": delta }),
-            )
-            .await;
-            return;
-        };
-        let (modern, legacy, gzip) = {
-            let clients = self.clients.read().await;
+        let mode = |client: &ClientSession| {
             (
-                clients.values().any(|s| s.compact_diagnostics),
-                clients.values().any(|s| !s.compact_diagnostics),
-                clients.values().any(|s| s.gzip),
+                diagnostics.is_some() && client.capabilities.compact_diagnostics,
+                delta.conditions_patch.is_some() && client.capabilities.conditions_patch,
             )
         };
-        let legacy = if legacy {
-            PreparedEvent::new(
-                WsServerMessage::new_event(
-                    event_seq,
-                    TOPIC,
-                    serde_json::json!({
-                        "instance_id": instance_id, "delta": &delta
-                    }),
-                ),
-                gzip,
-            )
-            .await
-        } else {
-            None
-        };
-        let compact = if modern {
-            delta.changes.remove("strategy_diagnostics");
-            PreparedEvent::new(WsServerMessage::new_event(event_seq, TOPIC, serde_json::json!({
-                "instance_id": instance_id, "delta": delta, "diagnostic_changes": diagnostics
-            })), gzip).await
-        } else {
-            None
-        };
-        self.clients.write().await.retain(|id, session| {
-            let event = if session.compact_diagnostics {
-                &compact
+        let mut modes = HashMap::new();
+        {
+            let clients = self.clients.read().await;
+            for session in clients.values() {
+                *modes.entry(mode(session)).or_insert(false) |= session.capabilities.gzip;
+            }
+        }
+        let mut frames = HashMap::new();
+        for (key @ (compact_diagnostics, compact_conditions), gzip) in modes {
+            let mut outgoing = std::borrow::Cow::Borrowed(&delta);
+            if !compact_conditions && delta.conditions_patch.is_some() {
+                snapshot.expand_conditions_patch(outgoing.to_mut());
+            }
+            let payload = if compact_diagnostics {
+                outgoing.to_mut().changes.remove("strategy_diagnostics");
+                serde_json::json!({"instance_id": instance_id, "delta": outgoing.as_ref(),
+                    "diagnostic_changes": diagnostics})
             } else {
-                &legacy
+                serde_json::json!({"instance_id": instance_id, "delta": outgoing.as_ref()})
             };
-            event.as_ref().map_or(true, |frame| {
-                Self::enqueue(*id, session, frame.message(session.gzip), TOPIC)
+            let event = WsServerMessage::Event {
+                event_seq,
+                topic: TOPIC.into(),
+                payload,
+            };
+            if let Some(frame) = PreparedEvent::new(event, gzip).await {
+                frames.insert(key, frame);
+            }
+        }
+        self.clients.write().await.retain(|id, session| {
+            frames.get(&mode(session)).map_or(true, |frame| {
+                Self::enqueue(
+                    *id,
+                    session,
+                    frame.message(session.capabilities.gzip),
+                    TOPIC,
+                )
             })
         });
     }
@@ -517,11 +636,11 @@ impl RealtimeHub {
             if clients.is_empty() {
                 return;
             }
-            clients.values().any(|s| s.gzip)
+            clients.values().any(|s| s.capabilities.gzip)
         };
         if let Some(frame) = PreparedEvent::new(msg, gzip).await {
             self.clients.write().await.retain(|id, session| {
-                Self::enqueue(*id, session, frame.message(session.gzip), topic)
+                Self::enqueue(*id, session, frame.message(session.capabilities.gzip), topic)
             });
         }
     }
@@ -603,6 +722,43 @@ struct PreparedEvent {
 }
 
 impl PreparedEvent {
+    async fn from_trader_snapshot(
+        event_seq: u64,
+        snapshot: &SharedTraderSnapshot,
+        gzip: bool,
+    ) -> Option<Self> {
+        #[derive(serde::Serialize)]
+        struct SnapshotEvent<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            event_seq: u64,
+            topic: &'static str,
+            payload: &'a SharedTraderSnapshot,
+        }
+
+        let snapshot = snapshot.clone();
+        tokio::task::spawn_blocking(move || {
+            let topic = "trader.updated";
+            let text = serde_json::to_string(&SnapshotEvent {
+                kind: "event",
+                event_seq,
+                topic,
+                payload: &snapshot,
+            })
+            .ok()?;
+            let fields = (text.len() >= 256 * 1024)
+                .then(|| snapshot.field_names().map(str::to_owned).collect());
+            let compressed = if gzip && text.len() >= 8192 {
+                gzip_message(&text).map(Arc::new)
+            } else {
+                None
+            };
+            Some(Self::from_frames(topic.into(), text, compressed, fields))
+        })
+        .await
+        .ok()?
+    }
+
     async fn new(event: WsServerMessage, gzip: bool) -> Option<Self> {
         let WsServerMessage::Event { topic, payload, .. } = &event else {
             return None;
@@ -630,6 +786,15 @@ impl PreparedEvent {
         } else {
             (text, None)
         };
+        Some(Self::from_frames(topic, text, gzip, fields))
+    }
+
+    fn from_frames(
+        topic: String,
+        text: String,
+        gzip: Option<Arc<Message>>,
+        fields: Option<Vec<String>>,
+    ) -> Self {
         if let Some(fields) = fields {
             let compressed_bytes = gzip.as_deref().and_then(|msg| {
                 if let Message::Binary(bytes) = msg {
@@ -641,16 +806,16 @@ impl PreparedEvent {
             tracing::info!(
                 topic,
                 ?fields,
-                uncompressed_bytes,
+                uncompressed_bytes = text.len(),
                 ?compressed_bytes,
                 "大型 WebSocket 消息"
             );
         }
-        Some(Self {
+        Self {
             topic,
             text: Arc::new(Message::Text(text)),
             gzip,
-        })
+        }
     }
 
     fn message(&self, gzip: bool) -> Arc<Message> {

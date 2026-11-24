@@ -1,4 +1,5 @@
 use crate::auth::AuthDevice;
+use crate::realtime::ClientCapabilities;
 use crate::state::ServerContext;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -15,43 +16,32 @@ pub async fn ws_handler(
     device: AuthDevice,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let trader_delta = headers
-        .get("X-Ntrend-Trader-Delta")
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
-    let gzip = headers
-        .get("X-Ntrend-Ws-Gzip")
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
-    let compact_diagnostics = headers
-        .get("X-Ntrend-Trader-Compact-Diagnostics")
-        .is_some_and(|v| v == "1");
-    ws.on_upgrade(move |socket| {
-        handle_socket(socket, ctx, device, trader_delta, gzip, compact_diagnostics)
-    })
+    let enabled = |name| headers.get(name).is_some_and(|value| value == "1");
+    let capabilities = ClientCapabilities {
+        trader_delta: enabled("X-Ntrend-Trader-Delta"),
+        gzip: enabled("X-Ntrend-Ws-Gzip"),
+        compact_diagnostics: enabled("X-Ntrend-Trader-Compact-Diagnostics"),
+        conditions_patch: enabled("X-Ntrend-Trader-Conditions-Patch"),
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, ctx, device, capabilities))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     ctx: Arc<ServerContext>,
     device: AuthDevice,
-    trader_delta: bool,
-    gzip: bool,
-    compact_diagnostics: bool,
+    capabilities: ClientCapabilities,
 ) {
     // Keep the baseline before all deltas published to this client.
     let (client_id, mut rx, disconnect) = {
+        let _slot = ctx.realtime_hub.baseline_slot().await;
         let snapshot = ctx.trader_snapshot.read().await;
-        let baseline = (!snapshot.is_empty()).then(|| {
-            WsServerMessage::new_event(ctx.next_event_seq(), "trader.updated", &*snapshot)
-        });
+        let baseline = (!snapshot.is_empty()).then(|| (ctx.next_event_seq(), &*snapshot));
         ctx.realtime_hub
             .register_with_baseline(
                 device.id.clone(),
                 device.role.clone(),
-                trader_delta,
-                gzip,
-                compact_diagnostics,
+                capabilities,
                 baseline,
             )
             .await

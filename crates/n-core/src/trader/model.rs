@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub(super) const EXECUTION_QUOTE_MAX_AGE_SECONDS: i64 = 15;
+pub const EXECUTION_QUOTE_MAX_AGE_SECONDS: i64 = 15;
 
 pub fn is_actual_futures_contract(code: &str) -> bool {
     let prefix = code.bytes().take_while(u8::is_ascii_alphabetic).count();

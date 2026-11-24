@@ -1,9 +1,13 @@
 //! Each account progresses in its own task; one unavailable broker never blocks another.
 use crate::state::ServerContext;
-use n_core::trader::{broker::BrokerClient, instances::*, strategy::StrategyEvent};
+use n_core::trader::{
+    broker::BrokerClient, execution::ExecutionTimings, instances::*,
+    model::EXECUTION_QUOTE_MAX_AGE_SECONDS, strategy::StrategyEvent,
+};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -87,6 +91,7 @@ pub fn spawn(ctx: Arc<ServerContext>) {
                     let account = r.clone();
                     tokio::spawn(async move {
                         let mut backoff = 1;
+                        let mut last_slow_broker_report: Option<Instant> = None;
                         loop {
                             if c.is_shutting_down.load(Ordering::Relaxed)
                                 || c.instances
@@ -104,15 +109,42 @@ pub fn spawn(ctx: Arc<ServerContext>) {
                                     let mut s = stream.next_snapshot().await?;
                                     s["bridge_online"] = json!(true);
                                     let manager = c.instances.get().unwrap();
-                                    manager
-                                        .validate_snapshot(&account.definition.id, &s)
-                                        .await?;
-                                    let evs = account.engine.reconcile(&s).await?;
-                                    dispatch_live_trade_emails(&c, &account.definition.name, evs);
-                                    account
-                                        .engine
-                                        .dispatch(StrategyEvent::ExecutionUpdate(s.clone()))
-                                        .await?;
+                                    let started = Instant::now();
+                                    let mut validate_time = Duration::ZERO;
+                                    let mut reconcile_time = Duration::ZERO;
+                                    let mut dispatch_time = Duration::ZERO;
+                                    let (result, execution) = ExecutionTimings::measure(async {
+                                        measure_stage(
+                                            &mut validate_time,
+                                            manager.validate_snapshot(&account.definition.id, &s),
+                                        ).await?;
+                                        let evs = measure_stage(
+                                            &mut reconcile_time, account.engine.reconcile(&s),
+                                        ).await?;
+                                        dispatch_live_trade_emails(&c, &account.definition.name, evs);
+                                        measure_stage(
+                                            &mut dispatch_time,
+                                            account.engine.dispatch(StrategyEvent::ExecutionUpdate(s.clone())),
+                                        ).await
+                                    }).await;
+                                    let elapsed = started.elapsed();
+                                    if elapsed >= Duration::from_millis(500)
+                                        && last_slow_broker_report
+                                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                                    {
+                                        tracing::warn!(instance_id = %account.definition.id,
+                                            processing_ms = elapsed.as_millis(),
+                                            validate_ms = validate_time.as_millis(),
+                                            reconcile_ms = reconcile_time.as_millis(),
+                                            strategy_dispatch_ms = dispatch_time.as_millis(),
+                                            state_lock_wait_ms = execution.state_lock_wait.as_millis(),
+                                            save_ms = execution.save_total.as_millis(),
+                                            sqlite_write_ms = execution.sqlite_write.as_millis(),
+                                            sqlite_commit_ms = execution.sqlite_commit.as_millis(),
+                                            "实例柜台回报应用较慢");
+                                        last_slow_broker_report = Some(Instant::now());
+                                    }
+                                    result?;
                                     *account.snapshot.write().await = s;
                                     *account.error.write().await = None;
                                     backoff = 1;
@@ -549,8 +581,15 @@ impl InstancePublisher {
                     break;
                 }
                 let started = Instant::now();
+                let mut snapshot_time = Duration::ZERO;
+                let mut publish_time = Duration::ZERO;
+                let mut equity_time = Duration::ZERO;
                 let result: anyhow::Result<()> = async {
-                    let mut snapshot = manager.build_shared_snapshot(&r.definition.id, &mut fields).await?;
+                    let mut snapshot = measure_stage(
+                        &mut snapshot_time,
+                        manager.build_shared_snapshot(&r.definition.id, &mut fields),
+                    ).await?;
+                    let publish_started = Instant::now();
                     let calendar = snapshot.object("strategy_diagnostics")
                         .and_then(|fields| fields.get("calendar_health"));
                     warn_calendar_coverage(&r.definition.id, calendar, &mut calendar_warnings);
@@ -558,10 +597,10 @@ impl InstancePublisher {
                     let (baseline, delta, diagnostics) = publisher.update_shared(snapshot, true);
                     // Publish before potentially slow equity SQL, which must
                     // not hold up REST recovery or the quote/exit task either.
-                    *r.published.write().await = baseline;
+                    *r.published.write().await = baseline.clone();
                     if let Some(delta) = delta {
                         ctx.realtime_hub.broadcast_instance_delta(
-                            ctx.next_event_seq(), &r.definition.id, delta, diagnostics
+                            ctx.next_event_seq(), &r.definition.id, delta, diagnostics, &baseline
                         ).await;
                     }
                     if last_heartbeat.elapsed() >= Duration::from_secs(15) {
@@ -569,20 +608,154 @@ impl InstancePublisher {
                             json!({"instance_id":r.definition.id,"heartbeat":publisher.heartbeat()})).await;
                         last_heartbeat = Instant::now();
                     }
+                    publish_time = publish_started.elapsed();
                     // Only the small broker snapshot is needed for sampling.
                     let broker = r.snapshot.read().await.clone();
-                    manager.sample_equity(&r.definition.id, &broker).await?;
+                    measure_stage(&mut equity_time, manager.sample_equity(&r.definition.id, &broker)).await?;
                     Ok(())
                 }.await;
                 if let Err(error) = result {
                     tracing::warn!(instance_id = %r.definition.id, error = %error, "实例状态发布/净值采样失败，行情消费继续独立运行");
                 }
                 if started.elapsed() >= Duration::from_millis(500) {
-                    tracing::warn!(instance_id = %r.definition.id, publish_ms = started.elapsed().as_millis(), "实例后台发布较慢");
+                    tracing::warn!(instance_id = %r.definition.id,
+                        publish_ms = started.elapsed().as_millis(),
+                        snapshot_ms = snapshot_time.as_millis(),
+                        websocket_publish_ms = publish_time.as_millis(),
+                        equity_sample_ms = equity_time.as_millis(),
+                        "实例后台发布较慢");
                 }
             }
         }))
     }
+}
+
+async fn measure_stage<T>(elapsed: &mut Duration, operation: impl Future<Output = T>) -> T {
+    let started = Instant::now();
+    let result = operation.await;
+    *elapsed += started.elapsed();
+    result
+}
+
+#[derive(Default)]
+struct AccountCycleTimings {
+    elapsed: Duration,
+    paper_quotes: Duration,
+    engine_quotes: Duration,
+    timer: Duration,
+    paper_sync: Duration,
+    history: Duration,
+    final_drive: Duration,
+    execution: ExecutionTimings,
+    batch_quotes: usize,
+    waiting_batches_at_start: usize,
+    waiting_batches_at_end: usize,
+    oldest_quote_age_seconds: i64,
+    oldest_feed_to_consumer_seconds: i64,
+    quotes_past_age_limit: usize,
+    finished_at_ms: i64,
+    failed: bool,
+}
+
+#[derive(Default)]
+struct SlowAccountCycles {
+    slowest: Option<AccountCycleTimings>,
+    slow_cycles: usize,
+    quotes_past_age_limit: usize,
+    max_quote_age_seconds: i64,
+    max_feed_to_consumer_seconds: i64,
+    max_waiting_batches: usize,
+}
+
+impl SlowAccountCycles {
+    fn observe(&mut self, cycle: AccountCycleTimings) {
+        let slow = cycle.elapsed >= Duration::from_millis(250);
+        if !slow && cycle.quotes_past_age_limit == 0 {
+            return;
+        }
+        self.slow_cycles += usize::from(slow);
+        self.quotes_past_age_limit += cycle.quotes_past_age_limit;
+        self.max_quote_age_seconds = self.max_quote_age_seconds.max(cycle.oldest_quote_age_seconds);
+        self.max_feed_to_consumer_seconds = self
+            .max_feed_to_consumer_seconds
+            .max(cycle.oldest_feed_to_consumer_seconds);
+        self.max_waiting_batches = self
+            .max_waiting_batches
+            .max(cycle.waiting_batches_at_start.max(cycle.waiting_batches_at_end));
+        if self
+            .slowest
+            .as_ref()
+            .is_none_or(|slowest| cycle.elapsed > slowest.elapsed)
+        {
+            self.slowest = Some(cycle);
+        }
+    }
+
+    fn report(&mut self, instance_id: &str) {
+        let Some(cycle) = self.slowest.take() else {
+            return;
+        };
+        let execution = cycle.execution;
+        tracing::warn!(
+            instance_id, slow_cycles = self.slow_cycles,
+            quotes_past_age_limit = self.quotes_past_age_limit,
+            max_quote_age_seconds = self.max_quote_age_seconds,
+            max_feed_to_consumer_seconds = self.max_feed_to_consumer_seconds,
+            max_waiting_batches = self.max_waiting_batches,
+            batch_quotes = cycle.batch_quotes, failed = cycle.failed,
+            sampled_cycle_finished_at_ms = cycle.finished_at_ms,
+            processing_ms = cycle.elapsed.as_millis(),
+            paper_quotes_ms = cycle.paper_quotes.as_millis(),
+            engine_quotes_ms = cycle.engine_quotes.as_millis(),
+            timer_ms = cycle.timer.as_millis(),
+            paper_sync_ms = cycle.paper_sync.as_millis(),
+            history_apply_ms = cycle.history.as_millis(),
+            final_drive_ms = cycle.final_drive.as_millis(),
+            observe_quotes_ms = execution.observe_quotes.as_millis(),
+            strategy_handler_ms = execution.strategy_handler.as_millis(),
+            flush_quotes_ms = execution.flush_quotes.as_millis(),
+            drive_after_quotes_ms = execution.drive_after_quotes.as_millis(),
+            drive_lock_wait_ms = execution.drive_lock_wait.as_millis(),
+            state_lock_wait_ms = execution.state_lock_wait.as_millis(),
+            broker_request_ms = execution.broker_requests.as_millis(),
+            save_count = execution.save_count, save_ms = execution.save_total.as_millis(),
+            sqlite_write_ms = execution.sqlite_write.as_millis(),
+            sqlite_commit_ms = execution.sqlite_commit.as_millis(),
+            "实例执行消费较慢或报价过期"
+        );
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn slow_cycle_summary_keeps_the_slowest_breakdown_and_counts_expired_quotes() {
+    let mut summary = SlowAccountCycles::default();
+    summary.observe(AccountCycleTimings {
+        elapsed: Duration::from_millis(100),
+        ..Default::default()
+    });
+    assert!(summary.slowest.is_none());
+
+    summary.observe(AccountCycleTimings {
+        elapsed: Duration::from_millis(800),
+        history: Duration::from_millis(600),
+        waiting_batches_at_end: 4,
+        ..Default::default()
+    });
+    summary.observe(AccountCycleTimings {
+        elapsed: Duration::from_millis(100),
+        oldest_quote_age_seconds: 20,
+        oldest_feed_to_consumer_seconds: 16,
+        quotes_past_age_limit: 3,
+        ..Default::default()
+    });
+    assert_eq!(summary.slowest.unwrap().history, Duration::from_millis(600));
+    assert_eq!(summary.slow_cycles, 1);
+    assert_eq!(summary.quotes_past_age_limit, 3);
+    assert_eq!(summary.max_quote_age_seconds, 20);
+    assert_eq!(summary.max_feed_to_consumer_seconds, 16);
+    assert_eq!(summary.max_waiting_batches, 4);
 }
 
 async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
@@ -599,6 +772,8 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
     let mut last_timer = None::<Instant>;
     let mut total_quotes = 0u64;
     let mut queue_high_water = 0usize;
+    let mut slow_cycles = SlowAccountCycles::default();
+    let mut last_slow_report = Instant::now();
     loop {
         let (quotes, loaded) =
             match next_account_event(&mut timer, &mut rx, &mut history.updates).await {
@@ -607,24 +782,25 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                 AccountEvent::Tick => (None, None),
                 AccountEvent::Closed => break,
             };
-        queue_high_water = queue_high_water.max(rx.len());
+        let waiting_batches_at_start = rx.len();
+        queue_high_water = queue_high_water.max(waiting_batches_at_start);
         let quotes = quotes.map(|events| crate::runtime::drain_quote_batches(&mut rx, events));
         let batch_quotes = quotes.as_ref().map_or(0, Vec::len);
         total_quotes = total_quotes.saturating_add(batch_quotes as u64);
-        let oldest_quote_age_seconds = quotes
-            .as_ref()
-            .and_then(|events| {
-                events
-                    .iter()
-                    .map(|event| {
-                        chrono::Utc::now()
-                            .timestamp()
-                            .saturating_sub(event.quote.timestamp)
-                            .max(0)
-                    })
-                    .max()
-            })
-            .unwrap_or(0);
+        let mut cycle = AccountCycleTimings {
+            batch_quotes,
+            waiting_batches_at_start,
+            ..Default::default()
+        };
+        let dequeued_at = chrono::Utc::now().timestamp();
+        for event in quotes.iter().flatten() {
+            let age = dequeued_at.saturating_sub(event.quote.timestamp);
+            cycle.oldest_quote_age_seconds = cycle.oldest_quote_age_seconds.max(age);
+            cycle.oldest_feed_to_consumer_seconds = cycle
+                .oldest_feed_to_consumer_seconds
+                .max(dequeued_at.saturating_sub(event.received_at));
+            cycle.quotes_past_age_limit += usize::from(age > EXECUTION_QUOTE_MAX_AGE_SECONDS);
+        }
         let processing_started = Instant::now();
         let timer_due = last_timer.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
         let mut needs_drive = quotes.is_none() || timer_due;
@@ -634,7 +810,7 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
         {
             break;
         }
-        let result: anyhow::Result<()> = async {
+        let (result, execution) = ExecutionTimings::measure(async {
             if r.quote_gap.swap(false, Ordering::Relaxed) {
                 r.engine
                     .quote_gap_with_reason("本实例行情消费队列已满")
@@ -642,33 +818,40 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
             }
             if let Some(events) = quotes {
                 if let BrokerClient::Paper(p) = &r.broker {
-                    p.on_received_quotes(&events)?;
-                    let evs = r.engine.reconcile(&p.snapshot()).await?;
-                    dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
+                    measure_stage(&mut cycle.paper_quotes, async {
+                        p.on_received_quotes(&events)?;
+                        let evs = r.engine.reconcile(&p.snapshot()).await?;
+                        dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
+                        Ok::<_, anyhow::Error>(())
+                    }).await?;
                 }
-                r.engine.on_received_quote_batch(events).await?;
+                measure_stage(
+                    &mut cycle.engine_quotes,
+                    r.engine.on_received_quote_batch(events),
+                ).await?;
             }
             if timer_due {
                 last_timer = Some(Instant::now());
-                if let Err(e) = r
-                    .engine
-                    .dispatch(StrategyEvent::Timer {
+                if let Err(e) = measure_stage(
+                    &mut cycle.timer,
+                    r.engine.dispatch(StrategyEvent::Timer {
                         timestamp: chrono::Utc::now().timestamp(),
-                    })
-                    .await
+                    }),
+                ).await
                 {
                     r.engine.pause(true).await?;
                     tracing::error!("实例策略定时处理失败，继续执行平仓: {e}");
                 }
             }
             if let BrokerClient::Paper(p) = &r.broker {
-                let s = p.snapshot();
-                let evs = r.engine.reconcile(&s).await?;
-                dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
-                r.engine
-                    .dispatch(StrategyEvent::ExecutionUpdate(s.clone()))
-                    .await?;
-                *r.snapshot.write().await = s;
+                measure_stage(&mut cycle.paper_sync, async {
+                    let s = p.snapshot();
+                    let evs = r.engine.reconcile(&s).await?;
+                    dispatch_live_trade_emails(&ctx, &r.definition.name, evs);
+                    r.engine.dispatch(StrategyEvent::ExecutionUpdate(s.clone())).await?;
+                    *r.snapshot.write().await = s;
+                    Ok::<_, anyhow::Error>(())
+                }).await?;
             }
             // Apply at most one loaded symbol between quote batches. Slow I/O
             // remains in the background; engine mutations stay serialized here.
@@ -689,41 +872,47 @@ async fn run_account(ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>) {
                     Err(error) => {
                         tracing::warn!(instance_id = %r.definition.id, symbol = %message.key.0,
                             error = %error, "实例历史更新失败，将重试；继续行情和风险退出");
-                        history_errors.insert(message.key, error.to_string());
+                        history_errors.insert(message.key.clone(), error.to_string());
                         false
                     }
                 };
                 let _ = message.applied.send(applied);
-                if applied_at.elapsed() >= Duration::from_millis(250) {
+                cycle.history = applied_at.elapsed();
+                if cycle.history >= Duration::from_millis(250) {
                     tracing::warn!(instance_id = %r.definition.id,
-                        apply_ms = applied_at.elapsed().as_millis(), quote_queue_batches = rx.len(),
+                        symbol = %message.key.0, timeframe = %message.key.1,
+                        apply_ms = cycle.history.as_millis(), quote_queue_batches = rx.len(),
                         "实例历史应用较慢，请检查策略计算与持久化耗时");
                 }
             }
             if needs_drive {
-                r.engine.drive().await?;
+                measure_stage(&mut cycle.final_drive, r.engine.drive()).await?;
             }
             *r.runtime_error.write().await = None;
-            Ok(())
-        }
-        .await;
+            Ok::<_, anyhow::Error>(())
+        }).await;
+        cycle.execution = execution;
+        cycle.failed = result.is_err();
         if let Err(e) = result {
             *r.runtime_error.write().await = Some(e.to_string());
             tracing::warn!("实例 {} 推进失败: {e:#}", r.definition.id);
         }
-        let elapsed = processing_started.elapsed();
+        cycle.elapsed = processing_started.elapsed();
+        cycle.finished_at_ms = chrono::Utc::now().timestamp_millis();
+        cycle.waiting_batches_at_end = rx.len();
         *diagnostics.write().await = json!({"quote_queue_batches":rx.len(),
             "quote_queue_high_water":queue_high_water,"processed_quotes":total_quotes,
-            "last_batch_quotes":batch_quotes,"oldest_quote_age_seconds":oldest_quote_age_seconds,
-            "last_processing_ms":elapsed.as_millis() as u64,
+            "last_batch_quotes":batch_quotes,"oldest_quote_age_seconds":cycle.oldest_quote_age_seconds,
+            "last_processing_ms":cycle.elapsed.as_millis() as u64,
             "history_errors":history_errors.iter().map(|(key,error)|
                 json!({"symbol":key.0,"timeframe":key.1,"error":error})).collect::<Vec<_>>()});
-        if batch_quotes > 0 && elapsed >= Duration::from_millis(250) {
-            tracing::warn!(instance_id = %r.definition.id, batch_quotes,
-                processing_ms = elapsed.as_millis(), quote_queue_batches = rx.len(),
-                oldest_quote_age_seconds, "实例行情处理较慢");
+        slow_cycles.observe(cycle);
+        if last_slow_report.elapsed() >= Duration::from_secs(5) {
+            slow_cycles.report(&r.definition.id);
+            last_slow_report = Instant::now();
         }
     }
+    slow_cycles.report(&r.definition.id);
 }
 
 pub fn dispatch_live_trade_emails(

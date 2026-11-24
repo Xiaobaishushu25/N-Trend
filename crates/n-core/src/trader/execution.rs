@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 
 use super::broker::BrokerClient;
@@ -13,6 +14,9 @@ mod execution_replay;
 #[path = "execution_store.rs"]
 mod execution_store;
 use execution_store::ExecutionStore;
+#[path = "execution_timing.rs"]
+mod execution_timing;
+pub use execution_timing::ExecutionTimings;
 use super::client::CtpTraderClient;
 use super::model::*;
 use super::overnight::{append_snapshot_jsonl, check_pre_close_checkpoint, OvernightSnapshot};
@@ -320,7 +324,7 @@ pub struct ExecutionOrder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funds_at_submit: Option<EntryFunds>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry_rules: Option<EntryRuleSnapshot>,
+    pub entry_rules: Option<Box<EntryRuleSnapshot>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -417,23 +421,77 @@ struct OrderProgress {
     any_working: bool,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct SharedState<T>(Arc<T>);
+
+impl<T: PartialEq> PartialEq for SharedState<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl<T> std::ops::Deref for SharedState<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for SharedState<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<A, T: FromIterator<A>> FromIterator<A> for SharedState<T> {
+    fn from_iter<I: IntoIterator<Item = A>>(iter: I) -> Self {
+        Self(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedState<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&*self.0).into_iter()
+    }
+}
+
+impl<'a, T: Clone> IntoIterator for &'a mut SharedState<T>
+where
+    &'a mut T: IntoIterator,
+{
+    type Item = <&'a mut T as IntoIterator>::Item;
+    type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Arc::make_mut(&mut self.0).into_iter()
+    }
+}
+
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct ExecutionState {
     definition: StrategyDefinition,
     active_config: Option<ExecutionConfig>,
-    strategy_states: HashMap<String, serde_json::Value>,
+    strategy_states: SharedState<HashMap<String, serde_json::Value>>,
     strategy_bars: HashMap<String, String>,
-    quote_gaps: Vec<i64>,
+    quote_gaps: SharedState<Vec<i64>>,
     paused: bool,
     strategy_error: Option<String>,
-    conditions: HashMap<String, ConditionOrder>,
-    positions: HashMap<String, ManagedPosition>,
-    history: Vec<TradeRecord>,
+    conditions: SharedState<HashMap<String, ConditionOrder>>,
+    positions: SharedState<HashMap<String, ManagedPosition>>,
+    history: SharedState<Vec<TradeRecord>>,
     orders: execution_store::Orders,
     closes: HashMap<String, CloseTask>,
-    seen_trades: HashSet<String>,
-    trade_times: HashMap<String, super::trade_time::TradeTimeEvidence>,
+    seen_trades: SharedState<HashSet<String>>,
+    trade_times: SharedState<HashMap<String, super::trade_time::TradeTimeEvidence>>,
     time_normalization_version: u32,
     aborted_entries: HashSet<String>,
     // Ordinary timeouts cancel the remainder. An explicit abort removes this
@@ -455,7 +513,7 @@ struct ExecutionState {
     entry_trigger_sequences: HashMap<String, u64>,
     symbol_slots: HashMap<String, String>,
     symbol_release_after: HashMap<String, u64>,
-    entry_decisions: HashMap<String, serde_json::Value>,
+    entry_decisions: SharedState<HashMap<String, serde_json::Value>>,
     comparison: super::comparison::ComparisonBook,
     #[serde(skip_serializing_if = "super::p3_comparison::P3RunnerBook::is_empty")]
     p3_runner: super::p3_comparison::P3RunnerBook,
@@ -794,6 +852,7 @@ impl ExecutionEngine {
             None => (None, ExecutionState::default()),
         };
         state.rebuild_indices();
+        state.symbol_release_after.retain(|k, _| k.contains(':'));
         state.normalize_legacy_trade_times();
         state.p3_runner.invalidate_active("execution_restarted");
         state.p3_stall.interrupt(&state.positions, "execution_restarted");
@@ -826,6 +885,7 @@ impl ExecutionEngine {
             anyhow::bail!("{error}");
         }
         if let Some(path) = &self.state_path {
+            let save_started = Instant::now();
             if let Err(e) = state
                 .comparison
                 .archive_completed(&path.with_file_name("strategy_comparison.jsonl"))
@@ -841,12 +901,19 @@ impl ExecutionEngine {
             let result = self.store.lock().unwrap().as_mut()
                 .ok_or_else(|| anyhow::anyhow!("执行状态数据库未打开"))
                 .and_then(|store| store.save(state));
+            execution_timing::record(|timings| {
+                timings.save_count += 1;
+                timings.save_total += save_started.elapsed();
+            });
             if let Err(e) = result {
                 state.persistence_error = Some(format!("执行状态保存失败，禁止报单: {e}"));
                 anyhow::bail!("{}", state.persistence_error.as_ref().unwrap());
             }
         }
         state.refresh_order_indices();
+        if self.state_path.is_some() {
+            state.orders.release_settled_rule_details();
+        }
         state.orders.mark_saved();
         state.quote_observations_dirty = false;
         Ok(())
@@ -881,6 +948,15 @@ impl ExecutionEngine {
             .collect()
     }
     pub async fn list_orders(&self) -> Vec<ExecutionOrder> {
+        {
+            let store = self.store.lock().unwrap();
+            if let Some(store) = store.as_ref() {
+                match store.list_orders() {
+                    Ok(orders) => return orders,
+                    Err(error) => tracing::warn!(%error, "执行委托数据库读取失败"),
+                }
+            }
+        }
         let mut orders = self
             .state
             .lock()
@@ -900,7 +976,7 @@ impl ExecutionEngine {
         orders
     }
     pub async fn get_trade_history(&self) -> Vec<TradeRecord> {
-        self.state.lock().await.history.clone()
+        self.state.lock().await.history.to_vec()
     }
 
     pub(super) async fn comparison_trades(
@@ -1053,9 +1129,9 @@ impl ExecutionEngine {
     /// Persist the capital wait once per rejection, including legacy saved orders.
     /// Replayed counter snapshots must not move the recovery threshold each time.
     fn refresh_entry_funding_waits(s: &mut ExecutionState) -> bool {
-        let mut latest: HashMap<String, &ExecutionOrder> = HashMap::new();
+        let mut latest: HashMap<&str, &ExecutionOrder> = HashMap::new();
         for order in s.orders.values().filter(|o| o.reason.is_none()) {
-            let old = latest.entry(order.condition_id.clone()).or_insert(order);
+            let old = latest.entry(&order.condition_id).or_insert(order);
             if (order.action_at, &order.request.order_ref) > (old.action_at, &old.request.order_ref)
             {
                 *old = order;
@@ -1068,7 +1144,7 @@ impl ExecutionEngine {
             }
             let order_ref = order.request.order_ref.clone().unwrap_or_default();
             if s.entry_funding_waits
-                .get(&id)
+                .get(id)
                 .is_some_and(|w| w.order_ref == order_ref && w.checkpoint.is_some())
             {
                 continue;
@@ -1081,11 +1157,11 @@ impl ExecutionEngine {
                 .as_ref()
                 .zip(missing_funds(&order.note))
                 .map(|(funds, shortfall)| funds.available.max(0.0) + shortfall + 0.01);
-            if checkpoint.is_none() && s.entry_funding_waits.contains_key(&id) {
+            if checkpoint.is_none() && s.entry_funding_waits.contains_key(id) {
                 continue;
             }
             s.entry_funding_waits.insert(
-                id,
+                id.to_owned(),
                 EntryFundingWait {
                     order_ref,
                     checkpoint,
@@ -1387,7 +1463,9 @@ impl ExecutionEngine {
 
     /// Complete counter snapshots are replayable. Only trade records change holdings.
     pub async fn reconcile(&self, snapshot: &serde_json::Value) -> Result<ReconcileEvents> {
+        let lock_started = Instant::now();
         let mut guard = self.state.lock().await;
+        execution_timing::record(|timings| timings.state_lock_wait += lock_started.elapsed());
         let mut next = guard.clone();
         match self.reconcile_snapshot(&mut next, snapshot) {
             Ok(events) => {
@@ -2109,7 +2187,8 @@ impl ExecutionEngine {
             }
             Arc::new(progress)
         }).clone();
-        for (id, condition) in &mut s.conditions {
+        let mut condition_updates = Vec::new();
+        for (id, condition) in &s.conditions {
             let p = progress.get(id.as_str()).copied().unwrap_or_default();
             let closing = s.closes.contains_key(id);
             let pos = s.positions.get(id);
@@ -2117,20 +2196,21 @@ impl ExecutionEngine {
                 // Only keep the exception while the broker still owes order or fill evidence.
                 durable_changed |= s.entry_timeouts.remove(id).is_some();
             }
-            if p.open_filled > 0 && !p.entry_unsettled && s.aborted_entries.contains(id) {
+            let volume =
+                if p.open_filled > 0 && !p.entry_unsettled && s.aborted_entries.contains(id) {
                 // Freeze the actual entry quantity after the remainder is cancelled.
                 // The original plan and sizing configuration remain frozen.
-                let volume = condition.volume.min(p.open_filled);
-                durable_changed |= condition.volume != volume;
-                condition.volume = volume;
-            }
+                    condition.volume.min(p.open_filled)
+                } else {
+                    condition.volume
+                };
             let phase = if pos.is_some_and(|p| p.is_closed) && !p.any_unsettled {
                 Some(ConditionState::Closed)
             } else if closing && pos.is_none() && !p.any_unsettled {
                 Some(ConditionState::Canceled)
             } else if closing {
                 Some(ConditionState::Closing)
-            } else if p.open_filled >= condition.volume {
+            } else if p.open_filled >= volume {
                 Some(ConditionState::Filled)
             } else if p.open_filled > 0 {
                 Some(ConditionState::PartFilled)
@@ -2139,10 +2219,16 @@ impl ExecutionEngine {
             } else {
                 None
             };
-            if let Some(phase) = phase {
-                durable_changed |= condition.state != phase;
-                condition.state = phase;
+            let phase = phase.unwrap_or(condition.state);
+            if condition.volume != volume || condition.state != phase {
+                condition_updates.push((id.clone(), volume, phase));
             }
+        }
+        durable_changed |= !condition_updates.is_empty();
+        for (id, volume, phase) in condition_updates {
+            let condition = s.conditions.get_mut(&id).unwrap();
+            condition.volume = volume;
+            condition.state = phase;
         }
         // Never rewrite strategy quantities from an ambiguous aggregate snapshot.
         // A lower authoritative quantity freezes submissions until reconciliation.
@@ -2392,8 +2478,15 @@ impl ExecutionEngine {
 
     pub async fn on_received_quote_batch(&self, events: Vec<ReceivedExecutionQuote>) -> Result<()> {
         // Observe every tick, then submit using the newest book, not a queued old tick.
+        let lock_started = Instant::now();
         let guard = self.drive_lock.lock().await;
-        self.state.lock().await.rebuild_indices();
+        execution_timing::record(|timings| timings.drive_lock_wait += lock_started.elapsed());
+        let observe_started = Instant::now();
+        {
+            let mut state = self.state.lock().await;
+            execution_timing::record(|timings| timings.state_lock_wait += observe_started.elapsed());
+            state.rebuild_indices();
+        }
         for ReceivedExecutionQuote {
             symbol,
             quote,
@@ -2407,23 +2500,33 @@ impl ExecutionEngine {
                 )
                 .await
             {
+                execution_timing::record(|timings| timings.observe_quotes += observe_started.elapsed());
                 self.save_quote_observations().await?;
                 return Err(error);
             }
         }
+        execution_timing::record(|timings| timings.observe_quotes += observe_started.elapsed());
         // No broker action can run before this commit. Critical transitions
         // commit immediately; ordinary observations need only one batch commit.
         self.save_quote_observations().await?;
         drop(guard);
-        self.drive().await
+        let drive_started = Instant::now();
+        let result = self.drive().await;
+        execution_timing::record(|timings| timings.drive_after_quotes += drive_started.elapsed());
+        result
     }
 
     async fn save_quote_observations(&self) -> Result<()> {
+        let started = Instant::now();
         let mut s = self.state.lock().await;
-        if s.quote_observations_dirty || s.persistence_error.is_some() {
-            self.save(&mut s)?;
-        }
-        Ok(())
+        execution_timing::record(|timings| timings.state_lock_wait += started.elapsed());
+        let result = if s.quote_observations_dirty || s.persistence_error.is_some() {
+            self.save(&mut s)
+        } else {
+            Ok(())
+        };
+        execution_timing::record(|timings| timings.flush_quotes += started.elapsed());
+        result
     }
 
     pub async fn on_quotes(&self, quotes: HashMap<String, ExecutionQuote>) -> Result<()> {
@@ -2447,7 +2550,9 @@ impl ExecutionEngine {
         // Strategy callbacks need the current requested alias (e.g. EG0) as
         // well as the actual contract key, including the first tick after roll.
         {
+            let lock_started = Instant::now();
             let mut s = self.state.lock().await;
+            execution_timing::record(|timings| timings.state_lock_wait += lock_started.elapsed());
             if self.consume_delayed_quotes(
                 &mut s,
                 &mut quotes,
@@ -2474,7 +2579,9 @@ impl ExecutionEngine {
             }
         }
         let fallback_mode = self.get_config().await.mode;
+        let lock_started = Instant::now();
         let mut s = self.state.lock().await;
+        execution_timing::record(|timings| timings.state_lock_wait += lock_started.elapsed());
         let mode = s.active_config.as_ref().map_or(fallback_mode, |config| config.mode);
         let now = self.now_utc().timestamp();
         // A tick can also expire while a strategy callback is waiting for the state lock.
@@ -2918,10 +3025,14 @@ impl ExecutionEngine {
     /// Serialize broker actions. New entries are rate limited; risk exits and
     /// cancellations do not wait behind the entry throttle.
     pub async fn drive(&self) -> Result<()> {
+        let lock_started = Instant::now();
         let _drive = self.drive_lock.lock().await;
+        execution_timing::record(|timings| timings.drive_lock_wait += lock_started.elapsed());
         let cfg = self.get_config().await;
         let now = self.now_utc().timestamp();
+        let lock_started = Instant::now();
         let mut s = self.state.lock().await;
+        execution_timing::record(|timings| timings.state_lock_wait += lock_started.elapsed());
         let cfg = s.active_config.as_ref().unwrap_or(&cfg).clone();
         let state = &mut *s;
         if state.comparison.advance(&state.quotes, now) {
@@ -3443,7 +3554,7 @@ impl ExecutionEngine {
                 note: "已持久化提交意图，等待柜台回报".into(),
                 cancel_attempts: 0,
                 funds_at_submit,
-                entry_rules,
+                entry_rules: entry_rules.map(Box::new),
             },
         );
         s.record_order_update(&r);
@@ -3456,7 +3567,9 @@ impl ExecutionEngine {
         s.last_action_at = now;
         self.save(&mut s)?;
         drop(s);
+        let broker_started = Instant::now();
         let result = self.client.insert_order(&req).await;
+        execution_timing::record(|timings| timings.broker_requests += broker_started.elapsed());
         let mut s = self.state.lock().await;
         let order = s.orders.get_mut(&r).unwrap();
         if order.phase == OrderPhase::Unknown {

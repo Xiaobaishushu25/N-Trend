@@ -1,5 +1,5 @@
 use super::*;
-use n_protocol::trader_stream::SharedTraderSnapshot;
+use n_protocol::trader_stream::{ConditionRows, SharedTraderSnapshot};
 use serde_json::{json, Value};
 
 struct CachedField<T> {
@@ -48,12 +48,13 @@ impl<T: Clone + PartialEq + serde::Serialize> FieldUpdate<T> {
 /// execution lock and serialize changed fields after releasing it.
 #[derive(Default)]
 pub struct ExecutionSnapshotCache {
-    conditions: Option<CachedField<HashMap<String, ConditionOrder>>>,
-    positions: Option<CachedField<HashMap<String, ManagedPosition>>>,
-    history: Option<CachedField<Vec<TradeRecord>>>,
+    conditions: SharedState<HashMap<String, ConditionOrder>>,
+    condition_rows: Arc<ConditionRows>,
+    positions: Option<CachedField<SharedState<HashMap<String, ManagedPosition>>>>,
+    history: Option<CachedField<SharedState<Vec<TradeRecord>>>>,
     statistics: Arc<Value>,
-    strategy_states: Option<CachedField<HashMap<String, Value>>>,
-    entry_decisions: Option<CachedField<HashMap<String, Value>>>,
+    strategy_states: Option<CachedField<SharedState<HashMap<String, Value>>>>,
+    entry_decisions: Option<CachedField<SharedState<HashMap<String, Value>>>>,
     symbol_slots: Option<CachedField<HashMap<String, String>>>,
 }
 
@@ -68,7 +69,7 @@ impl ExecutionEngine {
         let mut fields = SharedTraderSnapshot::default();
         fields.insert("config", serde_json::to_value(&*cfg)?);
         drop(cfg);
-        let conditions = FieldUpdate::capture(&cache.conditions, &s.conditions);
+        let conditions = s.conditions.clone();
         let positions = FieldUpdate::capture(&cache.positions, &s.positions);
         let history = FieldUpdate::capture(&cache.history, &s.history);
         fields.insert("execution_error", json!(s.execution_error()));
@@ -91,12 +92,20 @@ impl ExecutionEngine {
         };
         drop(s);
 
-        fields.insert_shared(
-            "conditions",
-            conditions.render(&mut cache.conditions, |items| {
-                serde_json::to_value(items.values().collect::<Vec<_>>())
-            })?,
-        );
+        if !Arc::ptr_eq(&cache.conditions.0, &conditions.0) {
+            let updates = conditions
+                .iter()
+                .filter(|(id, row)| cache.conditions.get(*id) != Some(*row))
+                .map(|(id, row)| Ok((id.clone(), Arc::from(serde_json::value::to_raw_value(row)?))))
+                .collect::<Result<Vec<_>>>()?;
+            if !updates.is_empty() || cache.conditions.len() != conditions.len() {
+                let rows = Arc::make_mut(&mut cache.condition_rows);
+                rows.retain(|id, _| conditions.contains_key(id));
+                rows.extend(updates);
+            }
+            cache.conditions = conditions;
+        }
+        fields.insert_conditions(cache.condition_rows.clone());
         fields.insert_shared(
             "managed_positions",
             positions.render(&mut cache.positions, |items| {

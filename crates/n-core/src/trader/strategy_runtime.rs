@@ -258,8 +258,9 @@ impl ExecutionEngine {
         });
     }
     pub(super) fn symbol_slot_blocked(s: &ExecutionState, c: &ConditionOrder) -> bool {
+        let release_key = format!("{}:{}", c.symbol.to_uppercase(), c.instrument_id.to_uppercase());
         s.symbol_slots.get(&c.symbol).is_some_and(|id| id != &c.id)
-            || s.symbol_release_after.get(&c.symbol).is_some_and(|seq| {
+            || s.symbol_release_after.get(&release_key).is_some_and(|seq| {
                 s.quote_sequences
                     .get(&c.instrument_id.to_uppercase())
                     .copied()
@@ -309,15 +310,19 @@ impl ExecutionEngine {
                 let instrument = s.conditions.get(id)?.instrument_id.to_uppercase();
                 Some((
                     symbol.clone(),
+                    instrument.clone(),
                     s.quote_sequences.get(&instrument).copied().unwrap_or(0)
                         + u64::from(!observed.contains(&instrument)),
                 ))
             })
             .collect::<Vec<_>>();
         let changed = !release.is_empty();
-        for (symbol, seq) in release {
+        for (symbol, instrument, seq) in release {
             s.symbol_slots.remove(&symbol);
-            s.symbol_release_after.insert(symbol, seq);
+            let symbol_upper = symbol.to_uppercase();
+            let prefix = format!("{symbol_upper}:");
+            s.symbol_release_after.retain(|k, _| !k.to_uppercase().starts_with(&prefix));
+            s.symbol_release_after.insert(format!("{symbol_upper}:{instrument}"), seq);
         }
         changed
     }
@@ -1057,7 +1062,9 @@ impl ExecutionEngine {
         let fallback = self.get_config().await;
         let identity = self.identity.read().await.clone();
         let instance_id = identity.1.clone();
+        let lock_started = Instant::now();
         let mut guard = self.state.lock().await;
+        execution_timing::record(|timings| timings.state_lock_wait += lock_started.elapsed());
         if matches!(&event, StrategyEvent::Quote(quote) if !quote.valid_at(self.now_utc().timestamp())) {
             return Ok(());
         }
@@ -1189,10 +1196,12 @@ impl ExecutionEngine {
                 config: version_config,
                 allow_entries: d.revision == active.revision && !guard.paused,
             };
+            let handler_started = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 strategy.on_event(&event, &context, &mut state)
             }))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("策略模块发生panic")));
+            execution_timing::record(|timings| timings.strategy_handler += handler_started.elapsed());
             match result {
                 Ok(intents) => {
                     let state_changed = !scope.unchanged(

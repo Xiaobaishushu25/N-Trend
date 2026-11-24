@@ -158,3 +158,64 @@ fn shared_baseline_reuses_large_fields_across_heartbeat_and_account_change() {
         8800
     );
 }
+
+#[test]
+fn updating_one_condition_only_serializes_that_record() {
+    use n_protocol::trader_stream::{ConditionRows, TraderDelta, TraderSnapshotCache};
+    use serde_json::value::to_raw_value;
+
+    let evidence = "frozen strategy evidence ".repeat(155);
+    let row = |id: &str, state: &str| {
+        Arc::from(to_raw_value(&json!({"id":id,"state":state,"frozen":evidence})).unwrap())
+    };
+    let mut rows: ConditionRows = (0..1114)
+        .map(|index| {
+            let id = format!("condition-{index:04}");
+            let record = row(&id, "pending");
+            (id, record)
+        })
+        .collect();
+    let mut publisher = TraderPublisher::new("boot".into());
+    let build = |rows| {
+        let mut snapshot = SharedTraderSnapshot::default();
+        snapshot.insert_conditions(Arc::new(rows));
+        snapshot
+    };
+    let (baseline, _, _) = publisher.update_shared(build(rows.clone()), false);
+    let baseline = baseline.to_value();
+    assert!(serde_json::to_vec(&baseline).unwrap().len() > 4_000_000);
+    let mut client = TraderSnapshotCache::default();
+    client.replace(baseline);
+
+    for index in 0..120 {
+        let id = format!("condition-{index:04}");
+        rows.insert(id.clone(), row(&id, "closed"));
+        let (snapshot, delta, _) = publisher.update_shared(build(rows.clone()), false);
+        let delta = delta.unwrap();
+        let bytes = serde_json::to_vec(&delta).unwrap();
+        assert!(
+            bytes.len() < 4_300,
+            "single update sent {} bytes",
+            bytes.len()
+        );
+        assert!(delta.changes.is_empty());
+        let decoded = serde_json::from_slice::<TraderDelta>(&bytes).unwrap();
+        assert!(client.apply(decoded).unwrap().is_some());
+        if index == 119 {
+            let mut legacy = delta;
+            snapshot.expand_conditions_patch(&mut legacy);
+            assert!(legacy.conditions_patch.is_none());
+            assert_eq!(
+                legacy.changes["conditions"],
+                snapshot.to_value()["conditions"]
+            );
+        }
+    }
+    rows.remove("condition-0000");
+    rows.insert("new".into(), row("new", "pending"));
+    let (expected, delta, _) = publisher.update_shared(build(rows), false);
+    assert_eq!(
+        client.apply(delta.unwrap()).unwrap().unwrap(),
+        expected.to_value()
+    );
+}

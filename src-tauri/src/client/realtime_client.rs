@@ -302,6 +302,10 @@ impl RealtimeClient {
             );
             req.headers_mut()
                 .insert("X-Ntrend-Trader-Delta", HeaderValue::from_static("1"));
+            req.headers_mut().insert(
+                "X-Ntrend-Trader-Conditions-Patch",
+                HeaderValue::from_static("1"),
+            );
             req.headers_mut()
                 .insert("X-Ntrend-Ws-Gzip", HeaderValue::from_static("1"));
             req.headers_mut().insert(

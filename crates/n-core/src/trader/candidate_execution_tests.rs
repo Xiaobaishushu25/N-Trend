@@ -463,3 +463,108 @@ async fn short_fixed_s1_opens_on_bid_and_closes_on_ask() {
     assert_eq!(s.history[0].exit_price, 900.);
     assert_eq!(s.history[0].realized_pnl_amount, 970.);
 }
+
+fn test_condition(id: &str, symbol: &str, instrument_id: &str) -> ConditionOrder {
+    ConditionOrder {
+        frozen: None,
+        origin: TradeOrigin::default(),
+        id: id.into(),
+        event_id: None,
+        symbol: symbol.into(),
+        instrument_id: instrument_id.into(),
+        direction: "up".into(),
+        tier: PositionTier::Small,
+        entry_price: 1000.0,
+        stop_price: 990.0,
+        target_price: 1020.0,
+        risk: 10.0,
+        score: 3.0,
+        volume: 1,
+        warning_bar_ts: "2026-11-24 10:00:00".into(),
+        trigger_ts: None,
+        bars_waited: 0,
+        max_wait_bars: 10,
+        state: ConditionState::Pending,
+        created_at: 1000,
+        note: String::new(),
+    }
+}
+
+#[test]
+fn rollover_slot_release_does_not_block_new_contract() {
+    let mut state = ExecutionState::default();
+    state.symbol_release_after.insert("EB0:EB2612".into(), 77256);
+    state.quote_sequences.insert("EB2701".into(), 29940);
+    state.quote_sequences.insert("EB2612".into(), 70000);
+
+    let cond_new = test_condition("eb2701_cond", "EB0", "eb2701");
+
+    // 1. 新主力合约 eb2701 独立序号 (29940) 虽然 <= 旧合约释放序号 (77256)，但不应被跨合约误拦截
+    assert!(!ExecutionEngine::symbol_slot_blocked(&state, &cond_new));
+
+    let cond_old = test_condition("eb2612_cond", "EB0", "eb2612");
+
+    // 2. 同一合约 eb2612 内，行情序号尚未走过释放阈值时，保持防抖拦截
+    assert!(ExecutionEngine::symbol_slot_blocked(&state, &cond_old));
+
+    // 3. 同一合约行情序号走过释放阈值后，解除拦截
+    state.quote_sequences.insert("EB2612".into(), 77257);
+    assert!(!ExecutionEngine::symbol_slot_blocked(&state, &cond_old));
+}
+
+#[test]
+fn legacy_symbol_release_after_migration_clears_on_startup() {
+    let legacy_json = serde_json::json!({
+        "symbol_release_after": {
+            "EB0": 77256
+        }
+    });
+    let mut state: ExecutionState = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(state.symbol_release_after.get("EB0"), Some(&77256));
+
+    let cond = test_condition("eb2701_cond", "EB0", "eb2701");
+
+    // 旧存档未绑定合约的纯数值不应阻断开仓
+    assert!(!ExecutionEngine::symbol_slot_blocked(&state, &cond));
+
+    // 启动时自动清洗旧残留（不含冒号的旧键）
+    state.symbol_release_after.retain(|k, _| k.contains(':'));
+    assert!(state.symbol_release_after.is_empty());
+}
+
+#[test]
+fn old_binary_can_load_sqlite_records_written_by_new_binary_on_rollback() {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("ntrend_rollback_test_{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("trader_execution.json");
+    let (mut store, mut state) = super::ExecutionStore::open(&path).unwrap();
+
+    // 模拟新版：释放槽位并记录新格式 "EB0:EB2701" -> 29940 (数值型)
+    state.symbol_release_after.insert("EB0:EB2701".into(), 29940);
+    store.save(&state).unwrap();
+    drop(store);
+
+    // 模拟旧版直接读取 SQLite execution_fields 字段
+    let db_path = path.with_file_name("trader_execution.sqlite3");
+    let conn = rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut stmt = conn.prepare("SELECT key, value FROM execution_fields WHERE field='symbol_release_after'").unwrap();
+    let mut rows = stmt.query([]).unwrap();
+
+    let mut old_loaded_map: HashMap<String, u64> = HashMap::new();
+    while let Some(row) = rows.next().unwrap() {
+        let key: String = row.get(0).unwrap();
+        let blob: Vec<u8> = row.get(1).unwrap();
+        // 旧版直接使用 serde_json::from_slice::<u64>(&blob) 反序列化
+        let seq: u64 = serde_json::from_slice(&blob).expect("旧版二进制反序列化 u64 必须成功");
+        old_loaded_map.insert(key, seq);
+    }
+
+    assert_eq!(old_loaded_map.get("EB0:EB2701"), Some(&29940));
+
+    // 模拟旧版的 symbol_slot_blocked: old_state.symbol_release_after.get(&c.symbol)
+    let cond = test_condition("eb2701_cond", "EB0", "eb2701");
+    assert_eq!(old_loaded_map.get(&cond.symbol), None);
+
+    let _ = fs::remove_dir_all(&dir);
+}
