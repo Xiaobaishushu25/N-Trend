@@ -378,6 +378,7 @@ interface StrategyNoteMeta {
 
 const STRATEGY_NOTE_MAP: Record<string, StrategyNoteMeta> = {
   zero_volume_at_price: { category: '金额风控', text: '拟报价格下允许手数为零', tooltip: '按当前拟报价格复核后没有可批准的开仓手数，本次信号终止。' },
+  s1_wick_at_least_half: { category: '入场筛选', text: 'S1 目标侧影线达到 50%', tooltip: '按拟报限价判断执行目标为 S1。做多看上影线，做空看下影线，影线占 S1 K 线振幅至少 50% 时拦截开仓。' },
   contract_rollover: { category: '换月保护', text: '主力合约已切换，撤销待开仓单', tooltip: '待开仓信号绑定的实际合约与当前主力合约不同，撤销剩余开仓意图。' },
   delivery_month: { category: '合约过滤', text: '避开交割月及过期合约', tooltip: 'P3 主动限制交割月及已过期月份合约开仓。' },
   outside_trading_session: { category: '会话保护', text: '等待实际合约交易会话', tooltip: '当前不在实际合约的连续交易会话，等待新鲜盘口。' },

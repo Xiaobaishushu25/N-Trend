@@ -399,30 +399,27 @@ pub async fn register_execution_signals(
     let Ok(quotes) = tq.execution_quotes(&codes).await else {
         return;
     };
-    let mut bar_times = std::collections::HashMap::new();
+    let mut signal_bars = std::collections::HashMap::new();
     let mut raw_bars = std::collections::HashMap::new();
     for code in &codes {
         if let Ok(bars) = ctx.services.shared_bars_for(code, "15m").await {
-            bar_times.insert(
-                code.clone(),
-                bars.iter().map(|b| b.dt.to_bar_ts()).collect::<Vec<_>>(),
-            );
+            signal_bars.insert(code.clone(), bars);
         }
         if let Ok(rows) = ctx.services.shared_raw_for(code).await {
             raw_bars.insert(code.clone(), rows);
         }
     }
     for signal in signals {
-        let Some(times) = bar_times
+        let Some(bars) = signal_bars
             .get(&signal.symbol)
-            .filter(|times| !times.is_empty())
+            .filter(|bars| !bars.is_empty())
         else {
             continue;
         };
-        if times
-            .iter()
-            .filter(|ts| ts.as_str() > signal.warning_ts.as_str())
-            .count()
+        let Some(warning_time) = n_core::analyze::model::DT::from_bar_ts(&signal.warning_ts) else {
+            continue;
+        };
+        if bars.len() - bars.partition_point(|bar| bar.dt <= warning_time)
             > n_core::analyze::outcome::PENDING_BARS
         {
             continue;
@@ -445,12 +442,23 @@ pub async fn register_execution_signals(
                 .ok()
                 .flatten()
         });
+        let s1_wick_ratio = n_core::analyze::model::DT::from_bar_ts(&signal.s1_ts)
+            .filter(|s1| *s1 < warning_time)
+            .and_then(|s1| bars.binary_search_by_key(&s1, |bar| bar.dt).ok())
+            .and_then(|i| {
+                n_core::trader::strategy::s1_target_wick_ratio(
+                    &bars[i],
+                    &signal.direction,
+                    signal.s1_price,
+                )
+            });
         for target in &targets {
             let engine = &target.engine;
             if !target.needs(signal.id, &signal.warning_ts) || engine.paused().await {
                 continue;
             }
             let mut payload = serde_json::to_value(signal).unwrap_or_default();
+            payload["s1_wick_ratio"] = serde_json::json!(s1_wick_ratio);
             payload["source_evidence"] = payload.clone();
             payload["instrument_id"] = serde_json::json!(actual);
             payload["created_at_epoch"] = serde_json::json!(chrono::Utc::now().timestamp());

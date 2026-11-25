@@ -163,6 +163,73 @@ async fn filtered_signal_keeps_display_evidence_after_restart_without_orders() {
 }
 
 #[tokio::test]
+async fn s1_wick_filter_blocks_at_half_only_on_enabled_instance() {
+    for (key, enabled, wick, blocked) in [
+        ("at-half", true, 0.50, true),
+        ("below-half", true, 0.49, false),
+        ("disabled", false, 0.80, false),
+    ] {
+        let root = directory();
+        let p = broker(&root, key);
+        let e = engine(&root, key, p.clone()).await;
+        e.update_config(ExecutionConfig {
+            filter_long_s1_wick: enabled,
+            ..e.get_config().await
+        })
+        .await
+        .unwrap();
+        let mut payload = signal(key);
+        payload["source_evidence"] = json!({"s1_price": 1100., "s1_wick_ratio": wick});
+        send(&e, payload).await;
+        tick(&e, &p, 1000.).await;
+        tick(&e, &p, 1002.).await;
+        let cond = e.list_conditions().await.pop().unwrap();
+        assert_eq!(e.list_orders().await.is_empty(), blocked);
+        if blocked {
+            assert_eq!(cond.state, ConditionState::Rejected);
+            let diagnostics = e.strategy_diagnostics().await;
+            let decision = &diagnostics["entry_decisions"][&cond.id];
+            assert_eq!(decision["reason"], "s1_wick_at_least_half");
+            assert_eq!(decision["s1_wick_ratio"], wick);
+
+            let mut original = cond.clone();
+            let f = Arc::make_mut(original.frozen.as_mut().unwrap());
+            f.definition = StrategyDefinition::default();
+            original.tier = PositionTier::Large;
+            assert_eq!(original.blocked_s1_wick_ratio(1003., 2), Some(wick));
+            assert_eq!(original.blocked_s1_wick_ratio(1003., 1), None);
+            assert_eq!(original.blocked_s1_wick_ratio(1040., 2), None);
+
+            let mut p3 = cond.clone();
+            let f = Arc::make_mut(p3.frozen.as_mut().unwrap());
+            f.definition.strategy_id = super::super::candidates::p3::ID.into();
+            f.definition.exit_policy = super::super::candidates::p3::EXIT.into();
+            assert_eq!(p3.blocked_s1_wick_ratio(1039., 1), Some(wick));
+            assert_eq!(p3.blocked_s1_wick_ratio(1040., 1), None);
+        }
+    }
+}
+
+#[test]
+fn s1_wick_uses_the_target_side_of_the_candle() {
+    let mut bar = crate::analyze::model::Bar {
+        dt: crate::analyze::model::DT::from_bar_ts("2026-11-25 09:15:00").unwrap(),
+        open: 105.0,
+        high: 120.0,
+        low: 100.0,
+        close: 110.0,
+        volume: 1.0,
+        hold: 0.0,
+        rollover: false,
+    };
+    assert_eq!(s1_target_wick_ratio(&bar, "up", 120.0), Some(0.50));
+    assert_eq!(s1_target_wick_ratio(&bar, "down", 100.0), Some(0.25));
+    assert_eq!(s1_target_wick_ratio(&bar, "up", 100.0), None);
+    bar.open = f64::NAN;
+    assert_eq!(s1_target_wick_ratio(&bar, "up", 120.0), None);
+}
+
+#[tokio::test]
 async fn p2_next_quote_real_fill_fixed_lot_and_restart_keep_frozen_version() {
     let root = directory();
     let p = broker(&root, "a");

@@ -8,6 +8,32 @@ use std::{collections::BTreeMap, sync::Arc};
 pub const N_STRATEGY: &str = "n_pattern";
 pub const N_VERSION: &str = "1";
 
+/// Measure the side of the signal candle that defines the native S1 target.
+pub fn s1_target_wick_ratio(
+    bar: &crate::analyze::model::Bar,
+    direction: &str,
+    s1_price: f64,
+) -> Option<f64> {
+    let body_low = bar.open.min(bar.close);
+    let body_high = bar.open.max(bar.close);
+    let range = bar.high - bar.low;
+    if ![bar.open, bar.high, bar.low, bar.close, s1_price, range]
+        .into_iter()
+        .all(f64::is_finite)
+        || range <= 0.0
+        || body_low < bar.low
+        || body_high > bar.high
+    {
+        return None;
+    }
+    let wick = match direction {
+        "up" if (bar.high - s1_price).abs() <= 1e-6 => bar.high - body_high,
+        "down" if (bar.low - s1_price).abs() <= 1e-6 => body_low - bar.low,
+        _ => return None,
+    };
+    Some(wick / range)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TradeOrigin {

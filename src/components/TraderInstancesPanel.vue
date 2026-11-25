@@ -1019,6 +1019,14 @@ watch(
                   <input v-model.number="config.min_entry_risk_ticks" type="number" min="0" class="form-input" :disabled="isP3" required>
                 </div>
 
+                <div v-if="['n_pattern', 'n_p2', 'n_p3_v1'].includes(strategy.strategy_id)" class="form-row">
+                  <label class="form-label">
+                    <input v-model="config.filter_long_s1_wick" type="checkbox">
+                    过滤 S1 长影线
+                  </label>
+                  <span class="field-hint">新信号以 S1 为执行目标且目标侧影线占振幅至少 50% 时，拦截首笔开仓委托。</span>
+                </div>
+
                 <div class="form-row">
                   <label class="form-label">报单偏移滑点 (tick)</label>
                   <input v-model.number="config.slippage_ticks" type="number" min="0" max="100" class="form-input" required>

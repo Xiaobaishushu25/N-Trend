@@ -980,6 +980,7 @@ export interface ExecutionConfig {
   max_slippage_ticks?: number
   max_exit_slippage_ticks?: number
   min_entry_risk_ticks?: number
+  filter_long_s1_wick?: boolean
   quote_source?: 'tianqin' | 'ctp'
 }
 

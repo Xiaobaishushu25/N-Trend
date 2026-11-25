@@ -115,6 +115,47 @@ pub struct ConditionOrder {
     pub note: String,
 }
 
+impl ConditionOrder {
+    fn blocked_s1_wick_ratio(&self, proposed_price: f64, lots: i32) -> Option<f64> {
+        let frozen = self.frozen.as_ref()?;
+        if !frozen.execution.filter_long_s1_wick {
+            return None;
+        }
+        let evidence = frozen
+            .plan
+            .evidence
+            .get("source_evidence")
+            .filter(|source| source.is_object())
+            .unwrap_or(&frozen.plan.evidence);
+        let ratio = evidence["s1_wick_ratio"].as_f64()?;
+        let s1 = evidence["s1_price"].as_f64()?;
+        let sign = if self.direction == "up" { 1.0 } else { -1.0 };
+        let target_distance = (s1 - proposed_price) * sign;
+        let risk = (proposed_price - self.stop_price) * sign;
+        if !(0.5 - 1e-9..=1.0).contains(&ratio)
+            || (self.target_price - s1).abs() > 1e-6
+            || target_distance <= 0.0
+            || risk <= 0.0
+        {
+            return None;
+        }
+        let s1_applies = match (
+            frozen.definition.strategy_id.as_str(),
+            frozen.definition.exit_policy.as_str(),
+        ) {
+            (N_STRATEGY, "n_exit_v1") => {
+                self.tier == PositionTier::Large && lots >= 2 && target_distance > risk + 1e-6
+            }
+            (super::candidates::P2, "p2_fixed_exit_v1") => true,
+            (super::candidates::p3::ID, super::candidates::p3::EXIT) => {
+                target_distance > risk + 1e-6
+            }
+            _ => false,
+        };
+        s1_applies.then_some(ratio)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManagedPosition {
     #[serde(default, flatten)]
@@ -257,6 +298,8 @@ pub struct ExecutionConfig {
     #[serde(default = "default_min_entry_risk_ticks")]
     pub min_entry_risk_ticks: u32,
     #[serde(default)]
+    pub filter_long_s1_wick: bool,
+    #[serde(default)]
     pub quote_source: QuoteSource,
 }
 
@@ -273,6 +316,7 @@ impl Default for ExecutionConfig {
             max_slippage_ticks: default_max_slippage(),
             max_exit_slippage_ticks: 0,
             min_entry_risk_ticks: default_min_entry_risk_ticks(),
+            filter_long_s1_wick: false,
             quote_source: QuoteSource::default(),
         }
     }
@@ -3485,6 +3529,18 @@ impl ExecutionEngine {
                         entry_state_changed = true;
                         continue;
                     }
+                }
+            }
+            // A partially filled entry has already started executing its frozen plan.
+            if reason.is_none() && filled == 0
+                && !s.positions.get(&cond.id).is_some_and(|p| !p.is_closed)
+            {
+                if let Some(ratio) = cond.blocked_s1_wick_ratio(price, qty) {
+                    let decision = self.reject_strategy_entry(&mut s, &cond.id, "s1_wick_at_least_half");
+                    decision["s1_wick_ratio"] = serde_json::json!(ratio);
+                    decision["proposed"] = serde_json::json!(price);
+                    entry_state_changed = true;
+                    continue;
                 }
             }
             s.last_ref = (s.last_ref + 1).max(self.now_utc().timestamp() as u64 * 100);
