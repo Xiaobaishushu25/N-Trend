@@ -651,6 +651,16 @@ impl InstanceManager {
             AccountKind::Ctp { .. } => "ctp",
             AccountKind::Paper { .. } => "paper",
         });
+        s["trading_environment"] = json!(match &r.account.kind {
+            AccountKind::Paper { .. } => "paper",
+            AccountKind::Ctp { broker_id, .. } => {
+                if s["health"]["broker_id"].as_str().unwrap_or(broker_id) == "9999" {
+                    "simnow"
+                } else {
+                    "real"
+                }
+            }
+        });
         let mut snapshot = SharedTraderSnapshot::from_value(s);
         snapshot.extend(r.engine.snapshot_fields(cache, true).await?);
         if let Some(error) = r

@@ -16,18 +16,21 @@ import {
 } from '@vicons/tabler'
 import { extractTradeDate, formatCalendarPnl } from '../utils/tradeTime'
 import { formatPnlAmount } from '../utils/multipliers'
+import type { TradeFeeSummary } from '../types'
 
 interface DailyPnlItem {
   totalPnl: number
   count: number
   winCount: number
   lossCount: number
+  fees: TradeFeeSummary
 }
 
 const props = defineProps<{
   modelValue: string // 格式: 'YYYY-MM-DD' 或 ''
   dailyPnlMap: Record<string, DailyPnlItem>
   latestExitTs?: string | null
+  showNet?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -178,12 +181,18 @@ const currentMonthStats = computed(() => {
   let totalPnl = 0
   let count = 0
   let winCount = 0
+  let confirmedCount = 0
+  let netCents = 0
+  let feeCents = 0
 
   for (const [date, item] of Object.entries(props.dailyPnlMap)) {
     if (date.startsWith(prefix)) {
       totalPnl += item.totalPnl
       count += item.count
       winCount += item.winCount
+      confirmedCount += item.fees.confirmed_count
+      netCents += item.fees.net_pnl_cents ?? 0
+      feeCents += item.fees.commission_cents ?? 0
     }
   }
 
@@ -191,6 +200,9 @@ const currentMonthStats = computed(() => {
     totalPnl,
     count,
     winRate: count > 0 ? (winCount / count) * 100 : 0,
+    confirmedCount,
+    netPnl: confirmedCount ? netCents / 100 : null,
+    feesPaid: confirmedCount ? feeCents / 100 : null,
   }
 })
 
@@ -222,6 +234,27 @@ const selectedPnlItem = computed(() => {
   if (!props.modelValue) return null
   return props.dailyPnlMap[props.modelValue] || null
 })
+
+function displayedPnl(item: DailyPnlItem): number | null {
+  if (!props.showNet) return item.totalPnl
+  return item.fees.net_pnl_cents == null ? null : item.fees.net_pnl_cents / 100
+}
+
+function pnlClass(item?: DailyPnlItem): string {
+  if (!item?.count) return 'has-no-trade'
+  const amount = displayedPnl(item)
+  if (amount == null) return ''
+  return amount >= 0 ? 'pnl-profit' : 'pnl-loss'
+}
+
+function dayDescription(cell: CalendarCell): string {
+  const item = cell.pnlItem
+  if (!item?.count) return cell.dateStr
+  const gross = formatPnlAmount(item.totalPnl, { decimals: 2 })
+  if (!props.showNet) return `${cell.dateStr} 平仓 ${item.count} 笔 · 毛盈亏 ${gross}`
+  const fee = formatPnlAmount(item.fees.commission_cents == null ? null : item.fees.commission_cents / 100, { decimals: 2 })
+  return `${cell.dateStr} · 毛盈亏 ${gross} · 手续费 ${fee} · 已对账净盈亏 ${formatPnlAmount(displayedPnl(item), { decimals: 2 })} · 已对账 ${item.fees.confirmed_count}/${item.count} 笔`
+}
 </script>
 
 <template>
@@ -250,9 +283,9 @@ const selectedPnlItem = computed(() => {
             <span
               v-if="selectedPnlItem"
               class="sel-pnl font-num"
-              :class="selectedPnlItem.totalPnl >= 0 ? 'is-up' : 'is-down'"
+              :class="displayedPnl(selectedPnlItem) == null ? '' : (displayedPnl(selectedPnlItem) ?? 0) >= 0 ? 'is-up' : 'is-down'"
             >
-              {{ selectedPnlItem.totalPnl >= 0 ? '+' : '' }}{{ Math.round(selectedPnlItem.totalPnl).toLocaleString('zh-CN') }}
+              {{ formatPnlAmount(displayedPnl(selectedPnlItem), { decimals: 2 }) }}
             </span>
           </span>
           <n-icon
@@ -306,13 +339,21 @@ const selectedPnlItem = computed(() => {
             <span class="sum-val font-num">{{ currentMonthStats.count }} 笔</span>
           </div>
           <div class="sum-item">
-            <span class="sum-lbl">当月累计盈亏</span>
+            <span class="sum-lbl">{{ showNet ? '当月毛盈亏' : '当月累计盈亏' }}</span>
             <span
               class="sum-val font-num font-bold"
               :class="currentMonthStats.totalPnl >= 0 ? 'is-up' : 'is-down'"
             >
-              {{ formatPnlAmount(currentMonthStats.totalPnl, { decimals: 0 }) }}
+              {{ formatPnlAmount(currentMonthStats.totalPnl, { decimals: 2 }) }}
             </span>
+          </div>
+          <div v-if="showNet" class="sum-item">
+            <span class="sum-lbl">当月手续费</span>
+            <span class="sum-val font-num">{{ formatPnlAmount(currentMonthStats.feesPaid, { decimals: 2 }) }}</span>
+          </div>
+          <div v-if="showNet" class="sum-item">
+            <span class="sum-lbl">已对账净盈亏 · {{ currentMonthStats.confirmedCount }}/{{ currentMonthStats.count }} 笔</span>
+            <span class="sum-val font-num font-bold">{{ formatPnlAmount(currentMonthStats.netPnl, { decimals: 2 }) }}</span>
           </div>
           <div v-if="currentMonthStats.count > 0" class="sum-item">
             <span class="sum-lbl">当月胜率</span>
@@ -344,11 +385,9 @@ const selectedPnlItem = computed(() => {
               !cell.isCurrentMonth ? 'is-other-month' : '',
               cell.isToday ? 'is-today' : '',
               cell.dateStr === modelValue ? 'is-active-selected' : '',
-              cell.pnlItem && cell.pnlItem.count > 0 ? (cell.pnlItem.totalPnl >= 0 ? 'pnl-profit' : 'pnl-loss') : 'has-no-trade',
+              pnlClass(cell.pnlItem),
             ]"
-            :title="cell.pnlItem && cell.pnlItem.count > 0
-              ? `${cell.dateStr}：平仓 ${cell.pnlItem.count} 笔，盈亏 ${cell.pnlItem.totalPnl >= 0 ? '+' : ''}${cell.pnlItem.totalPnl.toFixed(2)} 元 (点击筛选)`
-              : cell.dateStr"
+            :title="dayDescription(cell)"
             @click="handleCellClick(cell)"
           >
             <div class="cell-day-num font-num">
@@ -357,7 +396,10 @@ const selectedPnlItem = computed(() => {
             </div>
 
             <div v-if="cell.pnlItem && cell.pnlItem.count > 0" class="cell-pnl-val font-num">
-              {{ formatCalendarPnl(cell.pnlItem.totalPnl) }}
+              {{ displayedPnl(cell.pnlItem) == null ? '待对账' : formatCalendarPnl(displayedPnl(cell.pnlItem) ?? 0) }}
+              <small v-if="showNet && cell.pnlItem.fees.confirmed_count > 0 && cell.pnlItem.fees.confirmed_count < cell.pnlItem.count">
+                {{ cell.pnlItem.fees.confirmed_count }}/{{ cell.pnlItem.count }}
+              </small>
             </div>
             <div v-else class="cell-empty-dot" />
           </div>
@@ -509,6 +551,8 @@ const selectedPnlItem = computed(() => {
 /* 当月战报汇总 */
 .calendar-month-summary {
   display: flex;
+  flex-wrap: wrap;
+  gap: 5px 9px;
   align-items: center;
   justify-content: space-around;
   padding: 6px 10px;
@@ -606,6 +650,12 @@ const selectedPnlItem = computed(() => {
   text-align: center;
   white-space: nowrap;
   letter-spacing: -0.2px;
+}
+
+.cell-pnl-val small {
+  display: block;
+  font-weight: 400;
+  color: #64748b;
 }
 
 .cell-empty-dot {

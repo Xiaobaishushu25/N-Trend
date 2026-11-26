@@ -5,7 +5,7 @@ import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { isMarketTradingWindow } from '../utils/tradingHours'
 import { chaseRejectionNote, filteredConditionRows } from '../utils/conditionPool'
-import { parseTradeTimestamp, extractTradeDate, getTradeRecordPnl } from '../utils/tradeTime'
+import { parseTradeTimestamp, extractTradeDate, getTradeRecordPnl, addConfirmedTradeFee, summarizeTradeFees } from '../utils/tradeTime'
 import type {
   CtpHealth,
   LiveTraderSnapshot,
@@ -14,6 +14,7 @@ import type {
   LiveBrokerPosition,
   LiveConditionOrder,
   LiveManagedPosition,
+  PositionCloseProgress,
   LiveTradeRecord,
   LiveTradeStatistics,
   ExecutionOrder,
@@ -22,6 +23,7 @@ import type {
   StrategyDefinition,
   StrategyDiagnostics,
   ConditionPoolRow,
+  TradeFeeSummary,
 } from '../types'
 
 export type LiveTraderTab = 'positions' | 'conditions' | 'history' | 'comparison' | 'orders'
@@ -34,6 +36,12 @@ interface DiagnosticChange {
 interface ConditionsPatch {
   upsert: LiveConditionOrder[]
   remove: string[]
+}
+
+interface CloseRequest {
+  status: 'submitting' | 'accepted' | 'failed'
+  positionIds?: string[]
+  error?: string
 }
 
 function applyDiagnosticChanges(
@@ -72,10 +80,13 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     instanceStreamId: '',
     instanceRevision: 0,
     health: null as CtpHealth | null,
+    tradingEnvironment: undefined as LiveTraderSnapshot['trading_environment'],
     config: null as ExecutionConfig | null,
     account: null as TraderAccount | null,
     brokerPositions: [] as LiveBrokerPosition[],
     managedPositions: [] as LiveManagedPosition[],
+    closeProgress: [] as PositionCloseProgress[],
+    closeRequest: null as CloseRequest | null,
     conditions: [] as LiveConditionOrder[],
     history: [] as LiveTradeRecord[],
     executionOrders: [] as ExecutionOrder[],
@@ -274,21 +285,25 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         return (b.id || '').localeCompare(a.id || '')
       })
     },
-    dailyPnlMap(): Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number }> {
-      const map: Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number }> = {}
+    dailyPnlMap(): Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number; fees: TradeFeeSummary }> {
+      const map: Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number; fees: TradeFeeSummary }> = {}
       for (const rec of this.history) {
         const d = extractTradeDate(rec.exit_ts)
         if (!d) continue
         const pnl = getTradeRecordPnl(rec)
         if (!map[d]) {
-          map[d] = { totalPnl: 0, count: 0, winCount: 0, lossCount: 0 }
+          map[d] = { totalPnl: 0, count: 0, winCount: 0, lossCount: 0, fees: summarizeTradeFees([]) }
         }
         map[d].totalPnl += pnl
         map[d].count += 1
+        addConfirmedTradeFee(map[d].fees, rec)
         if (pnl > 0) map[d].winCount += 1
         else if (pnl < 0) map[d].lossCount += 1
       }
       return map
+    },
+    realizedTradeFees(): TradeFeeSummary {
+      return this.statistics?.fee_reconciliation ?? summarizeTradeFees(this.history)
     },
     totalRealizedPnlAmount(): number {
       if (this.statistics?.total_pnl != null && this.statistics.total_pnl !== 0) {
@@ -431,7 +446,9 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.pushRevision++
       this.refreshing = false
       this.health = null; this.account = null; this.config = null
+      this.tradingEnvironment = undefined
       this.brokerPositions = []; this.managedPositions = []; this.conditions = []; this.history = []
+      this.closeProgress = []; this.closeRequest = null
       this.statistics = null; this.strategyComparison = null; this.quotes = {}
       this.currentStrategy = null; this.strategyDiagnostics = null
       this.executionOrdersSeq++; this.executionOrders = []; this.executionOrdersTotal = 0
@@ -442,9 +459,9 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       await this.refresh()
       if (this.activeTab === 'orders') await this.loadExecutionOrders()
     },
-    async instanceAction(action: Record<string, unknown>) {
+    async instanceAction<T = any>(action: Record<string, unknown>) {
       const id = this.selectedInstanceId
-      const result = await api.traderInstanceRequest('action', id, action)
+      const result = await api.traderInstanceRequest<T>('action', id, action)
       if (id === this.selectedInstanceId) { await this.loadInstances(); await this.refresh() }
       return result
     },
@@ -453,6 +470,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (id === this.selectedInstanceId) {
         this.health = null; this.account = null; this.bridgeOnline = false
         this.brokerPositions = []; this.errorMsg = null
+        this.closeProgress = []; this.closeRequest = null
         this.instanceGeneration++; this.pushRevision++
         this.refreshing = false
         await this.loadInstances()
@@ -500,8 +518,10 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       const baseline: LiveTraderSnapshot = {
         instance_id: this.selectedInstanceId, source: 'server', health: this.health, account: this.account,
+        trading_environment: this.tradingEnvironment,
         broker_positions: this.brokerPositions, config: this.config || undefined,
         managed_positions: this.managedPositions, conditions, history: this.history,
+        close_progress: this.closeProgress,
         statistics: this.statistics, strategy_comparison: this.strategyComparison,
         strategy: this.currentStrategy || undefined, strategy_diagnostics: diagnostics,
         bridge_online: this.bridgeOnline, execution_error: this.errorMsg,
@@ -516,6 +536,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot._stream_id) { this.instanceStreamId = snapshot._stream_id; this.instanceRevision = snapshot._revision ?? 0 }
       if (snapshot.source && snapshot.source !== this.snapshotSource) {
         this.quotes = {}
+        this.closeProgress = []
         this.strategyComparison = null
         this.currentStrategy = null; this.strategyDiagnostics = null
         this.executionOrdersSeq++
@@ -527,11 +548,13 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       }
       if (snapshot.source) this.snapshotSource = snapshot.source
       this.health = snapshot.health
+      this.tradingEnvironment = snapshot.trading_environment
       this.bridgeOnline = snapshot.bridge_online !== false
       if (snapshot.account !== undefined) this.account = snapshot.account
       this.brokerPositions = snapshot.broker_positions || []
       if (snapshot.config) this.config = snapshot.config
       if (snapshot.managed_positions) this.managedPositions = snapshot.managed_positions
+      if (snapshot.close_progress !== undefined) this.closeProgress = snapshot.close_progress
       if (snapshot.conditions) this.conditions = snapshot.conditions
       if (snapshot.history) this.history = snapshot.history
       if (snapshot.statistics !== undefined) this.statistics = snapshot.statistics
@@ -755,13 +778,24 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     },
 
     async emergencyCloseAll() {
+      if (this.closeRequest?.status === 'submitting') return
+      const generation = this.instanceGeneration
+      this.closeRequest = { status: 'submitting' }
       try {
-        if (this.instancesSupported) await this.instanceAction({ action: 'close_all' })
-        else await api.emergencyCloseAll()
-        notify.error('已触发紧急一键全平！')
-        await this.refresh()
+        if (this.instancesSupported) {
+          const result = await this.instanceAction<{ position_ids?: string[] }>({ action: 'close_all' })
+          if (generation !== this.instanceGeneration) return
+          this.closeRequest = { status: 'accepted', positionIds: result?.position_ids }
+        } else {
+          const result = await api.emergencyCloseAll()
+          if (generation !== this.instanceGeneration) return
+          if (result === false || result?.success === false) throw new Error(result?.error || '柜台未接受平仓请求')
+          this.closeRequest = { status: 'accepted' }
+          await this.refresh()
+        }
       } catch (e: any) {
-        notify.error(`一键全平失败: ${e}`)
+        if (generation !== this.instanceGeneration) return
+        this.closeRequest = { status: 'failed', error: e?.message || String(e) }
       }
     },
 

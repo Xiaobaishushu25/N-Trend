@@ -122,7 +122,7 @@ macro_rules! state_fields {
             comparison, p3_runner);
         $apply!(scalar_default: p3_stall);
         $apply!(map: strategy_states, strategy_bars, conditions, positions, closes,
-            trade_times, entry_timeouts, last_bars, overnight_snapshots, entry_funding_waits,
+            trade_times, fill_links, settlement_days, entry_timeouts, last_bars, overnight_snapshots, entry_funding_waits,
             quote_sequences, entry_trigger_sequences, symbol_slots, symbol_release_after,
             entry_decisions);
         $apply!(set: seen_trades, aborted_entries, authorized_entries, recorded_checkpoints);

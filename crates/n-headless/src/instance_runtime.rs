@@ -44,7 +44,13 @@ pub fn spawn(ctx: Arc<ServerContext>) {
             }
             drop(sidecars);
             for r in all {
-                if r.definition.id == DEFAULT_INSTANCE || !started.insert(r.definition.id.clone()) {
+                if !started.insert(r.definition.id.clone()) {
+                    continue;
+                }
+                if let BrokerClient::Ctp(client) = r.broker.clone() {
+                    tokio::spawn(run_settlement(ctx.clone(), r.clone(), client));
+                }
+                if r.definition.id == DEFAULT_INSTANCE {
                     continue;
                 }
                 if matches!(r.broker, BrokerClient::Disabled(_)) {
@@ -182,6 +188,62 @@ pub fn spawn(ctx: Arc<ServerContext>) {
             sidecar.stop().await;
         }
     });
+}
+
+async fn run_settlement(
+    ctx: Arc<ServerContext>, r: Arc<InstanceRuntime>, client: n_core::trader::CtpTraderClient,
+) {
+    let mut timer = tokio::time::interval(Duration::from_secs(15));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut retry_at = HashMap::<String, Instant>::new();
+    loop {
+        timer.tick().await;
+        if ctx.is_shutting_down.load(Ordering::Relaxed)
+            || ctx.instances.get().unwrap().get(&r.definition.id).await.is_err() {
+            break;
+        }
+        if let Err(error) = r.engine.refresh_settlement_projection().await {
+            tracing::warn!(instance_id = %r.definition.id, %error, "结算统计刷新失败");
+        }
+        let trading_day = {
+            let snapshot = r.snapshot.read().await;
+            if snapshot["health"]["logged_in"] != true || snapshot["bridge_online"] == false {
+                continue;
+            }
+            snapshot["health"]["trading_day"].as_str().unwrap_or("").to_owned()
+        };
+        if trading_day.len() != 8 {
+            continue;
+        }
+        let shanghai = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let can_try_today = trading_day == shanghai.format("%Y%m%d").to_string()
+            && shanghai.time() >= chrono::NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+        let now = Instant::now();
+        let Some(day) = r.engine.settlement_days_to_query().await.into_iter().find(|day| {
+            (day < &trading_day || (can_try_today && day == &trading_day))
+                && retry_at.get(day).is_none_or(|retry| *retry <= now)
+        }) else {
+            continue;
+        };
+        let delay = match client.settlement(&day).await {
+            Ok(reply) => match r.engine.apply_settlement_reply(&day, reply).await {
+                Ok(true) => {
+                    retry_at.remove(&day);
+                    if let Err(error) = r.engine.refresh_settlement_projection().await {
+                        tracing::warn!(instance_id = %r.definition.id, %error, "结算统计刷新失败");
+                    }
+                    continue;
+                }
+                Ok(false) => Duration::from_secs(if day == trading_day { 300 } else { 3600 }),
+                Err(error) => {
+                    tracing::warn!(instance_id = %r.definition.id, %error, "结算对账暂不能保存");
+                    Duration::from_secs(300)
+                }
+            },
+            Err(_) => Duration::from_secs(300),
+        };
+        retry_at.insert(day, now + delay);
+    }
 }
 
 type HistoryKey = (String, String);

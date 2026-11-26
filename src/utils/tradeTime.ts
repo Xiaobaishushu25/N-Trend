@@ -1,4 +1,4 @@
-import type { LiveTradeRecord } from '../types'
+import type { LiveTradeRecord, TradeFeeSummary } from '../types'
 import { calcTradeRecordPnlAmount } from './multipliers'
 
 // Dates supplied by the backend are natural Shanghai timestamps. Presentation
@@ -43,6 +43,21 @@ export function getTradeRecordPnl(rec: LiveTradeRecord): number {
     return rec.realized_pnl_amount
   }
   return calcTradeRecordPnlAmount(rec.instrument_id || rec.symbol, rec.realized_pnl_pts, rec.volume)
+}
+
+export function addConfirmedTradeFee(summary: TradeFeeSummary, record: LiveTradeRecord): void {
+  summary.total_count += 1
+  const fee = record.fee_reconciliation
+  if (fee?.status !== 'confirmed' || fee.commission_cents == null || fee.net_pnl_cents == null) return
+  summary.confirmed_count += 1
+  summary.commission_cents = (summary.commission_cents ?? 0) + fee.commission_cents
+  summary.net_pnl_cents = (summary.net_pnl_cents ?? 0) + fee.net_pnl_cents
+}
+
+export function summarizeTradeFees(records: readonly LiveTradeRecord[]): TradeFeeSummary {
+  const result: TradeFeeSummary = { confirmed_count: 0, total_count: 0, commission_cents: null, net_pnl_cents: null }
+  for (const record of records) addConfirmedTradeFee(result, record)
+  return result
 }
 
 /**

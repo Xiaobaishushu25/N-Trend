@@ -1179,7 +1179,17 @@ async fn queued_expired_stop_is_persisted_and_waits_for_the_rebounded_book() {
     ready(&engine, vec![], vec![]).await;
     let id = register(&engine, 1000.0, 990.0).await;
     quote(&engine, 1000.0).await;
-    let open = counter.inserts()[0].clone();
+    let open = {
+        let mut inserts = counter.inserts();
+        for _ in 0..50 {
+            if !inserts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            inserts = counter.inserts();
+        }
+        inserts[0].clone()
+    };
     ready(&engine, vec![order(&open, "all_traded", 2)], vec![trade(&open, "open", 2, 1000.0)]).await;
     let mut book = {
         let mut state = engine.state.lock().await;
@@ -1225,7 +1235,17 @@ async fn late_protection_requires_a_valid_receipt_and_prior_position_exposure() 
     ready(&engine, vec![], vec![]).await;
     let id = register(&engine, 1000.0, 990.0).await;
     quote(&engine, 1000.0).await;
-    let open = counter.inserts()[0].clone();
+    let open = {
+        let mut inserts = counter.inserts();
+        for _ in 0..50 {
+            if !inserts.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            inserts = counter.inserts();
+        }
+        inserts[0].clone()
+    };
     ready(&engine, vec![order(&open, "all_traded", 2)], vec![trade(&open, "open", 2, 1000.0)]).await;
     let mut book = {
         let mut state = engine.state.lock().await;
@@ -1491,6 +1511,71 @@ async fn price_rejected_entry_waits_for_a_fresh_different_limit_price() {
         .await
         .unwrap();
     assert_eq!(counter.inserts().len(), 2);
+}
+
+#[tokio::test]
+async fn flatten_progress_explains_quantity_reserved_by_unconfirmed_cancel() {
+    let counter = Counter::new();
+    let engine = counter.engine(ExecutionMode::FullAuto, 2);
+    ready(&engine, vec![], vec![]).await;
+    let id = register(&engine, 1010.0, 1000.0).await;
+    quote(&engine, 1010.0).await;
+    let open = counter.inserts()[0].clone();
+    let opened = trade(&open, "open", 2, 1010.0);
+    let filled_entry = order(&open, "all_traded", 2);
+    ready(&engine, vec![filled_entry.clone()], vec![opened.clone()]).await;
+    engine.state.lock().await.broker_positions.push(TraderPosition {
+        instrument_id: "pb2611".into(),
+        direction: "buy".into(),
+        position: 2,
+        yd_position: 0,
+        today_position: 2,
+        open_cost: 1010.0,
+        position_profit: 0.0,
+        margin: 1000.0,
+    });
+
+    assert_eq!(engine.flatten_positions().await.unwrap(), vec![id.clone()]);
+    let mut cache = ExecutionSnapshotCache::default();
+    let snapshot = engine.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(snapshot["close_progress"][0]["status"], "waiting_submit");
+    engine.drive().await.unwrap();
+    let close = counter.inserts()[1].clone();
+    let reference = close["order_ref"].as_str().unwrap();
+    ready(
+        &engine,
+        vec![filled_entry.clone(), order(&close, "queueing", 0)],
+        vec![opened.clone()],
+    )
+    .await;
+    let snapshot = engine.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(snapshot["close_progress"][0]["status"], "working");
+    {
+        let mut state = engine.state.lock().await;
+        let close = state.orders.get_mut(reference).unwrap();
+        close.phase = OrderPhase::Unknown;
+        close.cancel_attempts = 3;
+        close.note = "撤单未确认".into();
+        state.record_order_update(reference);
+    }
+    engine.drive().await.unwrap();
+    assert_eq!(counter.inserts().len(), 2);
+    let snapshot = engine.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(snapshot["close_progress"], json!([{
+        "position_id": id, "instrument_id": "pb2611", "direction": "up",
+        "remaining": 2, "reserved": 2, "unreserved": 0,
+        "status": "cancel_unconfirmed", "order_ref": reference, "detail": "撤单未确认"
+    }]));
+
+    ready(
+        &engine,
+        vec![filled_entry, order(&close, "all_traded", 2)],
+        vec![opened, trade(&close, "close", 2, 1009.0)],
+    )
+    .await;
+    let snapshot = engine.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(snapshot["close_progress"], json!([]));
+    assert_eq!(snapshot["managed_positions"][0]["is_closed"], true);
 }
 
 #[tokio::test]

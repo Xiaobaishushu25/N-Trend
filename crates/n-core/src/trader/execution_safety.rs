@@ -82,6 +82,7 @@ pub(super) struct RejectionWaits {
 pub(super) struct Rejections {
     pub(super) entries: HashSet<String>,
     pub(super) waits: HashMap<String, RejectionWaits>,
+    pub(super) latest_exit_rejections: HashMap<String, String>,
 }
 
 impl ExecutionState {
@@ -118,9 +119,13 @@ impl ExecutionState {
             }
         }
         let mut waits = HashMap::<_, RejectionWaits>::new();
-        for ((id, is_exit), ((submitted_at, _, _), order)) in last {
+        let mut latest_exit_rejections = HashMap::new();
+        for ((id, is_exit), ((submitted_at, _, reference), order)) in last {
             if !order.clean_rejection() {
                 continue;
+            }
+            if is_exit {
+                latest_exit_rejections.insert(id.to_owned(), reference.to_owned());
             }
             let wait = if order.note.contains("该交易席位未连接到交易所") {
                 RejectionWait::Seat { submitted_at }
@@ -144,6 +149,7 @@ impl ExecutionState {
         Rejections {
             entries: rejected_entries.into_iter().map(str::to_owned).collect(),
             waits,
+            latest_exit_rejections,
         }
     }
 

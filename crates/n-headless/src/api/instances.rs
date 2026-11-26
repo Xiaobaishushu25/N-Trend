@@ -230,7 +230,9 @@ pub async fn action(
                     }
                 }
                 Action::CloseAll => {
-                    r.engine.flatten_positions().await?;
+                    let position_ids = r.engine.flatten_positions().await?;
+                    *r.published.write().await = Default::default();
+                    return Ok(json!({"instance_id":id,"accepted":true,"position_ids":position_ids}));
                 }
                 Action::ClosePosition {
                     position_id,

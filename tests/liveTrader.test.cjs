@@ -55,6 +55,70 @@ function snapshot() {
     account: { balance: 1000 }, broker_positions: [] }
 }
 
+test('net PnL preserves confirmed zero fees and does not mix accounts or unconfirmed records', async () => {
+  const { store, api } = setup()
+  store.instancesSupported = true
+  const exitTs = '2026-11-25 21:05:00'
+  const entries = [
+    { id: 'confirmed', exit_ts: exitTs, realized_pnl_amount: -10,
+      fee_reconciliation: { status: 'confirmed', commission_cents: 0, net_pnl_cents: -1000 } },
+    { id: 'pending', exit_ts: exitTs, realized_pnl_amount: 50,
+      fee_reconciliation: { status: 'pending', commission_cents: 100, net_pnl_cents: null } },
+  ]
+  store.applySnapshot({ ...snapshot(), trading_environment: 'simnow', history: entries })
+  assert.equal(store.tradingEnvironment, 'simnow')
+  assert.equal(store.realizedTradeFees.confirmed_count, 1)
+  assert.equal(store.realizedTradeFees.total_count, 2)
+  assert.equal(store.realizedTradeFees.commission_cents, 0)
+  assert.equal(store.dailyPnlMap['2026-11-25'].fees.net_pnl_cents, -1000)
+  api.traderInstanceRequest = async () => ({ ...snapshot(), instance_id: 'ctp-real', trading_environment: 'real', history: [] })
+  await store.selectInstance('ctp-real')
+  store.applySnapshot({ ...snapshot(), trading_environment: 'simnow', history: entries })
+  assert.equal(store.tradingEnvironment, 'real')
+  assert.equal(store.realizedTradeFees.net_pnl_cents, null)
+})
+
+test('instance flatten keeps the request and updates close progress from the live stream', async () => {
+  const { store, api } = setup()
+  store.instancesSupported = true
+  store.selectedInstanceId = 'ctp-a'
+  const base = { ...snapshot(), instance_id: 'ctp-a', _stream_id: 'ctp', _revision: 1 }
+  const blocked = { position_id: 'p1', remaining: 5, reserved: 5, unreserved: 0, status: 'cancel_unconfirmed' }
+  api.traderInstanceRequest = async (operation, id, payload) => {
+    if (operation === 'list') return { instances: [], default_instance_id: 'default' }
+    assert.equal(id, 'ctp-a')
+    if (operation === 'action') {
+      assert.equal(payload.action, 'close_all')
+      assert.equal(store.closeRequest.status, 'submitting')
+      return { accepted: true, position_ids: ['p1'] }
+    }
+    return { ...base, managed_positions: [{ id: 'p1', volume: 5 }], close_progress: [blocked] }
+  }
+  await store.emergencyCloseAll()
+  assert.equal(store.closeRequest.status, 'accepted')
+  assert.equal(store.closeRequest.positionIds[0], 'p1')
+  assert.equal(store.closeProgress[0].unreserved, 0)
+  store.applyInstanceDelta({ instance_id: 'ctp-a', delta: {
+    stream_id: 'ctp', base_revision: 1, revision: 2, changes: { broker_positions: [] },
+  } })
+  assert.equal(store.closeProgress[0].status, 'cancel_unconfirmed')
+  store.applyInstanceDelta({ instance_id: 'ctp-a', delta: {
+    stream_id: 'ctp', base_revision: 2, revision: 3,
+    changes: { managed_positions: [{ id: 'p1', is_closed: true, volume: 0 }], close_progress: [] },
+  } })
+  assert.equal(store.closeProgress.length, 0)
+  assert.equal(store.managedPositions[0].is_closed, true)
+
+  api.traderInstanceRequest = async operation => {
+    if (operation === 'action') throw Error('连接中断')
+    return { ...snapshot(), instance_id: 'ctp-b' }
+  }
+  await store.emergencyCloseAll()
+  assert.equal(store.closeRequest.error, '连接中断')
+  await store.selectInstance('ctp-b')
+  assert.equal(store.closeRequest, null)
+})
+
 test('relogin invalidates a pending old snapshot and still refreshes the selected account', async () => {
   const { store, api } = setup()
   store.instancesSupported = true; store.selectedInstanceId = 'sim-a'

@@ -369,6 +369,17 @@ impl CtpTraderClient {
         Ok(res)
     }
 
+    pub async fn settlement(&self, trading_day: &str) -> Result<super::execution::SettlementReply> {
+        anyhow::ensure!(self.expected_identity.read().unwrap().as_ref().is_some_and(|(broker, user)|
+            !broker.is_empty() && !user.is_empty()), "结算查询缺少柜台账户身份");
+        Ok(self.mutation("/settlement/query")
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({"trading_day": trading_day}))
+            .send().await?
+            .error_for_status()?
+            .json().await?)
+    }
+
     pub async fn positions(&self) -> Result<Vec<TraderPosition>> {
         let url = format!("{}/positions", self.base_url);
         let resp = self

@@ -123,6 +123,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
         self.lock = threading.RLock()
         # Serialize submissions without holding the state lock needed by SPI callbacks.
         self._submission_lock = threading.Lock()
+        self._settlement_query_lock = threading.Lock()
 
         # State flags
         self.is_connected = False
@@ -541,6 +542,7 @@ class CtpTraderManager(tdapi.CThostFtdcTraderSpi):
                     "close_profit": float(pAccount.CloseProfit),
                     "position_profit": float(pAccount.PositionProfit),
                     "commission": float(pAccount.Commission),
+                    "trading_day": str(getattr(pAccount, "TradingDay", "") or self.trading_day),
                     "risk_ratio": margin / balance if balance > 0 else 0.0,
                     "updated_at": time.time(),
                 }
@@ -1445,6 +1447,26 @@ class CtpHttpHandler(http.server.BaseHTTPRequestHandler):
             return self._send_json(409, {"success": False, "msg": "Account identity mismatch"})
 
         path = self.path.split("?")[0]
+        if path == "/settlement/query":
+            if not expected_broker or not expected_user or not g_trader_mgr.is_logged_in:
+                return self._send_json(409, {"status": "retry"})
+            from ctp_settlement import day_key, query_settlement
+            try:
+                trading_day = day_key(params.get("trading_day", ""))
+            except (ValueError, TypeError):
+                return self._send_json(400, {"status": "invalid_date"})
+            if trading_day > g_trader_mgr.trading_day:
+                return self._send_json(409, {"status": "retry"})
+            if not g_trader_mgr._settlement_query_lock.acquire(blocking=False):
+                return self._send_json(429, {"status": "retry"})
+            try:
+                result = query_settlement(g_trader_mgr.config, trading_day)
+            except Exception:
+                logger.warning("[结算查询] 独立查询失败")
+                result = {"status": "retry"}
+            finally:
+                g_trader_mgr._settlement_query_lock.release()
+            return self._send_json(200, result)
         if path == "/order/insert":
             inst = params.get("instrument_id")
             dir_str = params.get("direction")

@@ -911,6 +911,9 @@ fn spawn_trader_stream(ctx: Arc<ServerContext>) {
             snapshot["instance_id"] = serde_json::json!("default");
             snapshot["account_id"] = serde_json::json!("default");
             snapshot["account_kind"] = serde_json::json!("ctp");
+            snapshot["trading_environment"] = serde_json::json!(
+                if snapshot["health"]["broker_id"].as_str() == Some("9999") { "simnow" } else { "real" }
+            );
             if let Some(manager) = ctx.instances.get() {
                 if let Ok(r) = manager.get("default").await {
                     *r.snapshot.write().await = snapshot.clone();

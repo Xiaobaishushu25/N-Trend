@@ -9,6 +9,7 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 import { emit } from '@tauri-apps/api/event'
 import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import {
+  NAlert,
   NBadge,
   NButton,
   NDivider,
@@ -62,12 +63,71 @@ import {
   formatRMultiple,
   getSymbolMultiplier,
 } from '../utils/multipliers'
-import { getTradeRecordPnl, formatTradeDateTime } from '../utils/tradeTime'
-import type { LiveTradeRecord, OpenReviewChartPayload, ReviewSignalDetail } from '../types'
+import { getTradeRecordPnl, formatTradeDateTime, summarizeTradeFees } from '../utils/tradeTime'
+import type { LiveTradeRecord, OpenReviewChartPayload, PositionCloseProgress, ReviewSignalDetail } from '../types'
 
 const trader = useLiveTraderStore()
 const selectedInstance = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
-const executionLabel = computed(() => selectedInstance.value?.account.kind === 'paper' ? '模拟' : '实盘')
+const isPaper = computed(() => trader.tradingEnvironment === 'paper' || selectedInstance.value?.account.kind === 'paper')
+const isSimNow = computed(() => trader.tradingEnvironment === 'simnow' || trader.health?.broker_id === '9999')
+const executionLabel = computed(() => isSimNow.value ? 'SimNow ' : isPaper.value ? '模拟' : '实盘')
+const feeSourceLabel = computed(() => isSimNow.value ? '模拟结算' : '柜台实收')
+const realizedFees = computed(() => trader.realizedTradeFees)
+const realizedNetComplete = computed(() => realizedFees.value.confirmed_count > 0 &&
+  realizedFees.value.confirmed_count === realizedFees.value.total_count)
+
+function feeMoney(cents?: number | null): string {
+  return cents == null ? '—' : (cents / 100).toLocaleString('zh-CN', { style: 'currency', currency: 'CNY' })
+}
+
+function netMoney(cents?: number | null): string {
+  return formatPnlAmount(cents == null ? null : cents / 100, { decimals: 2 })
+}
+
+function settlementStatus(record: LiveTradeRecord): string {
+  const status = record.fee_reconciliation?.status
+  if (status === 'confirmed') return feeSourceLabel.value
+  if (status === 'missing_detail') return '缺结算明细'
+  if (status === 'unmatched') return '待对账'
+  return '待结算'
+}
+
+function settlementDay(record: LiveTradeRecord): string {
+  return record.fee_reconciliation?.trading_day.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3') || '—'
+}
+const closeStatusLabels: Record<PositionCloseProgress['status'], string> = {
+  waiting_submit: '平仓任务已登记，等待报单',
+  waiting_broker: '等待柜台就绪',
+  waiting_quote: '等待有效合约行情',
+  waiting_ack: '报单结果待柜台确认',
+  working: '委托已报，等待成交',
+  waiting_cancel: '等待撤单确认',
+  cancel_unconfirmed: '旧委托撤单未确认，暂不能补报',
+  waiting_fills: '等待成交明细核对',
+  rejected: '最近一次平仓委托被拒',
+  blocked: '平仓报单暂缓',
+}
+const closeRows = computed(() => trader.closeProgress)
+const closeTotals = computed(() => closeRows.value.reduce(
+  (totals, row) => ({
+    remaining: totals.remaining + row.remaining,
+    reserved: totals.reserved + row.reserved,
+    unreserved: totals.unreserved + row.unreserved,
+  }),
+  { remaining: 0, reserved: 0, unreserved: 0 },
+))
+const requestedPositionsClosed = computed(() => {
+  const ids = trader.closeRequest?.positionIds
+  if (!ids?.length) return false
+  const closed = new Set(trader.managedPositions.filter(row => row.is_closed || row.volume === 0).map(row => row.id))
+  return ids.every(id => closed.has(id))
+})
+const closeAlertType = computed(() => {
+  if (trader.closeRequest?.status === 'failed') return 'error'
+  if (closeRows.value.some(row => ['blocked', 'cancel_unconfirmed', 'rejected'].includes(row.status))) return 'warning'
+  if (requestedPositionsClosed.value && !closeRows.value.length) return 'success'
+  return 'info'
+})
 
 // 平仓流水分页与统计状态
 const historyPage = ref(1)
@@ -115,6 +175,7 @@ const paginatedHistory = computed(() => {
 const filteredTotalPnl = computed(() => {
   return trader.filteredHistory.reduce((sum, rec) => sum + getTradeRecordPnl(rec), 0)
 })
+const filteredFees = computed(() => summarizeTradeFees(trader.filteredHistory))
 watch(() => trader.activeTab, (tab) => {
   if (tab === 'orders') void trader.loadExecutionOrders(1)
 })
@@ -848,7 +909,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
           <n-popconfirm @positive-click="trader.emergencyCloseAll">
             <template #trigger>
-              <n-button size="small" secondary type="error">
+              <n-button size="small" secondary type="error" :loading="trader.closeRequest?.status === 'submitting'">
                 <template #icon><n-icon :component="AlertTriangle" /></template>
                 {{ trader.instancesSupported ? '平本实例持仓' : '紧急全平' }}
               </n-button>
@@ -862,6 +923,39 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </n-button>
         </div>
       </div>
+
+      <n-alert
+        v-if="trader.closeRequest || closeRows.length"
+        class="close-progress"
+        title="平仓进度"
+        :type="closeAlertType"
+        role="status"
+      >
+        <div v-if="trader.closeRequest?.status === 'submitting'">正在提交平仓请求…</div>
+        <div v-else-if="trader.closeRequest?.status === 'failed'">
+          平仓请求未确认。{{ trader.closeRequest.error }}
+        </div>
+        <div v-else-if="!closeRows.length && trader.closeRequest?.positionIds?.length === 0">受理时没有需要平的托管持仓。</div>
+        <div v-else-if="!closeRows.length && requestedPositionsClosed">本次托管持仓已归零。</div>
+        <div v-else-if="trader.closeRequest?.status === 'accepted' && !closeRows.length">
+          {{ trader.closeRequest.positionIds ? '平仓请求已受理，等待交易状态更新。' : '平仓请求已受理，服务端未返回进度明细，请查看委托记录。' }}
+        </div>
+        <template v-if="closeRows.length">
+          <div v-if="!trader.bridgeOnline">连接已断开，以下为最后一次收到的进度。</div>
+          <div class="close-progress-summary">
+            待平 {{ closeTotals.remaining }} 手 · 委托占用 {{ closeTotals.reserved }} 手 · 未占用 {{ closeTotals.unreserved }} 手
+          </div>
+          <ul class="close-progress-list">
+            <li v-for="row in closeRows" :key="row.position_id">
+              <span class="font-num">{{ row.instrument_id }}</span>
+              {{ row.direction === 'up' ? '卖平' : '买平' }} {{ row.remaining }} 手
+              · {{ closeStatusLabels[row.status] }}
+              <span v-if="row.order_ref"> · 委托号 {{ row.order_ref }}</span>
+              <div v-if="row.detail">{{ row.detail }}</div>
+            </li>
+          </ul>
+        </template>
+      </n-alert>
 
       <!-- 2. SimNow 真实账户资金横条（白色卡片条，大字号高清晰度） -->
       <div class="account-strip">
@@ -901,6 +995,13 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </span>
         </div>
         <div class="acc-divider" />
+        <div v-if="!isPaper" class="acc-col">
+          <span class="acc-label">账户手续费 {{ trader.account?.trading_day || trader.health?.trading_day || '' }}</span>
+          <span class="acc-val font-num">
+            {{ feeMoney(trader.account?.commission == null ? null : Math.round(trader.account.commission * 100)) }}
+          </span>
+        </div>
+        <div v-if="!isPaper" class="acc-divider" />
         <div class="acc-col">
           <span class="acc-label">风险度</span>
           <span class="acc-val font-num">
@@ -935,8 +1036,20 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           </span>
         </div>
         <div class="kpi-divider" />
-        <div class="kpi-box">
-          <span class="kpi-name">{{ executionLabel }}平仓盈亏</span>
+        <div v-if="!isPaper" class="kpi-box">
+          <span class="kpi-name">{{ realizedNetComplete ? '累计净盈亏' : '已对账净盈亏' }}</span>
+          <span class="kpi-num font-num"
+            :class="realizedFees.net_pnl_cents == null ? '' : realizedFees.net_pnl_cents >= 0 ? 'is-up' : 'is-down'">
+            {{ netMoney(realizedFees.net_pnl_cents) }}
+          </span>
+          <span class="kpi-sub">
+            毛盈亏 {{ formatPnlAmount(trader.totalRealizedPnlAmount, { decimals: 2 }) }}
+            · 手续费 {{ feeMoney(realizedFees.commission_cents) }}
+          </span>
+          <span class="kpi-sub">已对账 {{ realizedFees.confirmed_count }} / {{ realizedFees.total_count }} 笔 · {{ feeSourceLabel }}</span>
+        </div>
+        <div v-else class="kpi-box">
+          <span class="kpi-name">模拟平仓毛盈亏</span>
           <span
             class="kpi-num font-num"
             :class="trader.totalRealizedPnlAmount >= 0 ? 'is-up' : 'is-down'"
@@ -1036,6 +1149,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         <TradePnlCalendarPopover
           v-model="trader.filterDate"
           :daily-pnl-map="trader.dailyPnlMap"
+          :show-net="!isPaper"
           :latest-exit-ts="trader.history[0] ? formatTradeDateTime(trader.history[0].exit_ts) : undefined"
           @change="onFilterDateChange"
         />
@@ -1572,10 +1686,21 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 </span>
               </div>
 
-              <div class="head-right font-num">
+              <div class="head-right history-pnl-values font-num">
                 <span class="pnl-amount" :class="getTradeRecordPnl(rec) >= 0 ? 'is-up' : 'is-down'">
+                  <span v-if="!isPaper" class="fee-inline-label">毛盈亏</span>
                   {{ formatPnlAmount(getTradeRecordPnl(rec), { decimals: 2 }) }}
                 </span>
+                <template v-if="!isPaper">
+                  <span class="history-fee"><span class="fee-inline-label">手续费</span>
+                    {{ feeMoney(rec.fee_reconciliation?.commission_cents) }}
+                  </span>
+                  <span class="pnl-amount"
+                    :class="rec.fee_reconciliation?.net_pnl_cents == null ? '' : rec.fee_reconciliation.net_pnl_cents >= 0 ? 'is-up' : 'is-down'">
+                    <span class="fee-inline-label">净盈亏</span>
+                    {{ netMoney(rec.fee_reconciliation?.net_pnl_cents) }}
+                  </span>
+                </template>
                 <span class="pnl-pts" :class="rec.realized_pnl_pts >= 0 ? 'is-up' : 'is-down'">
                   {{ formatPnlPoints(rec.realized_pnl_pts) }}
                 </span>
@@ -1586,6 +1711,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             </div>
 
             <div class="hist-card-body">
+              <details v-if="!isPaper" class="history-fee-details">
+                <summary>手续费明细 · {{ settlementStatus(rec) }}</summary>
+                <div class="history-fee-lines">
+                  <span>开仓费分摊 {{ feeMoney(rec.fee_reconciliation?.open_fee_cents) }}</span>
+                  <span>平仓费 {{ feeMoney(rec.fee_reconciliation?.close_fee_cents) }}</span>
+                  <span>结算交易日 {{ settlementDay(rec) }}</span>
+                </div>
+              </details>
               <!-- 全流程执行时间线 (预警拟定 -> 突破开仓 -> 动态平仓) -->
               <div class="hist-full-timeline">
                 <!-- 阶段1: 预警拟定 -->
@@ -1671,7 +1804,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                       <span class="field-val exit-reason-text">{{ exitReasonBadge(rec.exit_reason).text }}</span>
                     </div>
                     <div class="node-field">
-                      <span class="field-lbl">净收益实现</span>
+                      <span class="field-lbl">平仓点数与 R 倍数</span>
                       <span class="field-val font-num font-bold" :class="rec.realized_pnl_pts >= 0 ? 'is-up' : 'is-down'">
                         {{ formatPnlPoints(rec.realized_pnl_pts) }} ({{ formatRMultiple(rec.r_multiple) }})
                       </span>
@@ -1724,13 +1857,18 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               <template v-if="trader.filterReason">
                 · 原因: <span class="font-bold filter-tag-text">{{ getExitReasonLabel(trader.filterReason) }}</span>
               </template>
-              · 筛选盈亏:
+              · 筛选毛盈亏
               <span
                 class="font-num font-bold"
                 :class="filteredTotalPnl >= 0 ? 'is-up' : 'is-down'"
               >
                 {{ formatPnlAmount(filteredTotalPnl, { decimals: 2 }) }}
               </span>
+              <template v-if="!isPaper">
+                · 手续费 <span class="font-num">{{ feeMoney(filteredFees.commission_cents) }}</span>
+                · 已对账净盈亏 <span class="font-num font-bold">{{ netMoney(filteredFees.net_pnl_cents) }}</span>
+                · 已对账 {{ filteredFees.confirmed_count }} / {{ filteredFees.total_count }} 笔
+              </template>
             </div>
 
             <n-pagination
@@ -1891,6 +2029,19 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 </template>
 
 <style scoped>
+.close-progress {
+  margin-bottom: 12px;
+}
+
+.close-progress-summary {
+  font-weight: 600;
+}
+
+.close-progress-list {
+  margin: 6px 0 0;
+  padding-inline-start: 20px;
+  overflow-wrap: anywhere;
+}
 .orders-toolbar {
   display: flex;
   justify-content: space-between;
@@ -2797,6 +2948,8 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
@@ -2950,6 +3103,44 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
   gap: 10px;
   white-space: nowrap;
   flex-shrink: 0;
+}
+
+.history-pnl-values {
+  flex-shrink: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.fee-inline-label {
+  display: inline-block;
+  margin-right: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.history-fee {
+  font-size: 13px;
+  color: #334155;
+}
+
+.history-fee-details {
+  margin: 4px 0 10px;
+  font-size: 12px;
+  color: #475569;
+}
+
+.history-fee-details summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.history-fee-lines {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding-top: 5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .wait-progress {

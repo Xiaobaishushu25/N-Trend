@@ -528,7 +528,7 @@ impl ExecutionEngine {
         }
         self.save(&mut s)
     }
-    pub async fn flatten_positions(&self) -> Result<()> {
+    pub async fn flatten_positions(&self) -> Result<Vec<String>> {
         let mut s = self.state.lock().await;
         let positions = s
             .positions
@@ -551,6 +551,7 @@ impl ExecutionEngine {
             c.state = ConditionState::Canceled;
             c.note = "紧急平仓已取消后续入场".into();
         }
+        let position_ids = positions.iter().map(|p| p.id.clone()).collect();
         for p in positions {
             let actual: i32 = s.broker_positions
                 .iter()
@@ -619,7 +620,8 @@ impl ExecutionEngine {
         }
         s.rebuild_indices();
         s.error = None;
-        self.save(&mut s)
+        self.save(&mut s)?;
+        Ok(position_ids)
     }
 
     pub async fn close_managed_position(

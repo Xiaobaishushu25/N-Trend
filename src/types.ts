@@ -993,6 +993,7 @@ export interface TraderAccount {
   close_profit: number
   position_profit: number
   commission: number
+  trading_day?: string
   risk_ratio: number
   updated_at?: number
 }
@@ -1054,6 +1055,7 @@ export interface LiveTraderSnapshot {
   instance_id?: string
   account_id?: string
   account_kind?: 'ctp' | 'paper'
+  trading_environment?: 'real' | 'simnow' | 'paper'
   paused?: boolean
   strategy?: StrategyDefinition
   strategy_diagnostics?: StrategyDiagnostics | null
@@ -1067,11 +1069,25 @@ export interface LiveTraderSnapshot {
   bridge_online?: boolean
   config?: ExecutionConfig
   managed_positions?: LiveManagedPosition[]
+  close_progress?: PositionCloseProgress[]
   conditions?: LiveConditionOrder[]
   history?: LiveTradeRecord[]
   statistics?: LiveTradeStatistics | null
   execution_error?: string | null
   execution_orders?: ExecutionOrder[] // Legacy servers only; never used as the paged archive.
+}
+
+export interface PositionCloseProgress {
+  position_id: string
+  instrument_id: string
+  direction: string
+  remaining: number
+  reserved: number
+  unreserved: number
+  status: 'waiting_submit' | 'waiting_broker' | 'waiting_quote' | 'waiting_ack' | 'working' |
+    'waiting_cancel' | 'cancel_unconfirmed' | 'waiting_fills' | 'rejected' | 'blocked'
+  order_ref: string | null
+  detail: string | null
 }
 
 export interface StrategyDiagnostics {
@@ -1324,6 +1340,7 @@ export interface LiveTradeRecord {
   exit_reason: string
   realized_pnl_pts: number
   realized_pnl_amount?: number
+  fee_reconciliation?: TradeFeeReconciliation
   r_multiple: number
   max_mfe_r: number
   max_mae_r: number
@@ -1338,6 +1355,23 @@ export interface LiveTradeRecord {
   is_manual?: boolean | null
 }
 
+export interface TradeFeeReconciliation {
+  trading_day: string
+  status: 'pending' | 'missing_detail' | 'unmatched' | 'confirmed'
+  source: 'broker_settlement' | 'simnow_settlement'
+  open_fee_cents?: number | null
+  close_fee_cents?: number | null
+  commission_cents?: number | null
+  net_pnl_cents?: number | null
+}
+
+export interface TradeFeeSummary {
+  confirmed_count: number
+  total_count: number
+  commission_cents: number | null
+  net_pnl_cents: number | null
+}
+
 export interface LiveTradeStatistics {
   total_trades: number
   win_trades: number
@@ -1350,6 +1384,7 @@ export interface LiveTradeStatistics {
   small_trades_count: number
   exit_reason_breakdown: Record<string, number>
   total_pnl?: number
+  fee_reconciliation?: TradeFeeSummary
 }
 
 /** Independent display-only quality; never a win probability or execution score. */

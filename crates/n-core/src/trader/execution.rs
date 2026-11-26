@@ -30,6 +30,9 @@ mod execution_safety;
 #[path = "execution_snapshot.rs"]
 mod execution_snapshot;
 pub use execution_snapshot::ExecutionSnapshotCache;
+#[path = "execution_settlement.rs"]
+mod execution_settlement;
+pub use execution_settlement::SettlementReply;
 #[path = "execution_trade_time.rs"]
 mod execution_trade_time;
 #[path = "p3_stall.rs"]
@@ -536,6 +539,8 @@ struct ExecutionState {
     closes: HashMap<String, CloseTask>,
     seen_trades: SharedState<HashSet<String>>,
     trade_times: SharedState<HashMap<String, super::trade_time::TradeTimeEvidence>>,
+    fill_links: SharedState<HashMap<String, execution_settlement::FillLink>>,
+    settlement_days: SharedState<HashMap<String, execution_settlement::Statement>>,
     time_normalization_version: u32,
     aborted_entries: HashSet<String>,
     // Ordinary timeouts cancel the remainder. An explicit abort removes this
@@ -755,6 +760,7 @@ pub struct ExecutionEngine {
     state_path: Option<PathBuf>,
     store: std::sync::Mutex<Option<ExecutionStore>>,
     state: Mutex<ExecutionState>,
+    settlement_projection: RwLock<Option<execution_settlement::ProjectionCache>>,
     drive_lock: Mutex<()>,
     _state_lock: Option<std::fs::File>,
 }
@@ -919,6 +925,7 @@ impl ExecutionEngine {
             state_path,
             store: std::sync::Mutex::new(store),
             state: Mutex::new(state),
+            settlement_projection: RwLock::new(None),
             drive_lock: Mutex::new(()),
             _state_lock: state_lock,
         }
@@ -1732,8 +1739,9 @@ impl ExecutionEngine {
 
                     if let Some(pos_id) = matching_pos_id {
                         s.seen_trades.insert(key.clone());
+                        let close_vol = trade.volume.min(s.positions[&pos_id].volume);
+                        s.record_fill_link(key, &pos_id, trade, close_vol);
                         let pos = s.positions.get_mut(&pos_id).unwrap();
-                        let close_vol = trade.volume.min(pos.volume);
                         let points = (trade.price - pos.fill_price)
                             * if pos.direction == "up" { 1.0 } else { -1.0 };
                         pos.volume -= close_vol;
@@ -1862,6 +1870,7 @@ impl ExecutionEngine {
                 );
             }
             s.seen_trades.insert(key.clone());
+            s.record_fill_link(key, &order.condition_id, trade, trade.volume);
             durable_changed = true;
             let ord = s.orders.get_mut(&trade.order_ref).unwrap();
             ord.filled += trade.volume;
