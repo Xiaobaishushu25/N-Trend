@@ -152,6 +152,7 @@ pub enum Action {
     ConfigureStrategy {
         config: ExecutionConfig,
         strategy: StrategyDefinition,
+        note: Option<String>,
     },
     P3RunnerComparison {
         enabled: bool,
@@ -200,8 +201,8 @@ pub async fn action(
                 }
                 Action::Delete => m.remove(&id).await?,
                 Action::Rename { name } => m.rename(&id, name).await?,
-                Action::ConfigureStrategy { config, strategy } => {
-                    r.engine.configure_strategy(strategy, config).await?
+                Action::ConfigureStrategy { config, strategy, note } => {
+                    r.engine.configure_strategy_with_note(strategy, config, note).await?
                 }
                 Action::Configure { config } => r.engine.update_config(config).await?,
                 Action::Strategy { strategy } => r.engine.set_definition(strategy).await?,

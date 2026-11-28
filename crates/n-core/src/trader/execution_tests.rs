@@ -1586,7 +1586,7 @@ async fn snapshot_reuses_history_and_refreshes_only_changed_fields() {
     let mut cache = ExecutionSnapshotCache::default();
     let first = engine.snapshot_fields(&mut cache, true).await.unwrap();
     let second = engine.snapshot_fields(&mut cache, true).await.unwrap();
-    for key in ["history", "statistics", "managed_positions"] {
+    for key in ["history", "statistics", "managed_positions", "strategy_revisions"] {
         assert!(
             std::ptr::eq(first.get(key).unwrap(), second.get(key).unwrap()),
             "{key}"

@@ -5,7 +5,7 @@ import { DEFAULT_MULTIPLIERS, getSymbolPrefix } from '../utils/multipliers'
 import { notify } from '../utils/notify'
 import { isMarketTradingWindow } from '../utils/tradingHours'
 import { chaseRejectionNote, filteredConditionRows } from '../utils/conditionPool'
-import { parseTradeTimestamp, extractTradeDate, getTradeRecordPnl, addConfirmedTradeFee, summarizeTradeFees } from '../utils/tradeTime'
+import { parseTradeTimestamp, extractTradeDate, dailyTradePnl, summarizeTradeFees } from '../utils/tradeTime'
 import type {
   CtpHealth,
   LiveTraderSnapshot,
@@ -100,6 +100,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
     strategyComparison: null as LiveTraderSnapshot['strategy_comparison'],
     updatingP3Runner: false,
     currentStrategy: null as StrategyDefinition | null,
+    strategyRevisions: [] as NonNullable<LiveTraderSnapshot['strategy_revisions']>,
     strategyDiagnostics: null as StrategyDiagnostics | null,
     updatingEntryFilter: false,
     loading: false,
@@ -193,13 +194,14 @@ export const useLiveTraderStore = defineStore('liveTrader', {
 
       for (const mp of this.managedPositions) {
         if (mp.is_closed) continue
+        const direction = mp.direction === 'up' ? 'buy' : 'sell'
         const exists = list.some(
-          (item) => item.instrument_id.toLowerCase() === mp.instrument_id.toLowerCase(),
+          (item) => item.instrument_id.toLowerCase() === mp.instrument_id.toLowerCase() && item.direction === direction,
         )
         if (!exists) {
           list.push({
             instrument_id: mp.instrument_id,
-            direction: mp.direction === 'up' ? 'buy' : 'sell',
+            direction,
             position: mp.volume,
             today_position: mp.volume,
             yd_position: 0,
@@ -285,22 +287,8 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         return (b.id || '').localeCompare(a.id || '')
       })
     },
-    dailyPnlMap(): Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number; fees: TradeFeeSummary }> {
-      const map: Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number; fees: TradeFeeSummary }> = {}
-      for (const rec of this.history) {
-        const d = extractTradeDate(rec.exit_ts)
-        if (!d) continue
-        const pnl = getTradeRecordPnl(rec)
-        if (!map[d]) {
-          map[d] = { totalPnl: 0, count: 0, winCount: 0, lossCount: 0, fees: summarizeTradeFees([]) }
-        }
-        map[d].totalPnl += pnl
-        map[d].count += 1
-        addConfirmedTradeFee(map[d].fees, rec)
-        if (pnl > 0) map[d].winCount += 1
-        else if (pnl < 0) map[d].lossCount += 1
-      }
-      return map
+    dailyPnlMap(): ReturnType<typeof dailyTradePnl> {
+      return dailyTradePnl(this.history)
     },
     realizedTradeFees(): TradeFeeSummary {
       return this.statistics?.fee_reconciliation ?? summarizeTradeFees(this.history)
@@ -450,7 +438,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       this.brokerPositions = []; this.managedPositions = []; this.conditions = []; this.history = []
       this.closeProgress = []; this.closeRequest = null
       this.statistics = null; this.strategyComparison = null; this.quotes = {}
-      this.currentStrategy = null; this.strategyDiagnostics = null
+      this.currentStrategy = null; this.strategyDiagnostics = null; this.strategyRevisions = []
       this.executionOrdersSeq++; this.executionOrders = []; this.executionOrdersTotal = 0
       this.executionOrdersPage = 1; this.executionOrdersError = ''; this.executionOrdersLoading = false
       this.filterDate = ''; this.filterReason = ''
@@ -524,6 +512,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         close_progress: this.closeProgress,
         statistics: this.statistics, strategy_comparison: this.strategyComparison,
         strategy: this.currentStrategy || undefined, strategy_diagnostics: diagnostics,
+        strategy_revisions: this.strategyRevisions,
         bridge_online: this.bridgeOnline, execution_error: this.errorMsg,
         _stream_id: delta.stream_id, _revision: delta.revision,
       }
@@ -538,7 +527,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
         this.quotes = {}
         this.closeProgress = []
         this.strategyComparison = null
-        this.currentStrategy = null; this.strategyDiagnostics = null
+        this.currentStrategy = null; this.strategyDiagnostics = null; this.strategyRevisions = []
         this.executionOrdersSeq++
         this.executionOrders = []
         this.executionOrdersTotal = 0
@@ -562,6 +551,7 @@ export const useLiveTraderStore = defineStore('liveTrader', {
       if (snapshot.source !== 'local') {
         this.currentStrategy = snapshot.strategy || null
         this.strategyDiagnostics = snapshot.strategy_diagnostics || null
+        if (snapshot.strategy_revisions) this.strategyRevisions = snapshot.strategy_revisions
       }
       this.errorMsg = snapshot.execution_error || snapshot.health?.sync_error || null
     },

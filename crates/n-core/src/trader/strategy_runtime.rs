@@ -467,11 +467,27 @@ impl ExecutionEngine {
     }
     pub async fn configure_strategy(
         &self,
-        mut d: StrategyDefinition,
+        d: StrategyDefinition,
         cfg: ExecutionConfig,
     ) -> Result<()> {
+        self.configure_strategy_with_note(d, cfg, None).await
+    }
+
+    pub async fn configure_strategy_with_note(
+        &self,
+        mut d: StrategyDefinition,
+        cfg: ExecutionConfig,
+        note: Option<String>,
+    ) -> Result<()> {
+        use super::execution_versions::{RevisionIdentity, SavedRevision};
+
         self.registry.validate(&d)?;
         Self::validate_config(&cfg)?;
+        let note = note.map(|note| note.trim().to_owned()).filter(|note| !note.is_empty());
+        anyhow::ensure!(
+            note.as_ref().is_none_or(|note| note.chars().count() <= 240),
+            "策略变更备注最多240字"
+        );
         let constraints = self.registry.strategy(&d)?.entry_constraints();
         if let Some(timeout) = constraints.entry_timeout_seconds {
             anyhow::ensure!(
@@ -487,8 +503,33 @@ impl ExecutionEngine {
         }
         let mut current = self.config.write().await;
         let mut s = self.state.lock().await;
+        d.revision.clone_from(&s.definition.revision);
+        if d == s.definition
+            && s.active_config.as_ref() == Some(&cfg)
+            && s.strategy_error.is_none()
+            && s.persistence_error.is_none()
+        {
+            return Ok(());
+        }
         d.revision = uuid::Uuid::new_v4().to_string();
         let mut next = s.clone();
+        let had_previous = s.active_config.is_some() || !s.conditions.is_empty() || !s.history.is_empty();
+        if had_previous && next.strategy_revisions.is_empty() {
+            next.strategy_revisions.push(SavedRevision {
+                definition: s.definition.clone(),
+                execution: current.clone(),
+                effective_at: None,
+                previous: None,
+                note: None,
+            });
+        }
+        next.strategy_revisions.push(SavedRevision {
+            definition: d.clone(),
+            execution: cfg.clone(),
+            effective_at: Some(self.now_utc().timestamp()),
+            previous: had_previous.then(|| RevisionIdentity::from(&s.definition)),
+            note,
+        });
         next.definition = d;
         next.active_config = Some(cfg.clone());
         next.strategy_error = None;

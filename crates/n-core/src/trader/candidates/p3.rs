@@ -12,6 +12,7 @@ use risk_budget::{BudgetSettings, RiskBudget};
 
 pub const ID: &str = "n_p3_v1";
 pub const VERSION: &str = "3";
+pub const V4: &str = "4";
 const PREVIOUS_VERSION: &str = "2";
 const ATR_FLOOR_VERSION: &str = "1";
 const MAX_TARGET_ATR: f64 = 3.5;
@@ -109,6 +110,7 @@ impl P3Strategy {
     }
     fn for_version(p: P3Parameters, version: &str) -> Result<Self> {
         p.validate()?;
+        validate_v4_parameters(version, &p)?;
         if version == ATR_FLOOR_VERSION {
             ensure!(
                 p.min_net_rr == 1.,
@@ -126,7 +128,7 @@ impl P3Strategy {
             budget: p.budget()?,
             exit_mode: p.exit_mode,
             entry_cutoffs: p.entry_cutoffs,
-            max_target_atr: (version == VERSION).then_some(MAX_TARGET_ATR),
+            max_target_atr: matches!(version, VERSION | V4).then_some(MAX_TARGET_ATR),
         })
     }
     #[cfg(test)]
@@ -502,6 +504,37 @@ pub fn definition(parameters: P3Parameters) -> StrategyDefinition {
         parameters: serde_json::to_value(parameters).unwrap(),
     }
 }
+pub fn definition_v4(mut parameters: P3Parameters) -> StrategyDefinition {
+    parameters.max_lots = 1;
+    parameters.exit_mode = ExitMode::FixedS1;
+    StrategyDefinition {
+        code_version: V4.into(),
+        ..definition(parameters)
+    }
+}
+
+fn validate_v4_parameters(version: &str, parameters: &P3Parameters) -> Result<()> {
+    ensure!(
+        version != V4 || (parameters.max_lots == 1 && parameters.exit_mode == ExitMode::FixedS1),
+        "P3 V4 固定最多一手，到目标全平"
+    );
+    Ok(())
+}
+
+pub(in crate::trader) fn v4_shadow_two_lots(
+    plan: &EntryPlan,
+    parameters: &P3Parameters,
+    proposed_price: f64,
+    fill_price: f64,
+) -> Result<bool> {
+    risk_budget::v3_two_lots_at_prices(
+        plan,
+        parameters.risk_budget_yuan,
+        proposed_price,
+        fill_price,
+    )
+}
+
 pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     if d.strategy_id != ID {
         ensure!(
@@ -511,13 +544,14 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     }
     if d.strategy_id == ID {
         ensure!(
-            [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION].contains(&d.code_version.as_str())
+            [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION, V4].contains(&d.code_version.as_str())
                 && d.exit_policy == EXIT
                 && d.sizing_policy == SIZING,
             "P3必须使用配套金额预算和退出模块"
         );
         let parameters = serde_json::from_value::<P3Parameters>(d.parameters.clone())?;
         parameters.validate()?;
+        validate_v4_parameters(&d.code_version, &parameters)?;
         if d.code_version == ATR_FLOOR_VERSION {
             ensure!(
                 parameters.min_net_rr == 1.,
@@ -528,7 +562,7 @@ pub fn validate_definition(d: &StrategyDefinition) -> Result<()> {
     Ok(())
 }
 pub fn register(r: &mut StrategyRegistry) {
-    for version in [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION] {
+    for version in [ATR_FLOOR_VERSION, PREVIOUS_VERSION, VERSION, V4] {
         r.register_strategy(ID, version, move |p| {
             Ok(Box::new(P3Strategy::for_version(
                 serde_json::from_value(p.clone())?,
@@ -540,7 +574,7 @@ pub fn register(r: &mut StrategyRegistry) {
     r.register_exit(EXIT, Arc::new(P3Exit));
 }
 pub fn preset() -> Value {
-    json!({"label":"P3 · 600元预算 / S1与分批追踪","definition":definition(P3Parameters::reference_snapshot())})
+    json!({"label":"P3 V4 · 单手目标全平","definition":definition_v4(P3Parameters::reference_snapshot())})
 }
 
 #[cfg(test)]

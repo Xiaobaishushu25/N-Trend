@@ -693,6 +693,147 @@ async fn p3_runner_comparison_continues_both_lanes_after_external_close() {
 }
 
 #[tokio::test]
+async fn p3_v4_executes_one_lot_and_compares_two_lot_and_far_s1_without_shadow_orders() {
+    for (short, risk, target_space, far_s1, two_lot_eligible) in [
+        (false, 20., 24., false, true), // exactly 1R after the entry fill
+        (true, 20., 30., true, true),
+        (true, 20., 18., false, true),
+        (false, 75., 120., true, false), // V3 can afford one lot only
+    ] {
+        let counter = Counter::new();
+        let mut e = counter.engine(ExecutionMode::FullAuto, 2);
+        let at = candidates::parse_time("2026-10-16 10:00:00").unwrap();
+        let clock = Arc::new(ReplayClock::new(at));
+        e.clock = clock.clone();
+        let mut params = parameters(ExitMode::FixedS1);
+        params.min_net_rr = 0.1;
+        let mut cfg = e.get_config().await;
+        cfg.slippage_ticks = 0;
+        e.configure_strategy(p3::definition_v4(params), cfg).await.unwrap();
+        let snapshot = |orders, fills| {
+            json!({"bridge_online":true,
+                "health":{"ready":true,"logged_in":true,"sync_pending":false,"trading_day":"20261016","broker_id":"fake","user_id":"offline-test"},
+                "account":{"available":50000.,"curr_margin":0.,"updated_at":at},
+                "orders":orders,"trades":fills,"broker_positions":[]})
+        };
+        e.reconcile(&snapshot(Vec::<Value>::new(), Vec::<Value>::new())).await.unwrap();
+        let mut payload = signal("v4-shadow", short, risk, target_space);
+        let warning = candidates::label(at - 900);
+        payload["created_at_epoch"] = json!(at);
+        payload["warning_ts"] = json!(warning);
+        payload["warning_context"]["as_of"] = json!(warning);
+        send(&e, payload).await;
+        let sign = if short { -1. } else { 1. };
+        quote(&e, 1000.).await;
+        clock.advance(at + 1).unwrap();
+        age(&e).await;
+        quote(&e, 1000. + sign).await;
+        let open = counter.inserts()[0].clone();
+        assert_eq!(open["volume"], 1);
+        assert_eq!(e.comparison_summary().await["p3_v4"]["observed"], 0);
+        let cost = 1000. + sign * 2.;
+        let entry = trade(&open, "v4-entry", 1, cost);
+        let open_order = order(&open, "all_traded", 1);
+        e.reconcile(&snapshot(vec![open_order.clone()], vec![entry.clone()])).await.unwrap();
+        let position = e.list_positions().await.remove(0);
+        let target = cost + sign * (risk + 2.).max(target_space - 2.);
+        assert_eq!(position.target_price, target);
+        let comparison = e.comparison_summary().await;
+        let shadow = &comparison["p3_v4"];
+        assert_eq!(shadow["observed"], 1);
+        assert_eq!(shadow["far_s1"]["kept"], usize::from(far_s1));
+        assert_eq!(shadow["far_s1"]["skipped"], usize::from(!far_s1));
+        assert_eq!(shadow["v3_two_lot"]["pending"], usize::from(two_lot_eligible));
+        assert_eq!(shadow["v3_two_lot"]["over_budget"], usize::from(!two_lot_eligible));
+        assert!(comparison["p3_runner"]["recent"].as_array().unwrap().is_empty());
+
+        clock.advance(at + 2).unwrap();
+        age(&e).await;
+        quote(&e, target).await;
+        let close = counter.inserts()[1].clone();
+        assert_eq!(close["volume"], 1);
+        assert_eq!(e.state.lock().await.closes[&position.id].reason,
+            if far_s1 { "target_s1" } else { "target_1r" });
+        let mut exit = trade(&close, "v4-exit", 1, target);
+        exit["trade_time"] = json!("10:00:02");
+        e.reconcile(&snapshot(vec![open_order, order(&close, "all_traded", 1)],
+            vec![entry, exit])).await.unwrap();
+        assert!(e.list_positions().await[0].is_closed);
+        if two_lot_eligible {
+            clock.advance(at + 3).unwrap();
+            quote(&e, cost + sign * position.risk * 4.).await;
+            clock.advance(at + 4).unwrap();
+            quote(&e, cost + sign * position.risk * 2.).await;
+        }
+        let comparison = e.comparison_summary().await["p3_v4"].clone();
+        assert_eq!(comparison["far_s1"]["comparable"], 1);
+        assert_eq!(comparison["far_s1"]["settled"], usize::from(far_s1));
+        let actual = ((target - cost) * sign * 5.) - 6.;
+        assert_eq!(comparison["far_s1"]["delta_yuan"], if far_s1 { 0. } else { -actual });
+        assert_eq!(comparison["v3_two_lot"]["paired"], usize::from(two_lot_eligible));
+        if two_lot_eligible {
+            let row = &comparison["recent"][0];
+            assert_eq!(row["v3_tail"]["reason"], "trailing");
+            assert_eq!(row["v3_first"]["price"], target - sign);
+            assert!(row["v3_net_yuan"].as_f64().unwrap() > actual);
+        }
+        assert_eq!(counter.inserts().len(), 2);
+        drop(e);
+        let restarted = counter.engine(ExecutionMode::FullAuto, 2);
+        assert_eq!(restarted.comparison_summary().await["p3_v4"], comparison);
+    }
+}
+
+#[tokio::test]
+async fn p3_strategy_revisions_recover_old_fills_and_persist_the_new_configuration() {
+    let counter = Counter::new();
+    let e = engine(&counter, ExitMode::HybridS1).await;
+    let historical = e.definition().await;
+    // Simulate a book written before the version history existed.
+    e.state.lock().await.strategy_revisions.clear();
+    let (id, open, entry) = opened(&counter, &e, false).await;
+    let cfg = e.get_config().await;
+    let mut cache = ExecutionSnapshotCache::default();
+    let old_snapshot = e.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(old_snapshot["strategy_revisions"][0]["definition"]["code_version"], "3");
+    assert!(old_snapshot["strategy_revisions"][0]["effective_at"].is_null());
+    assert!(old_snapshot["strategy_revisions"][0]["first_condition_at"].is_i64());
+
+    e.configure_strategy_with_note(
+        p3::definition_v4(parameters(ExitMode::FixedS1)),
+        cfg.clone(),
+        Some("  单手全平  ".into()),
+    ).await.unwrap();
+    let current = e.definition().await;
+    assert_ne!(historical.revision, current.revision);
+    e.configure_strategy(current.clone(), cfg).await.unwrap();
+    assert_eq!(e.definition().await.revision, current.revision);
+    assert_eq!(e.list_positions().await[0].origin.strategy_version, historical.revision);
+    age(&e).await;
+    quote(&e, 979.).await;
+    let exit = counter.inserts()[1].clone();
+    assert_eq!(exit["volume"], 2);
+    ready(&e, vec![order(&open, "all_traded", 2), order(&exit, "all_traded", 2)],
+        vec![entry, trade(&exit, "old-revision-close", 2, 979.)]).await;
+    let snapshot = e.snapshot_fields(&mut cache, true).await.unwrap().to_value();
+    assert_eq!(snapshot["history"][0]["strategy_version"], historical.revision);
+    assert_eq!(snapshot["history"][0]["condition_order_id"], id);
+    let versions = snapshot["strategy_revisions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0]["first_fill_at"].is_i64());
+    assert!(versions[0]["effective_at"].is_null());
+    assert_eq!(versions[1]["previous"]["revision"], historical.revision);
+    assert_eq!(versions[1]["definition"]["parameters"]["max_lots"], 1);
+    assert_eq!(versions[1]["note"], "单手全平");
+    assert!(versions[1]["effective_at"].is_i64());
+    drop(e);
+    let restored = counter.engine(ExecutionMode::FullAuto, 2);
+    let restored = restored.snapshot_fields(&mut ExecutionSnapshotCache::default(), true)
+        .await.unwrap().to_value();
+    assert_eq!(restored["strategy_revisions"], snapshot["strategy_revisions"]);
+}
+
+#[tokio::test]
 async fn p3_single_stall_pairs_the_next_book_with_real_exit_without_submitting() {
     use crate::fetch::kline::Kline;
 

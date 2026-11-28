@@ -1018,6 +1018,23 @@ export interface StrategyDefinition {
   sizing_policy: string
   parameters: unknown
 }
+
+export interface StrategyOriginFields {
+  strategy_id?: string
+  strategy_version?: string
+}
+
+export interface StrategyRevision {
+  strategy_id: string
+  revision: string
+  definition: StrategyDefinition | null
+  execution: ExecutionConfig | null
+  effective_at: number | null
+  first_condition_at: number | null
+  first_fill_at: number | null
+  previous: { strategy_id: string; revision: string } | null
+  note: string | null
+}
 export interface TraderInstanceRow {
   instance: { id: string; name: string; account_id: string; created_at: number }
   account: { id: string; name: string; kind: 'ctp' | 'paper'; port?: number; broker_id?: string; user_id?: string; credential_ref?: string; config?: unknown }
@@ -1058,6 +1075,7 @@ export interface LiveTraderSnapshot {
   trading_environment?: 'real' | 'simnow' | 'paper'
   paused?: boolean
   strategy?: StrategyDefinition
+  strategy_revisions?: StrategyRevision[]
   strategy_diagnostics?: StrategyDiagnostics | null
   _stream_id?: string
   _revision?: number
@@ -1115,7 +1133,7 @@ export type ConditionPoolRow = Omit<LiveConditionOrder, 'state'> & {
   chase_rejection_note?: { text: string; tooltip: string }
 }
 
-export interface ExecutionOrder {
+export interface ExecutionOrder extends StrategyOriginFields {
   condition_id: string
   request: { instrument_id: string; direction: string; offset?: string; volume: number; price: number; order_ref: string }
   phase: 'Unknown' | 'Working' | 'CancelPending' | 'Terminal' | 'Rejected'
@@ -1135,6 +1153,7 @@ export interface ExecutionOrdersPage {
 export interface StrategyComparisonSummary {
   p3_runner?: P3RunnerComparison
   p3_stall?: P3StallComparison
+  p3_v4?: P3V4Comparison
   archive_error?: string | null
   active_run: string | null
   archived_runs: number
@@ -1191,6 +1210,25 @@ export interface P3StallComparison {
   }>
 }
 
+export interface P3V4Comparison {
+  observed: number
+  v3_two_lot: {
+    paired: number; pending: number; unavailable: number; over_budget: number
+    net_yuan: number; v4_net_yuan: number; delta_yuan: number
+  }
+  far_s1: {
+    kept: number; skipped: number; comparable: number; settled: number; unavailable: number
+    net_yuan: number; v4_net_yuan: number; delta_yuan: number
+  }
+  recent: Array<{
+    id: string; instrument: string; event_id: number | null; opened_at: number
+    s1_r: number; far_s1: boolean; actual_net_yuan: number | null
+    v3_status: 'paired' | 'pending' | 'over_budget' | 'unavailable'
+    v3_net_yuan: number | null; v3_invalid: string | null
+    v3_first: P3ShadowExit | null; v3_tail: P3ShadowExit | null; v3_common_exit: P3ShadowExit | null
+  }>
+}
+
 export interface P3RunnerComparison {
   version: string
   eligible: boolean
@@ -1231,10 +1269,11 @@ export interface P3ShadowExit {
   atr: number | null
 }
 
-export interface LiveConditionOrder {
+export interface LiveConditionOrder extends StrategyOriginFields {
   id: string
   signal_key?: string
-  origin?: { signal_id?: string }
+  origin?: StrategyOriginFields & { signal_id?: string }
+  frozen?: { definition: StrategyDefinition; execution: ExecutionConfig } | null
   event_id?: number | null
   symbol: string
   instrument_id: string
@@ -1281,7 +1320,7 @@ export interface LiveConditionOrder {
   note: string
 }
 
-export interface LiveManagedPosition {
+export interface LiveManagedPosition extends StrategyOriginFields {
   id: string
   condition_order_id: string
   symbol: string
@@ -1315,7 +1354,7 @@ export interface LiveManagedPosition {
   is_manual?: boolean | null
 }
 
-export interface LiveTradeRecord {
+export interface LiveTradeRecord extends StrategyOriginFields {
   signal_evidence?: {
     origin?: string
     event_id?: number

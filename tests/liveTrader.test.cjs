@@ -388,6 +388,24 @@ test('compact diagnostics update individual fields and preserve untouched histor
   assert.equal(Object.hasOwn(store.strategyDiagnostics.entry_decisions, 'removed'), false)
 })
 
+test('strategy revisions follow the selected instance and survive unrelated stream deltas', async () => {
+  const { store, api } = setup()
+  store.instancesSupported = true
+  store.selectedInstanceId = 'ctp-a'
+  const first = { strategy_id: 'n_p3_v1', revision: 'v3' }
+  const second = { strategy_id: 'n_p3_v1', revision: 'v4' }
+  store.applySnapshot({ ...snapshot(), source: 'server', instance_id: 'ctp-a', _stream_id: 'a',
+    _revision: 1, strategy_revisions: [first] })
+  store.applyInstanceDelta({ instance_id: 'ctp-a', delta: { stream_id: 'a', base_revision: 1,
+    revision: 2, changes: { strategy_revisions: [first, second] } } })
+  store.applyInstanceDelta({ instance_id: 'ctp-a', delta: { stream_id: 'a', base_revision: 2,
+    revision: 3, changes: { bridge_online: true } } })
+  assert.deepEqual(store.strategyRevisions, [first, second])
+  api.traderInstanceRequest = async () => ({ ...snapshot(), instance_id: 'ctp-b' })
+  await store.selectInstance('ctp-b')
+  assert.equal(store.strategyRevisions.length, 0)
+})
+
 test('an old server reports missing multi-account support and can be retried after deployment', async () => {
   const { store, api } = setup()
   api.traderInstanceRequest = async () => { throw '服务端返回错误状态码: 404 Not Found' }
@@ -675,6 +693,7 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
       trigger_ts: null,
       note: 'unfilled',
       display_only: false,
+      strategy_version: 'p3-v3',
     },
   ]
   store.conditions.push({
@@ -735,6 +754,10 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
 
   const context = {
     trader: store,
+    revisionByKey: new Map([['p3-v3', {}]]),
+    revisionLabels: { 'p3-v3': 'P3 V3 / 配置 1' },
+    conditionRevision: row => row.strategy_version,
+    openRevisions() {},
     getInstrumentName: () => 'PVC 2701',
     dirLabel: (d) => (d === 'up' ? '做多' : '做空'),
     conditionBadgeType: () => 'error',
@@ -765,6 +788,7 @@ test('rejected conditions with unfilled reason show readable labels, no retry te
 
   const html = await renderToString(app)
   assert.match(html, /PVC 2701/)
+  assert.match(html, /P3 V3 \/ 配置 1/)
   assert.match(html, /已拒绝开仓/)
   assert.ok(!html.includes('等待重试'), 'Should not display misleading 等待重试')
   assert.match(html, /已等待 1 根K线 \(不限\)/)

@@ -84,12 +84,21 @@ const contracts = ref([{ symbol: '', multiplier: '', margin: '', open: '', close
 const config = ref<ExecutionConfig | null>(null)
 const strategy = ref<StrategyDefinition | null>(null)
 const parameters = ref('{}')
+const strategyChangeNote = ref('')
 const createPreset = ref('')
 const presets = computed(() => trader.instanceCatalog?.modules?.presets || [])
 const strategyIds = computed(() => [...new Set(trader.instanceCatalog?.modules?.strategies?.map(s => s.id))])
 const isCandidate = computed(() => ['n_p2', 'n_b5_six', 'n_p3_v1'].includes(strategy.value?.strategy_id || ''))
 const isB5 = computed(() => strategy.value?.strategy_id === 'n_b5_six')
 const isP3 = computed(() => strategy.value?.strategy_id === 'n_p3_v1')
+const isP3V4 = computed(() => isP3.value && strategy.value?.code_version === '4')
+function lockP3V4Parameters() {
+  if (!isP3V4.value) return
+  try {
+    const next = JSON.parse(parameters.value)
+    parameters.value = JSON.stringify({ ...next, max_lots: 1, exit_mode: 'fixed_s1' }, null, 2)
+  } catch { setDialogError('请先修正策略参数中的 JSON。') }
+}
 function p3Parameter(key: string, fallback: string | number): string | number {
   try { return JSON.parse(parameters.value)[key] ?? fallback } catch { return fallback }
 }
@@ -207,6 +216,7 @@ async function login() {
   finally { simnow.value.password = ''; busy.value = false }
 }
 function openConfigure() {
+  strategyChangeNote.value = ''
   if (!selected.value) return
   config.value = {
     quote_source: 'tianqin',
@@ -262,8 +272,14 @@ async function save() {
       ...strategy.value,
       parameters: JSON.parse(parameters.value),
     }
+    if (isP3V4.value) {
+      next.parameters = { ...next.parameters, max_lots: 1, exit_mode: 'fixed_s1' }
+    }
     // One operation commits module selection and execution parameters together.
-    await trader.instanceAction({ action: 'configure_strategy', strategy: next, config: config.value })
+    await trader.instanceAction({
+      action: 'configure_strategy', strategy: next, config: config.value,
+      note: strategyChangeNote.value.trim() || undefined,
+    })
     dialog.value = null
     setNotice('配置已保存。')
   } catch (e) { setDialogError(e) } finally { busy.value = false }
@@ -503,7 +519,7 @@ watch(
               />
 
               <!-- 实例名称与账号 -->
-              <span class="tab-name" :title="row.instance.name">{{ row.instance.name }}</span>
+              <span class="tab-name" :title="`${row.instance.name} · ${moduleLabel(row.strategy.strategy_id)} V${row.strategy.code_version}`">{{ row.instance.name }}</span>
               <span class="tab-user font-num">
                 ({{ row.account.user_id || row.account.name || '模拟' }})
               </span>
@@ -972,6 +988,12 @@ watch(
                 </div>
               </div>
 
+              <div class="form-row">
+                <label class="form-label" for="strategy-change-note">变更备注（可选）</label>
+                <input id="strategy-change-note" v-model="strategyChangeNote" class="form-input"
+                  maxlength="240" placeholder="例如：切换到 P3 V4，观察单手全平表现">
+              </div>
+
               <div class="form-grid">
                 <div class="form-row">
                   <label class="form-label">信号模块</label>
@@ -982,10 +1004,11 @@ watch(
 
                 <div class="form-row">
                   <label class="form-label">代码版本</label>
-                  <select v-model="strategy.code_version" class="form-select">
+                  <select v-model="strategy.code_version" class="form-select" @change="lockP3V4Parameters">
                     <option v-for="s in trader.instanceCatalog?.modules.strategies.filter(s => s.id === strategy?.strategy_id)" :key="s.version" :value="s.version">{{ s.version }}</option>
                   </select>
-                  <span v-if="isP3 && strategy.code_version === '3'" class="field-hint">计划目标距离大于 3.5 ATR 时过滤新开仓信号。</span>
+                  <span v-if="isP3V4" class="field-hint">固定最多一手，到目标全平。成交后自动记录两套影子对比。</span>
+                  <span v-else-if="isP3 && strategy.code_version === '3'" class="field-hint">计划目标距离大于 3.5 ATR 时过滤新开仓信号。</span>
                   <span v-else-if="strategy.strategy_id === 'n_p2' && strategy.code_version === '2'" class="field-hint">P2 V2：准入门槛评分为 2.5（v1 为 3.0）。</span>
                   <span v-else-if="strategy.strategy_id === 'n_p2' && strategy.code_version === '1'" class="field-hint">P2 原版：准入门槛评分为 3.0。</span>
                 </div>
@@ -1047,7 +1070,7 @@ watch(
               <div v-if="isP3" class="form-grid">
                 <div class="form-row">
                   <label class="form-label">P3 出场方式</label>
-                  <select v-model="p3ExitMode" class="form-select">
+                  <select v-model="p3ExitMode" class="form-select" :disabled="isP3V4">
                     <option value="fixed_s1">模式 A：全部在目标位退出</option>
                     <option value="hybrid_s1">模式 B：双手首手 S1，余仓保本追踪</option>
                   </select>
@@ -1059,7 +1082,7 @@ watch(
                 </div>
                 <div class="form-row">
                   <label class="form-label">最多开仓手数</label>
-                  <select v-model.number="p3MaxLots" class="form-select"><option :value="1">1 手</option><option :value="2">2 手</option></select>
+                  <select v-model.number="p3MaxLots" class="form-select" :disabled="isP3V4"><option :value="1">1 手</option><option :value="2">2 手</option></select>
                 </div>
                   <div class="form-row">
                     <label class="form-label">S1 最低净盈亏比</label>

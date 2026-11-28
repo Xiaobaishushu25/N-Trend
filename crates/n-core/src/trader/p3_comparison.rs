@@ -47,6 +47,15 @@ struct Pair {
     runners: [Runner; 2],
     invalid: Option<String>,
     interventions: BTreeMap<String, Intervention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    v4: Option<V4Sample>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+struct V4Sample {
+    s1_r: f64,
+    far_s1: bool,
+    two_lot_eligible: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -82,23 +91,27 @@ impl P3RunnerBook {
         self.started_at.is_none()
     }
 
+    pub fn has_v4_samples(&self) -> bool {
+        self.pairs.values().any(|pair| pair.v4.is_some())
+    }
+
     pub fn register(
         &mut self,
         condition: &ConditionOrder,
         position: &ManagedPosition,
         exchange: &str,
+        proposed_price: f64,
         fill_at: Option<i64>,
         now: i64,
     ) {
-        if !self.enabled || position.volume != 2 || self.pairs.contains_key(&position.id) {
+        if self.pairs.contains_key(&position.id) {
             return;
         }
         let (Some(frozen), Some(fill_at)) = (&condition.frozen, fill_at) else {
             return;
         };
+        let is_v4 = frozen.definition.code_version == p3::V4;
         if frozen.definition.strategy_id != p3::ID
-            || frozen.definition.parameters["exit_mode"] != "hybrid_s1"
-            || self.enabled_since.is_none_or(|started| fill_at < started)
             || exchange.is_empty()
             || !position.risk.is_finite()
             || position.risk <= 0.
@@ -108,9 +121,16 @@ impl P3RunnerBook {
         let Ok(opened_at) = candidates::parse_time(&position.open_ts) else {
             return;
         };
-        if self
-            .enabled_since
-            .is_some_and(|started| opened_at < started)
+        if is_v4 && (position.volume != 1 || position.is_manual) {
+            return;
+        }
+        if !is_v4
+            && (!self.enabled
+                || position.volume != 2
+                || frozen.definition.parameters["exit_mode"] != "hybrid_s1"
+                || self
+                    .enabled_since
+                    .is_none_or(|started| fill_at < started || opened_at < started))
         {
             return;
         }
@@ -118,6 +138,29 @@ impl P3RunnerBook {
             serde_json::from_value::<p3::P3Parameters>(frozen.definition.parameters.clone())
         else {
             return;
+        };
+        let v4 = if is_v4 {
+            let Some(s1) = frozen.plan.target_price else {
+                return;
+            };
+            let sign = if position.direction == "up" { 1. } else { -1. };
+            let space = (s1 - position.fill_price) * sign;
+            if !space.is_finite() {
+                return;
+            }
+            Some(V4Sample {
+                s1_r: space / position.risk,
+                far_s1: space - position.risk > 1e-6,
+                two_lot_eligible: p3::v4_shadow_two_lots(
+                    &frozen.plan,
+                    &params,
+                    proposed_price,
+                    position.fill_price,
+                )
+                .ok(),
+            })
+        } else {
+            None
         };
         let Ok(strategy) = p3::P3Strategy::new(params) else {
             return;
@@ -165,6 +208,7 @@ impl P3RunnerBook {
                 runners: [runner.clone(), runner],
                 invalid: None,
                 interventions: BTreeMap::new(),
+                v4,
             },
         );
     }
@@ -276,7 +320,11 @@ impl P3RunnerBook {
         let mut unavailable = 0;
         let mut delta = 0.;
         let mut interrupted_delta = 0.;
-        let mut recent = self.pairs.values().collect::<Vec<_>>();
+        let mut recent = self
+            .pairs
+            .values()
+            .filter(|pair| pair.v4.is_none())
+            .collect::<Vec<_>>();
         for pair in &recent {
             if pair.active() {
                 active += 1;
@@ -306,13 +354,163 @@ impl P3RunnerBook {
                 "interventions": pair.interventions.values().collect::<Vec<_>>()
             })).collect::<Vec<_>>()})
     }
+
+    pub fn v4_summary<'a>(
+        &self,
+        history: impl IntoIterator<Item = &'a TradeRecord>,
+        is_open: impl Fn(&str) -> bool,
+    ) -> Value {
+        let mut exits = BTreeMap::new();
+        for trade in history {
+            if self
+                .pairs
+                .get(&trade.condition_order_id)
+                .is_some_and(|pair| pair.v4.is_some())
+            {
+                // A valid single-lot trade can have exactly one closing fill.
+                exits
+                    .entry(trade.condition_order_id.as_str())
+                    .and_modify(|exit| *exit = None)
+                    .or_insert(Some(trade));
+            }
+        }
+        let mut rows: Vec<_> = self
+            .pairs
+            .values()
+            .filter_map(|pair| pair.v4.as_ref().map(|sample| (pair, sample)))
+            .collect();
+        rows.sort_unstable_by_key(|(pair, _)| std::cmp::Reverse(pair.registered_at));
+        let (mut paired, mut pending, mut unavailable, mut over_budget) = (0, 0, 0, 0);
+        let (mut kept, mut skipped, mut comparable, mut settled, mut actual_unavailable) =
+            (0, 0, 0, 0, 0);
+        let (mut v3_total, mut v4_total, mut far_net, mut filtered_net) = (0., 0., 0., 0.);
+        let mut recent = Vec::new();
+        for (pair, sample) in &rows {
+            let id = pair.position.id.as_str();
+            let open = is_open(id);
+            let actual = (!open)
+                .then(|| exits.get(id).copied().flatten())
+                .flatten()
+                .and_then(|trade| pair.v4_actual(trade));
+            if sample.far_s1 {
+                kept += 1;
+            } else {
+                skipped += 1;
+            }
+            if let Some(net) = actual {
+                comparable += 1;
+                if sample.far_s1 {
+                    settled += 1;
+                    far_net += net;
+                } else {
+                    filtered_net += net;
+                }
+            } else if !open {
+                actual_unavailable += 1;
+            }
+            let model = pair.v3_shadow_net();
+            let status = match sample.two_lot_eligible {
+                Some(false) => {
+                    over_budget += 1;
+                    "over_budget"
+                }
+                Some(true) if pair.invalid.is_none() && (open || actual.is_some()) => {
+                    if let Some((model, actual)) = model.zip(actual) {
+                        paired += 1;
+                        v3_total += model;
+                        v4_total += actual;
+                        "paired"
+                    } else {
+                        pending += 1;
+                        "pending"
+                    }
+                }
+                _ => {
+                    unavailable += 1;
+                    "unavailable"
+                }
+            };
+            if recent.len() < 24 {
+                recent.push(json!({
+                    "id": id, "event_id": pair.position.event_id, "instrument": pair.position.instrument_id,
+                    "opened_at": pair.opened_at, "s1_r": sample.s1_r, "far_s1": sample.far_s1,
+                    "actual_net_yuan": actual, "v3_status": status,
+                    "v3_net_yuan": model, "v3_invalid": pair.invalid,
+                    "v3_first": pair.first_fill, "v3_tail": pair.runners[0].fill,
+                    "v3_common_exit": pair.common_exit
+                }));
+            }
+        }
+        json!({
+            "observed": rows.len(), "recent": recent,
+            "v3_two_lot": {"paired": paired, "pending": pending, "unavailable": unavailable,
+                "over_budget": over_budget, "net_yuan": v3_total, "v4_net_yuan": v4_total,
+                "delta_yuan": v3_total - v4_total},
+            "far_s1": {"kept": kept, "skipped": skipped, "comparable": comparable,
+                "settled": settled, "unavailable": actual_unavailable, "net_yuan": far_net,
+                "v4_net_yuan": far_net + filtered_net, "delta_yuan": -filtered_net}
+        })
+    }
 }
 
 impl Pair {
     fn active(&self) -> bool {
-        self.invalid.is_none()
+        self.v4
+            .as_ref()
+            .is_none_or(|sample| sample.two_lot_eligible == Some(true))
+            && self.invalid.is_none()
             && self.common_exit.is_none()
-            && self.runners.iter().any(|runner| runner.fill.is_none())
+            && self
+                .runners
+                .iter()
+                .take(self.runner_count())
+                .any(|runner| runner.fill.is_none())
+    }
+
+    fn runner_count(&self) -> usize {
+        if self.v4.is_some() {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn v3_shadow_net(&self) -> Option<f64> {
+        if self.invalid.is_some() {
+            return None;
+        }
+        if let Some(exit) = &self.common_exit {
+            return Some(exit.net_yuan);
+        }
+        Some(self.first_fill.as_ref()?.net_yuan + self.runners[0].fill.as_ref()?.net_yuan)
+    }
+
+    fn v4_actual(&self, trade: &TradeRecord) -> Option<f64> {
+        let entry = self.position.fill_price;
+        let sign = if self.position.direction == "up" {
+            1.
+        } else {
+            -1.
+        };
+        (self.interventions.is_empty()
+            && !trade.is_manual
+            && !trade.exit_reason.starts_with("manual")
+            && trade.exit_reason != "external_manual"
+            && !trade.id.starts_with("sync_broker:")
+            && !trade.id.starts_with("manual_close:")
+            && trade.volume == 1
+            && trade
+                .instrument_id
+                .eq_ignore_ascii_case(&self.position.instrument_id)
+            && trade.direction == self.position.direction
+            && (trade.fill_price - entry).abs() <= 1e-6
+            && trade.exit_price.is_finite()
+            && trade.exit_price > 0.
+            && candidates::parse_time(&trade.exit_ts).is_ok_and(|at| at >= self.opened_at))
+        .then(|| {
+            (trade.exit_price - entry) * sign * self.multiplier
+                - self.fees.bound(entry, trade.exit_price, self.multiplier)
+        })
     }
 
     fn delta(&self) -> Option<f64> {
@@ -449,7 +647,10 @@ impl Pair {
         });
         let Some((_, atr_value)) = usable_atr
             .filter(|_| self.peak_r >= TRAIL_ACTIVATE_R)
-            .or_else(|| (self.peak_r < TRAIL_ACTIVATE_R || forced.is_some()).then_some((0, 0.)))
+            .or_else(|| {
+                (self.v4.is_some() || self.peak_r < TRAIL_ACTIVATE_R || forced.is_some())
+                    .then_some((0, 0.))
+            })
         else {
             self.invalid = Some("atr_unavailable".into());
             return true;
@@ -458,10 +659,12 @@ impl Pair {
             TRAIL_DISTANCE_R,
             TRAIL_DISTANCE_R.max(ATR_FACTOR * atr_value / risk),
         ];
+        let runner_count = self.runner_count();
         for (runner, distance) in self
             .runners
             .iter_mut()
             .zip(distances)
+            .take(runner_count)
             .filter(|(lane, _)| lane.fill.is_none())
         {
             let stop = p3::runner_stop(&self.position, q, self.peak_r, runner.stop, distance);

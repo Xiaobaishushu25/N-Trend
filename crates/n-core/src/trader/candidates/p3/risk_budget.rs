@@ -54,6 +54,19 @@ pub(super) fn initial_volume(s: &Snapshot, budget: &BudgetSettings) -> Result<i3
     )
 }
 
+pub(super) fn v3_two_lots_at_prices(
+    plan: &EntryPlan,
+    budget: f64,
+    proposed: f64,
+    fill: f64,
+) -> Result<bool> {
+    let snapshot = snapshot(plan)?;
+    let budget = BudgetSettings::new(budget, 2)?;
+    Ok(initial_volume(&snapshot, &budget)? == 2
+        && unit_loss(&snapshot, proposed)? <= budget.cents / 2
+        && unit_loss(&snapshot, fill)? <= budget.cents / 2)
+}
+
 pub(super) struct RiskBudget;
 fn snapshot(plan: &EntryPlan) -> Result<Snapshot> {
     let s: Snapshot = serde_json::from_value(plan.evidence["candidate"].clone())?;

@@ -50,8 +50,10 @@ import {
 import { useLiveTraderStore } from '../stores/liveTrader'
 import StrategyComparisonPanel from '../components/StrategyComparisonPanel.vue'
 import P3RunnerComparisonPanel from '../components/P3RunnerComparisonPanel.vue'
+import P3V4ComparisonPanel from '../components/P3V4ComparisonPanel.vue'
 import P3StallComparisonPanel from '../components/P3StallComparisonPanel.vue'
 import TradePnlCalendarPopover from '../components/TradePnlCalendarPopover.vue'
+import StrategyRevisionPanel from '../components/StrategyRevisionPanel.vue'
 import { api } from '../services/api'
 import { notify } from '../utils/notify'
 import { chaseRejectionFallback } from '../utils/conditionPool'
@@ -63,8 +65,12 @@ import {
   formatRMultiple,
   getSymbolMultiplier,
 } from '../utils/multipliers'
-import { getTradeRecordPnl, formatTradeDateTime, summarizeTradeFees } from '../utils/tradeTime'
-import type { LiveTradeRecord, OpenReviewChartPayload, PositionCloseProgress, ReviewSignalDetail } from '../types'
+import { dailyTradePnl, getTradeRecordPnl, formatTradeDateTime, summarizeTradeFees } from '../utils/tradeTime'
+import {
+  originRevisionKey, strategyLabel, strategyOverview, strategyRevisionKey, unassignedStrategy, versionTradeStats,
+} from '../utils/traderStrategyVersions'
+import type { LiveConditionOrder, LiveTradeRecord, OpenReviewChartPayload, PositionCloseProgress,
+  ReviewSignalDetail, StrategyOriginFields, StrategyRevision } from '../types'
 
 const trader = useLiveTraderStore()
 const selectedInstance = computed(() => trader.instanceCatalog?.instances.find(r => r.instance.id === trader.selectedInstanceId))
@@ -132,6 +138,91 @@ const closeAlertType = computed(() => {
 // 平仓流水分页与统计状态
 const historyPage = ref(1)
 const historyPageSize = ref(10)
+const historyVersion = ref<string | null>(null)
+const showRevisionHistory = ref(false)
+const focusedRevision = ref<string>()
+
+const activeRevisionKey = computed(() => {
+  const definition = trader.currentStrategy
+  return definition ? strategyRevisionKey(definition.strategy_id, definition.revision) : undefined
+})
+const revisionRows = computed(() => {
+  const definition = trader.currentStrategy
+  if (!definition || trader.strategyRevisions.some(row =>
+    strategyRevisionKey(row.strategy_id, row.revision) === activeRevisionKey.value)) {
+    return trader.strategyRevisions
+  }
+  const current: StrategyRevision = {
+    strategy_id: definition.strategy_id, revision: definition.revision, definition,
+    execution: trader.config, effective_at: null, first_condition_at: null,
+    first_fill_at: null, previous: null, note: null,
+  }
+  return [...trader.strategyRevisions, current]
+})
+const revisionByKey = computed(() => new Map(revisionRows.value.map(row =>
+  [strategyRevisionKey(row.strategy_id, row.revision), row])))
+const revisionLabels = computed(() => {
+  const counts = new Map<string, number>()
+  const labels: Record<string, string> = { [unassignedStrategy]: '策略归属待核' }
+  for (const row of revisionRows.value) {
+    const label = strategyLabel(row.strategy_id, row.definition?.code_version)
+    const index = (counts.get(label) || 0) + 1
+    counts.set(label, index)
+    labels[strategyRevisionKey(row.strategy_id, row.revision)] = `${label} / 配置 ${index}`
+  }
+  return labels
+})
+const conditionById = computed(() => new Map(trader.conditions.map(row => [row.id, row])))
+
+function conditionRevision(row?: Pick<LiveConditionOrder, 'origin' | 'frozen'> & StrategyOriginFields) {
+  const definition = row?.frozen?.definition
+  return originRevisionKey(row) || originRevisionKey(row?.origin) ||
+    (definition ? strategyRevisionKey(definition.strategy_id, definition.revision) : undefined)
+}
+
+function tradeRevision(row: StrategyOriginFields & { condition_order_id?: string }) {
+  return originRevisionKey(row) || conditionRevision(conditionById.value.get(row.condition_order_id || '')) ||
+    unassignedStrategy
+}
+
+const positionRevisions = computed(() => {
+  const byContract = new Map<string, Map<string, number>>()
+  let oldPositions = 0
+  for (const row of trader.managedPositions) {
+    if (row.is_closed || row.volume <= 0) continue
+    const contract = row.instrument_id.toLowerCase() + ':' + (row.direction === 'up' ? 'buy' : 'sell')
+    const batches = byContract.get(contract) || new Map<string, number>()
+    const version = tradeRevision(row)
+    batches.set(version, (batches.get(version) || 0) + row.volume)
+    byContract.set(contract, batches)
+    if (activeRevisionKey.value && version !== unassignedStrategy && version !== activeRevisionKey.value) oldPositions++
+  }
+  return { byContract, oldPositions }
+})
+const revisionStats = computed(() => versionTradeStats(trader.history, tradeRevision,
+  new Set(trader.managedPositions.filter(row => !row.is_closed && row.volume > 0).map(row => row.condition_order_id || row.id))))
+const revisionOptions = computed(() => Object.keys(revisionStats.value).map(key => ({
+  value: key, label: revisionLabels.value[key] || '版本待核',
+})))
+const versionFilteredHistory = computed(() => {
+  const selected = historyVersion.value
+  return selected ? trader.filteredHistory.filter(row => tradeRevision(row) === selected) : trader.filteredHistory
+})
+const versionCalendarPnl = computed(() => historyVersion.value
+  ? dailyTradePnl(trader.history.filter(row => tradeRevision(row) === historyVersion.value))
+  : trader.dailyPnlMap)
+
+function openRevisions(key?: string) {
+  focusedRevision.value = key || activeRevisionKey.value
+  showRevisionHistory.value = true
+}
+
+function openRevisionTrades(key: string) {
+  clearHistoryFilters()
+  historyVersion.value = key
+  trader.activeTab = 'history'
+  showRevisionHistory.value = false
+}
 
 function onFilterDateChange() {
   historyPage.value = 1
@@ -140,6 +231,7 @@ function onFilterDateChange() {
 function clearHistoryFilters() {
   trader.filterDate = ''
   trader.filterReason = ''
+  historyVersion.value = null
   historyPage.value = 1
 }
 
@@ -157,11 +249,14 @@ watch(() => trader.filterDate, () => {
 })
 
 watch(() => trader.selectedInstanceId, () => {
+  historyVersion.value = null
+  showRevisionHistory.value = false
   historyPage.value = 1
 })
 
-watch([() => trader.filteredHistory.length, historyPageSize], () => {
-  const maxPage = Math.max(1, Math.ceil(trader.filteredHistory.length / historyPageSize.value))
+watch(historyVersion, () => { historyPage.value = 1 })
+watch([() => versionFilteredHistory.value.length, historyPageSize], () => {
+  const maxPage = Math.max(1, Math.ceil(versionFilteredHistory.value.length / historyPageSize.value))
   if (historyPage.value > maxPage) {
     historyPage.value = maxPage
   }
@@ -169,13 +264,13 @@ watch([() => trader.filteredHistory.length, historyPageSize], () => {
 
 const paginatedHistory = computed(() => {
   const start = (historyPage.value - 1) * historyPageSize.value
-  return trader.filteredHistory.slice(start, start + historyPageSize.value)
+  return versionFilteredHistory.value.slice(start, start + historyPageSize.value)
 })
 
 const filteredTotalPnl = computed(() => {
-  return trader.filteredHistory.reduce((sum, rec) => sum + getTradeRecordPnl(rec), 0)
+  return versionFilteredHistory.value.reduce((sum, rec) => sum + getTradeRecordPnl(rec), 0)
 })
-const filteredFees = computed(() => summarizeTradeFees(trader.filteredHistory))
+const filteredFees = computed(() => summarizeTradeFees(versionFilteredHistory.value))
 watch(() => trader.activeTab, (tab) => {
   if (tab === 'orders') void trader.loadExecutionOrders(1)
 })
@@ -924,6 +1019,16 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         </div>
       </div>
 
+      <div v-if="trader.currentStrategy" class="strategy-status-line">
+        <strong>当前策略</strong>
+        <n-tag size="small" type="info">{{ revisionLabels[activeRevisionKey || ''] }}</n-tag>
+        <span>{{ strategyOverview(trader.currentStrategy, trader.config) }}</span>
+        <n-tag v-if="positionRevisions.oldPositions" size="small" type="warning">
+          旧版持仓 {{ positionRevisions.oldPositions }} 笔
+        </n-tag>
+        <n-button size="small" text type="primary" @click="openRevisions()">策略变更历史</n-button>
+      </div>
+
       <n-alert
         v-if="trader.closeRequest || closeRows.length"
         class="close-progress"
@@ -1148,7 +1253,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
       <div v-if="trader.activeTab === 'history'" class="history-filter">
         <TradePnlCalendarPopover
           v-model="trader.filterDate"
-          :daily-pnl-map="trader.dailyPnlMap"
+          :daily-pnl-map="versionCalendarPnl"
           :show-net="!isPaper"
           :latest-exit-ts="trader.history[0] ? formatTradeDateTime(trader.history[0].exit_ts) : undefined"
           @change="onFilterDateChange"
@@ -1160,6 +1265,8 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           placeholder="筛选平仓原因"
           style="width: 170px"
         />
+        <n-select v-model:value="historyVersion" :options="revisionOptions" clearable size="small"
+          placeholder="全部策略版本" aria-label="按策略版本筛选平仓" style="width: 215px" />
       </div>
     </div>
 
@@ -1167,9 +1274,12 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
     <main class="trader-content-box">
       <section v-if="trader.activeTab === 'comparison'" class="tab-pane">
         <template v-if="trader.currentStrategy?.strategy_id === 'n_p3_v1'">
+          <P3V4ComparisonPanel v-if="trader.strategyComparison?.p3_v4"
+            :comparison="trader.strategyComparison.p3_v4" />
           <P3StallComparisonPanel v-if="trader.strategyComparison?.p3_stall"
             :comparison="trader.strategyComparison.p3_stall" />
           <P3RunnerComparisonPanel
+            v-if="trader.currentStrategy?.code_version !== '4' || trader.strategyComparison?.p3_runner?.started_at"
             :comparison="trader.strategyComparison?.p3_runner" :updating="trader.updatingP3Runner"
             @change="trader.setP3RunnerComparison" />
         </template>
@@ -1207,12 +1317,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <n-tag size="small" type="info">
                   在手 {{ pos.position }} 手 (今仓 {{ pos.today_position }} / 昨仓 {{ pos.yd_position }})
                 </n-tag>
-                <n-tag v-if="pos.managed" size="small" :type="pos.managed.tier === 'large' ? 'warning' : 'default'">
-                  {{ pos.managed.tier === 'large' ? '策略托管: 大仓分批' : '策略托管: 小仓1:1' }}
-                </n-tag>
-                <n-tag v-else size="small" type="default">
+                <n-tag v-if="!pos.managed" size="small" type="default">
                   账户直接持仓
                 </n-tag>
+                <n-button
+                  v-for="[key, lots] in positionRevisions.byContract.get(pos.instrument_id.toLowerCase() + ':' +
+                    (pos.direction === 'up' || pos.direction === 'buy' ? 'buy' : 'sell')) || []"
+                  :key="key" size="small" text type="info" :disabled="!revisionByKey.has(key)" @click="openRevisions(key)"
+                >{{ revisionLabels[key] || '版本待核' }} · {{ lots }} 手</n-button>
 
                 <!-- 关联预警信号标签 (点击直达主窗口K线复盘打点) -->
                 <n-tag
@@ -1429,6 +1541,11 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               <div class="head-left">
                 <span class="inst-name">{{ getInstrumentName(cond.instrument_id) }}</span>
                 <span class="inst-code font-num">({{ cond.instrument_id }})</span>
+                <n-button v-if="!cond.display_only" size="small" text type="info"
+                  :disabled="!revisionByKey.has(conditionRevision(cond) || '')"
+                  @click="openRevisions(conditionRevision(cond))">
+                  {{ revisionLabels[conditionRevision(cond) || ''] || '版本待核' }}
+                </n-button>
                 <n-tag
                   :type="cond.direction === 'up' ? 'error' : 'success'"
                   size="small"
@@ -1599,6 +1716,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
                 <div class="head-left">
                   <span class="inst-name">{{ getInstrumentName(order.request.instrument_id) }}</span>
                   <span class="inst-code font-num">({{ order.request.instrument_id }})</span>
+                  <n-button size="small" text type="info" :disabled="!revisionByKey.has(tradeRevision(order))"
+                    @click="openRevisions(tradeRevision(order))">
+                    {{ revisionLabels[tradeRevision(order)] || '版本待核' }}
+                  </n-button>
                   <n-tag
                     :type="order.request.direction === 'buy' ? 'error' : 'success'"
                     size="small"
@@ -1633,9 +1754,9 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 
       <!-- C. 真实成交平仓流水标签页 -->
       <section v-else-if="trader.activeTab === 'history'" class="tab-pane">
-        <div v-if="!trader.filteredHistory.length" class="empty-holder">
+        <div v-if="!versionFilteredHistory.length" class="empty-holder">
           <n-empty :description="trader.filterDate ? `${trader.filterDate} 暂无平仓流水记录` : '暂无符合筛选条件的真实平仓成交记录'">
-            <template v-if="trader.filterDate || trader.filterReason" #extra>
+            <template v-if="trader.filterDate || trader.filterReason || historyVersion" #extra>
               <n-button
                 size="small"
                 secondary
@@ -1659,6 +1780,10 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
               <div class="head-left">
                 <span class="hist-inst">{{ getInstrumentName(rec.instrument_id) }}</span>
                 <span class="hist-code font-num">({{ rec.instrument_id }})</span>
+                <n-button size="small" text type="info" :disabled="!revisionByKey.has(tradeRevision(rec))"
+                  @click="openRevisions(tradeRevision(rec))">
+                  {{ revisionLabels[tradeRevision(rec)] || '版本待核' }}
+                </n-button>
                 <span class="hist-dir" :class="rec.direction === 'up' ? 'is-up' : 'is-down'">
                   {{ dirLabel(rec.direction) }} {{ rec.volume }} 手
                 </span>
@@ -1850,7 +1975,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
           <!-- 平仓流水分页栏 -->
           <div class="history-pagination-bar">
             <div class="history-pagination-info">
-              共 <span class="font-num font-bold">{{ trader.filteredHistory.length }}</span> 笔平仓
+              共 <span class="font-num font-bold">{{ versionFilteredHistory.length }}</span> 条平仓成交
               <template v-if="trader.filterDate">
                 · 日期: <span class="font-num font-bold filter-tag-text">{{ trader.filterDate }}</span>
               </template>
@@ -1874,7 +1999,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
             <n-pagination
               v-model:page="historyPage"
               v-model:page-size="historyPageSize"
-              :item-count="trader.filteredHistory.length"
+              :item-count="versionFilteredHistory.length"
               show-size-picker
               :page-sizes="[10, 20, 50, 100]"
               size="medium"
@@ -1883,6 +2008,12 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
         </div>
       </section>
     </main>
+
+    <n-modal v-model:show="showRevisionHistory" preset="card" title="策略变更历史"
+      style="width: 720px; max-width: 94vw;">
+      <StrategyRevisionPanel :rows="revisionRows" :labels="revisionLabels" :stats="revisionStats"
+        :active-key="activeRevisionKey" :focus-key="focusedRevision" @history="openRevisionTrades" />
+    </n-modal>
 
     <!-- 主观手动平仓弹窗 -->
     <n-modal
@@ -2029,6 +2160,14 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 </template>
 
 <style scoped>
+.strategy-status-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 8px;
+  font-size: 12px;
+}
 .close-progress {
   margin-bottom: 12px;
 }
@@ -2884,6 +3023,7 @@ function getSlippageInfo(fillPrice: number, plannedPrice?: number | null, direct
 /* 平仓过滤器 */
 .history-filter {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }

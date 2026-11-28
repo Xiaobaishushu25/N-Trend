@@ -60,6 +60,22 @@ export function summarizeTradeFees(records: readonly LiveTradeRecord[]): TradeFe
   return result
 }
 
+export function dailyTradePnl(records: readonly LiveTradeRecord[]) {
+  const days: Record<string, { totalPnl: number; count: number; winCount: number; lossCount: number; fees: TradeFeeSummary }> = {}
+  for (const record of records) {
+    const date = extractTradeDate(record.exit_ts)
+    if (!date) continue
+    const pnl = getTradeRecordPnl(record)
+    const day = days[date] ??= { totalPnl: 0, count: 0, winCount: 0, lossCount: 0, fees: summarizeTradeFees([]) }
+    day.totalPnl += pnl
+    day.count += 1
+    addConfirmedTradeFee(day.fees, record)
+    if (pnl > 0) day.winCount += 1
+    else if (pnl < 0) day.lossCount += 1
+  }
+  return days
+}
+
 /**
  * 格式化日历小格子内的紧凑金额展示
  */

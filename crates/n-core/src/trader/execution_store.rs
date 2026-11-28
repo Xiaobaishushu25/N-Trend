@@ -126,7 +126,7 @@ macro_rules! state_fields {
             quote_sequences, entry_trigger_sequences, symbol_slots, symbol_release_after,
             entry_decisions);
         $apply!(set: seen_trades, aborted_entries, authorized_entries, recorded_checkpoints);
-        $apply!(list: quote_gaps, history);
+        $apply!(list: quote_gaps, history, strategy_revisions);
     };
 }
 

@@ -471,13 +471,35 @@ fn frozen_v1_definitions_keep_their_floor_and_fixed_rr_after_roundtrip() {
     altered_old.parameters["min_net_rr"] = json!(0.8);
     assert!(registry.validate(&altered_old).is_err());
     let mut unknown = current;
-    unknown.code_version = "4".into();
+    unknown.code_version = "5".into();
     assert!(registry.validate(&unknown).is_err());
     for bad in [0., -0.1, f64::NAN, f64::INFINITY] {
         let mut params = parameters();
         params.min_net_rr = bad;
         assert!(params.validate().is_err());
     }
+}
+
+#[test]
+fn v4_preset_and_registry_enforce_single_lot_fixed_exit_and_v3_admission() {
+    let registry = StrategyRegistry::default();
+    let d: StrategyDefinition = serde_json::from_value(preset()["definition"].clone()).unwrap();
+    assert_eq!(d.code_version, V4);
+    assert_eq!(d.parameters["max_lots"], 1);
+    assert_eq!(d.parameters["exit_mode"], "fixed_s1");
+    registry.validate(&d).unwrap();
+    for (key, value) in [("max_lots", json!(2)), ("exit_mode", json!("hybrid_s1"))] {
+        let mut invalid = d.clone();
+        invalid.parameters[key] = value;
+        assert!(registry.validate(&invalid).is_err());
+        assert!(registry.strategy(&invalid).is_err());
+    }
+    let mut payload = signal();
+    payload["target"] = json!(1106.);
+    let strategy = registry.strategy(&d).unwrap();
+    let (actions, decision) = signal_decision(strategy.as_ref(), payload);
+    assert!(actions.is_empty());
+    assert_eq!(decision["reason"], "target_atr_above_max");
 }
 
 #[test]
@@ -495,6 +517,11 @@ fn monetary_boundaries_include_slippage_and_fees_in_both_directions() {
             risk_budget::unit_loss(&snapshot, 1000. + snapshot.sign()).unwrap(),
             22600
         );
+        let sign = snapshot.sign();
+        let params = parameters();
+        assert!(v4_shadow_two_lots(&plan, &params, 1000. + 8. * sign, 1000. + sign).unwrap());
+        assert!(!v4_shadow_two_lots(&plan, &params, 1000. + 9. * sign, 1000. + sign).unwrap());
+        assert!(!v4_shadow_two_lots(&plan, &params, 1000. + sign, 1000. + 9. * sign).unwrap());
         for (unit, expected) in [(300., 2), (300.01, 1), (600., 1), (600.01, 0)] {
             snapshot.fees =
                 serde_json::from_value(json!({"roundtrip_fixed_yuan_per_lot":unit-220.})).unwrap();

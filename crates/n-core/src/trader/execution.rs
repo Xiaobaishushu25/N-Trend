@@ -30,6 +30,8 @@ mod execution_safety;
 #[path = "execution_snapshot.rs"]
 mod execution_snapshot;
 pub use execution_snapshot::ExecutionSnapshotCache;
+#[path = "execution_versions.rs"]
+mod execution_versions;
 #[path = "execution_settlement.rs"]
 mod execution_settlement;
 pub use execution_settlement::SettlementReply;
@@ -527,6 +529,7 @@ where
 struct ExecutionState {
     definition: StrategyDefinition,
     active_config: Option<ExecutionConfig>,
+    strategy_revisions: SharedState<Vec<execution_versions::SavedRevision>>,
     strategy_states: SharedState<HashMap<String, serde_json::Value>>,
     strategy_bars: HashMap<String, String>,
     quote_gaps: SharedState<Vec<i64>>,
@@ -1119,13 +1122,29 @@ impl ExecutionEngine {
         if state.definition.strategy_id == super::candidates::p3::ID || !state.p3_stall.is_empty() {
             summary["p3_stall"] = state.p3_stall_summary();
         }
+        if (state.definition.strategy_id == super::candidates::p3::ID
+            && state.definition.code_version == super::candidates::p3::V4)
+            || state.p3_runner.has_v4_samples()
+        {
+            summary["p3_v4"] = Self::p3_v4_summary(state);
+        }
         summary
+    }
+
+    fn p3_v4_summary(state: &ExecutionState) -> serde_json::Value {
+        state.p3_runner.v4_summary(state.history.iter(), |id| {
+            state
+                .positions
+                .get(id)
+                .is_some_and(|position| !position.is_closed && position.volume > 0)
+        })
     }
 
     pub async fn comparison_details(&self) -> serde_json::Value {
         let state = self.state.lock().await;
         serde_json::json!({"active_and_aggregate": &state.comparison, "p3_runner": &state.p3_runner,
             "p3_stall": state.p3_stall_summary(), "p3_stall_observations": &state.p3_stall,
+            "p3_v4": Self::p3_v4_summary(&state),
             "archive_file":self.state_path.as_ref().map(|p|p.with_file_name("strategy_comparison.jsonl")),
             "archive_dedup_key":"archive_id"})
     }
@@ -2010,6 +2029,7 @@ impl ExecutionEngine {
                     s.p3_stall.register(&cond, &s.positions[&cond.id], &trade.exchange_id, fill_at, now);
                     s.p3_runner.register(
                         &cond, &s.positions[&cond.id], &trade.exchange_id,
+                        order.request.price,
                         fill_at, now,
                     );
                 }

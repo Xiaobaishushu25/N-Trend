@@ -1,5 +1,6 @@
 use super::*;
 use super::execution_settlement::ReconciledFee;
+use super::execution_versions::RevisionSource;
 use n_protocol::trader_stream::{ConditionRows, SharedTraderSnapshot};
 use serde_json::{json, Value};
 
@@ -13,7 +14,7 @@ enum FieldUpdate<T> {
     Changed(T),
 }
 
-impl<T: Clone + PartialEq + serde::Serialize> FieldUpdate<T> {
+impl<T: Clone + PartialEq> FieldUpdate<T> {
     fn capture(cache: &Option<CachedField<T>>, data: &T) -> Self {
         if let Some(cached) = cache.as_ref().filter(|cached| cached.data == *data) {
             Self::Reuse(cached.json.clone())
@@ -40,7 +41,10 @@ impl<T: Clone + PartialEq + serde::Serialize> FieldUpdate<T> {
         }
     }
 
-    fn render_json(self, cache: &mut Option<CachedField<T>>) -> Result<Arc<Value>> {
+    fn render_json(self, cache: &mut Option<CachedField<T>>) -> Result<Arc<Value>>
+    where
+        T: serde::Serialize,
+    {
         self.render(cache, |data| serde_json::to_value(data))
     }
 }
@@ -54,6 +58,7 @@ pub struct ExecutionSnapshotCache {
     positions: Option<CachedField<SharedState<HashMap<String, ManagedPosition>>>>,
     history: Option<CachedField<(SharedState<Vec<TradeRecord>>, Option<Arc<HashMap<String, ReconciledFee>>>)>>,
     statistics: Arc<Value>,
+    strategy_revisions: Option<CachedField<RevisionSource>>,
     strategy_states: Option<CachedField<SharedState<HashMap<String, Value>>>>,
     entry_decisions: Option<CachedField<SharedState<HashMap<String, Value>>>>,
     symbol_slots: Option<CachedField<HashMap<String, String>>>,
@@ -162,6 +167,9 @@ impl ExecutionEngine {
         let s = self.state.lock().await;
         let mut fields = SharedTraderSnapshot::default();
         fields.insert("config", serde_json::to_value(&*cfg)?);
+        let revisions = include_strategy_details.then(|| {
+            FieldUpdate::capture(&cache.strategy_revisions, &RevisionSource::capture(&s, &cfg))
+        });
         drop(cfg);
         let conditions = s.conditions.clone();
         let positions = FieldUpdate::capture(&cache.positions, &s.positions);
@@ -239,6 +247,12 @@ impl ExecutionEngine {
         })?;
         fields.insert_shared("history", history);
         fields.insert_shared("statistics", cache.statistics.clone());
+        if let Some(revisions) = revisions {
+            fields.insert_shared(
+                "strategy_revisions",
+                revisions.render(&mut cache.strategy_revisions, RevisionSource::render)?,
+            );
+        }
         let mut diagnostics = SharedTraderSnapshot::default();
         diagnostics.insert("calendar_health", json!(calendar));
         if let Some((states, entry_decisions, symbol_slots)) = details {
